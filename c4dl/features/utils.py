@@ -1,5 +1,6 @@
 from numba import njit, prange
 import numpy as np
+from scipy.signal import convolve
 
 
 def log_scale_with_zero(range, n=65536, dtype=np.float32):
@@ -107,3 +108,29 @@ def mode_pool(x, num_values=256, factor=2):
             y[iy,jy] = v.argmax()
         
     return y
+
+
+def fill_holes(missing=65535, rad=1):
+    def fill(x):
+        # identify mask of points to fill
+        o = np.ones((2*rad+1,2*rad+1), dtype=np.uint16)
+        n = np.prod(o.shape)
+        valid = (x != missing)
+        num_valid_neighbors = convolve(valid, o, mode='same', method='direct')
+        mask = ~valid & (num_valid_neighbors > 0)
+
+        # compute mean of valid points around each fillable point
+        fx = x.copy()
+        fx[~valid] = 0
+        mx = convolve(fx, o.astype(np.float64), mode='same', method='direct')        
+        mx = mx[mask] / num_valid_neighbors[mask]
+        if np.issubdtype(x.dtype, np.integer):
+            mx = mx.round().astype(x.dtype)        
+        
+        # fill holes with mean
+        fx = x.copy()
+        fx[mask] = mx
+        return fx
+
+    return fill
+

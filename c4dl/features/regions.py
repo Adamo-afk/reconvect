@@ -11,36 +11,63 @@ from scipy.signal import convolve
 from skimage.measure import label, regionprops
 from skimage.morphology import closing
 
-from .utils import average_pool, mode_pool
+from .utils import average_pool, mode_pool, fill_holes
 from .utils import log_scale_with_zero, log_quantize_with_zero
+
+
+def area_threshold(threshold=10, rad=10, missing=255):
+    (i,j) = np.mgrid[-rad:rad+1,-rad:rad+1]
+    kernel = ((i**2+j**2) <= rad**2).astype(np.uint16)
+
+    def func(x):        
+        above_threshold = (x >= threshold) & (x != missing)
+        if not above_threshold.any():
+            return above_threshold.astype(np.uint16)
+        else:
+            return convolve(above_threshold.astype(np.uint16), 
+                kernel, mode='same').round().astype(np.uint16)
+    
+    return func
 
 
 def save_patches_radar(patches, archive_path, out_dir, suffix="2020"):
     from ..datasets import mchradar
 
-    variables = ["RZC", "CZC", "BZC", "EZC-20", "EZC-45", "HZC", "LZC"]
+    variables = ["RZC", "CZC", "BZC", "EZC-20", "EZC-45", "HZC", "LZC", "CPCH", "AREA57"]
+    source_vars = {
+        "AREA57": "CZC"
+    }
+    reader_vars = list((set(variables) - set(source_vars.keys())) | set(source_vars.values()))
     mchradar_reader = mchradar.MCHRadarReader(
         archive_path=archive_path,
-        variables=variables,
+        variables=reader_vars,
         phys_values=False
     )
 
     ezc_nonzero_count_func = lambda x: np.count_nonzero((x >= 1) & (x<251))
     nonzero_count_func = {
         "RZC": lambda x: np.count_nonzero(x > 1),
+        "CPCH": lambda x: np.count_nonzero(x > 1),
         "CZC": lambda x: np.count_nonzero((x >= 10) & (x<251)),
         "BZC": lambda x: np.count_nonzero((x >= 1) & (x<=100)),
         "EZC-20": ezc_nonzero_count_func,
         "EZC-45": ezc_nonzero_count_func,
         "HZC": ezc_nonzero_count_func,
-        "LZC": lambda x: np.count_nonzero((x > 1) & (x<251))
+        "LZC": lambda x: np.count_nonzero((x > 1) & (x<251)),
+        "AREA57": lambda x: np.count_nonzero(x > 0)
+    }
+    postproc = {
+        # 165 is the equivalent of 57 dBZ
+        "AREA57": area_threshold(threshold=165, rad=10)
     }
     zero_value = {v: 0 for v in variables}    
     zero_value["RZC"] = 1
     zero_value["CZC"] = 1
+    zero_value["CPCH"] = 1
 
     save_patches_all(mchradar_reader, patches, variables,
-        nonzero_count_func, zero_value, out_dir, suffix)
+        nonzero_count_func, zero_value, out_dir, suffix,
+        source_vars=source_vars, postproc=postproc)
 
 
 def save_patches_lightning(patches, archive_path, out_dir, suffix="2020"):
@@ -51,10 +78,10 @@ def save_patches_lightning(patches, archive_path, out_dir, suffix="2020"):
         projection.ccs4_swiss_grid_area)
     mchlightning_reader = mchlightning.MCHLightningReader(
         grid_projection, archive_path=archive_path,
-        variables=["density", "current", "occurrence-10"])
+        variables=["density", "current", "occurrence-8-10"])
 
     postproc = {
-        "occurrence-10": lambda x: x.astype(np.uint8),
+        "occurrence-8-10": lambda x: x.astype(np.uint8),
         "density": lambda x: log_quantize_with_zero(x, (0.001, 50.0))[0],
         "current": lambda x: log_quantize_with_zero(x, (0.001, 500.0))[0],
     }
@@ -64,7 +91,7 @@ def save_patches_lightning(patches, archive_path, out_dir, suffix="2020"):
     }
     zero_value = {var_name: 0 for var_name in variables}
     scale = {
-        "occurrence-10": np.array([0, 1], dtype=np.float32),
+        "occurrence-8-10": np.array([0, 1], dtype=np.float32),
         "density": log_scale_with_zero((0.001, 50.0)),
         "current": log_scale_with_zero((0.001, 500.0))
     }
@@ -112,26 +139,33 @@ def save_patches_nwcsaf(patches, archive_path, out_dir, suffix="2020"):
     nwcsaf_reader = msgccs4.NWCSAFCCS4Reader(
         grid_projection, archive_path=archive_path)
 
-    variables = ["ctth_alti", "ctth_tempe", "cmic_phase"]
+    #variables = ["ctth_alti", "ctth_tempe", "cmic_phase", "cmic_cot"]
+    variables = ["cmic_cot"]
     nonzero_count_func = {
         "ctth_alti": lambda x: np.count_nonzero(x!=65535),
         "ctth_tempe": lambda x: np.count_nonzero(x!=65535),
         "cmic_phase": lambda x: np.count_nonzero(x!=4),
+        "cmic_cot": lambda x: np.count_nonzero(x!=65535),
     }
     zero_value = {
         "ctth_alti": 65535,
         "ctth_tempe": 65535,
         "cmic_phase": 4,
+        "cmic_cot": 65535,
     }
     pool = {
         "ctth_alti": lambda x: average_pool(x, factor=4, missing=65535),
         "ctth_tempe": lambda x: average_pool(x, factor=4, missing=65535),
         "cmic_phase": lambda x: mode_pool(x, factor=4),
+        "cmic_cot": lambda x: average_pool(x, factor=4, missing=65535),
+    }
+    postproc = {
+        "cmic_cot": fill_holes(missing=65535)
     }
 
     save_patches_all(nwcsaf_reader, patches, variables,
         nonzero_count_func, zero_value, out_dir, suffix,
-        pool=pool)
+        pool=pool, postproc=postproc)
 
 
 def save_patches_cosmo(patches, archive_path, out_dir, suffix="2020"):
@@ -227,13 +261,15 @@ def save_patches_solar(patches, out_dir, suffix="2020"):
 def save_patches_all(
     reader, patches, variables, nonzero_count_func, zero_value,
     out_dir, suffix, epoch=datetime(1970,1,1), postproc={}, scale=None,
-    pool={}, parallel=False
+    pool={}, source_vars={}, parallel=False
 ):
 
     def save_var(var_name):
+        src_name = source_vars.get(var_name, var_name)
+
         (patch_data, patch_coords, patch_times, 
             zero_patch_coords, zero_patch_times) = get_patches(
-                reader, var_name, patches, 
+                reader, src_name, patches, 
                 nonzero_count_func=nonzero_count_func[var_name],
                 postproc=postproc.get(var_name),
                 pool=pool.get(var_name)
@@ -241,7 +277,7 @@ def save_patches_all(
         try:
             time = epoch + timedelta(seconds=int(patch_times[0]))
             var_scale = reader.get_scale(time, var_name)
-        except AttributeError:
+        except (AttributeError, KeyError):
             var_scale = None if (scale is None) else scale[var_name]
             pass
         

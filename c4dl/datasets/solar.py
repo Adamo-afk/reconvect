@@ -4,6 +4,8 @@ import numpy as np
 from pyorbital.astronomy import get_alt_az
 
 class SolarReader(DatasetReader):
+    name = "solar"
+
     def __init__(self, grid_projection, 
         variables=["sun_x", "sun_y", "sun_z"]
     ):

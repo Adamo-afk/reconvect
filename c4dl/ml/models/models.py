@@ -12,6 +12,7 @@ from tensorflow.keras.optimizers import Adam
 
 from .blocks import ConvBlock, ResBlock
 from ...features.batch import BatchSequence
+from .optimizers import AdaBeliefOptimizer
 from .rnn import ConvGRU, ResGRU
 
 
@@ -27,6 +28,12 @@ def concat(**kwargs):
         else:
             return inputs[0]
     return concat_func
+
+
+from keras.engine import base_preprocessing_layer
+class Cast(base_preprocessing_layer.PreprocessingLayer):
+    def call(self, x):
+        return tf.cast(x, tf.float32)
 
 
 def rnn_model(
@@ -57,10 +64,17 @@ def rnn_model(
         shape_divisor = input_spec.get("shape_divisor", 1)
         shape = (base_shape[0]//shape_divisor, base_shape[1]//shape_divisor)
         channels = input_spec.get("channels", 1)
+        dtype = input_spec.get("dtype", tf.float32)
         
-        ip = Input(shape=(timesteps,shape[0],shape[1],channels), name=input_spec["name"])
+        ip = Input(
+            shape=(timesteps,shape[0],shape[1],channels),
+            name=input_spec["name"],
+            dtype=dtype
+        )
         inputs.append(ip)
-
+        if dtype != np.float32:
+            ip = tf.cast(ip, tf.float32)
+        
         if timeframe == "static": # expand static variable in time dimension
             ip_past = tf.repeat(ip, axis=1, repeats=past_timesteps)
             add_input("past", shape_divisor, ip_past)
@@ -173,15 +187,18 @@ def logit(x):
 def dice_coef(y_true, y_pred, smooth=1):
     axes = (1,2,3,4)
     s = lambda x: tf.math.reduce_sum(x, axis=axes)
+    y_true = tf.cast(y_true, tf.float32)
     intersection = s(y_true * y_pred)
     return (2. * intersection + smooth) / (s(y_true) + s(y_pred) + smooth)
 
 
 def dice_coef_loss(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     return 1 - dice_coef(y_true, y_pred)
 
 
 def iou_metric(y_true, y_pred): # this is the same as critical success index
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     intersection = y_true * y_pred
     union = (1 - y_true) * y_pred + y_true
@@ -191,6 +208,7 @@ def iou_metric(y_true, y_pred): # this is the same as critical success index
 
 
 def dice_metric(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     true_pos = y_true * y_pred
     false_pos = (1 - y_true) * y_pred
@@ -204,24 +222,28 @@ def dice_metric(y_true, y_pred):
 
 
 def true_pos(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     tp = y_true * y_pred
     return tf.math.reduce_mean(tp, axis=(1,2,3,4))
 
 
 def true_neg(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     tn = (1-y_true) * (1-y_pred)
     return tf.math.reduce_mean(tn, axis=(1,2,3,4))
 
 
 def false_pos(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     fp = (1-y_true) * y_pred
     return tf.math.reduce_mean(fp, axis=(1,2,3,4))
 
 
 def false_neg(y_true, y_pred):
+    y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
     fn = y_true * (1-y_pred)
     return tf.math.reduce_mean(fn, axis=(1,2,3,4))
@@ -234,7 +256,9 @@ def create_weighted_binary_crossentropy(ones_fraction):
         1./(2*ones_fraction)
     )
 
+    @tf.function
     def weighted_binary_crossentropy(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
         loss = tf.losses.binary_crossentropy(y_true, y_pred)
         # Apply the weights
         w = (1 - y_true) * weights[0] + y_true * weights[1]
@@ -245,10 +269,12 @@ def create_weighted_binary_crossentropy(ones_fraction):
     return weighted_binary_crossentropy
 
 
-def create_weighted_focal_loss(ones_fraction, gamma=2.0):
-    wce = create_weighted_binary_crossentropy(ones_fraction)
+def create_weighted_focal_loss(ones_fraction, gamma=tf.constant(2.0)):
+    wce = create_weighted_binary_crossentropy(tf.constant(ones_fraction))
+    
     def weighted_focal_loss(y_true, y_pred):
-        y_pred = 0.001 + y_pred*0.998 # scale to inhibit exploding gradients
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.constant(0.001) + y_pred*tf.constant(0.998) # scale to inhibit exploding gradients
         ce = wce(y_true, y_pred)
         pt = tf.where(y_true==1, y_pred, 1-y_pred)
         return (1-pt[...,0])**gamma * ce
@@ -257,7 +283,7 @@ def create_weighted_focal_loss(ones_fraction, gamma=2.0):
 
 def compile_model(
     model,
-    optimizer='adam',
+    optimizer='adabelief',
     loss='weighted_focal_loss', 
     metrics=[
         'binary_accuracy', "iou_metric", "dice_metric",
@@ -280,8 +306,8 @@ def compile_model(
     }
     loss = metric_names.get(loss, loss)
     metrics = [metric_names.get(m,m) for m in metrics]
-    if optimizer == "adam":
-        optimizer = Adam()
+    if optimizer == "adabelief":
+        optimizer = AdaBeliefOptimizer()
     model.compile(loss=loss,
         optimizer=optimizer, metrics=metrics)
 
@@ -315,7 +341,8 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
             "shape_divisor": shape_divisor,
             "channels": channels,
             "timeframe": timeframe,
-            "name": pred_name
+            "name": pred_name,
+            "dtype": x.dtype
         }
         input_specs.append(input_spec)
 
@@ -353,33 +380,6 @@ def combined_model(models, output_names):
     return comb_model
 
 
-def make_tf_dataset(batch_gen, strategy=None, dataset="train"):
-    generator = batch_gen.generate(dataset=dataset)
-    def generate():
-        for (X,Y) in generator:
-            X = tuple([tf.convert_to_tensor(x) for x in X])
-            Y = tuple([tf.convert_to_tensor(y) for y in Y])
-            yield (X,Y)
-    
-    (X,Y) = batch_gen.next_batch()
-    signature = (
-        tuple([tf.TensorSpec(shape=x.shape, dtype=tf.float32) for x in X]),
-        tuple([tf.TensorSpec(shape=y.shape, dtype=tf.float32) for y in Y])
-    )
-
-    data = tf.data.Dataset.from_generator(
-        generate,
-        output_signature=signature
-    )
-    options = tf.data.Options()
-    options.experimental_distribute.auto_shard_policy = \
-        tf.data.experimental.AutoShardPolicy.DATA
-    data = data.with_options(options)
-    if strategy is not None:
-        data = strategy.experimental_distribute_dataset(data)
-    return data
-
-
 def train_model(model, strategy, batch_gen,
     weight_fn="model.h5", monitor="val_loss"):
 
@@ -393,7 +393,8 @@ def train_model(model, strategy, batch_gen,
             monitor=monitor
         )
         reducelr = tf.keras.callbacks.ReduceLROnPlateau(
-            patience=3, mode="min", factor=0.2, monitor=monitor
+            patience=3, mode="min", factor=0.2, monitor=monitor,
+            verbose=1
         )
         earlystop = tf.keras.callbacks.EarlyStopping(
             patience=6, mode="min", restore_best_weights=True,

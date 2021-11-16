@@ -94,6 +94,8 @@ class BatchGenerator:
             return
 
         interp = raw_data.get("interpolation", None)
+        zero_value = raw_data.get("zero_value", 0)
+        missing_value = raw_data.get("missing_value", zero_value)
         if interp is None:
             self.raw_batch_index[raw_name] = PatchIndex(
                 raw_data["patches"],
@@ -101,8 +103,8 @@ class BatchGenerator:
                 raw_data["patch_times"],
                 raw_data["zero_patch_coords"],
                 raw_data["zero_patch_times"],
-                zero_value=raw_data.get("zero_value", 0),
-                missing_value=raw_data.get("missing_value", 0),
+                zero_value=zero_value,
+                missing_value=missing_value,
                 interval=self.interval,
                 box_size=(time_dim,)+box_size,
                 index_limits=index_limits,
@@ -115,8 +117,8 @@ class BatchGenerator:
                 raw_data["patch_times"],                
                 raw_data["zero_patch_coords"],
                 raw_data["zero_patch_times"],
-                zero_value=raw_data.get("zero_value", 0),
-                missing_value=raw_data.get("missing_value", 0),
+                zero_value=zero_value,
+                missing_value=missing_value,
                 interval=self.interval,
                 box_size=(time_dim,)+box_size,
                 index_limits=index_limits,
@@ -303,19 +305,10 @@ class PatchIndex:
             PatchIndex.IDX_MISSING,
             dtype=np.int32
         )
-        for k in range(patch_data.shape[0]):
-            t = (patch_times[k]-t0) // self.dt
-            if (t < 0) or (t >= self.patch_index.shape[0]):
-                continue
-            (i,j) = patch_coords[k,:]
-            self.patch_index[t,i,j] = k
-
-        for k in range(zero_patch_coords.shape[0]):
-            t = (zero_patch_times[k]-t0) // self.dt
-            if (t < 0) or (t >= self.patch_index.shape[0]):
-                continue
-            (i,j) = zero_patch_coords[k,:]
-            self.patch_index[t,i,j] = PatchIndex.IDX_ZERO
+        init_patch_index(self.patch_index, patch_coords,
+            patch_times, self.t0, self.dt)
+        init_patch_index_zero(self.patch_index, zero_patch_coords,
+            zero_patch_times, self.t0, self.dt, PatchIndex.IDX_ZERO)
 
         self._batch = None
 
@@ -347,13 +340,37 @@ class PatchIndex:
         return batch
 
 
+@njit(parallel=True)
+def init_patch_index(patch_index, patch_coords, patch_times, t0, dt):
+    for k in prange(patch_coords.shape[0]):
+        t = (patch_times[k]-t0) // dt
+        if (t < 0) or (t >= patch_index.shape[0]):
+            continue
+        i = patch_coords[k,0]
+        j = patch_coords[k,1]
+        patch_index[t,i,j] = k
+
+
+@njit(parallel=True)
+def init_patch_index_zero(patch_index, zero_patch_coords, 
+    zero_patch_times, t0, dt, idx_zero):
+
+    for k in prange(zero_patch_coords.shape[0]):
+        t = (zero_patch_times[k]-t0) // dt
+        if (t < 0) or (t >= patch_index.shape[0]):
+            continue
+        i = zero_patch_coords[k,0]
+        j = zero_patch_coords[k,1]
+        patch_index[t,i,j] = idx_zero
+
+
 class InterpolatingPatchIndex(PatchIndex):
     def __init__(self, *args, stride=12, method='linear', **kwargs):
         super().__init__(*args, **kwargs)
         self.stride = stride
         self.method = method
 
-        times_with_data = (self.patch_index != -1).any(axis=(1,2))
+        times_with_data = (self.patch_index >= 0).any(axis=(1,2))
         self.first_valid_step = np.nonzero(times_with_data)[0][0]
         self._batches = None
 
@@ -384,11 +401,15 @@ class InterpolatingPatchIndex(PatchIndex):
 
         # compute returned batch using interpolation
         batch_ip = self._alloc_batch(n_samples)
-        interp_batch(batch_ip, batches, t0_all, dt0, self.stride, num_timesteps)
+        interp_batch(batch_ip, batches, t0_all, dt0, self.stride, num_timesteps,
+            ip_linear=(self.method=='linear'))
 
         return batch_ip
 
 
+# numba can't find these values from PatchIndex
+IDX_ZERO = PatchIndex.IDX_ZERO
+IDX_MISSING = PatchIndex.IDX_MISSING
 @njit(parallel=True)
 def build_batch(
     batch, patch_data, patch_index,
@@ -415,14 +436,16 @@ def build_batch(
                     bj1 = bj0 + bj_size
                     if ind >= 0:                        
                         batch[k,bt,bi0:bi1,bj0:bj1] = patch_data[ind]
-                    elif ind == PatchIndex.IDX_ZERO:                        
+                    elif ind == IDX_ZERO:                        
                         batch[k,bt,bi0:bi1,bj0:bj1] = zero_value
-                    elif ind == PatchIndex.IDX_MISSING:
+                    elif ind == IDX_MISSING:
                         batch[k,bt,bi0:bi1,bj0:bj1] = missing_value
 
 
 @njit(parallel=True)
-def interp_batch(batch_ip, batches, t0_all, dt0, stride, num_timesteps):
+def interp_batch(batch_ip, batches, t0_all, dt0, stride, num_timesteps,
+    ip_linear=True):
+
     n = len(t0_all)
     for k in prange(n):
         t0 = t0_all[k]
@@ -434,15 +457,14 @@ def interp_batch(batch_ip, batches, t0_all, dt0, stride, num_timesteps):
             prev_batch = batches[:,prev_batch_index,...]
             next_batch = batches[:,prev_batch_index+1,...]
             
-            #if self.method == "linear":
-            #    w_next = dt/self.stride
-            #    w_prev = 1-w_next
-            #    batch_ip[k,bt,:,:] = w_prev*prev_batch[k,bt,:,:] + \
-            #        w_next*next_batch[k,bt,:,:]
-            #elif self.method == "nearest":
-            
-            batch_ip[k,bt,:,:] = prev_batch[k,:,:] if \
-                dt < stride/2 else next_batch[k,:,:]
+            if ip_linear:
+                w_next = dt/stride
+                w_prev = 1-w_next
+                batch_ip[k,bt,:,:] = w_prev*prev_batch[k,:,:] + \
+                    w_next*next_batch[k,:,:]
+            else:            
+                batch_ip[k,bt,:,:] = prev_batch[k,:,:] if \
+                    dt < stride/2 else next_batch[k,:,:]
 
             dt += 1
             if dt >= stride:

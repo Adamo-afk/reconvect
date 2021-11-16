@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 import gc
 import os
 
+import dask
 import numpy as np
 
 from c4dl.features import batch, regions, transform
@@ -21,21 +22,53 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
 
     # raw data
     raw = {
-        var_name: regions.load_patches(fn)
+        var_name: dask.delayed(regions.load_patches)(fn)
         for (var_name, fn) in files.items()
     }
+    raw = dask.compute(raw, scheduler="processes")[0]
 
     raw_interp = ["CAPE-MU", "CIN-MU", "HZEROCL", "MCONV",
-        "OMEGA", "SLI", "SOILTYP", "T-2M", "T-SO"]
+        "LCL-ML", "OMEGA", "SLI", "SOILTYP", "T-2M", "T-SO"]
     for var in raw_interp:
         if var in raw:
-            raw[var]["interpolation"] = "nearest"
+            raw[var]["interpolation"] = "linear"
             raw[var]["stride"] = 12
 
     static_vars = ["Altitude", "EW-deriv", "NS-deriv"]
     for var in static_vars:
         if var in raw:
             raw[var]["static"] = True
+
+    # configure missing values (to use when data is missing)
+    missing_values = {
+        "CAPE-MU": 200.0,
+        "CIN-MU": 21.0,
+        "HZEROCL": 3300.0,
+        "LCL-ML": 1000.0,
+        "MCONV": 0.0,
+        "OMEGA": 0.0,
+        "SLI": 2.0,
+        "SOILTYP": 5.0,
+        "T-2M": 289.18,
+        "T-SO": 289.63,
+        "HRV": 38.9,
+        "VIS006": 37.1,
+        "VIS008": 57.0,
+        "IR-016": 41.8,
+        "IR-039": 274.2,
+        "WV-062": 232.8,
+        "WV-073": 247.3,
+        "IR-087": 266.1,
+        "IR-097": 247.5,
+        "IR-108": 267.5,
+        "IR-120": 266.1,
+        "IR-134": 250.6,
+        "ctth-tempe": 260.0,
+        "ctth-alti": 5260.0,
+        "cmic-phase": 4
+    }
+    for var in missing_values:
+        raw[var]["missing_value"] = np.float32(missing_values[var])
 
     transform_CAPE = lambda: transform.normalize(std=200.0)
     transform_CIN = lambda: transform.normalize(std=21.0)
@@ -51,66 +84,78 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
         mean=290.0, std=7.2, threshold=200, fill_value=290.0)
     transform_Altitude = lambda: transform.normalize(std=820.0)
     transform_deriv = lambda: transform.normalize(std=200.0)
+    transform_HRV = lambda: transform.normalize(std=100.0, dtype=np.float16)
+    transform_radiance = lambda: transform.normalize(std=100.0)
+    transform_TB = lambda: transform.normalize(mean=250.0, std=10.0)
 
     # features and targets are defined by transforming the raw data
     transforms = {
         "RZC": {
             "source_vars": ["RZC"],
             "transform": transform.scale_log_norm(raw["RZC"]["scale"],
-                threshold=0.1, fill_value=0.01, mean=-0.051, std=0.528)
+                threshold=0.1, fill_value=0.01, mean=-0.051, std=0.528,
+                dtype=np.float16)
         },
         "CZC": {
             "source_vars": ["CZC"],
             "transform": transform.scale_norm(raw["CZC"]["scale"],
-                threshold=5.0, fill_value=-5.0, mean=21.3, std=8.71)
+                threshold=5.0, fill_value=-5.0, mean=21.3, std=8.71,
+                dtype=np.float16)
         },
         "EZC-20": {
             "source_vars": ["EZC-20"],
             "transform": transform.scale_norm(raw["EZC-20"]["scale"],
-                std=1.97)
+                std=1.97, dtype=np.float16)
         },
         "EZC-45": {
             "source_vars": ["EZC-45"],
             "transform": transform.scale_norm(raw["EZC-45"]["scale"],
-                std=1.97)
+                std=1.97, dtype=np.float16)
         },
         "HZC": {
             "source_vars": ["HZC"],
             "transform": transform.scale_norm(raw["HZC"]["scale"],
-                std=1.97)
+                std=1.97, dtype=np.float16)
         },
         "LZC": {
             "source_vars": ["LZC"],
             "transform": transform.scale_log_norm(raw["LZC"]["scale"],
-                threshold=0.75, fill_value=0.5, mean=-0.274, std=0.135)
+                threshold=0.75, fill_value=0.5, mean=-0.274, std=0.135,
+                dtype=np.float16)
         },
         "BZC": {
             "source_vars": ["BZC"],
             "transform": transform.scale_norm(raw["BZC"]["scale"],
-                std=29.2)
+                std=100.0, dtype=np.float16)
         },
-        "occurrence-10-target": {
-            "source_vars": ["occurrence-10"],
-            "transform": lambda x: x.astype(np.float32),
+        "AREA57": {
+            "source_vars": ["AREA57"],
+            "transform": transform.normalize(std=14.0, dtype=np.float16)
         },
-        "occurrence-10": {
-            "source_vars": ["occurrence-10"],
-            "transform": lambda x: x.astype(np.float32),
+        "occurrence-8-10-target": {
+            "source_vars": ["occurrence-8-10"],
+            "transform": transform.cast(np.uint8) #x.astype(np.float32),
+        },
+        "occurrence-8-10": {
+            "source_vars": ["occurrence-8-10"],
+            "transform": transform.cast(np.uint8)
         },
         "density": {
             "source_vars": ["density"],
             "transform": transform.scale_log_norm(raw["density"]["scale"],
-               threshold=1e-3, fill_value=1e-4, mean=-0.593, std=0.640)
+               threshold=1e-3, fill_value=1e-4, mean=-0.593, std=0.640,
+               dtype=np.float16)
         },
         "current": {
             "source_vars": ["current"],
             "transform": transform.scale_log_norm(raw["current"]["scale"],
-                threshold=1e-7, fill_value=1e-8, mean=0.0718, std=0.731)
+                threshold=1e-7, fill_value=1e-8, mean=0.0718, std=0.731,
+                dtype=np.float16)
         },
         "ctth-tempe": {
             "source_vars": ["ctth-tempe"],
             "transform": transform.scale_norm(raw["ctth-tempe"]["scale"],
-                missing_value=65535, fill_value=360.0, mean=260.0, std=19.1)
+                missing_value=65535, fill_value=330.0, mean=260.0, std=19.1)
         },
         "ctth-alti": {
             "source_vars": ["ctth-alti"],
@@ -120,6 +165,59 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
         "cmic-phase": {
             "source_vars": ["cmic-phase"],
             "transform": transform.one_hot(values=[1,2,3,4,255])
+        },
+        "cmic-cot": {
+            "source_vars": ["cmic-cot"],
+            "transform": transform.scale_log_norm(raw["cmic-cot"]["scale"],
+                missing_value=65535, fill_value=0.1, mean=0.94, std=0.588)
+        },
+        "HRV": {
+            "source_vars": ["HRV"],
+            "transform": transform_HRV()
+        },
+        "VIS006": {
+            "source_vars": ["VIS006"],
+            "transform": transform_radiance()
+        },
+        "VIS008": {
+            "source_vars": ["VIS008"],
+            "transform": transform_radiance()
+        },
+        "IR-016": {
+            "source_vars": ["IR-016"],
+            "transform": transform_radiance()
+        },
+        "IR-039": {
+            "source_vars": ["IR-039"],
+            "transform": transform.normalize(mean=274, std=17.5)
+        },
+        "WV-062": {
+            "source_vars": ["WV-062"],
+            "transform": transform_TB()
+        },
+        "WV-073": {
+            "source_vars": ["WV-073"],
+            "transform": transform_TB()
+        },
+        "IR-087": {
+            "source_vars": ["IR-087"],
+            "transform": transform_TB()
+        },
+        "IR-097": {
+            "source_vars": ["IR-097"],
+            "transform": transform_TB()
+        },
+        "IR-108": {
+            "source_vars": ["IR-108"],
+            "transform": transform_TB()
+        },
+        "IR-120": {
+            "source_vars": ["IR-120"],
+            "transform": transform_TB()
+        },
+        "IR-134": {
+            "source_vars": ["IR-134"],
+            "transform": transform_TB()
         },
         "CAPE-MU": {
             "source_vars": ["CAPE-MU"],
@@ -148,12 +246,12 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
             "transform": transform_HZEROCL(),
             "timeframe": "future"
         },
-        "LCL": {
-            "source_vars": ["LCL"],
+        "LCL-ML": {
+            "source_vars": ["LCL-ML"],
             "transform": transform_LCL()
         },
-        "LCL-future": {
-            "source_vars": ["LCL"],
+        "LCL-ML-future": {
+            "source_vars": ["LCL-ML"],
             "transform": transform_LCL(),
             "timeframe": "future"
         },
@@ -222,13 +320,17 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
             "transform": transform_deriv(),
             "timeframe": "static"
         },
+        "sun-z": {
+            "source_vars": ["sun-z"],
+            "transform": transform.normalize(std=127.0)
+        },
         "R10-target": {
-            "source_vars": ["RZC"],
-            "transform": transform.R_threshold(raw["RZC"]["scale"], 10.0)
+            "source_vars": ["CPCH"],
+            "transform": transform.R_threshold(raw["CPCH"]["scale"], 10.0)
         },
         "R10": {
-            "source_vars": ["RZC"],
-            "transform": transform.R_threshold(raw["RZC"]["scale"], 10.0)
+            "source_vars": ["CPCH"],
+            "transform": transform.R_threshold(raw["CPCH"]["scale"], 10.0)
         }
     }
 
@@ -238,19 +340,20 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
         "EZC-20", "EZC-45",
         "HZC", "LZC",
         "density", "current",
-        "ctth-tempe", "ctth-alti", "cmic-phase",
-        "CAPE-MU-future",
-        "CIN-MU-future",
-        "HZEROCL-future",
-        "MCONV-future",
-        "OMEGA-future",
-        "SLI-future",
-        "SOILTYP",
-        "T-2M-future",
-        "T-SO-future",
-        "Altitude", "EW-deriv", "NS-deriv"
+        "ctth-tempe", "ctth-alti", "cmic-phase", "cmic-cot",
+        "HRV", "VIS006", "VIS008", "IR-016",
+        "IR-016", "IR-039", "WV-062", "WV-073",
+        "IR-087", "IR-097", "IR-108", "IR-120", "IR-134",
+        "CAPE-MU-future", "CIN-MU-future",
+        "HZEROCL-future", "LCL-ML-future",
+        "MCONV-future", "OMEGA-future",
+        "SLI-future", "SOILTYP",
+        "T-2M-future", "T-SO-future",
+        "Altitude", "EW-deriv", "NS-deriv",
+        "sun-z"
     ]
-    pred_names.append(target)
+    if not ("CPCH" in transforms[target]["source_vars"]):
+        pred_names.append(target)
 
     predictors = {
         var_name: transforms[var_name]

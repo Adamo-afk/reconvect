@@ -1,5 +1,32 @@
+import multiprocessing
+import concurrent.futures
+
 from numba import njit, prange
 import numpy as np
+
+
+def quick_cast(x, y):        
+    num_threads = multiprocessing.cpu_count()
+    with concurrent.futures.ThreadPoolExecutor(num_threads) as executor:
+        futures = {}
+        limits = np.linspace(0, x.shape[0], num_threads+1).round().astype(int)
+        def _cast(k0,k1):
+            y[k0:k1,...] = x[k0:k1,...]        
+        for k in range(len(limits)-1):
+            args = (_cast, limits[k], limits[k+1])
+            futures[executor.submit(*args)] = k
+        concurrent.futures.wait(futures)
+
+
+def cast(dtype=np.float16):
+    xc = None
+    def transform(raw):
+        nonlocal xc
+        if (xc is None) or (xc.shape != raw.shape):
+            xc = np.empty_like(raw, dtype=dtype)
+        quick_cast(raw, xc)
+        return xc
+    return transform
 
 
 @njit(parallel=True)
@@ -13,16 +40,21 @@ def scale_array(in_arr, out_arr, scale):
 #def scale_array(in_arr, out_arr, scale):
 #    out_arr[:] = scale[in_arr]
 
-def normalize(mean=0.0, std=1.0):
-    scaled = None
+def normalize(mean=0.0, std=1.0, dtype=np.float32):
+    scaled = scaled_dt = None
 
     def transform(raw):
-        nonlocal scaled
+        nonlocal scaled, scaled_dt
         if (scaled is None) or (scaled.shape != raw.shape):
-            scaled = np.empty_like(raw, dtype=np.float32)        
+            scaled = np.empty_like(raw, dtype=np.float32)
+            scaled_dt = np.empty_like(raw, dtype=dtype)
         normalize_array(raw, scaled, mean, std)
 
-        return scaled
+        if dtype == np.float32:
+            return scaled
+        else:
+            quick_cast(scaled, scaled_dt)
+            return scaled_dt
 
     return transform
 
@@ -41,28 +73,37 @@ def normalize_threshold(mean=0.0, std=1.0, threshold=0.0, fill_value=0.0):
     return transform
 
 
-def scale_log_norm(scale, threshold=None, fill_value=0, mean=0.0, std=1.0):    
+def scale_log_norm(scale, threshold=None, missing_value=None,
+    fill_value=0, mean=0.0, std=1.0, dtype=np.float32):
+
     log_scale = np.log10(scale).astype(np.float32)
     if threshold is not None:
         log_scale[log_scale < np.log10(threshold)] = np.log10(fill_value)
+    if missing_value is not None:
+        log_scale[missing_value] = np.log10(fill_value)
     log_scale[~np.isfinite(log_scale)] = np.log10(fill_value)
     log_scale -= mean
     log_scale /= std
-    scaled = None
+    scaled = scaled_dt = None
 
     def transform(raw):
-        nonlocal scaled
+        nonlocal scaled, scaled_dt
         if (scaled is None) or (scaled.shape != raw.shape):
             scaled = np.empty_like(raw, dtype=np.float32)
+            scaled_dt = np.empty_like(raw, dtype=dtype)
         scale_array(raw, scaled, log_scale)
 
-        return scaled
+        if dtype == np.float32:
+            return scaled
+        else:
+            quick_cast(scaled, scaled_dt)
+            return scaled_dt
 
     return transform
 
 
 def scale_norm(scale, threshold=None, missing_value=None,
-    fill_value=0, mean=0.0, std=1.0):
+    fill_value=0, mean=0.0, std=1.0, dtype=np.float32):
 
     scale = scale.astype(np.float32).copy()
     scale[np.isnan(scale)] = fill_value
@@ -74,15 +115,20 @@ def scale_norm(scale, threshold=None, missing_value=None,
             scale[m] = fill_value
     scale -= mean
     scale /= std
-    scaled = None
+    scaled = scaled_dt = None    
 
     def transform(raw):
-        nonlocal scaled
+        nonlocal scaled, scaled_dt
         if (scaled is None) or (scaled.shape != raw.shape):
             scaled = np.empty_like(raw, dtype=np.float32)
+            scaled_dt = np.empty_like(raw, dtype=dtype)
         scale_array(raw, scaled, scale)
 
-        return scaled
+        if dtype == np.float32:
+            return scaled
+        else:
+            quick_cast(scaled, scaled_dt)
+            return scaled_dt
 
     return transform
 
@@ -100,15 +146,18 @@ def one_hot(values):
     num_categories = len(values)
     for (i,v) in enumerate(values):
         translation[v] = i
-    onehot = None
+    onehot = onehot_dt = None
 
     def transform(raw):
-        nonlocal onehot
+        nonlocal onehot, onehot_dt
         if (onehot is None) or (onehot.shape[:-1] != raw.shape):
             onehot = np.empty(raw.shape+(num_categories,),
                 dtype=np.float32)
+            onehot = np.empty(raw.shape+(num_categories,),
+                dtype=np.uint8)
         onehot_transform(raw, onehot, translation)
-        
+        quick_cast(onehot, onehot_dt)
+
         return onehot
 
     return transform

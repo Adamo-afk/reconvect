@@ -5,10 +5,14 @@ from zipfile import ZipFile
 
 import metranet
 import numpy as np
+from PIL import Image
 
 from ..utils import CacheDict
 from .datasetreader import DatasetReader
 from .. import projection
+
+
+file_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 def read_metranet_zip_archive(archive_name, file_name):
@@ -27,7 +31,7 @@ def read_metranet_zip_archive(archive_name, file_name):
         data = mn_data.data
         scale = mn_data.scale
 
-    return (data, scale)
+    return (data, scale)         
 
 
 class MCHRadarReader(DatasetReader):
@@ -49,6 +53,7 @@ class MCHRadarReader(DatasetReader):
         self.cache = {v: CacheDict(cache_size=cache_size) for v in variables}
         self.phys_values = phys_values
         self.min_value = min_value
+        self.cpc_lookup = None
 
     def read_data_and_scale(self, time, variable):
         if time not in self.cache[variable]:
@@ -60,7 +65,7 @@ class MCHRadarReader(DatasetReader):
                 datestamp
             )        
 
-            if variable in ["RZC", "CZC", "HZC", "LZC"]:
+            if variable in ["RZC", "CZC", "HZC", "LZC", "CPC", "CPCH"]:
                 level = "01"
                 var_code = variable
             elif variable == "BZC":
@@ -69,13 +74,21 @@ class MCHRadarReader(DatasetReader):
             elif variable.startswith("EZC"):                
                 level = variable.split("-")[1]
                 var_code = "EZC"
-            zip_filename = "{}{}VL.8{}".format(var_code, timestamp, level)
+            if variable in ["CPC", "CPCH"]:
+                timestamp += "X_00005"
+            else:
+                timestamp += "VL"
+            
+            zip_filename = "{}{}.8{}".format(var_code[:3], timestamp, level)
 
             zip_name = "{}{}.zip".format(var_code, datestamp)
             zip_path = os.path.join(day_dir,zip_name)
 
             try:
-                (data, scale) = read_metranet_zip_archive(zip_path, zip_filename)                
+                if variable in ["CPC", "CPCH"]:
+                    (data, scale) = self.read_gif_zip_archive(zip_path, zip_filename)
+                else:
+                    (data, scale) = read_metranet_zip_archive(zip_path, zip_filename)                
                 self.cache[variable][time] = (data, scale)
             except (KeyError, FileNotFoundError):
                 # zip archive not found, or file not found in archive 
@@ -109,3 +122,26 @@ class MCHRadarReader(DatasetReader):
     def get_scale(self, time, variable):
         (data, scale) = self.read_data_and_scale(time, variable)
         return scale
+
+
+    def read_gif_zip_archive(self, archive_name, file_name):
+        file_name += ".gif"
+        with ZipFile(archive_name, 'r') as zip_file:
+            names = set(zip_file.namelist())
+            for quality_flag in range(9,-1,-1):
+                fn = file_name.replace("X", str(quality_flag))
+                if fn in names:
+                    break
+            else:
+                raise FileNotFoundError()
+
+            with zip_file.open(fn, 'r') as f:
+                with Image.open(f, 'r', formats=["GIF"]) as im:
+                    data = np.array(im)
+
+        if self.cpc_lookup is None:
+            lookup_fn = os.path.join(file_dir, "cpc_lookup.txt")
+            self.cpc_lookup = np.loadtxt(lookup_fn, skiprows=2, usecols=2)
+        scale = self.cpc_lookup.copy()
+
+        return (data, scale)

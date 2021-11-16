@@ -41,6 +41,27 @@ def read_lightning_archive(archive_path, day):
 class MCHLightningReader(DatasetReader):
     name = "mchlightning"
 
+    var_params = {
+        "occurrence": {
+            "radius_mul": 1,
+            "smoothing_func": smoothing.tophat,
+            "normalize_filter": False,
+            "data_map": "lightning"
+        },
+        "density": {
+            "radius_mul": 4,
+            "smoothing_func": smoothing.gaussian,
+            "normalize_filter": True,
+            "data_map": "lightning"
+        },
+        "current": {
+            "radius_mul": 4,
+            "smoothing_func": smoothing.gaussian,
+            "normalize_filter": True,
+            "data_map": "current"
+        },
+    }
+
     def __init__(self, grid_projection, *, archive_path,
         interval=timedelta(minutes=5), mode="archive",
         variables=None):
@@ -62,7 +83,7 @@ class MCHLightningReader(DatasetReader):
             interval = self.interval
         if time not in self.lightning_cache:
             if self.mode == "archive":
-                t = time-self.interval
+                t = time-interval
                 day = datetime(t.year,t.month,t.day)
                 if not day in self.days:
                     self.days[day] = read_lightning_archive(self.archive_path, day)
@@ -72,91 +93,59 @@ class MCHLightningReader(DatasetReader):
 
         return self.lightning_cache[time]
 
-    def lightning_maps(self, lightning):
+    def lightning_maps(self, time, variable):
+        var_parts = variable.split("-")
+        var_type = var_parts[0]
+        var_p = MCHLightningReader.var_params[var_type]
+
+        if len(var_parts) > 2:
+            interval_mins = float(var_parts[2])
+            interval = timedelta(minutes=interval_mins)
+        else:
+            interval = None # use default
+
+        lightning = self.lightning_for_time(time, interval=interval)        
         lon = lightning["lon"].values
-        lat = lightning["lat"].values
-        current = abs(lightning["current"].values)
-
-        maps = np.zeros((
-            self.grid_projection.area.height,
-            self.grid_projection.area.width,
-            len(self.variables)
-        ), dtype=np.float32)
-
-        if lon.size == 0:
-            return maps
-
-        lightning_map = np.zeros((
-            self.grid_projection.area.height,
-            self.grid_projection.area.width
-        ))
-        current_map = np.zeros((
-            self.grid_projection.area.height,
-            self.grid_projection.area.width
-        ))
-
+        lat = lightning["lat"].values        
         (i,j) = self.grid_projection(lon,lat)
-        grid_accumulate(i, j, lightning_map,
-            weights=current, weighted_grid=current_map)
-
-        var_params = {
-            "occurrence": {
-                "radius_mul": 1,
-                "smoothing_func": smoothing.tophat,
-                "normalize_filter": False,
-                "data_map": lightning_map
-            },
-            "density": {
-                "radius_mul": 4,
-                "smoothing_func": smoothing.gaussian,
-                "normalize_filter": True,
-                "data_map": lightning_map
-            },
-            "current": {
-                "radius_mul": 4,
-                "smoothing_func": smoothing.gaussian,
-                "normalize_filter": True,
-                "data_map": current_map
-            },
-        }
-
-        for (i,var) in enumerate(self.variables):
-            var_parts = var.split("-")
-            var_type = var_parts[0]
-            var_p = var_params[var_type]
-            
-            if len(var_parts) > 1:
-                smoothing_scale = float(var_parts[1])
-                smoothing_rad = int(np.ceil(smoothing_scale * var_p["radius_mul"]))
-                smoothing_func = var_p["smoothing_func"](smoothing_scale)
-
-                (x,y) = np.mgrid[
-                    -smoothing_rad:smoothing_rad+1,
-                    -smoothing_rad:smoothing_rad+1, 
-                ]
-                d = np.sqrt(x**2 + y**2)
-                k = smoothing_func(d)
-                if var_p["normalize_filter"]:
-                    k /= k.sum()
-
-                lmap = convolve(var_p["data_map"], k, mode='same')
-            else:
-                lmap = var_p["data_map"]
-            
-            if var_type == "occurrence":
-                lmap.clip(min=0, max=1, out=lmap)
-                lmap.round(out=lmap)
-            else:
-                lmap.clip(min=0, out=lmap)
-
-            maps[:,:,i] = lmap
         
-        return maps
+        lmap = np.zeros((
+            self.grid_projection.area.height,
+            self.grid_projection.area.width
+        ))
+        if var_p["data_map"] == "current":
+            current = abs(lightning["current"].values)
+            grid_accumulate(i, j, weights=current, weighted_grid=lmap)
+        else:
+            grid_accumulate(i, j, grid=lmap)
+        
+        if len(var_parts) > 1:
+            smoothing_scale = float(var_parts[1])
+            smoothing_rad = int(np.ceil(smoothing_scale * var_p["radius_mul"]))
+            smoothing_func = var_p["smoothing_func"](smoothing_scale)
 
-    def data_for_time(self, time):
-        if time not in self.density_cache:
-            lightning = self.lightning_for_time(time)
-            density = self.lightning_maps(lightning)
-            self.density_cache[time] = density
+            (x,y) = np.mgrid[
+                -smoothing_rad:smoothing_rad+1,
+                -smoothing_rad:smoothing_rad+1, 
+            ]
+            d = np.sqrt(x**2 + y**2)
+            k = smoothing_func(d)
+            if var_p["normalize_filter"]:
+                k /= k.sum()
 
-        return self.density_cache[time]
+            lmap = convolve(lmap, k, mode='same')
+        
+        if var_type == "occurrence":
+            lmap.clip(min=0, max=1, out=lmap)
+            lmap.round(out=lmap)
+        else:
+            lmap.clip(min=0, out=lmap)
+        
+        return lmap
+
+    def variable_for_time(self, time, variable):
+        if (time, variable) not in self.density_cache:            
+            density = self.lightning_maps(time, variable)
+            self.density_cache[(time, variable)] = density
+
+        return self.density_cache[(time, variable)]
