@@ -48,7 +48,7 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
         "MCONV": 0.0,
         "OMEGA": 0.0,
         "SLI": 2.0,
-        "SOILTYP": 5.0,
+        "SOILTYP": 5,
         "T-2M": 289.18,
         "T-SO": 289.63,
         "HRV": 38.9,

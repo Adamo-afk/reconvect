@@ -75,7 +75,7 @@ class ConvGRU(Layer):
         z = self.update_gate(xh)
         r = self.reset_gate(xh)
         o = self.output_gate(tf.concat((x,r*h), axis=-1))
-        h = z*h + (tf.constant(1.0)-z)*tf.math.tanh(o)
+        h = z*h + (1.0-z)*tf.math.tanh(o)
         return h
 
     def call(self, inputs):
@@ -96,14 +96,19 @@ class ResGRU(ConvGRU):
         return_sequences=False, time_steps=1,
         **kwargs):
 
+        dropout = kwargs.pop("dropout", 0.0)
+        norm = kwargs.pop("norm", None)
         super(ConvGRU, self).__init__(**kwargs)
 
         self.update_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='sigmoid', padding='same')
+            final_activation='sigmoid', padding='same', dropout=dropout,
+            norm=norm)
         self.reset_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='sigmoid', padding='same')
+            final_activation='sigmoid', padding='same', dropout=dropout,
+            norm=norm)
         self.output_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='linear', padding='same')
+            final_activation='linear', padding='same', dropout=dropout,
+            norm=norm)
 
         self.return_sequences = return_sequences
         self.time_steps = time_steps

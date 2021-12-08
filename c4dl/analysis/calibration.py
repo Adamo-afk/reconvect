@@ -1,6 +1,10 @@
+import os
+import gc
+
+import tensorflow as tf
+import tensorflow_probability as tfp
 from numba import njit
 import numpy as np
-from scipy.interpolate import interp1d
 
 from ..features import batch
 
@@ -22,6 +26,18 @@ def calibration_curve(model, batch_gen, dataset='valid', nbins=100):
     return (p, occurrence_rate)
 
 
+def calibration_curve_models(model, batch_gen, weight_files, out_dir):
+    for fn in weight_files:
+        model.load_weights(fn)
+        (p, occurrence_rate) = calibration_curve(model, batch_gen)
+        fn_root = fn.split("/")[-1].split(".")[0]
+        np.save(
+            os.path.join(out_dir, "calibration-{}.npy".format(fn_root)), 
+            occurrence_rate
+        )
+        gc.collect()
+
+
 @njit
 def accumulate_hits(Y, Y_pred, bin_counts, bin_occurrences):
     n = len(bin_counts)
@@ -38,62 +54,18 @@ def accumulate_hits(Y, Y_pred, bin_counts, bin_occurrences):
             bin_occurrences[bin_ind] += 1
 
 
-def calibration_func(p, occurrence_rate):
-    valid = np.isfinite(occurrence_rate)
-    p = p[valid]
-    occurrence_rate = occurrence_rate[valid]
+def calibrated_model(model, p, occurrence_rate):
+    inputs = model.inputs
+    out = model(inputs)
+    occurrence_rate = tf.convert_to_tensor(occurrence_rate, dtype=tf.float32)
 
-    if p[0] != 0:
-        p = np.hstack((0, p))
-        occurrence_rate = np.hstack((occurrence_rate[0], occurrence_rate))
-    if p[-1] != 1:
-        p = np.hstack((p, 1))
-        occurrence_rate = np.hstack((occurrence_rate, occurrence_rate[-1]))
+    out_calib = tfp.math.interp_regular_1d_grid(
+        out, 
+        x_ref_min=tf.constant(p[0], dtype=tf.float32), 
+        x_ref_max=tf.constant(p[-1], dtype=tf.float32), 
+        y_ref=occurrence_rate, fill_value='extrapolate'
+    )
+    out_calib = tf.clip_by_value(out_calib, 0.0, 1.0)
+    c_model = tf.keras.models.Model(inputs=inputs, outputs=out_calib)
+    return c_model
 
-    func = interp1d(p, occurrence_rate, kind='cubic')
-    return func
-    
-
-def intersection_over_union(model, batch_gen, dataset='valid', threshold=0.5):
-    batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
-    tp = fp = fn = 0
-
-    for i in range(len(batch_seq)):
-        print("{}/{}".format(i,len(batch_seq)))
-        (X,Y) = batch_seq[i]
-        Y_pred = model.predict(X)
-        Y_pred = (Y_pred >= threshold)
-        Y = Y[0].astype(bool)
-        tp += np.count_nonzero(Y_pred & Y)        
-        fp += np.count_nonzero(Y_pred & ~Y)
-        fn += np.count_nonzero(~Y_pred & Y)
-        
-    return tp / (tp+fp+fn)
-
-
-def best_iou(model, batch_gen, dataset='valid')
-    dtresh = 0.1
-    min_dtresh = 0.01
-    tresh = np.arange(0.1, 0.91, dtresh)    
-    iou = np.zeros_like(x)
-
-    # initial search
-    for (i,t) in enumerate(tresh):
-        iou[i] = intersection_over_union(model, batch_gen, dataset=dataset, threshold=t)
-
-    dtresh /= 2
-    while dtresh >= min_dtresh:
-        ind_opt = np.argmax(iou)
-        t_opt = tresh[ind_opt]
-        print("Optimal treshold: {}, IoU: {}".format(t[ind_out]))
-
-        t_new = [t_opt-dtresh, t_opt+dtresh]
-        iou_new = [
-            intersection_over_union(model, batch_gen, dataset=dataset, threshold=t)
-            for t in t_new
-        ]
-        tresh = np.hstack(tresh[:ind_opt], t_new[0], tresh[ind_opt], t_new[1], tresh[ind_opt+1:])
-        iou = np.hstack(iou[:ind_opt], iou_new[0], iou[ind_opt], iou_new[1], iou[ind_opt+1:])
-        dtresh /= 2
-
-    return (tresh, iou)

@@ -1,17 +1,20 @@
 import numpy as np
-from tensorflow.keras.layers import Layer, Add, Conv2D
+from tensorflow.keras.layers import Layer, Add, Conv2D, Dropout
 from tensorflow.keras.layers import Activation, ELU, LeakyReLU, ReLU
 from tensorflow.keras.layers import AveragePooling2D
 from tensorflow.keras.layers import BatchNormalization, TimeDistributed
 from tensorflow.keras.layers import LayerNormalization
 from tensorflow.keras.regularizers import l2
+import tensorflow as tf
 from .layers import ReflectionPadding2D
 
 
 class ConvBlock(Layer):
     def __init__(self, channels, conv_size=(3,3), time_dist=False,
-        norm='none', stride=1, activation='relu', padding='same',
-        order=("conv", "act", "norm"), scale_norm=False):
+        norm=None, stride=1, activation='relu', padding='same',
+        order=("conv", "act", "dropout", "norm"), scale_norm=False,
+        dropout=0
+        ):
 
         super().__init__()
         TD = TimeDistributed if time_dist else (lambda x: x)
@@ -44,6 +47,11 @@ class ConvBlock(Layer):
         else:
             self.norm = lambda x: x
 
+        if dropout > 0:
+            self.dropout = Dropout(dropout)
+        else:
+            self.dropout = lambda x: x
+
         self.order = order
 
     def call(self, x):
@@ -51,9 +59,11 @@ class ConvBlock(Layer):
             if layer == "conv":
                 x = self.conv(self.padding(x))
             elif layer == "act":
-                x = self.act(x)
+                x = self.act(x)                
             elif layer == "norm":
                 x = self.norm(x)
+            elif layer == "dropout":
+                x = self.dropout(x)
             else:
                 raise ValueError("Unknown layer {}".format(layer))
         return x
@@ -79,6 +89,7 @@ class ResBlock(Layer):
         self.conv_block_2 = ConvBlock(channels, activation='leakyrelu', **kwargs)
         self.add = Add()
 
+    @tf.function
     def call(self, x):
         x_in = self.pool(x)
         in_channels = int(x.shape[-1])        

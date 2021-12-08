@@ -30,18 +30,11 @@ def concat(**kwargs):
     return concat_func
 
 
-from keras.engine import base_preprocessing_layer
-class Cast(base_preprocessing_layer.PreprocessingLayer):
-    def call(self, x):
-        return tf.cast(x, tf.float32)
-
-
-def rnn_model(
+def create_inputs(
     input_specs,
     base_shape=(256,256),
     past_timesteps=12,
     future_timesteps=12,
-    num_outputs=1
 ):
     # separate inputs by resolution and timeframe; build input list
     inputs_by_shape = {}    
@@ -74,6 +67,9 @@ def rnn_model(
         inputs.append(ip)
         if dtype != np.float32:
             ip = tf.cast(ip, tf.float32)
+        #for half precision
+        #if dtype != np.float16:
+        #    ip = tf.cast(ip, tf.float16)
         
         if timeframe == "static": # expand static variable in time dimension
             ip_past = tf.repeat(ip, axis=1, repeats=past_timesteps)
@@ -85,6 +81,22 @@ def rnn_model(
             add_input("future", shape_divisor, ip_future)
         else:
             add_input(timeframe, shape_divisor, ip)
+
+    return (inputs, inputs_by_shape)
+
+
+def rnn_model(
+    input_specs,
+    base_shape=(256,256),
+    past_timesteps=12,
+    future_timesteps=12,
+    num_outputs=1,
+    dropout=0,
+    norm=None
+):
+    (inputs, inputs_by_shape) = create_inputs(input_specs,
+        base_shape=base_shape, past_timesteps=past_timesteps,
+        future_timesteps=future_timesteps)
 
     # number of channels by depth
     #block_channels = [32, 64, 128, 256]
@@ -115,16 +127,16 @@ def rnn_model(
 
             for s in xt:
                 stride = 2 if (s == 1) else 1 # do not downsample lores data
-                xt[s] = ResBlock(channels, time_dist=True, stride=stride)(xt[s])
+                xt[s] = ResBlock(channels, time_dist=True, stride=stride,
+                    dropout=dropout, norm=norm)(xt[s])
                 
                 initial_state = Lambda(lambda y: tf.zeros_like(y[:,0,...]))(xt[s])
                 # TODO: future steps should iterate backwards in time?
                 
                 xt[s] = ResGRU(                
-                    channels, return_sequences=True, 
+                    channels, return_sequences=True,
                     time_steps=past_timesteps if timeframe=="past" else future_timesteps,
-                )([xt[s],initial_state])
-                
+                )([xt[s],initial_state])                
 
             if timeframe == "past":
                 intermediate.append(ConvBlock(channels)(xt[1][:,-1,...]))
@@ -144,8 +156,11 @@ def rnn_model(
             channels, return_sequences=True, time_steps=future_timesteps
         )([xt,intermediate[i]])        
         xt = TimeDistributed(UpSampling2D(interpolation='bilinear'))(xt)
-        xt = ResBlock(block_channels[max(i-1,0)], time_dist=True)(xt)
+        xt = ResBlock(block_channels[max(i-1,0)], time_dist=True,
+            dropout=dropout, norm=norm)(xt)
 
+    #if using half precision
+    #xt = tf.cast(xt, tf.float32)
     seq_out = TimeDistributed(Conv2D(num_outputs, kernel_size=(1,1),
         activation='sigmoid'))(xt)
 
@@ -184,27 +199,33 @@ def logit(x):
     return tf.math.log(x/(1-x))
 
 
-def dice_coef(y_true, y_pred, smooth=1):
-    axes = (1,2,3,4)
-    s = lambda x: tf.math.reduce_sum(x, axis=axes)
+def dice_coef(y_true, y_pred, smooth=1e-6):
+    s = lambda x: tf.math.reduce_mean(x)
     y_true = tf.cast(y_true, tf.float32)
     intersection = s(y_true * y_pred)
-    return (2. * intersection + smooth) / (s(y_true) + s(y_pred) + smooth)
+    return (2.0 * intersection) / (s(y_true) + s(y_pred) + smooth)
 
 
 def dice_coef_loss(y_true, y_pred):
-    y_true = tf.cast(y_true, tf.float32)
     return 1 - dice_coef(y_true, y_pred)
 
 
-def iou_metric(y_true, y_pred): # this is the same as critical success index
+def iou_metric(y_true, y_pred, smooth=1e-6): # this is the same as critical success index
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.math.round(y_pred)
-    intersection = y_true * y_pred
-    union = (1 - y_true) * y_pred + y_true
-    int_sum = tf.math.reduce_sum(intersection, axis=(1,2,3,4))
-    uni_sum = tf.math.reduce_sum(union, axis=(1,2,3,4))
-    return tf.where(uni_sum != 0, int_sum / uni_sum, 1)
+    intersection = tf.math.reduce_mean(y_true * y_pred)
+    total = tf.math.reduce_mean(y_true + y_pred)    
+    union = total - intersection
+    return intersection / (union + smooth)
+
+
+@tf.function
+def iou_loss(y_true, y_pred, smooth=1e-6): # this is the same as critical success index
+    y_true = tf.cast(y_true, tf.float32)
+    intersection = tf.math.reduce_mean(y_true * y_pred)
+    total = tf.math.reduce_mean(y_true + y_pred)    
+    union = total - intersection
+    return 1.0 - intersection / (union + smooth)
 
 
 def dice_metric(y_true, y_pred):
@@ -259,6 +280,7 @@ def create_weighted_binary_crossentropy(ones_fraction):
     @tf.function
     def weighted_binary_crossentropy(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
         loss = tf.losses.binary_crossentropy(y_true, y_pred)
         # Apply the weights
         w = (1 - y_true) * weights[0] + y_true * weights[1]
@@ -269,34 +291,62 @@ def create_weighted_binary_crossentropy(ones_fraction):
     return weighted_binary_crossentropy
 
 
-def create_weighted_focal_loss(ones_fraction, gamma=tf.constant(2.0)):
+def create_weighted_focal_loss(ones_fraction, gamma=2.0):
     wce = create_weighted_binary_crossentropy(tf.constant(ones_fraction))
     
+    @tf.function
     def weighted_focal_loss(y_true, y_pred):
         y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.constant(0.001) + y_pred*tf.constant(0.998) # scale to inhibit exploding gradients
+        y_pred = tf.cast(y_pred, tf.float32)
+        y_pred = 0.001 + y_pred*0.998 # scale to inhibit exploding gradients
         ce = wce(y_true, y_pred)
         pt = tf.where(y_true==1, y_pred, 1-y_pred)
         return (1-pt[...,0])**gamma * ce
+
     return weighted_focal_loss
+
+
+def create_weighted_mse(ones_fraction):
+    zeros_fraction = 1-ones_fraction
+    weights = (
+        1./(2*zeros_fraction),
+        1./(2*ones_fraction)
+    )
+
+    @tf.function
+    def weighted_mse(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        loss = tf.losses.mse(y_true, y_pred)
+        # Apply the weights
+        w = (1 - y_true) * weights[0] + y_true * weights[1]
+        weighted_loss = w[...,0] * loss
+        # Return the mean error
+        return weighted_loss
+
+    return weighted_mse
 
 
 def compile_model(
     model,
     optimizer='adabelief',
     loss='weighted_focal_loss', 
+    wfc_gamma=2.0,
     metrics=[
         'binary_accuracy', "iou_metric", "dice_metric",
         "true_pos", "true_neg", "false_pos", "false_neg"
     ],
     #event_occurrence=0.00278 # R10
-    event_occurrence=0.0106 # occurrence-10
+    event_occurrence=0.0106, # occurrence-8-10
+    opt_kwargs={}
 ):
     metric_names = {
         "weighted_binary_crossentropy": create_weighted_binary_crossentropy(
             event_occurrence),
         "weighted_focal_loss": create_weighted_focal_loss(
-            event_occurrence),
+            event_occurrence, gamma=wfc_gamma),
+        "weighted_mse": create_weighted_mse(event_occurrence),
+        "iou_loss": iou_loss,
         "iou_metric": iou_metric,
         "dice_metric": dice_metric,
         "true_pos": true_pos,
@@ -307,13 +357,13 @@ def compile_model(
     loss = metric_names.get(loss, loss)
     metrics = [metric_names.get(m,m) for m in metrics]
     if optimizer == "adabelief":
-        optimizer = AdaBeliefOptimizer()
+        optimizer = AdaBeliefOptimizer(**opt_kwargs)
     model.compile(loss=loss,
         optimizer=optimizer, metrics=metrics)
 
 
 def init_model(batch_gen, model_func=rnn_model, compile=True, 
-    init_strategy=True, **kwargs):
+    init_strategy=True, compile_kwargs={}, **kwargs):
 
     (past_timesteps, future_timesteps) = batch_gen.timesteps
     num_outputs = len(batch_gen.target_names)
@@ -361,7 +411,7 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
             **kwargs
         )
         if compile:
-            compile_model(model)
+            compile_model(model, **compile_kwargs)
 
     gc.collect()
     
@@ -394,7 +444,7 @@ def train_model(model, strategy, batch_gen,
         )
         reducelr = tf.keras.callbacks.ReduceLROnPlateau(
             patience=3, mode="min", factor=0.2, monitor=monitor,
-            verbose=1
+            verbose=1, min_delta=0.0
         )
         earlystop = tf.keras.callbacks.EarlyStopping(
             patience=6, mode="min", restore_best_weights=True,

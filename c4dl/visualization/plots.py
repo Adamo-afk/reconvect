@@ -3,186 +3,214 @@ import os
 import string
 
 from matplotlib import colors, gridspec, patches, pyplot as plt
-from mpl_toolkits.basemap import Basemap
 import numpy as np
-from pyresample.plot import area_def2basemap
-from pyresample.geometry import AreaDefinition
-import seaborn as sns
 
-from .. import projection
-from ..ml.models import base, gradboost
+from ..analysis import evaluation
 
 
-def storm_tracks(motion_vectors, tracks, time, marker_index=(0,-1), Z_time=None,
-    cax=None):
+def plot_calibration(p, occurrence_rate, names):
+    fig = plt.figure()
+    ax = fig.add_subplot()
 
-    if Z_time is None:
-        Z_time = time
-    Z = motion_vectors.reader.variable_for_time(Z_time,
-        motion_vectors.motion_var)
-    (X, V) = motion_vectors.get_vectors(time)
-    current_tracks = tracks[time]
+    for model in occurrence_rate:
+        ax.plot(p, occurrence_rate[model], label=names[model])
+    
+    ax.set_xlim((0,1))
+    ax.set_ylim((0,1))
+    ax.legend()
+    ax.set_xlabel("Predicted probability")
+    ax.set_ylabel("Occurrence rate")
 
-    # plot radar field
-    plt.imshow(Z, norm=colors.Normalize(20,60))
-    plt.gca().tick_params(bottom=False, left=False, 
-        labelbottom=False, labelleft=False)
-    cb = plt.colorbar(cax=cax)
-    cb.ax.set_title("dBZ")
-
-    # plot motion vectors
-    plt.quiver(
-        X[:, 0], X[:, 1], V[:, 0], V[:, 1],
-        color="black", angles="xy", scale_units="xy", scale=0.2,
-    )
-
-    for i in range(current_tracks[0].shape[0]):
-        for k in range(2):
-            (x, y) = (current_tracks[k][i,:,0], current_tracks[k][i,:,1])
-            plt.plot(x, y, 'tab:orange', linewidth=0.5)
-            if k == marker_index[0]:
-                j = marker_index[1]
-                plt.scatter(x[j], y[j], color=(0,0,0,0), edgecolors='tab:orange', 
-                    s=5, marker='o')
-        x = [current_tracks[0][i,-1,0], current_tracks[1][i,0,0]]
-        y = [current_tracks[0][i,-1,1], current_tracks[1][i,0,1]]
-        plt.plot(x, y, 'tab:orange', linewidth=0.5)
+    return fig
 
 
-def storm_tracks_anim(motion_vectors, tracks, time, out_dir):
-    interval = motion_vectors.time_interval
-    Z_time = time - interval * tracks[time][0].shape[1]
-    for k in range(2):
-        for j in range(tracks[time][k].shape[1]):
-            storm_tracks(motion_vectors, tracks, time, marker_index=(k,j),
-                Z_time=Z_time)
-            out_fn = os.path.join(out_dir, "frame-{}-{}.png".format(k,j))
-            plt.savefig(out_fn, bbox_inches='tight')
-            plt.close()
-            Z_time += interval
+def plot_pr_curve(conf_matrix, names):
+    precision = {}
+    recall = {}
+    labels = {}
+    for (k,cm) in conf_matrix.items():
+        precision[k] = evaluation.precision(cm)
+        recall[k] = evaluation.recall(cm)
+        auc = evaluation.pr_area_under_curve(cm)
+        labels[k] = f"{names[k]} (AUC: {auc:.3f})"
+
+    fig = plt.figure()
+    ax = fig.add_subplot()
+
+    for model in precision:
+        print(model, recall[model][-1], recall[model][0], precision[model][-1], precision[model][0])
+        ax.plot(recall[model], precision[model], label=labels[model])
+    
+    ax.set_xlim((0,1))
+    ax.set_ylim((0,1))
+    ax.legend()
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+
+    return fig
 
 
-def track_features(tracks, reader, features, time, out_dir, 
-    variable="MAXZ", flow_variables=["FLOW-U", "FLOW-V"],
-    feature="nb-33", box_size=33,
-    nb_readers=None, nb_variables=None, track_ind=0,
-    interval=timedelta(minutes=5), data_range=(0,60)):
+def plot_roc_curve(conf_matrix, names):
+    tpr = {}
+    fpr = {}
+    labels = {}
+    for (k,cm) in conf_matrix.items():
+        ((tp, fn), (fp, tn)) = cm
+        tpr[k] = tp / (tp + fn)
+        fpr[k] = fp / (fp + tn)        
+        auc = evaluation.roc_area_under_curve(cm)
+        labels[k] = f"{names[k]} (AUC: {auc:.3f})"
 
-    var_ranges = {
-        "mean_elevation": (0,500),
-        "ABIC08": (273.15-64.65, 273.15-52)#273.15-29.25)
+    fig = plt.figure()
+    ax = fig.add_subplot()
+
+    for model in tpr:
+        print(model, fpr[model][-1], fpr[model][0], tpr[model][-1], tpr[model][0])
+        ax.plot(fpr[model], tpr[model], label=labels[model])
+    
+    ax.set_xlim((0,1))
+    ax.set_ylim((0,1))
+    ax.legend()
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+
+    return fig
+
+
+def plot_threshold_metric_curve(thresholds, conf_matrix, names, metric):
+    metric_names = {
+        "CSI": "Critical Success Index",
+        "HSS": "Heidke Skill Score",
+        "PSS": "Peirce Skill Score",
+        "ETS": "Equitable Threat Score",
+    }
+    metric_funcs = {
+        "CSI": evaluation.intersection_over_union,
+        "HSS": evaluation.heidke_skill_score,
+        "PSS": evaluation.peirce_skill_score,
+        "ETS": evaluation.equitable_threat_score
     }
 
-    n = tracks[time][0].shape[1]
-    t = time - n*interval
+    metric_scores = {}
+    labels = {}
+    for (k,cm) in conf_matrix.items():
+        metric_scores[k] = metric_funcs[metric](cm)
+        best = metric_scores[k].max()
+        labels[k] = f"{names[k]} (Best: {best:.3f})"
 
-    track = tracks[time][0][track_ind,:,:]
-    norm = colors.Normalize(*data_range)
-    gs = gridspec.GridSpec(3,3)
+    fig = plt.figure()
+    ax = fig.add_subplot()
 
-    area = reader.grid_projection.area
-    bmap = area_def2basemap(area)
-    bmap.resolution = 'l'
+    for (model, score) in metric_scores.items():
+        ax.plot(thresholds, score, label=labels[model])
+    
+    ylim = ax.get_ylim()
+    ax.set_ylim((0,ylim[1]))
+    ax.set_xlim((0,1))
+    ax.legend()
+    ax.set_xlabel("Threshold")
+    ax.set_ylabel(metric_names[metric])
 
-    if nb_readers is None:
-        nb_readers = [reader]
-    if nb_variables is None:
-        nb_variables = [variable]
-
-    for k in range(n):
-        fig = plt.figure(figsize=(10,10))
-        (x,y) = track[k,:]
-        data = reader.variable_for_time(t, variable)
-        ax = fig.add_subplot(gs[:2,:3])
-        im = bmap.imshow(np.flipud(data), norm=norm, ax=ax)
-        x0 = int(round(x)) - box_size//2
-        x1 = x0 + box_size
-        y0 = int(round(y)) - box_size//2
-        y1 = y0 + box_size
-        box_x = np.array([x0,x1,x1,x0,x0])
-        box_y = np.array([y0,y0,y1,y1,y0])
-        (box_x, box_y) = bmap(*area.colrow2lonlat(box_x,box_y))
-        bmap.plot(box_x, box_y, 'k', ax=ax)
-
-        bmap.drawstates(ax=ax, color='gray')
-        bmap.drawcoastlines(ax=ax, color='gray')
-
-        if flow_variables is not None:
-            u = reader.variable_for_time(t, flow_variables[0])
-            v = reader.variable_for_time(t, flow_variables[1])
-            (x,y) = np.mgrid[:data.shape[1]:40,:data.shape[0]:40]
-            (x,y) = bmap(*area.colrow2lonlat(
-                x.round().astype(int),
-                y.round().astype(int)
-            ))
-            bmap.quiver(x, y, u[::40,::40], v[::40,::40], ax=ax)
-            
-        fig.colorbar(im, ax=ax)
-        
-        for (m,(r,v)) in enumerate(zip(nb_readers, nb_variables)):
-            ax = fig.add_subplot(gs[2,m])
-            feat_data = features[time][r.name][v][feature][track_ind,k,...]
-            if r.name == reader.name:
-                f_norm = norm
-            else:
-                f_norm = colors.Normalize(*var_ranges.get(v))
-            im = ax.imshow(feat_data, norm=f_norm)
-            fig.colorbar(im, ax=ax)
-            ax.set_title(r.name+"::"+v)
-
-        out_fn = "track-{}.png".format(t.strftime("%Y%m%d%H%M"))
-        fig.savefig(os.path.join(out_dir,out_fn), bbox_inches='tight')
-        plt.close()
-
-        t += interval
+    return fig
 
 
-def plot_study_area(config):
-    area_def = AreaDefinition(**projection.known_area(config["area"]))
-    (lon_bounds, lat_bounds) = area_def.get_boundary_lonlats()
+def plot_model_examples(X, Y, models, shown_inputs=(0,),
+    input_timesteps=(-5,-3,-1), output_timesteps=(0,1,3,6,11),
+    batch_member=0
+    ):
 
-    sides = [
-        (lon_bounds.side1, lat_bounds.side1),
-        (lon_bounds.side2, lat_bounds.side2),
-        (lon_bounds.side3, lat_bounds.side3),
-        (lon_bounds.side4, lat_bounds.side4)
-    ]
+    num_timesteps = len(input_timesteps)+len(output_timesteps)
+    gs_rows = 2 * max(len(models),len(shown_inputs))
+    gs_cols = num_timesteps
+    gs = gridspec.GridSpec(gs_rows, gs_cols)
+    batch = [x[batch_member:batch_member+1,...] for x in X]
 
-    m = Basemap(
-        width=5000000,
-        height=4000000,
-        resolution='l',
-        projection='stere',
-        lat_ts=config["area"]["params"]["lat0"],
-        lat_0=config["area"]["params"]["lat0"],
-        lon_0=config["area"]["params"]["lon0"]
-    )
+    fig = plt.figure(figsize=(gs_cols*1.5, gs_rows/2*1.5))
 
-    m.drawcoastlines(linewidth=1.5)
-    m.drawcountries(linewidth=1)
-    m.drawstates(color=(0.5,0.5,0.5))
+    # plot inputs
+    row0 = gs_rows//2 - len(shown_inputs)*2 + 1
+    for (i,k) in enumerate(shown_inputs):
+        row = row0 + 2*i        
+        ip = batch[k][0,input_timesteps,:,:,0]
+        norm = colors.Normalize(ip.min(), ip.max())
+        for m in range(len(input_timesteps)):
+            col = m
+            ax = fig.add_subplot(gs[row:row+2,col])
+            plot_frame(ip[m,:,:], norm=norm)
 
-    for (lon_side, lat_side) in sides:
-        (x,y) = m(lon_side, lat_side)
-        m.plot(x, y, color="tab:blue", linewidth=2)
+    # plot outputs
+    row0 = gs_rows//2 - len(models)*2 + 1
+    norm = colors.Normalize(0,1)
+    for (i,model) in enumerate(models):
+        Y_pred = model.predict(batch)
+        row = row0 + 2*i
+        op = Y_pred[0,input_timesteps,:,:,0]        
+        for m in range(len(output_timesteps)):
+            col = m + len(input_timesteps)
+            ax = fig.add_subplot(gs[row:row+2,col])
+            plot_frame(op[m,:,:], norm=norm)
+
+    return fig
+
+
+def plot_study_area(radar_archive_path, dem_path):
+    from pyresample.geometry import AreaDefinition
+    import cartopy
+    from ..datasets import mchradar, swissdem
+    from .. import projection
+
+    dt = datetime(2020,6,1) # dummy, not really needed
+
+    area_def = AreaDefinition(**projection.ccs4_swiss_grid_area)
+    (lons, lats) = area_def.get_lonlats()
+    crs = area_def.to_cartopy_crs()
+    ae = area_def.area_extent
+    img_extent = [ae[0], ae[2], ae[1], ae[3]]
+    ax = plt.axes(projection=crs)
+
+    swissdem_reader = swissdem.SwissDEMReader(dem_file=dem_path)
+    dem = swissdem_reader.variable_for_time(dt, "Altitude")
+    dem[dem<2] = -1
+    color_x = np.hstack(((np.zeros(8)+0.1),np.linspace(0.25,1,192)))
+    dem_colors = plt.cm.terrain(color_x)
+    dem_colors[0,:] = plt.cm.terrain(0.1)
+    terrain_trunc = colors.ListedColormap(dem_colors)
+    norm = colors.Normalize(-dem.max()*(8/192), dem.max())
+    im = ax.imshow(dem, origin='upper', extent=img_extent, transform=crs,
+        cmap=terrain_trunc, norm=norm)
+    cb = plt.colorbar(im)
+    cb.ax.set_ylabel("Elevation [m]")
+
+    ax.add_feature(cartopy.feature.COASTLINE, linewidth=1.5)
+    ax.add_feature(cartopy.feature.BORDERS, linewidth=1.0)    
+    ax.set_global()    
 
     radar_coords = np.array([
-        [-70.25694, 43.89139],                
-        [-71.13750, 41.95583],
-        [-72.86444, 40.86556],
-        [-73.16639, 44.51111],
-        [-74.06444, 42.58639],
-        [-74.41111, 39.94694],        
-        [-75.68000, 43.75583],
-        [-75.98500, 42.19972],
-        [-78.00389, 40.92306],
-        [-78.73694, 42.94861],
-        [-80.21833, 40.53167]
+        [8.512000, 47.284333],                
+        [6.099415, 46.425113],
+        [8.833217, 46.040791],
+        [7.486552, 46.370646],
+        [9.794458, 46.834974],
     ])
 
-    (radar_x, radar_y) = m(radar_coords[:,0], radar_coords[:,1])
-    m.plot(radar_x, radar_y, 'o', markeredgecolor='tab:orange',
-        markerfacecolor=(0,0,0,0))
+    ax.plot(
+        radar_coords[:,0], radar_coords[:,1], 
+        'o', markeredgecolor='tab:red',
+        markerfacecolor=(0,0,0,0), transform=cartopy.crs.PlateCarree()
+    )
+
+    mchradar_reader = mchradar.MCHRadarReader(
+        archive_path=radar_archive_path,
+        variables=["RZC"],
+        phys_values=False
+    )
+    data = mchradar_reader.variable_for_time(dt, "RZC")
+    mask = (data == 255).astype(np.float32)
+    img = np.zeros((mask.shape[0], mask.shape[1], 4))
+    img[:,:,3] = mask * 0.3
+    
+    ax.imshow(img, origin='upper', extent=img_extent, transform=crs)
+
 
 
 source_colors = {
@@ -325,80 +353,6 @@ feature_names = {
 def get_feature_name(feature):
     return feature_names.get(feature, feature)
 
-
-def plot_gradboost_importance(total_importance, source_importance,
-    source_leadtimes, num_importance=20,
-    source_x_range=(0,60), source_style="lines", legend=True, title=None,
-    fig=None, axes=None):
-
-    if axes is None:
-        fig = plt.figure(figsize=(8,16))
-        gs = gridspec.GridSpec(4, 1, hspace=0.1)
-
-    sources = [s for (g,s) in sorted(source_importance[0])]
-    
-    ax = axes[0] if (axes is not None) else fig.add_subplot(gs[:-1,0])
-    bar_y = np.arange(min(len(total_importance), num_importance))[::-1]
-    max_importance = total_importance[0][0]
-    bar_width = np.array([g for (g,f) in total_importance[:num_importance]]) / max_importance
-    color = [get_source_color(f.split("::")[0]) for (g,f) in total_importance]
-    ax.barh(bar_y, bar_width, color=color)
-    for (i,y) in enumerate(bar_y):
-        (source, feature) =  total_importance[i][1].split("::")
-        label = get_source_name(source) + " " + get_feature_name(feature)
-        ax.text(0.01, y, label, verticalalignment='center')
-    if legend:
-        legend_elements = [
-            patches.Patch(facecolor=get_source_color(s), edgecolor=None,
-                label=source_names[s])
-            for s in sorted(sources)
-        ]
-        ax.legend(handles=legend_elements, loc='lower right')
-    
-    ax.set_xlim((0,1.03))
-    ax.set_ylim((-0.5, bar_y[0]+0.5))
-    ax.tick_params(axis='y', left=False, labelleft=False, labelbottom=False)
-    if title:
-        ax.set_title(title)
-    
-
-    ax = axes[1] if (axes is not None) else fig.add_subplot(gs[-1,0])
-    bar_width = np.diff(source_leadtimes)
-    
-    cumul = np.zeros(len(source_importance))
-    for source in sources:
-        imp = []
-        for source_imp in source_importance:
-            si = {s: g for (g,s) in source_imp}
-            imp.append(si[source] / sum(si[s] for s in sources))
-        imp = np.array(imp)
-
-        color = get_source_color(source)
-        if source_style == "lines":
-            ax.fill_between(
-                source_leadtimes,
-                cumul,
-                cumul+imp,
-                facecolor=color,
-                edgecolor=None
-            )
-        elif source_style == "bars":
-            ax.bar(
-                source_leadtimes[:-1],
-                imp,
-                width=bar_width,
-                bottom=cumul,
-                color=color,
-                align='edge'
-            )
-        
-        cumul += imp
-    
-    ax.set_xlim(*source_x_range)
-    ax.set_ylim((0,1))
-    #ax.tick_params(axis='y', left=False, labelleft=False)
-
-    return fig
 
 
 def exclusion_plot(combination_metrics, dataset="test", fig=None, axes=None,
