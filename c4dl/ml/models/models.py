@@ -170,27 +170,43 @@ def rnn_model(
 
 
 def persistence_model(
-    num_inputs=1,
-    num_outputs=1,
+    input_specs,
+    persistence_vars=None,
+    base_shape=(256,256),
     past_timesteps=12,
     future_timesteps=12,
-    output_names=None
+    num_outputs=1
     ):
+    if persistence_vars is None:
+        persistence_vars = ["occurrence-8-10"]
 
-    past_in = Input(shape=(past_timesteps,None,None,num_inputs),
-        name="past_in")
-    inputs = [past_in]
+    (inputs, inputs_by_shape) = create_inputs(input_specs,
+        base_shape=base_shape, past_timesteps=past_timesteps,
+        future_timesteps=future_timesteps)
 
-    last_timestep = past_in[:,-1:,...]
-
-    persistence = tf.repeat(last_timestep, future_timesteps, axis=1)
-
-    outputs = [
-        Lambda(lambda x: x, name=name)(persistence[...,i:i+1])
-        for (i,name) in enumerate(output_names)
+    names = [s["name"] for s in input_specs]
+    pvar_indices = [names.index(var) for var in persistence_vars]
+    last_timesteps = [inputs[k][:,-1:,...] for k in pvar_indices]
+    persistence = [
+        tf.repeat(lts, axis=1, repeats=future_timesteps)
+        for lts in last_timesteps
     ]
 
-    model = Model(inputs=inputs, outputs=outputs)
+    model = Model(inputs=inputs, outputs=persistence)
+
+    return model
+
+
+def ensemble_model(models, weights=None):
+    N = len(models)
+    if weights is None:        
+        weights = [1/N]*N
+    inputs = models[0].inputs
+    weighted_outputs = [w*m(inputs) for (w,m) in zip(weights, models)]
+    ensemble_output = weighted_outputs[0]
+    for weighted_output in weighted_outputs[1:]:
+        ensemble_output = ensemble_output + weighted_output
+    model = Model(inputs=inputs, outputs=ensemble_output)
 
     return model
 
@@ -370,7 +386,7 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
 
     # construct input specs from a sample batch
     input_specs = []
-    (X, y) = batch_gen.batch(0)
+    (X, _) = batch_gen.batch(0)
     max_size = max(x.shape[2] for x in X)
     pred_names = batch_gen.pred_names_past + \
         batch_gen.pred_names_future + \

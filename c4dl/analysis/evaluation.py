@@ -49,6 +49,41 @@ def conf_matrix_models(model, batch_gen, weight_files, out_dir):
         )
 
 
+def conf_matrix_leadtimes(model, batch_gen, dataset='valid', thresholds=[0.5],
+    num_leadtimes=12):
+
+    batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
+    shape = (len(thresholds), num_leadtimes)
+    tp = np.zeros(shape, dtype=np.uint64)
+    fp = np.zeros(shape, dtype=np.uint64)
+    fn = np.zeros(shape, dtype=np.uint64)
+    num_threads = multiprocessing.cpu_count()
+
+    def acc(Y_pred, Y, i, t, threshold):
+        Y_pred_thresh = (Y_pred >= threshold)
+        tp[i,t] += np.count_nonzero(Y_pred_thresh & Y)
+        fp[i,t] += np.count_nonzero(Y_pred_thresh & ~Y)
+        fn[i,t] += np.count_nonzero(~Y_pred_thresh & Y)
+
+    for i in range(len(batch_seq)):
+        print("{}/{}".format(i,len(batch_seq)))
+        (X,Y) = batch_seq[i]
+        Y_pred = model.predict(X)
+        Y = Y[0].astype(bool)
+        
+        with concurrent.futures.ThreadPoolExecutor(num_threads) as executor:            
+            for (i,threshold) in enumerate(thresholds):
+                for t in range(num_leadtimes):
+                    executor.submit(acc, 
+                        Y_pred[:,t,...], Y[:,t,...], i, t, threshold
+                    )
+
+    N = len(batch_seq) * Y_pred.shape[0] * np.prod(Y_pred.shape[2:])
+    tn = N - tp - fp - fn
+
+    return np.array(((tp, fn), (fp, tn))) / N
+
+
 def precision(conf_matrix):
     ((tp, fn), (fp, tn)) = conf_matrix
     precision = tp / (tp + fp)
@@ -58,8 +93,11 @@ def precision(conf_matrix):
 
 def recall(conf_matrix):
     ((tp, fn), (fp, tn)) = conf_matrix
-    recall = tp / (tp + fn)
-    return recall
+    return tp / (tp + fn)
+
+
+def false_alarm_ratio(conf_matrix):
+    return 1.0 - precision(conf_matrix)
 
 
 def intersection_over_union(conf_matrix):
@@ -80,7 +118,7 @@ def peirce_skill_score(conf_matrix):
 
 def heidke_skill_score(conf_matrix):
     ((tp, fn), (fp, tn)) = conf_matrix
-    return 2 * (tp*tn - fn*fp) / ((tp+fn)*(fn+tn) + (tp+fp)*(fp+fn))
+    return 2 * (tp*tn - fn*fp) / ((tp+fn)*(fn+tn) + (tp+fp)*(fp+tn))
 
 
 def roc_area_under_curve(conf_matrix):

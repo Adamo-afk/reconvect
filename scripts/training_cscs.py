@@ -6,9 +6,10 @@ import dask
 import numpy as np
 
 from c4dl.features import batch, regions, transform
+from c4dl.ml.models import models
 
 
-def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", batch_size=64,
+def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", batch_size=48,
     epoch=datetime(1970,1,1)):
 
     files = os.listdir(file_dir)
@@ -381,3 +382,44 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
     gc.collect()
 
     return batch_gen
+
+
+def build_ensemble_model(batch_gen, dropout=True):
+    def create_model(init_strategy=False):
+        return models.init_model(batch_gen, 
+            init_strategy=init_strategy,
+            compile=False
+        )
+        
+    (model1,strategy) = create_model(init_strategy=True)
+    with strategy.scope():
+        (model2, _) = create_model()
+        (model3, _) = create_model()
+
+    ind_models = [model1, model2, model3]
+    if dropout:
+        weight_files = [
+            "../models/lightning_dropout_weightdecay_noclassweight.h5",
+            "../models/lightning_dropout_weightdecay_noclassweight2.h5",
+            "../models/lightning_dropout_weightdecay_noclassweight3.h5",
+        ]
+    else:
+        weight_files = [
+            "../models/lightning_noclassweight1.h5",
+            "../models/lightning_noclassweight2.h5",
+            "../models/lightning_noclassweight3.h5",
+        ]
+
+    for (m,w) in zip(ind_models, weight_files):
+        m.load_weights(w)
+    
+    with strategy.scope():
+        ens_model = models.ensemble_model(ind_models)
+        models.compile_model(ens_model, event_occurrence=0.5, optimizer='sgd')
+
+    return (ens_model, strategy)
+
+
+def build_persistence_model(batch_gen):
+    return models.init_model(batch_gen, 
+        model_func=models.persistence_model)

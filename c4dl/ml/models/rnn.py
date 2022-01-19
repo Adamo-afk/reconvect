@@ -135,4 +135,3 @@ class TrajGRU(ConvGRU):
                 h_all.append(h)
 
         return tf.stack(h_all,axis=1) if self.return_sequences else h
-

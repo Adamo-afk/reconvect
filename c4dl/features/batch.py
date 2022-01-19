@@ -393,11 +393,15 @@ class InterpolatingPatchIndex(PatchIndex):
         t0_mod.clip(0, self.patch_index.shape[0]-1, out=t0_mod)
 
         # retrieve valid time steps overlapping the search period
-        t_steps = list(range(0, num_timesteps+self.stride+1, self.stride))
-        batches = self._alloc_batches(len(t_steps), n_samples)
-        for (i,t_step) in enumerate(t_steps):
-            b = super().__call__(t0_mod+t_step, i0_all, j0_all, num_timesteps=1)
-            batches[:,i,...] = b[:,0,...]
+        t_steps = range(0, num_timesteps+self.stride+1, self.stride)
+        num_steps = len(t_steps)
+        batches = self._alloc_batches(num_steps, n_samples)
+        t_step = t0_mod
+        for i in range(num_steps):
+            b = super().__call__(t_step, i0_all, j0_all, num_timesteps=1)
+            batches[:,i,...] = b[:,0,...]            
+            valid_ind = (t_step + self.stride) < self.patch_index.shape[0]            
+            t_step[valid_ind] += self.stride
 
         # compute returned batch using interpolation
         batch_ip = self._alloc_batch(n_samples)
