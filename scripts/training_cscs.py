@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime, timedelta
 import gc
 import os
@@ -5,12 +6,16 @@ import os
 import dask
 import numpy as np
 
+from c4dl.analysis import calibration, evaluation
 from c4dl.features import batch, regions, transform
 from c4dl.ml.models import models
 
 
-def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", batch_size=48,
-    epoch=datetime(1970,1,1)):
+def setup_batch_gen(
+    file_dir, file_suffix="2020", primary="RZC",
+    target="R10", batch_size=48, epoch=datetime(1970,1,1),
+    sources=()
+):
 
     files = os.listdir(file_dir)
     files = [
@@ -356,6 +361,8 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
     if not ("CPCH" in transforms[target]["source_vars"]):
         pred_names.append(target)
 
+    pred_names = select_sources(pred_names, sources)
+
     predictors = {
         var_name: transforms[var_name]
         for var_name in pred_names
@@ -382,6 +389,48 @@ def setup_batch_gen(file_dir, file_suffix="2020", primary="RZC", target="R10", b
     gc.collect()
 
     return batch_gen
+
+
+def select_sources(pred_names, sources=()):
+    if not sources:
+        return pred_names
+
+    if sources:
+        source_list = {
+            "rad": [
+                "RZC", "CZC", "EZC-20", "EZC-45", "HZC", "LZC",
+                "R10", "CPCH", "BZC", "AREA57"
+            ],
+            "lig": [
+                "density", "current", "occurrence-8-10",
+            ],
+            "sat": [
+                "ctth-tempe", "ctth-alti", "cmic-phase", "cmic-cot",
+                "sun-z", "HRV", "VIS006", "VIS008", "IR-016",
+                "IR-016", "IR-039", "WV-062", "WV-073",
+                "IR-087", "IR-097", "IR-108", "IR-120", "IR-134"
+            ],
+            "nwp": [
+                "CAPE-MU", "CIN-MU", "HZEROCL", "LCL-ML",
+                "MCONV", "OMEGA", "SLI", "SOILTYP",
+                "T-2M", "T-SO"                
+            ],
+            "dem": [                
+                "Altitude", "EW-deriv", "NS-deriv"
+            ]
+        }
+        var_list = []
+        for source in sources:
+            var_list.extend(source_list[source])
+
+        pred_names_flt = []
+        for pred in pred_names:
+            for source_var in var_list:
+                if (pred == source_var) or pred.startswith(source_var+"-"):
+                    pred_names_flt.append(pred)
+                    break
+
+    return pred_names_flt
 
 
 def build_ensemble_model(batch_gen, dropout=True):
@@ -423,3 +472,86 @@ def build_ensemble_model(batch_gen, dropout=True):
 def build_persistence_model(batch_gen):
     return models.init_model(batch_gen, 
         model_func=models.persistence_model)
+
+
+def model_sources(sources_str, target="occurrence-8-10"):
+    all_sources = ("rad", "lig", "sat", "nwp", "dem")
+    sources = [s for s in all_sources if s[0] in sources_str]
+    sources_str = "".join(s[0] for s in sources)
+
+    batch_gen = setup_batch_gen("../data/2020/", target=target,
+        batch_size=48, sources=sources)
+
+    (model,strategy) = models.init_model(
+        batch_gen,
+        dropout=0.1, 
+        compile_kwargs={
+            "opt_kwargs": {"weight_decay": 1e-4},
+            "event_occurrence": 0.5
+        }
+    )
+
+    return (sources_str, batch_gen, model, strategy)
+
+def training_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning"):
+    (sources_str, batch_gen, model, strategy) = model_sources(
+        sources_str, target=target)
+
+    models.train_model(model, strategy, batch_gen,
+        weight_fn=f"../models/{fn_prefix}/{fn_prefix}-{sources_str}.h5")
+
+
+def eval_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning",
+    dataset="test"):
+
+    (sources_str, batch_gen, model, strategy) = model_sources(
+        sources_str, target=target)
+    
+    weight_fn = os.path.join("../models/", fn_prefix, f"{fn_prefix}-{sources_str}.h5")
+    model.load_weights(weight_fn)
+    result_dir = os.path.join("../results/", fn_prefix, dataset)
+
+    batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
+    eval_result = model.evaluate(batch_seq)
+    gc.collect()
+    eval_fn = os.path.join(result_dir, f"eval-{fn_prefix}-{sources_str}.csv")
+    np.savetxt(eval_fn, eval_result, delimiter=',', fmt='%.6e')
+
+    calibration.calibration_curve_models(model, batch_gen, [weight_fn],
+        result_dir, dataset=dataset)
+    
+    evaluation.conf_matrix_models(model, batch_gen, [weight_fn],
+        result_dir, dataset=dataset)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('task', type=str)
+    parser.add_argument('--sources', type=str)
+    parser.add_argument('--index', type=int, default=0)
+    parser.add_argument('--target', type=str, default="occurrence-8-10")
+    parser.add_argument('--prefix', type=str, default="lightning")
+    parser.add_argument('--overwrite', type=bool, default=False)
+    args = parser.parse_args()
+
+    task = args.task
+    if task == "train_sources":
+        sources_str = args.sources
+        target = args.target
+        fn_prefix = args.prefix
+        overwrite = args.overwrite
+        model_exists = os.path.isfile(
+            f"../models/{fn_prefix}/{fn_prefix}-{sources_str}.h5"
+        )
+        if model_exists and not overwrite:
+            return
+        training_sources(sources_str, target=target, fn_prefix=fn_prefix)
+    elif task == "eval_sources":
+        sources_str = args.sources
+        target = args.target
+        fn_prefix = args.prefix
+        eval_sources(sources_str, target=target, fn_prefix=fn_prefix)
+
+
+if __name__ == "__main__":
+    main()

@@ -110,6 +110,8 @@ def rnn_model(
             s: concat(axis=-1)(inputs_by_shape[timeframe][s])
             for s in inputs_by_shape[timeframe]
         }
+
+    print(xt_by_time)
     
     intermediate = []
     for timeframe in inputs_by_shape:
@@ -140,6 +142,9 @@ def rnn_model(
 
             if timeframe == "past":
                 intermediate.append(ConvBlock(channels)(xt[1][:,-1,...]))
+            elif (timeframe == "future") and ("past" not in inputs_by_shape):
+                zeros = Lambda(lambda y: tf.zeros_like(y[:,-1:,...]))(xt[s])
+                intermediate.append(zeros)
 
         xt_by_time[timeframe] = xt[1]
 

@@ -181,6 +181,13 @@ def plot_metric_leadtime(conf_matrix_lt, names, metrics=("CSI", "PSS"),
             ax.plot(leadtime, score, label=names[model],
                 color=c, linestyle=ls)
 
+        ax.text(
+            0.01, 0.975,
+            f"({string.ascii_lowercase[i]})",
+            horizontalalignment='left', verticalalignment='top',
+            transform=ax.transAxes
+        )
+
         ax.set_xlim((0, leadtime[-1]))
         ylim = ax.get_ylim()
         ax.set_ylim((0, ylim[1]))
@@ -345,6 +352,33 @@ def plot_study_area(radar_archive_path, dem_path):
     img[:,:,3] = mask * 0.3
     
     ax.imshow(img, origin='upper', extent=img_extent, transform=crs)
+
+    sl_offset_x = 272000
+    sl_offset_y = -136000
+    sl_capsize = 12000
+    sl_length = 256000
+    sl_labelmargin = 4000
+    sl_style = {"color": 'k', "linewidth": 0.85}
+    ax.plot(
+        [sl_offset_x, sl_offset_x+sl_length],
+        [sl_offset_y, sl_offset_y],
+        **sl_style
+    )
+    ax.plot(
+        [sl_offset_x, sl_offset_x], 
+        [sl_offset_y-sl_capsize/2, sl_offset_y+sl_capsize/2],
+        **sl_style
+    )
+    ax.plot(
+        [sl_offset_x+sl_length, sl_offset_x+sl_length], 
+        [sl_offset_y-sl_capsize/2, sl_offset_y+sl_capsize/2],
+        **sl_style
+    )
+    ax.text(
+        sl_offset_x+sl_length/2, sl_offset_y+sl_labelmargin,
+        f"{sl_length//1000} km",
+        horizontalalignment='center', verticalalignment='bottom'
+    )
 
 
 

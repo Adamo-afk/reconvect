@@ -1,4 +1,5 @@
 import os
+import string
 
 from matplotlib import pyplot as plt
 import numpy as np
@@ -106,7 +107,7 @@ def leadtime_metrics(metrics=("CSI", "PSS"), out_file=None, dataset='test'):
         ("PER"): (color_per, "-"),
     }
     conf_matrix_lt = {
-        k: np.load(os.path.join("../results", dataset, fn))
+        k: np.load(os.path.join("../results/lightning-study/", dataset, fn))
         for (k,fn) in conf_matrix_files.items()
     }
 
@@ -149,7 +150,7 @@ def metric_curves(
     dataset="valid"
 ):
     conf_matrix = {
-        k: np.load(os.path.join("../results", dataset, fn))
+        k: np.load(os.path.join("../results/lightning-study/", dataset, fn))
         for (k,fn) in conf_matrix_files.items()
     }
     thresholds = np.arange(0, 1.0001, 0.001)
@@ -164,28 +165,44 @@ def metric_curves(
         )
         if i==0:
             ax.legend(loc='lower center', bbox_to_anchor=(0.5,1.03), ncol=4)
+        ax.text(
+            0.01, 0.975,
+            f"({string.ascii_lowercase[i]})",
+            horizontalalignment='left', verticalalignment='top',
+            transform=ax.transAxes
+        )
 
     if out_file is not None:
         fig.savefig(out_file, bbox_inches='tight')
         plt.close(fig)
 
 
-def plot_examples(batch_gen, model, batch_number=13,
-    batch_member=30, out_file=None):
+def plot_examples(
+    batch_gen, model, batch_number=13,
+    batch_member=30, out_file=None, 
+    shown_inputs=("RZC", "occurrence-8-10", "HRV", "ctth-alti")
+):
+
+    names = batch_gen.pred_names_past
+    shown_inputs = [names.index(ip) for ip in shown_inputs]
+
     (X,Y) = batch_gen.batch(batch_number, dataset='test')
     fig = plots.plot_model_examples(X, Y, ["obs", model],
-        batch_member=batch_member)
+        batch_member=batch_member, shown_inputs=shown_inputs)
 
     if out_file is not None:
         fig.savefig(out_file, bbox_inches='tight', dpi=200)
         plt.close(fig)
 
 
-def plot_all_examples(batch_gen, model):
+def plot_all_examples(batch_gen, model,
+    shown_inputs=("RZC", "occurrence-8-10", "HRV", "ctth-alti")
+):
     samples = ((12, 28), (5, 37), (37, 30))
     for (i,(bn, bm)) in enumerate(samples):
         plot_examples(batch_gen, model,
             batch_number=bn, batch_member=bm, 
+            shown_inputs=shown_inputs,
             out_file=f"../figures/model-example-{i}.pdf")
 
 
