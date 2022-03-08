@@ -110,8 +110,6 @@ def rnn_model(
             s: concat(axis=-1)(inputs_by_shape[timeframe][s])
             for s in inputs_by_shape[timeframe]
         }
-
-    print(xt_by_time)
     
     intermediate = []
     for timeframe in inputs_by_shape:
@@ -291,6 +289,13 @@ def false_neg(y_true, y_pred):
     return tf.math.reduce_mean(fn, axis=(1,2,3,4))
 
 
+@tf.function
+def prob_binary_crossentropy(y_true, y_pred):
+    # defined because according to the documentation
+    # standard cross entropy requires labels to be 0 or 1
+    return -(y_true * tf.math.log(y_pred) + (1-y_true) * tf.math.log(1-y_pred))
+
+
 def create_weighted_binary_crossentropy(ones_fraction):
     zeros_fraction = 1-ones_fraction
     weights = (
@@ -366,6 +371,7 @@ def compile_model(
             event_occurrence),
         "weighted_focal_loss": create_weighted_focal_loss(
             event_occurrence, gamma=wfc_gamma),
+        "prob_binary_crossentropy": prob_binary_crossentropy,
         "weighted_mse": create_weighted_mse(event_occurrence),
         "iou_loss": iou_loss,
         "iou_metric": iou_metric,

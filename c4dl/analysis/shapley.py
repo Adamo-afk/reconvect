@@ -26,6 +26,7 @@ def shapley_value(scores, source):
     scores = {frozenset(k): v for (k,v) in scores.items()}
     source_keys = [k for k in scores if source in k]
     N = max(len(k) for k in source_keys)
+    source = set(source)
 
     s = []
     for num_sources in range(1, N+1):
@@ -38,3 +39,5 @@ def shapley_value(scores, source):
         s.append(np.mean(s_num))
 
     return np.mean(s)
+
+

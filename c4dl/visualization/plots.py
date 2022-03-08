@@ -201,6 +201,46 @@ def plot_metric_leadtime(conf_matrix_lt, names, metrics=("CSI", "PSS"),
     return fig
 
 
+def plot_loss_leadtime(loss_lt, var_names, model_names, 
+    colors_linestyles=None, fig=None, legend=True, dt_minutes=5
+):   
+    num_vars = loss_lt.shape[0]
+    num_models = loss_lt.shape[1]
+    leadtime = np.arange(1,loss_lt.shape[2]+1) * dt_minutes
+    if fig is None:
+        fig = plt.figure(figsize=(6,3*num_vars+1))
+    
+    for i in range(num_vars):
+        ax = fig.add_subplot(num_vars, 1, i+1)
+
+        for (j, model_name) in enumerate(model_names):
+            if colors_linestyles is not None:
+                (c, ls) = colors_linestyles[model_name]
+            else:
+                c = ls = None
+            ax.plot(leadtime, loss_lt[i,j,:],
+                label=model_name, color=c, linestyle=ls)
+
+        ax.text(
+            0.01, 0.975,
+            f"({string.ascii_lowercase[i]})",
+            horizontalalignment='left', verticalalignment='top',
+            transform=ax.transAxes
+        )
+
+        ax.set_xlim((0, leadtime[-1]))
+        ylim = ax.get_ylim()
+        ax.set_ylim((0, ylim[1]))
+        ax.tick_params(right=True)
+
+        if i == num_vars-1:
+            ax.set_xlabel("Lead time [min]")
+            ax.legend(loc='lower right')
+        ax.set_ylabel(var_names[i])
+
+    return fig
+
+
 def plot_frame(ax, frame, norm=None):
     im = ax.imshow(frame.astype(np.float32), norm=norm)
     ax.tick_params(left=False, bottom=False,
@@ -211,13 +251,21 @@ def plot_frame(ax, frame, norm=None):
 def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
     input_timesteps=(-4,-1), output_timesteps=(0,2,5,11),
     batch_member=0, interval_mins=5,
-    input_names=("Rain rate", "Lightning", "HRV", "CTH")
+    input_names=("Rain rate", "Lightning", "HRV", "CTH"),
+    min_p=0.025
 ):
     num_timesteps = len(input_timesteps)+len(output_timesteps)
     gs_rows = 2 * max(len(models),len(shown_inputs))
     gs_cols = num_timesteps
-    gs = gridspec.GridSpec(gs_rows, gs_cols+4, wspace=0.02, hspace=0.05,
-        width_ratios=[0.1,0.19]+[1]*gs_cols+[0.19,0.1])
+    width_ratios = (
+        [0.1, 0.19] +
+        [1]*len(input_timesteps) +
+        [0.1] +
+        [1]*len(output_timesteps) +
+        [0.19, 0.1]
+    )
+    gs = gridspec.GridSpec(gs_rows, gs_cols+5, wspace=0.02, hspace=0.05,
+        width_ratios=width_ratios)
     batch = [x[batch_member:batch_member+1,...] for x in X]
     obs = [y[batch_member:batch_member+1,...] for y in Y]
 
@@ -265,7 +313,6 @@ def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
     # plot outputs
     row0 = gs_rows//2 - len(models)
     #norm = colors.Normalize(0,1)
-    min_p = 0.025
     norm = colors.LogNorm(min_p,1,clip=True)
     for (i,model) in enumerate(models):
         if model == "obs":
@@ -275,7 +322,7 @@ def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
         row = row0 + 2*i
         op = Y_pred[0,output_timesteps,:,:,0]        
         for m in range(len(output_timesteps)):
-            col = m + len(input_timesteps) + 2
+            col = m + len(input_timesteps) + 3
             ax = fig.add_subplot(gs[row:row+2,col])
             im = plot_frame(ax, op[m,:,:], norm=norm)
             if i==0:
@@ -383,22 +430,22 @@ def plot_study_area(radar_archive_path, dem_path):
 
 
 source_colors = {
-    "nexrad": "tab:blue",
-    "ecmwf": "tab:orange",
-    "goesabi": "tab:green",
-    "goesglm": "tab:purple",
-    "aster": "tab:brown"
+    "r": "tab:blue",
+    "n": "tab:orange",
+    "s": "tab:green",
+    "l": "tab:purple",
+    "d": "tab:brown"
 }
 def get_source_color(source):
     return source_colors.get(source, "tab:gray")
 
 
 source_names = {
-    "nexrad": "NEXRAD",
-    "ecmwf": "ECMWF",
-    "goesabi": "GOES ABI",
-    "goesglm": "GOES GLM",
-    "aster": "ASTER",
+    "r": "Rad",
+    "n": "NWP",
+    "s": "Sat",
+    "l": "Lig",
+    "aster": "DEM",
     "composites": "Composite",
 }
 def get_source_name(source):
@@ -524,93 +571,79 @@ def get_feature_name(feature):
 
 
 
-def exclusion_plot(combination_metrics, dataset="test", fig=None, axes=None,
+def exclusion_plot(metrics, fig=None, axes=None,
     variable_name=None, subplot_index=0, significant_digits=3):
-    labels = []
-    metrics = {}
+
+    import seaborn as sns
 
     notation = {
-        "aster": "ASTER",
-        "goesabi": "ABI",
-        "goesglm": "GLM",
-        "ecmwf": "ECMWF",
-        "nexrad": "NEXRAD"
+        "r": "Rad",
+        "l": "Lig",
+        "s": "Sat",        
+        "n": "NWP",
+        "d": "DEM"
     }
     metric_notation = {
         "binary": "error rate",
         "cross_entropy": "cross-entropy",
         "mae": "MAE",
-        "rmse": "RMSE"
+        "rmse": "RMSE",
+        "FL2": "FL $\\gamma=2$"
     }
-
-    for subset in combination_metrics:
-        label = []
-        for source in notation:
-            if source in subset:
-                label.append(
-                    "$\\bf{{{}}}$".format(notation[source])
-                )
-        label = " ".join(label)
-        labels.append(label)
-
-        for metric in combination_metrics[subset]:
-            if metric not in metrics:
-                metrics[metric] = []
-            metrics[metric].append(combination_metrics[subset][metric][dataset])
 
     metrics_names = [metric_notation[k] for k in metrics]
     metrics_tables = {metric: np.full((8,4), np.nan) for metric in metrics}
     metric_pos = {
-        frozenset(("ecmwf", "goesglm", "aster", "nexrad", "goesabi")): (0,0),
-        frozenset(("ecmwf", "goesglm", "aster", "nexrad")): (0,1),
-        frozenset(("ecmwf", "goesglm", "aster", "goesabi")): (0,2),
-        frozenset(("ecmwf", "goesglm", "aster")): (0,3),
+        frozenset(("n", "l", "d", "r", "s")): (0,0),
+        frozenset(("n", "l", "d", "r")): (0,1),
+        frozenset(("n", "l", "d", "s")): (0,2),
+        frozenset(("n", "l", "d")): (0,3),
 
-        frozenset(("ecmwf", "goesglm", "nexrad", "goesabi")): (1,0),
-        frozenset(("ecmwf", "goesglm", "nexrad")): (1,1),
-        frozenset(("ecmwf", "goesglm", "goesabi")): (1,2),
-        frozenset(("ecmwf", "goesglm")): (1,3),
+        frozenset(("n", "l", "r", "s")): (1,0),
+        frozenset(("n", "l", "r")): (1,1),
+        frozenset(("n", "l", "s")): (1,2),
+        frozenset(("n", "l")): (1,3),
 
-        frozenset(("ecmwf", "aster", "nexrad", "goesabi")): (2,0),
-        frozenset(("ecmwf", "aster", "nexrad")): (2,1),
-        frozenset(("ecmwf", "aster", "goesabi")): (2,2),
-        frozenset(("ecmwf", "aster")): (2,3),
+        frozenset(("n", "d", "r", "s")): (2,0),
+        frozenset(("n", "d", "r")): (2,1),
+        frozenset(("n", "d", "s")): (2,2),
+        frozenset(("n", "d")): (2,3),
 
-        frozenset(("goesglm", "aster", "nexrad", "goesabi")): (3,0),
-        frozenset(("goesglm", "aster", "nexrad")): (3,1),
-        frozenset(("goesglm", "aster", "goesabi")): (3,2),
-        frozenset(("goesglm", "aster")): (3,3),
+        frozenset(("l", "d", "r", "s")): (3,0),
+        frozenset(("l", "d", "r")): (3,1),
+        frozenset(("l", "d", "s")): (3,2),
+        frozenset(("l", "d")): (3,3),
 
-        frozenset(("ecmwf", "nexrad", "goesabi")): (4,0),
-        frozenset(("ecmwf", "nexrad")): (4,1),
-        frozenset(("ecmwf", "goesabi")): (4,2),
-        frozenset(("ecmwf",)): (4,3),
+        frozenset(("n", "r", "s")): (4,0),
+        frozenset(("n", "r")): (4,1),
+        frozenset(("n", "s")): (4,2),
+        frozenset(("n",)): (4,3),
 
-        frozenset(("goesglm", "nexrad", "goesabi")): (5,0),
-        frozenset(("goesglm", "nexrad")): (5,1),
-        frozenset(("goesglm", "goesabi")): (5,2),
-        frozenset(("goesglm",)): (5,3),
+        frozenset(("l", "r", "s")): (5,0),
+        frozenset(("l", "r")): (5,1),
+        frozenset(("l", "s")): (5,2),
+        frozenset(("l",)): (5,3),
 
-        frozenset(("aster", "nexrad", "goesabi")): (6,0),
-        frozenset(("aster", "nexrad")): (6,1),
-        frozenset(("aster", "goesabi")): (6,2),
-        frozenset(("aster",)): (6,3),
+        frozenset(("d", "r", "s")): (6,0),
+        frozenset(("d", "r")): (6,1),
+        frozenset(("d", "s")): (6,2),
+        frozenset(("d",)): (6,3),
 
-        frozenset(("nexrad", "goesabi")): (7,0),
-        frozenset(("nexrad",)): (7,1),
-        frozenset(("goesabi",)): (7,2),
+        frozenset(("r", "s")): (7,0),
+        frozenset(("r",)): (7,1),
+        frozenset(("s",)): (7,2),
         frozenset(()): (7,3),
     }
     metric_pos_inv = {v: k for (k, v) in metric_pos.items()}
 
     for metric in metrics:
-        for subset in combination_metrics:
+        for subset in metrics[metric]:
             subset_frozen = frozenset(subset)
             (i,j) = metric_pos[subset_frozen]
-            metrics_tables[metric][i,j] = combination_metrics[subset][metric][dataset]
+            metrics_tables[metric][i,j] = metrics[metric][subset]
 
-    xlabels_show = frozenset(("nexrad", "goesabi"))
-    ylabels_show = frozenset(("ecmwf", "goesglm", "aster"))
+    xlabels_show = frozenset(("r", "s"))
+    ylabels_show = frozenset(("n", "l", "d"))
 
     with sns.plotting_context("paper"):
         if fig is None:

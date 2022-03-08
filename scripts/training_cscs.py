@@ -14,7 +14,7 @@ from c4dl.ml.models import models
 def setup_batch_gen(
     file_dir, file_suffix="2020", primary="RZC",
     target="R10", batch_size=48, epoch=datetime(1970,1,1),
-    sources=()
+    sources=("rad", "lig", "sat", "nwp", "dem")
 ):
 
     files = os.listdir(file_dir)
@@ -32,6 +32,24 @@ def setup_batch_gen(
         for (var_name, fn) in files.items()
     }
     raw = dask.compute(raw, scheduler="processes")[0]
+    if not sources:
+        raw["zeros"] = {
+            "patches": np.zeros(
+                (0,)+raw[primary]["patches"].shape[1:],
+                dtype=np.float32
+            ),
+            "patch_coords": np.empty((0,2), dtype=np.uint16),
+            "patch_times": np.empty(0, dtype=np.int64),
+            "zero_patch_coords": np.vstack((
+                raw[primary]["patch_coords"],
+                raw[primary]["zero_patch_coords"]
+            )).T,
+            "zero_patch_times": np.hstack((
+                raw[primary]["patch_times"],
+                raw[primary]["zero_patch_times"]
+            )),
+            "zero_value": np.float32(0.0)
+        }
 
     raw_interp = ["CAPE-MU", "CIN-MU", "HZEROCL", "MCONV",
         "LCL-ML", "OMEGA", "SLI", "SOILTYP", "T-2M", "T-SO"]
@@ -129,18 +147,23 @@ def setup_batch_gen(
                 threshold=0.75, fill_value=0.5, mean=-0.274, std=0.135,
                 dtype=np.float16)
         },
-        "BZC": {
+        "BZC-target": {
             "source_vars": ["BZC"],
             "transform": transform.scale_norm(raw["BZC"]["scale"],
                 std=100.0, dtype=np.float16)
         },
+        "BZC": {
+            "source_vars": ["BZC"],
+            "transform": transform.scale_norm(raw["BZC"]["scale"],
+                std=100.0, dtype=np.float16)
+        },        
         "AREA57": {
             "source_vars": ["AREA57"],
             "transform": transform.normalize(std=14.0, dtype=np.float16)
         },
         "occurrence-8-10-target": {
             "source_vars": ["occurrence-8-10"],
-            "transform": transform.cast(np.uint8) #x.astype(np.float32),
+            "transform": transform.cast(np.uint8)
         },
         "occurrence-8-10": {
             "source_vars": ["occurrence-8-10"],
@@ -337,6 +360,10 @@ def setup_batch_gen(
         "R10": {
             "source_vars": ["CPCH"],
             "transform": transform.R_threshold(raw["CPCH"]["scale"], 10.0)
+        },
+        "zeros": {
+            "source_vars": ["zeros"],
+            "transform": lambda x: x
         }
     }
 
@@ -362,6 +389,8 @@ def setup_batch_gen(
         pred_names.append(target)
 
     pred_names = select_sources(pred_names, sources)
+    if not pred_names:
+        pred_names = ["zeros"] # prediction with no input data
 
     predictors = {
         var_name: transforms[var_name]
@@ -392,8 +421,7 @@ def setup_batch_gen(
 
 
 def select_sources(pred_names, sources=()):
-    if not sources:
-        return pred_names
+    pred_names_flt = []
 
     if sources:
         source_list = {
@@ -423,7 +451,6 @@ def select_sources(pred_names, sources=()):
         for source in sources:
             var_list.extend(source_list[source])
 
-        pred_names_flt = []
         for pred in pred_names:
             for source_var in var_list:
                 if (pred == source_var) or pred.startswith(source_var+"-"):
@@ -448,15 +475,15 @@ def build_ensemble_model(batch_gen, dropout=True):
     ind_models = [model1, model2, model3]
     if dropout:
         weight_files = [
-            "../models/lightning_dropout_weightdecay_noclassweight.h5",
-            "../models/lightning_dropout_weightdecay_noclassweight2.h5",
-            "../models/lightning_dropout_weightdecay_noclassweight3.h5",
+            "../models/lightning-study/lightning_dropout_weightdecay_noclassweight.h5",
+            "../models/lightning-study/lightning_dropout_weightdecay_noclassweight2.h5",
+            "../models/lightning-study/lightning_dropout_weightdecay_noclassweight3.h5",
         ]
     else:
         weight_files = [
-            "../models/lightning_noclassweight1.h5",
-            "../models/lightning_noclassweight2.h5",
-            "../models/lightning_noclassweight3.h5",
+            "../models/lightning-study/lightning_noclassweight1.h5",
+            "../models/lightning-study/lightning_noclassweight2.h5",
+            "../models/lightning-study/lightning_noclassweight3.h5",
         ]
 
     for (m,w) in zip(ind_models, weight_files):
@@ -482,13 +509,17 @@ def model_sources(sources_str, target="occurrence-8-10"):
     batch_gen = setup_batch_gen("../data/2020/", target=target,
         batch_size=48, sources=sources)
 
+    compile_kwargs = {
+        "opt_kwargs": {"weight_decay": 1e-4},
+        "event_occurrence": 0.5
+    }
+    if target == "BZC":
+        compile_kwargs["loss"] = "prob_binary_crossentropy"
+
     (model,strategy) = models.init_model(
         batch_gen,
         dropout=0.1, 
-        compile_kwargs={
-            "opt_kwargs": {"weight_decay": 1e-4},
-            "event_occurrence": 0.5
-        }
+        compile_kwargs=compile_kwargs
     )
 
     return (sources_str, batch_gen, model, strategy)
@@ -497,38 +528,59 @@ def training_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning
     (sources_str, batch_gen, model, strategy) = model_sources(
         sources_str, target=target)
 
+    if sources_str == "":
+        sources_str = "null"
     models.train_model(model, strategy, batch_gen,
         weight_fn=f"../models/{fn_prefix}/{fn_prefix}-{sources_str}.h5")
 
 
 def eval_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning",
-    dataset="test"):
+    dataset="test", separate_leadtimes=False):
 
     (sources_str, batch_gen, model, strategy) = model_sources(
         sources_str, target=target)
     
+    if sources_str == "":
+        sources_str = "null"
     weight_fn = os.path.join("../models/", fn_prefix, f"{fn_prefix}-{sources_str}.h5")
     model.load_weights(weight_fn)
     result_dir = os.path.join("../results/", fn_prefix, dataset)
-
     batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
-    eval_result = model.evaluate(batch_seq)
-    gc.collect()
-    eval_fn = os.path.join(result_dir, f"eval-{fn_prefix}-{sources_str}.csv")
-    np.savetxt(eval_fn, eval_result, delimiter=',', fmt='%.6e')
 
-    calibration.calibration_curve_models(model, batch_gen, [weight_fn],
-        result_dir, dataset=dataset)
-    
-    evaluation.conf_matrix_models(model, batch_gen, [weight_fn],
-        result_dir, dataset=dataset)
+    if not separate_leadtimes:        
+        eval_result = model.evaluate(batch_seq)
+        gc.collect()
+        eval_fn = os.path.join(result_dir,
+            f"eval-{fn_prefix}-{sources_str}.csv")
+        np.savetxt(eval_fn, eval_result, delimiter=',', fmt='%.6e')
+
+        calibration.calibration_curve_models(model, batch_gen, [weight_fn],
+            result_dir, dataset=dataset)
+        
+        evaluation.conf_matrix_models(model, batch_gen, [weight_fn],
+            result_dir, dataset=dataset)
+    else:        
+        def loss_timestep(loss, timestep):
+            def l(y_true, y_pred):
+                y_true = y_true[:,timestep:timestep+1,...]
+                y_pred = y_pred[:,timestep:timestep+1,...]
+                return loss(y_true, y_pred)
+            l.__name__ = f"loss_{timestep}"
+            return l        
+        metrics = [loss_timestep(model.loss, i) for i in range(12)]
+        with strategy.scope():
+            model.compile(loss=model.loss, metrics=metrics, optimizer='sgd')
+        eval_result = model.evaluate(batch_seq)
+        eval_fn = os.path.join(result_dir,
+            f"eval_leadtime-{fn_prefix}-{sources_str}.csv")
+        np.savetxt(eval_fn, eval_result, delimiter=',', fmt='%.6e')
+
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('task', type=str)
     parser.add_argument('--sources', type=str)
-    parser.add_argument('--index', type=int, default=0)
     parser.add_argument('--target', type=str, default="occurrence-8-10")
     parser.add_argument('--prefix', type=str, default="lightning")
     parser.add_argument('--overwrite', type=bool, default=False)
@@ -551,6 +603,12 @@ def main():
         target = args.target
         fn_prefix = args.prefix
         eval_sources(sources_str, target=target, fn_prefix=fn_prefix)
+    elif task == "eval_sources_leadtime":
+        sources_str = args.sources
+        target = args.target
+        fn_prefix = args.prefix
+        eval_sources(sources_str, target=target, fn_prefix=fn_prefix,
+            separate_leadtimes=True)
 
 
 if __name__ == "__main__":
