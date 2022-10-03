@@ -37,7 +37,7 @@ def create_inputs(
     future_timesteps=12,
 ):
     # separate inputs by resolution and timeframe; build input list
-    inputs_by_shape = {}    
+    inputs_by_shape = {}
     inputs = []
     def add_input(timeframe, shape_divisor, ip):
         if timeframe not in inputs_by_shape:
@@ -92,7 +92,9 @@ def rnn_model(
     future_timesteps=12,
     num_outputs=1,
     dropout=0,
-    norm=None
+    norm=None,
+    last_only=False,
+    final_activation='sigmoid'
 ):
     (inputs, inputs_by_shape) = create_inputs(input_specs,
         base_shape=base_shape, past_timesteps=past_timesteps,
@@ -162,10 +164,11 @@ def rnn_model(
         xt = ResBlock(block_channels[max(i-1,0)], time_dist=True,
             dropout=dropout, norm=norm)(xt)
 
-    #if using half precision
-    #xt = tf.cast(xt, tf.float32)
     seq_out = TimeDistributed(Conv2D(num_outputs, kernel_size=(1,1),
-        activation='sigmoid'))(xt)
+        activation=final_activation))(xt)
+
+    if last_only:
+        seq_out = seq_out[:,-1,...]
 
     model = Model(inputs=inputs, outputs=[seq_out])
 
@@ -296,6 +299,129 @@ def prob_binary_crossentropy(y_true, y_pred):
     return -(y_true * tf.math.log(y_pred) + (1-y_true) * tf.math.log(1-y_pred))
 
 
+@tf.function
+def gaussian_crossentropy(mu_true, sigma_true, mu_pred, sigma_pred):
+    sigma_ratio = sigma_true/sigma_pred
+    return (
+        0.5 * (
+            tf.math.square(sigma_ratio) +
+            tf.math.square((mu_true-mu_pred)/sigma_pred) -
+            1
+        ) -
+        tf.math.log(sigma_ratio)
+    )
+
+
+@tf.function
+def rain_mean_std(log10_R):
+    m = log10_R
+    sigma = 0.3215 # equivalent to std = 0.33*mean
+    mu = tf.math.log(10.0)*m - 0.5*tf.math.square(sigma)
+    return (mu, sigma)
+
+
+@tf.function
+def normal_cdf(x, mu, sigma):
+    sqrt_2 = tf.math.sqrt(2.0)
+    mu = tf.expand_dims(mu, -1)
+    sigma = tf.expand_dims(sigma, -1)
+    return 0.5 * (1.0 + 
+        tf.math.erf((x[None,:]-mu)/(sqrt_2*sigma))
+    )
+
+
+@tf.function
+def rain_loss_lognorm(y_true, y_pred):
+    (mu_true, sigma_true) = rain_mean_std(y_true)
+    mu_pred = y_pred[...,0]
+    sigma_pred = y_pred[...,1]
+    return gaussian_crossentropy(mu_true, sigma_true, mu_pred, sigma_pred)
+
+
+@tf.function
+def tf_log10(x):
+    return tf.math.log(x) / tf.math.log(10.0)
+
+
+def make_rain_loss_hist(bins, rain_thresh=0.1, samples_per_hour=12.0):
+    log_bins = tf.convert_to_tensor(np.log(bins).astype(np.float32))
+    rain_thresh = tf.constant(np.log10(rain_thresh).astype(np.float32))
+    @tf.function
+    def rain_loss_hist(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_true = tf.cond(
+            tf.rank(y_true)==4,
+            lambda: tf.expand_dims(y_true,-1),
+            lambda: y_true
+        )
+        y_pred = tf.cast(y_pred, tf.float32)
+
+        # sum to accumulated rain in log10(mm/h)
+        y_true = tf.math.pow(10.0, y_true)
+        y_true = tf.where(y_true < rain_thresh, 0.0, y_true)
+        y_true = tf.math.reduce_sum(y_true, axis=1)
+        y_true = y_true / samples_per_hour
+        dry = (y_true < rain_thresh)
+        y_true = tf.where(dry, rain_thresh*0.1, y_true)        
+        y_true = tf_log10(y_true)
+
+        # create probability bins of precip
+        (mu_true, sigma_true) = rain_mean_std(y_true[...,0])
+        cdf = normal_cdf(log_bins, mu_true, sigma_true)
+        cdf_diff = cdf[...,1:]-cdf[...,:-1]        
+        first_bin = cdf[...,:1]
+        first_bin = tf.where(dry, 1.0, first_bin)
+        later_bins = tf.concat([cdf_diff, 1.0-cdf[...,-1:]], axis=-1)
+        later_bins = tf.where(dry, 0.0, later_bins)
+        bins_true = tf.concat([first_bin, later_bins], axis=-1)
+
+        # compute cross entropy loss
+        xent = -tf.math.reduce_sum(bins_true * tf.math.log(y_pred), 
+            axis=-1, keepdims=True)
+        return xent
+    return rain_loss_hist
+
+
+def make_rain_loss_hist_cumul(bins, rain_thresh=0.1, num_timesteps=12):
+    log_bins = tf.convert_to_tensor(np.log(bins).astype(np.float32))
+    rain_thresh = tf.constant(np.log10(rain_thresh).astype(np.float32))
+    @tf.function
+    def rain_loss_hist_cumul(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_true = tf.cond(
+            tf.rank(y_true)==4,
+            lambda: tf.expand_dims(y_true,-1),
+            lambda: y_true
+        )
+        y_pred = tf.cast(y_pred, tf.float32)
+
+        # sum to accumulated rain in log10(mm/h)
+        y_true = tf.math.pow(10.0, y_true)
+        y_true = tf.where(y_true < rain_thresh, 0.0, y_true)
+        y_true = tf.cumsum(y_true, axis=1) / \
+            tf.range(1, num_timesteps+1, dtype=tf.float32)[None,:,None,None,None]
+        dry = (y_true < rain_thresh)
+        y_true = tf.where(dry, rain_thresh*0.1, y_true)        
+        y_true = tf_log10(y_true)
+
+        # create probability bins of precip
+        (mu_true, sigma_true) = rain_mean_std(y_true[...,0])
+        cdf = normal_cdf(log_bins, mu_true, sigma_true)
+        cdf_diff = cdf[...,1:]-cdf[...,:-1]        
+        first_bin = cdf[...,:1]
+        first_bin = tf.where(dry, 1.0, first_bin)
+        later_bins = tf.concat([cdf_diff, 1.0-cdf[...,-1:]], axis=-1)
+        later_bins = tf.where(dry, 0.0, later_bins)
+        bins_true = tf.concat([first_bin, later_bins], axis=-1)
+
+        # compute cross entropy loss
+        xent = -tf.math.reduce_sum(bins_true * tf.math.log(y_pred), 
+            axis=-1, keepdims=True)
+        return xent
+    return rain_loss_hist_cumul
+
+
+
 def create_weighted_binary_crossentropy(ones_fraction):
     zeros_fraction = 1-ones_fraction
     weights = (
@@ -393,7 +519,6 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
     init_strategy=True, compile_kwargs={}, **kwargs):
 
     (past_timesteps, future_timesteps) = batch_gen.timesteps
-    num_outputs = len(batch_gen.target_names)
 
     # construct input specs from a sample batch
     input_specs = []
@@ -434,7 +559,6 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
             past_timesteps=past_timesteps,
             future_timesteps=future_timesteps,
             input_specs=input_specs,
-            num_outputs=num_outputs,
             **kwargs
         )
         if compile:

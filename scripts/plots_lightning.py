@@ -2,7 +2,7 @@ from itertools import product
 import os
 import string
 
-from matplotlib import pyplot as plt
+from matplotlib import pyplot as plt, gridspec
 import numpy as np
 
 from c4dl.analysis import shapley
@@ -95,7 +95,6 @@ def metric_curves_by_loss(**kwargs):
         loss_colors_linestyles, **kwargs)
 
 
-
 def leadtime_metrics(metrics=("CSI", "PSS"), out_file=None, dataset='test'):
     conf_matrix_files = {
         "FL2": "conf_matrix_leadtime-ensemble_dropout_weightdecay_noclassweight.npy",
@@ -148,7 +147,7 @@ def leadtime_losses(out_file=None):
         ("Network"): (color_fl2, "-"),
         ("Lagrangian"): (color_lag, "--"),
         ("Eulerian"): (color_per, "-.")
-    }            
+    }
 
     fig = plots.plot_loss_leadtime(loss_lt, var_names, model_names,
         colors_linestyles=colors_linestyles)
@@ -158,15 +157,6 @@ def leadtime_losses(out_file=None):
         plt.close(fig)
 
 
-def exclusion_plots(out_file=None):
-    scores = shapley.load_scores(
-        "/scratch/jleinone/c4dl/results/lightning/test/")
-    scores_norm = {s: v/scores[''] for (s,v) in scores.items()}
-    fig = plots.exclusion_plot({"FL2": scores_norm})
-
-    if out_file is not None:
-        fig.savefig(out_file, bbox_inches='tight')
-        plt.close(fig)
 
 
 ensemble_conf_matrix_files = {
@@ -231,17 +221,23 @@ def plot_examples(
     batch_gen, model, batch_number=13,
     batch_member=30, out_file=None, 
     shown_inputs=("RZC", "occurrence-8-10", "HRV", "ctth-alti"),
+    input_names=("Rain rate", "Lightning", "HRV", "CTH"),
+    shown_future_inputs=("CAPE-MU-future",),
+    future_input_names=("CAPE-MU",),
     plot_kwargs=None
 ):
     if plot_kwargs is None:
         plot_kwargs = {}
 
-    names = batch_gen.pred_names_past
+    names = batch_gen.pred_names_past + batch_gen.pred_names_future
     shown_inputs = [names.index(ip) for ip in shown_inputs]
+    shown_future_inputs = [names.index(ip) for ip in shown_future_inputs]
+    future_input_codes = [f"input-future-{ip}" for ip in shown_future_inputs]
 
     (X,Y) = batch_gen.batch(batch_number, dataset='test')
-    fig = plots.plot_model_examples(X, Y, ["obs", model],
-        batch_member=batch_member, shown_inputs=shown_inputs,
+    fig = plots.plot_model_examples(X, Y, future_input_codes+["obs", model],
+        batch_member=batch_member, shown_inputs=shown_inputs,        
+        input_names=input_names, future_input_names=future_input_names,
         **plot_kwargs)
 
     if out_file is not None:
@@ -250,13 +246,19 @@ def plot_examples(
 
 
 def plot_all_examples(batch_gen, model,
-    shown_inputs=("RZC", "occurrence-8-10", "HRV", "ctth-alti")
+    shown_inputs=("RZC", "occurrence-8-10", "HRV", "ctth-alti"),
+    input_names=("Rain rate", "Lightning", "HRV", "CTH"),
+    shown_future_inputs=("CAPE-MU-future",),
+    future_input_names=("CAPE-MU",),
+    plot_kwargs=None
 ):
     samples = ((12, 28), (5, 37), (37, 30))
     for (i,(bn, bm)) in enumerate(samples):
         plot_examples(batch_gen, model,
             batch_number=bn, batch_member=bm, 
             shown_inputs=shown_inputs,
+            input_names=input_names,
+            plot_kwargs=plot_kwargs,
             out_file=f"../figures/model-example-{i}.pdf")
 
 
@@ -277,6 +279,46 @@ def plot_random_examples(batch_gen, model,
             batch_number=bn, batch_member=bm, 
             shown_inputs=shown_inputs,
             out_file=f"../figures/random-example/random-example-{i:02d}.pdf")
+
+
+data_names = {
+    "RZC": "Rain rate",
+    "density": "Light. dens.",
+    "current": "Current dens.",
+    "ctth-tempe": "CTT",
+    "ctth-alti": "CTH",
+    "cmic-phase": "Cloud phase",
+    "cmic-cot": "COT",
+    "sun-z": "Solar zen. ang.",
+    "occurrence-8-10": "Lightning",
+    "SOILTYP": "Soil type",
+    "Altitude": "Elevation",
+    "EW-deriv": "El. EW-deriv.",
+    "NS-deriv": "El. NS-deriv."
+}
+
+def plot_data_examples(batch_gen, sample=(12,28), columns=8, out_file=None):
+    (bn,bm) = sample
+    (X,Y) = batch_gen.batch(bn, dataset='test')
+    names = batch_gen.pred_names_past + batch_gen.pred_names_future + \
+        batch_gen.pred_names_static
+    X_samples = []
+    for (name,x) in zip(names,X):
+        if name in ["SOILTYP", "cmic-phase"]: # one-hot variables
+            t_ind = 0 if name in batch_gen.pred_names_past else -1
+            xx = x[bm,t_ind,:,:,:]
+            X_samples.append(xx.argmax(axis=-1))
+        elif name in batch_gen.pred_names_past:
+            X_samples.append(x[bm,-1,:,:,0])
+        elif name in (batch_gen.pred_names_future+batch_gen.pred_names_static):
+            X_samples.append(x[bm,0,:,:,0])
+
+    plot_names = [n.replace("-future", "") for n in names]
+    plot_names = [data_names.get(n,n) for n in plot_names]
+    fig = plots.plot_data_examples(X_samples, plot_names, columns=columns)
+    if out_file is not None:
+        fig.savefig(out_file, bbox_inches='tight', dpi=200)
+        plt.close(fig)
 
 
 def model_metrics_table(

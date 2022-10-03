@@ -30,8 +30,3 @@ class LocalAttention2D(Layer):
 
         o = tf.math.add_n(terms)
         return self.output_conv(o)
-
-    
-
-
-

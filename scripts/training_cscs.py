@@ -361,6 +361,18 @@ def setup_batch_gen(
             "source_vars": ["CPCH"],
             "transform": transform.R_threshold(raw["CPCH"]["scale"], 10.0)
         },
+        "CPCH": {
+            "source_vars": ["CPCH"],
+            "transform": transform.scale_log_norm(raw["CPCH"]["scale"],
+                threshold=0.1, fill_value=0.01, mean=0.0, std=1.0,
+                dtype=np.float16)
+        },
+        "CPCH-target": {
+            "source_vars": ["CPCH"],
+            "transform": transform.scale_log_norm(raw["CPCH"]["scale"],
+                threshold=0.1, fill_value=0.01, mean=0.0, std=1.0,
+                dtype=np.float16)
+        },
         "zeros": {
             "source_vars": ["zeros"],
             "transform": lambda x: x
@@ -509,57 +521,76 @@ def model_sources(sources_str, target="occurrence-8-10"):
     batch_gen = setup_batch_gen("../data/2020/", target=target,
         batch_size=48, sources=sources)
 
+    kwargs = {}
     compile_kwargs = {
         "opt_kwargs": {"weight_decay": 1e-4},
         "event_occurrence": 0.5
     }
     if target == "BZC":
         compile_kwargs["loss"] = "prob_binary_crossentropy"
+    if target == "CPCH":        
+        bins = np.array(
+            [10, 30, 50],
+            dtype=np.float32
+        )
+        compile_kwargs["loss"] = models.make_rain_loss_hist(bins)        
+        compile_kwargs["metrics"] = []
+        kwargs["last_only"] = True
+        kwargs["num_outputs"] = len(bins)+1
+        kwargs["final_activation"] = "softmax"
 
     (model,strategy) = models.init_model(
         batch_gen,
         dropout=0.1, 
-        compile_kwargs=compile_kwargs
+        compile_kwargs=compile_kwargs,
+        **kwargs
     )
 
     return (sources_str, batch_gen, model, strategy)
 
 def training_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning"):
+    if sources_str in ("", "null"):
+        sources_str = ""
+        sources_suffix = "null"
+    else:
+        sources_suffix = sources_str
     (sources_str, batch_gen, model, strategy) = model_sources(
         sources_str, target=target)
 
-    if sources_str == "":
-        sources_str = "null"
     models.train_model(model, strategy, batch_gen,
-        weight_fn=f"../models/{fn_prefix}/{fn_prefix}-{sources_str}.h5")
+        weight_fn=f"../models/{fn_prefix}/{fn_prefix}-{sources_suffix}.h5")
 
 
 def eval_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning",
     dataset="test", separate_leadtimes=False):
-
+    if sources_str in ("", "null"):
+        sources_str = ""
+        sources_suffix = "null"
+    else:
+        sources_suffix = sources_str
     (sources_str, batch_gen, model, strategy) = model_sources(
         sources_str, target=target)
     
-    if sources_str == "":
-        sources_str = "null"
-    weight_fn = os.path.join("../models/", fn_prefix, f"{fn_prefix}-{sources_str}.h5")
+    weight_fn = os.path.join("../models/", fn_prefix, f"{fn_prefix}-{sources_suffix}.h5")
     model.load_weights(weight_fn)
     result_dir = os.path.join("../results/", fn_prefix, dataset)
     batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
 
-    if not separate_leadtimes:        
-        eval_result = model.evaluate(batch_seq)
+    if not separate_leadtimes:
+        eval_result = model.evaluate(batch_seq)        
         gc.collect()
         eval_fn = os.path.join(result_dir,
             f"eval-{fn_prefix}-{sources_str}.csv")
+        if np.ndim(eval_result) == 0:
+            eval_result = [eval_result]
         np.savetxt(eval_fn, eval_result, delimiter=',', fmt='%.6e')
 
-        calibration.calibration_curve_models(model, batch_gen, [weight_fn],
-            result_dir, dataset=dataset)
+        #calibration.calibration_curve_models(model, batch_gen, [weight_fn],
+        #    result_dir, dataset=dataset)
         
-        evaluation.conf_matrix_models(model, batch_gen, [weight_fn],
-            result_dir, dataset=dataset)
-    else:        
+        #evaluation.conf_matrix_models(model, batch_gen, [weight_fn],
+        #    result_dir, dataset=dataset)
+    else:
         def loss_timestep(loss, timestep):
             def l(y_true, y_pred):
                 y_true = y_true[:,timestep:timestep+1,...]

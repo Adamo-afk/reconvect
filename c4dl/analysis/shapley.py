@@ -4,9 +4,9 @@ import re
 import numpy as np
 
 
-def load_scores(score_dir, prefix='lightning', score_index=0):
+def load_scores(score_dir, prefix='lightning', file_type="eval", score_index=0):
     files = os.listdir(score_dir)
-    pattern = re.compile(f"eval-{prefix}-(?P<sources>.+).csv")
+    pattern = re.compile(f"{file_type}-{prefix}-(?P<sources>.+).csv")
     files = [fn for fn in files if pattern.match(fn)]
     
     scores = {}
@@ -16,10 +16,11 @@ def load_scores(score_dir, prefix='lightning', score_index=0):
             sources = ''
         path = os.path.join(score_dir, fn)
         scores_src = np.loadtxt(path)
+        if np.ndim(scores_src) == 0:
+            scores_src = [scores_src]
         scores[sources] = scores_src[score_index]
 
     return scores
-
 
 
 def shapley_value(scores, source):
@@ -39,5 +40,3 @@ def shapley_value(scores, source):
         s.append(np.mean(s_num))
 
     return np.mean(s)
-
-

@@ -2,7 +2,8 @@ from datetime import datetime, timedelta
 import os
 import string
 
-from matplotlib import colors, gridspec, patches, pyplot as plt
+from matplotlib import colors, gridspec, lines, patches, pyplot as plt
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 import numpy as np
 
 from ..analysis import evaluation
@@ -248,11 +249,107 @@ def plot_frame(ax, frame, norm=None):
     return im
 
 
+def plot_model_anim(X, Y, out_dir,
+    shown_input=25, batch_member=0, interval_mins=5, 
+    min_p=0.025):
+
+    X = X[shown_input][batch_member,...,0]
+    Y = Y[batch_member,...,0]
+    norm = colors.LogNorm(min_p,1,clip=True)
+
+
+    frame_ind = 0
+    def save_frame(x):
+        nonlocal frame_ind
+        fig = plt.figure()
+        ax = fig.add_subplot()
+        plot_frame(ax, x, norm=norm)
+        t_min = (frame_ind-X.shape[0]+1) * interval_mins
+        ax.set_title(f"$t={t_min}\\ \\mathrm{{min}}$")
+        path = os.path.join(out_dir, f"frame{frame_ind:02d}.png")
+        fig.savefig(path, bbox_inches='tight', dpi=200)
+        plt.close(fig)
+        frame_ind += 1
+
+    for i in range(X.shape[0]):
+        save_frame(X[i,:,:])    
+    for i in range(Y.shape[0]):
+        save_frame(Y[i,:,:])
+
+
+transform_TB = lambda x: x*10+250
+transform_radiance = lambda x: x*100
+transform_T = lambda x: x*7.2+290
+input_transforms = {
+    "Rain rate": lambda x: 10**(x*0.528-0.051),
+    "CZC": lambda x: x*8.71+21.3,
+    "EZC-20": lambda x: x*1.97,
+    "EZC-45": lambda x: x*1.97,
+    "HZC": lambda x: x*1.97,
+    "LZC": lambda x: 10**(x*0.135-0.274),
+    "Lightning": lambda x: x,
+    "Light. dens.": lambda x: 10**(x*0.640-0.593),
+    "Current dens.": lambda x: 10**(x*0.731-0.0718),
+    "POH": lambda x: x,
+    "$R > 10\\mathrm{mm\\,h^{-1}}$": lambda x: x,
+    "HRV": lambda x: x*100,
+    "CTH": lambda x: x*2.810+5.260,
+    "CAPE-MU": lambda x: x*0.2,
+    "CIN-MU": lambda x: x*21,
+    "LCL": lambda x: x*1000,
+    "MCONV": lambda x: x*3.8,
+    "HZEROCL": lambda x: x*3300,
+    "OMEGA": lambda x: x*4.2,
+    "SLI": lambda x: x*3.5,
+    "T-SO": transform_T,
+    "T-2M": transform_T,
+    "VIS006": transform_radiance,
+    "VIS008": transform_radiance,
+    "HRV": transform_radiance,
+    "IR-016": transform_radiance,
+    "IR-039": lambda x: x*17.5+274,
+    "WV-062": transform_TB,
+    "WV-073": transform_TB,
+    "IR-087": transform_TB,
+    "IR-097": transform_TB,
+    "IR-108": transform_TB,
+    "IR-120": transform_TB,
+    "IR-134": transform_TB,
+    "CTT": lambda x: x*19.1+260,
+    "Altitude": lambda x: x * 280,
+    "El. EW-deriv.": lambda x: x * 200,
+    "El. NS-deriv.": lambda x: x * 200,
+    "Solar zen. ang.": lambda x: x * 127
+}
+input_norm = {
+    "Rain rate": colors.LogNorm(0.01, 100, clip=True),
+    "LZC": colors.LogNorm(0.75, 100, clip=True),
+    "Light. dens.": colors.LogNorm(0.01, 100, clip=True),
+    "Current dens.": colors.LogNorm(0.01, 100, clip=True),
+    "Lightning": colors.Normalize(0, 1),
+    "POH": colors.Normalize(0, 1),
+    "$R > 10\\mathrm{mm\\,h^{-1}}$": colors.Normalize(0, 1),
+    "HRV": colors.Normalize(0,100),
+    "CTH": colors.Normalize(0,12),
+    "CAPE-MU": colors.Normalize(0,2)
+}
+input_ticks = {
+    "Rain rate": [0.1, 1, 10, 100],
+    "Lightning": [0, 0.5, 1],
+    "POH": [0, 0.5, 1],
+    "$R > 10\\mathrm{mm\\,h^{-1}}$": [0, 0.5, 1],
+    "HRV": [0, 25, 50, 75],
+    "CTH": [0, 5, 10],
+    "CAPE-MU": [0.5, 1, 1.5, 2],
+}
+
+
 def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
     input_timesteps=(-4,-1), output_timesteps=(0,2,5,11),
     batch_member=0, interval_mins=5,
     input_names=("Rain rate", "Lightning", "HRV", "CTH"),
-    min_p=0.025
+    future_input_names=("CAPE-MU",),
+    min_p=0.025, plot_scale=256
 ):
     num_timesteps = len(input_timesteps)+len(output_timesteps)
     gs_rows = 2 * max(len(models),len(shown_inputs))
@@ -272,24 +369,6 @@ def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
     fig = plt.figure(figsize=(gs_cols*1.5, gs_rows/2*1.5))
 
     # plot inputs
-    input_transforms = {
-        "Rain rate": lambda x: 10**(x*0.528-0.051),
-        "Lightning": lambda x: x,
-        "HRV": lambda x: x*100,
-        "CTH": lambda x: x*2.810+5.260
-    }
-    input_norm = {
-        "Rain rate": colors.LogNorm(0.01, 100, clip=True),
-        "Lightning": colors.Normalize(0, 1),
-        "HRV": colors.Normalize(0,100),
-        "CTH": colors.Normalize(0,12)
-    }
-    input_ticks = {
-        "Rain rate": [0.1, 1, 10, 100],
-        "Lightning": [0, 0.5, 1],
-        "HRV": [0, 25, 50, 75],
-        "CTH": [0, 5, 10]
-    }
     row0 = gs_rows//2 - len(shown_inputs)
     for (i,k) in enumerate(shown_inputs):
         row = row0 + 2*i        
@@ -311,14 +390,26 @@ def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
                 cax.yaxis.set_ticks_position('left')
 
     # plot outputs
-    row0 = gs_rows//2 - len(models)
-    #norm = colors.Normalize(0,1)
-    norm = colors.LogNorm(min_p,1,clip=True)
+    row0 = 0
+    future_input_ind = 0
+    norm_log = colors.LogNorm(min_p,1,clip=True)
     for (i,model) in enumerate(models):
         if model == "obs":
             Y_pred = obs[0]
+            norm = norm_log
+            label = "Observed"
+        elif isinstance(model, str) and model.startswith("input-future"):
+            var_ind = int(model.split("-")[-1])
+            Y_pred = batch[var_ind]
+            input_name = future_input_names[future_input_ind]
+            Y_pred = input_transforms[input_name](Y_pred)
+            norm = input_norm[input_name]
+            future_input_ind += 1
+            label = input_name
         else:
             Y_pred = model.predict(batch)
+            norm = norm_log
+            label = "Forecast"
         row = row0 + 2*i
         op = Y_pred[0,output_timesteps,:,:,0]        
         for m in range(len(output_timesteps)):
@@ -330,14 +421,62 @@ def plot_model_examples(X, Y, models, shown_inputs=(0,25,12,9),
                 ax.set_title(f"$+{iv}\\,\\mathrm{{min}}$")
             if m == len(output_timesteps)-1:
                 ax.yaxis.set_label_position("right")
-                label = "Observed" if (model=="obs") else "Forecast"
                 ax.set_ylabel(label)
-        if i==0:
-            cax = fig.add_subplot(gs[row0:gs_rows-row0,-1])            
+                if i == len(models)-1:
+                    scalebar = AnchoredSizeBar(ax.transData,
+                           op.shape[1],
+                           f'{plot_scale} km',
+                           'lower center', 
+                           pad=0.1,
+                           color='black',
+                           frameon=False,
+                           size_vertical=1,
+                           bbox_transform=ax.transAxes,
+                           bbox_to_anchor=(0.5,-0.27)
+                    )
+                    ax.add_artist(scalebar)
+
+        if i==len(models)-1:
+            r0 = row0 + 2*len(future_input_names)
+            r1 = r0 + 4
+            cax = fig.add_subplot(gs[r0:r1,-1])            
             cb = plt.colorbar(im, cax=cax)
             cb.set_ticks([min_p, 0.05, 0.1, 0.2, 0.5, 1])
             cb.set_ticklabels([min_p, 0.05, 0.1, 0.2, 0.5, 1])
-            cax.set_title("$p$", fontsize=12)
+            cax.set_xlabel("$p$", fontsize=12)
+        elif i<len(future_input_names):
+            cax = fig.add_subplot(gs[row:row+2,-1])            
+            cb = plt.colorbar(im, cax=cax)
+            cb.set_ticks(input_ticks[input_name])
+
+    return fig
+
+
+def plot_data_examples(X, names, columns=8):
+    rows = len(names) // columns
+    if len(names) % columns:
+        rows += 1
+    gs_rows = rows * 3
+    height_ratios = rows * [1,0.15,0.35]
+    fig = plt.figure(figsize=(columns*1.5, rows*1.5*1.5))
+    gs = gridspec.GridSpec(gs_rows, columns, wspace=0.3, hspace=0.05,
+        height_ratios=height_ratios)
+
+    for (k,name) in enumerate(names):
+        row = k // columns
+        col = k % columns
+
+        ax = fig.add_subplot(gs[row*3,col])
+        transform = input_transforms.get(name, lambda x: x)
+        img_data = transform(X[k])
+        norm = input_norm.get(name, None)
+        im = plot_frame(ax, img_data, norm=norm)
+        ax.set_title(name)
+
+        cax = fig.add_subplot(gs[row*3+1,col])  
+        cb = plt.colorbar(im, cax=cax, orientation='horizontal')
+        if name in input_ticks:
+            cb.set_ticks(input_ticks[name])
 
     return fig
 
@@ -396,7 +535,7 @@ def plot_study_area(radar_archive_path, dem_path):
     data = mchradar_reader.variable_for_time(dt, "RZC")
     mask = (data == 255).astype(np.float32)
     img = np.zeros((mask.shape[0], mask.shape[1], 4))
-    img[:,:,3] = mask * 0.3
+    img[:,:,3] = mask * 0.5
     
     ax.imshow(img, origin='upper', extent=img_extent, transform=crs)
 
@@ -569,30 +708,35 @@ feature_names = {
 def get_feature_name(feature):
     return feature_names.get(feature, feature)
 
+notation = {
+    "r": "Rad",
+    "l": "Lig",
+    "s": "Sat",        
+    "n": "NWP",
+    "d": "DEM"
+}
+prefix_notation = {
+    "lightning": "Lightning",
+    "hail": "Hail",
+    "rain": "Precipitation"
+}
 
-
-def exclusion_plot(metrics, fig=None, axes=None,
-    variable_name=None, subplot_index=0, significant_digits=3):
+def exclusion_plot(metrics, metrics_names, fig=None, axes=None,
+    variable_names=None, subplot_index=0, significant_digits=3):
 
     import seaborn as sns
 
-    notation = {
-        "r": "Rad",
-        "l": "Lig",
-        "s": "Sat",        
-        "n": "NWP",
-        "d": "DEM"
-    }
+
     metric_notation = {
-        "binary": "error rate",
-        "cross_entropy": "cross-entropy",
+        "binary": "Error rate",
+        "cross_entropy": "CE",
         "mae": "MAE",
         "rmse": "RMSE",
         "FL2": "FL $\\gamma=2$"
     }
 
-    metrics_names = [metric_notation[k] for k in metrics]
-    metrics_tables = {metric: np.full((8,4), np.nan) for metric in metrics}
+    prefixes_names = [prefix_notation[k] for k in metrics]
+    metrics_tables = {prefix: np.full((8,4), np.nan) for prefix in metrics}
     metric_pos = {
         frozenset(("n", "l", "d", "r", "s")): (0,0),
         frozenset(("n", "l", "d", "r")): (0,1),
@@ -636,11 +780,11 @@ def exclusion_plot(metrics, fig=None, axes=None,
     }
     metric_pos_inv = {v: k for (k, v) in metric_pos.items()}
 
-    for metric in metrics:
-        for subset in metrics[metric]:
+    for prefix in metrics:
+        for subset in metrics[prefix]:
             subset_frozen = frozenset(subset)
             (i,j) = metric_pos[subset_frozen]
-            metrics_tables[metric][i,j] = metrics[metric][subset]
+            metrics_tables[prefix][i,j] = metrics[prefix][subset]
 
     xlabels_show = frozenset(("r", "s"))
     ylabels_show = frozenset(("n", "l", "d"))
@@ -649,19 +793,19 @@ def exclusion_plot(metrics, fig=None, axes=None,
         if fig is None:
             fig = plt.figure(figsize=(3.125*len(metrics),7.5))
         
-        for (i,metric) in enumerate(metrics):
+        for (i,prefix) in enumerate(metrics):
             xlabels = [
                 "\n".join(sorted(notation[s] for s in metric_pos_inv[0,i] & xlabels_show))
-                for i in range(metrics_tables[metric].shape[1])
+                for i in range(metrics_tables[prefix].shape[1])
             ]
             ylabels = [
                 "\n".join(sorted(notation[s] for s in metric_pos_inv[i,0] & ylabels_show))
-                for i in range(metrics_tables[metric].shape[0])
+                for i in range(metrics_tables[prefix].shape[0])
             ]
 
             ax = axes[i] if (axes is not None) else fig.add_subplot(1,len(metrics),i+1)
             heatmap = sns.heatmap(
-                metrics_tables[metric],
+                metrics_tables[prefix],
                 xticklabels=xlabels,
                 yticklabels=ylabels,
                 annot=True,
@@ -674,13 +818,62 @@ def exclusion_plot(metrics, fig=None, axes=None,
             heatmap.set_yticklabels(heatmap.get_yticklabels(), rotation=0, ha='right')
             ax.set_title("({}) {}{}".format(
                 string.ascii_lowercase[i+subplot_index],
-                variable_name+" " if variable_name else "",
-                metric_notation[metric]
+                prefixes_names[i]+" " if prefixes_names[i] else "",
+                metric_notation[metrics_names[i]]+" " if metrics_names[i] else "",
             ))
             ax.tick_params(axis='both', bottom=False, left=False,
                 labelleft=(i+subplot_index==0))
 
     return fig
+
+
+def shapley_by_time(
+        leadtimes,
+        shapley_values,
+        interval=timedelta(minutes=5),
+        fig=None,
+        ax=None,
+        legend=True,
+    ):
+
+    interval_mins = interval.total_seconds() / 60
+    leadtimes = leadtimes * interval_mins
+    
+    if ax is None:
+        fig = plt.figure(figsize=(6,3))
+        ax = fig.add_subplot()
+
+    val_sum = None
+    for values in shapley_values.values():
+        if val_sum is None:
+            val_sum = values.copy()
+        else:
+            val_sum += values
+
+    for (source, values) in shapley_values.items():
+        ax.plot(
+            leadtimes, values/val_sum, linewidth=1,
+            label=notation[source], c=source_colors[source]
+        )
+    if legend:
+        ax.legend()
+    ax.set_xlim((0, leadtimes[-1]))
+    ax.set_xlabel("Lead time [min]")
+    ax.set_ylabel("Normalized Shapley value")
+
+    return fig
+
+def shapley_values_full_legend(shapley_values_full, ax):
+    val_sum_full = sum(shapley_values_full.values())
+    labels = [
+        f"{notation[s]}: {shapley_values_full[s]/val_sum_full:.03f}"
+        for s in shapley_values_full
+    ]
+    custom_lines = [
+        lines.Line2D([0], [0], color=source_colors[s], lw=1)
+        for s in shapley_values_full
+    ]
+    ax.legend(custom_lines, labels, ncol=3, mode="expand")
 
 
 def metrics_by_time(models, metrics, past_features, future_features,
