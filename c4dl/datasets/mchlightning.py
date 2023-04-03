@@ -16,7 +16,7 @@ from .gridding import grid_accumulate
 def read_lightning_archive_file(file):
     data = pd.read_csv(
         file, 
-        names=('date', 'lon', 'lat','current','nS','mode','intra',
+        names=('date','lon','lat','current','nS','mode','intra',
             'Ax','Ki2','Exc','Incl','Arc','d1','d2','d3','d4','d5'),
         delimiter="|",
         parse_dates=['date'], 

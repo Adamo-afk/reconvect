@@ -35,6 +35,7 @@ def create_inputs(
     base_shape=(256,256),
     past_timesteps=12,
     future_timesteps=12,
+    undefined_shape=False
 ):
     # separate inputs by resolution and timeframe; build input list
     inputs_by_shape = {}
@@ -55,9 +56,12 @@ def create_inputs(
         elif timeframe == "static":
             timesteps = 1
         shape_divisor = input_spec.get("shape_divisor", 1)
-        shape = (base_shape[0]//shape_divisor, base_shape[1]//shape_divisor)
+        if undefined_shape:
+            shape = (None, None)
+        else:
+            shape = (base_shape[0]//shape_divisor, base_shape[1]//shape_divisor)
         channels = input_spec.get("channels", 1)
-        dtype = input_spec.get("dtype", tf.float32)
+        dtype = input_spec.get("dtype", tf.float32)        
         
         ip = Input(
             shape=(timesteps,shape[0],shape[1],channels),
@@ -94,11 +98,16 @@ def rnn_model(
     dropout=0,
     norm=None,
     last_only=False,
-    final_activation='sigmoid'
+    final_activation='sigmoid',
+    undefined_shape=False
 ):
-    (inputs, inputs_by_shape) = create_inputs(input_specs,
-        base_shape=base_shape, past_timesteps=past_timesteps,
-        future_timesteps=future_timesteps)
+    (inputs, inputs_by_shape) = create_inputs(
+        input_specs,
+        base_shape=base_shape,
+        past_timesteps=past_timesteps,
+        future_timesteps=future_timesteps,
+        undefined_shape=undefined_shape
+    )
 
     # number of channels by depth
     #block_channels = [32, 64, 128, 256]

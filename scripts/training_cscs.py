@@ -513,7 +513,7 @@ def build_persistence_model(batch_gen):
         model_func=models.persistence_model)
 
 
-def model_sources(sources_str, target="occurrence-8-10"):
+def model_sources(sources_str, target="occurrence-8-10", undefined_shape=False):
     all_sources = ("rad", "lig", "sat", "nwp", "dem")
     sources = [s for s in all_sources if s[0] in sources_str]
     sources_str = "".join(s[0] for s in sources)
@@ -543,6 +543,7 @@ def model_sources(sources_str, target="occurrence-8-10"):
         batch_gen,
         dropout=0.1, 
         compile_kwargs=compile_kwargs,
+        undefined_shape=undefined_shape,
         **kwargs
     )
 
@@ -559,6 +560,27 @@ def training_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning
 
     models.train_model(model, strategy, batch_gen,
         weight_fn=f"../models/{fn_prefix}/{fn_prefix}-{sources_suffix}.h5")
+
+
+def export_model(sources_str, model_dir, target="occurrence-8-10"):
+    (sources_str, batch_gen, model, strategy) = model_sources(
+        sources_str, target=target, undefined_shape=True
+    )
+    pred = {
+        "occurrence-8-10": "lightning",
+        "BZC": "hail",
+        "CPCH": "rain"
+    }[target]
+    model.load_weights(f"../models/{pred}/{pred}-{sources_str}.h5")
+    if pred == "lightning":
+        occurrence = np.load(
+            f"../results/lightning/test/calibration-lightning-{sources_str}.npy"
+        )
+        p = np.linspace(0,1,len(occurrence)+1)
+        p = 0.5 * (p[:-1] + p[1:])
+        model = calibration.calibrated_model(model, p, occurrence)
+        
+    model.save(model_dir, include_optimizer=False)
 
 
 def eval_sources(sources_str, target="occurrence-8-10", fn_prefix="lightning",
