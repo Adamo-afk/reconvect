@@ -70,7 +70,7 @@ def save_patches_radar(patches, archive_path, out_dir, suffix="2020"):
         source_vars=source_vars, postproc=postproc)
 
 
-def save_patches_lightning(patches, archive_path, out_dir, suffix="2020"):
+def save_patches_lightning(patches, archive_path, out_dir, discharge_type="CG", suffix="2020"):
     from .. import projection
     from ..datasets import mchlightning
 
@@ -78,7 +78,7 @@ def save_patches_lightning(patches, archive_path, out_dir, suffix="2020"):
         projection.ccs4_swiss_grid_area)
     mchlightning_reader = mchlightning.MCHLightningReader(
         grid_projection, archive_path=archive_path,
-        variables=["density", "current", "occurrence-8-10"])
+        variables=["density", "current", "occurrence-8-10"], discharge_type=discharge_type)
 
     postproc = {
         "occurrence-8-10": lambda x: x.astype(np.uint8),
