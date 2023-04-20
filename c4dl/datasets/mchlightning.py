@@ -13,7 +13,7 @@ from ..utils import CacheDict
 from .gridding import grid_accumulate
 
 
-def read_lightning_archive_file(file):
+def read_lightning_archive_file(file, discharge_type):
     data = pd.read_csv(
         file, 
         names=('date','lon','lat','current','nS','mode','intra',
@@ -24,15 +24,24 @@ def read_lightning_archive_file(file):
         index_col=0,
         memory_map=True
     )
+    if "CG" in discharge_type and "IC" in discharge_type:
+        pass
+    elif "CG" in discharge_type:
+        data = data.loc[data.intra == 0]
+    elif "IC" in discharge_type:
+        data = data.loc[data.intra == 1]
+    else:
+        raise ValueError(f"Unsupported discharge type argument {discharge_type}")
+
     return data[["lon","lat","current","intra"]]
 
 
-def read_lightning_archive(archive_path, day):
+def read_lightning_archive(archive_path, day, discharge_type):
     filename = os.path.join(
         archive_path,
         day.strftime("THX%y%j0000.prd")
     )
-    all_lightning = read_lightning_archive_file(filename)
+    all_lightning = read_lightning_archive_file(filename, discharge_type)
     all_lightning.sort_index(inplace=True)
     
     return all_lightning
@@ -64,7 +73,7 @@ class MCHLightningReader(DatasetReader):
 
     def __init__(self, grid_projection, *, archive_path,
         interval=timedelta(minutes=5), mode="archive",
-        variables=None):
+        variables=None, discharge_type="CG"):
 
         if variables is None:
             variables = ["density-10", "occurrence-10", "current-10"]
@@ -77,6 +86,7 @@ class MCHLightningReader(DatasetReader):
         self.days = CacheDict(cache_size=3)
         self.lightning_cache = CacheDict(cache_size=128)
         self.density_cache = CacheDict(cache_size=128)
+        self.discharge_type = discharge_type
 
     def lightning_for_time(self, time, interval=None):
         if interval is None:
@@ -86,7 +96,7 @@ class MCHLightningReader(DatasetReader):
                 t = time-interval
                 day = datetime(t.year,t.month,t.day)
                 if not day in self.days:
-                    self.days[day] = read_lightning_archive(self.archive_path, day)
+                    self.days[day] = read_lightning_archive(self.archive_path, day, self.discharge_type)
                 day = self.days[day]
                 (i0,i1) = day.index.searchsorted([t, time])
                 self.lightning_cache[time] = day.iloc[i0:i1]
