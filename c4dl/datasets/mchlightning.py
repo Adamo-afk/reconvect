@@ -13,7 +13,7 @@ from ..utils import CacheDict
 from .gridding import grid_accumulate
 
 
-def read_lightning_archive_file(file,discharge_type):
+def read_lightning_archive_file(file, discharge_type):
     data = pd.read_csv(
         file, 
         names=('date','lon','lat','current','nS','mode','intra',
@@ -73,7 +73,7 @@ class MCHLightningReader(DatasetReader):
 
     def __init__(self, grid_projection, *, archive_path,
         interval=timedelta(minutes=5), mode="archive",
-        variables=None, discharge_type = "CG"):
+        variables=None, discharge_type="CG"):
 
         if variables is None:
             variables = ["density-10", "occurrence-10", "current-10"]
