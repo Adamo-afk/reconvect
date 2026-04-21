@@ -24,9 +24,43 @@ def parse_area(area_def):
 def known_area(area_dict):
     assert("type" in area_dict)
     if area_dict["type"] == "swiss_ccs4":
-        return ccs4_swiss_grid_area
+        # return ccs4_swiss_grid_area
+        return romania_grid_area
     elif area_dict["type"] == "azimuthal_equidistant":
         return centered_aeqd_area(**area_dict["params"])
+    
+
+def centered_aeqd_area(lon0, lat0, size, pixel_size=1000.0):
+    """Azimuthal equidistant projection centered on a given lon/lat point.
+    """
+
+    physical_size = (size[0]*pixel_size, size[1]*pixel_size)
+
+    area = {
+        "area_id": "aeqd:{:.3f}:{:.3f}:{}km:{}x{}".format(
+            lon0, lat0, pixel_size, size[0], size[1]
+        ),
+        "description": "Azimuthal Equidistant Projection " + \
+            "lon0={:.3f}, lat0={:.3f}, scale={}km, {}x{}".format(
+                lon0, lat0, pixel_size, size[0], size[1]
+        ),
+        "proj_id": "aeqd:{:.3f}:{:.3f}".format(lon0,lat0),
+        "projection": {
+            "proj": "aeqd",
+            "lon_0": lon0,
+            "lat_0": lat0,
+        },
+        "width": size[0],
+        "height": size[1],
+        "area_extent": (
+            -physical_size[0]/2, 
+            -physical_size[1]/2,
+            physical_size[0]/2, 
+            physical_size[1]/2
+        )
+    }
+
+    return area
 
 
 class GridProjection:
@@ -38,7 +72,8 @@ class GridProjection:
         self.transformer = pyproj.Transformer.from_proj(
             self.latlon_proj, self.grid_proj)
 
-    def __call__(self, lon, lat):
+    # object of this class can be called like a function (by using __call__)
+    def __call__(self, lon, lat): 
         # the pyproj call below does not handle empty inputs properly
         if (not np.isscalar(lon)) and (len(lon) == 0) \
             and (not np.isscalar(lat)) and (len(lat) == 0):
@@ -70,18 +105,46 @@ class GridProjection:
         # get longitude and latitude from cartesian projection values
         return self.transformer.transform(proj_x, proj_y,
             direction='inverse')
+    
+    def get_latlon_grids(self):
+        """
+        Generate latitude and longitude grids for the projection area.
+        
+        Returns:
+            tuple: (lats, lons) - 2D arrays of latitude and longitude values
+        """
+        # Create coordinate grids
+        y_coords, x_coords = np.mgrid[:self.area.height, :self.area.width]
+        
+        # Convert grid coordinates to lat/lon
+        lons, lats = self.inverse(y_coords, x_coords)
+        
+        return lats, lons
 
 
 # Adapted from: 
 # https://github.com/meteoswiss-mdr/monti-pytroll/blob/master/etc/areas.def
-ccs4_swiss_grid_area = {
-    "area_id": "ccs4",
-    "description": "CCS4 Swiss Grid",
-    "proj_id": "epsg:21781",
-    "projection": "epsg:21781",
-    "width": 710,
-    "height": 640,
-    "area_extent": (255000.0, -160000.0, 965000.0, 480000.0)
+# ccs4_swiss_grid_area = {
+#     "area_id": "ccs4",
+#     "description": "CCS4 Swiss Grid",
+#     "proj_id": "epsg:21781",
+#     "projection": "epsg:21781",
+#     "width": 710,
+#     "height": 640,
+#     "area_extent": (255000.0, -160000.0, 965000.0, 480000.0)
+# }
+
+romania_grid_area = {
+    "area_id": "romania",
+    "description": "Romania 1km Grid",
+    "proj_id": "epsg:31700",
+    "projection": "epsg:31700",
+    # "width": 1504, # 32 x 47 patches
+    # "height": 864, # 32 x 27 patches
+    "width": 1536, # 256 x 6 patches
+    "height": 768, # 256 x 3 patches
+    # results in a grid of 6 x 3 patches of 256x256 pixels each
+    "area_extent": (-177324, 77148, 1331353, 723370)
 }
 
 def geostationary_area(
@@ -132,49 +195,13 @@ def geostationary_area_alps():
         loff=1515, lfac=13642337        
     )
 
-def centered_aeqd_area(lon0, lat0, size, pixel_size=1000.0):
-    """Azimuthal equidistant projection centered on a given lon/lat point.
-    """
-
-    physical_size = (size[0]*pixel_size, size[1]*pixel_size)
-
-    area = {
-        "area_id": "aeqd:{:.3f}:{:.3f}:{}km:{}x{}".format(
-            lon0, lat0, pixel_size, size[0], size[1]
-        ),
-        "description": "Azimuthal Equidistant Projection " + \
-            "lon0={:.3f}, lat0={:.3f}, scale={}km, {}x{}".format(
-                lon0, lat0, pixel_size, size[0], size[1]
-        ),
-        "proj_id": "aeqd:{:.3f}:{:.3f}".format(lon0,lat0),
-        "projection": {
-            "proj": "aeqd",
-            "lon_0": lon0,
-            "lat_0": lat0,
-        },
-        "width": size[0],
-        "height": size[1],
-        "area_extent": (
-            -physical_size[0]/2, 
-            -physical_size[1]/2,
-            physical_size[0]/2, 
-            physical_size[1]/2
-        )
-    }
-
-    return area
-
-
 class ImageMapper:
     def __init__(self, source_area, target_area):
         self.source_area = source_area
         self.target_area = target_area
         source_proj = GridProjection(source_area)
         target_proj = GridProjection(target_area)
-        (y_src, x_src) = np.mgrid[
-            :target_area.height,
-            :target_area.width
-        ]
+        (y_src, x_src) = np.mgrid[:target_area.height, :target_area.width]
         (self.y_tgt, self.x_tgt) = source_proj(*target_proj.inverse(y_src, x_src))
        
     def __call__(self, image, **kwargs):

@@ -1,16 +1,20 @@
 import os
 import gc
-
+import sys
 import tensorflow as tf
 import tensorflow_probability as tfp
 from numba import njit
 import numpy as np
 
-from ..features import batch
+# from ..features import batch
+
+file_path = os.path.join(os.path.split(os.getcwd())[0], "features")
+
+sys.path.append(file_path)
 
 
-def calibration_curve(model, batch_gen, dataset='valid', nbins=100):
-    batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
+def calibration_curve(model, batch_seq, nbins=100):
+    # batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
     bin_counts = np.zeros(nbins, dtype=np.uint64)
     bin_occurrences = np.zeros(nbins, dtype=np.uint64)
 
@@ -20,22 +24,23 @@ def calibration_curve(model, batch_gen, dataset='valid', nbins=100):
         Y_pred = model.predict(X)
         accumulate_hits(Y[0], Y_pred, bin_counts, bin_occurrences)
 
-    p = np.linspace(0,1,nbins+1)
+    p = np.linspace(0, 1, nbins+1)
     p = 0.5 * (p[:-1] + p[1:])
     occurrence_rate = bin_occurrences/bin_counts
     return (p, occurrence_rate)
 
 
-def calibration_curve_models(model, batch_gen, weight_files, out_dir, dataset='valid'):
-    for fn in weight_files:
-        model.load_weights(fn)
-        (p, occurrence_rate) = calibration_curve(model, batch_gen, dataset=dataset)
-        fn_root = fn.split("/")[-1].split(".")[0]
-        np.save(
-            os.path.join(out_dir, "calibration-{}.npy".format(fn_root)), 
-            occurrence_rate
-        )
-        gc.collect()
+def calibration_curve_models(model, batch_gen, args, out_dir):
+    # for fn in weight_files:
+    #     model.load_weights(fn)
+    (p, occurrence_rate) = calibration_curve(model, batch_gen)
+    # fn_root = fn.split("/")[-1].split(".")[0]
+    fn_root = args.sources
+    np.save(
+        os.path.join(out_dir, "calibration-{}.npy".format(fn_root)), 
+        occurrence_rate
+    )
+    gc.collect()
 
 
 @njit

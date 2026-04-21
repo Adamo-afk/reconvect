@@ -118,22 +118,50 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
                 decay of learning rate. `lr` is included for backward
                 compatibility, recommended to use `learning_rate` instead.
         """
-        super().__init__(name, **kwargs)
+        super().__init__(learning_rate, **kwargs)
 
-        self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
-        self._set_hyper("beta_1", beta_1)
-        self._set_hyper("beta_2", beta_2)
-        self._set_hyper("decay", self._initial_decay)
-        self._set_hyper("weight_decay", weight_decay)
-        self._set_hyper("sma_threshold", sma_threshold)
-        self._set_hyper("total_steps", int(total_steps))
-        self._set_hyper("warmup_proportion", warmup_proportion)
-        self._set_hyper("min_lr", min_lr)
+        # self._set_hyper("learning_rate", kwargs.get("lr", learning_rate))
+        # self._set_hyper("beta_1", beta_1)
+        # self._set_hyper("beta_2", beta_2)
+        # self._set_hyper("decay", self._initial_decay)
+        # self._set_hyper("weight_decay", weight_decay)
+        # self._set_hyper("sma_threshold", sma_threshold)
+        # self._set_hyper("total_steps", int(total_steps))
+        # self._set_hyper("warmup_proportion", warmup_proportion)
+        # self._set_hyper("min_lr", min_lr)
+        self.learning_rate = learning_rate
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.weight_decay = weight_decay
+        self.sma_threshold = sma_threshold
+        self.total_steps = int(total_steps)
+        self.warmup_proportion = warmup_proportion
+        self.min_lr = min_lr
         self.epsilon = epsilon or tf.keras.backend.epsilon()
         self.amsgrad = amsgrad
         self.rectify = rectify
         self._has_weight_decay = weight_decay != 0.0
         self._initial_total_steps = total_steps
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "learning_rate": self.learning_rate,
+                "beta_1": self.beta_1,
+                "beta_2": self.beta_2,
+                "decay": self._initial_decay if hasattr(self, '_initial_decay') else 0.0,
+                "weight_decay": self.weight_decay,
+                "sma_threshold": self.sma_threshold,
+                "epsilon": self.epsilon,
+                "amsgrad": self.amsgrad,
+                "rectify": self.rectify,
+                "total_steps": self.total_steps,
+                "warmup_proportion": self.warmup_proportion,
+                "min_lr": self.min_lr,
+            }
+        )
+        return config
 
     def _create_slots(self, var_list):
         for var in var_list:
@@ -152,7 +180,7 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
         super().set_weights(weights)
 
     def _decayed_wd(self, var_dtype):
-        wd_t = self._get_hyper("weight_decay", var_dtype)
+        wd_t = tf.cast(self.weight_decay, var_dtype)
         if isinstance(wd_t, tf.keras.optimizers.schedules.LearningRateSchedule):
             wd_t = tf.cast(wd_t(self.iterations), var_dtype)
         return wd_t
@@ -163,17 +191,17 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
         wd_t = self._decayed_wd(var_dtype)
         m = self.get_slot(var, "m")
         v = self.get_slot(var, "v")
-        beta_1_t = self._get_hyper("beta_1", var_dtype)
-        beta_2_t = self._get_hyper("beta_2", var_dtype)
+        beta_1_t = tf.cast(self.beta_1, var_dtype)
+        beta_2_t = tf.cast(self.beta_2, var_dtype)
         epsilon_t = tf.convert_to_tensor(self.epsilon, var_dtype)
         local_step = tf.cast(self.iterations + 1, var_dtype)
         beta_1_power = tf.math.pow(beta_1_t, local_step)
         beta_2_power = tf.math.pow(beta_2_t, local_step)
 
         if self._initial_total_steps > 0:
-            total_steps = self._get_hyper("total_steps", var_dtype)
-            warmup_steps = total_steps * self._get_hyper("warmup_proportion", var_dtype)
-            min_lr = self._get_hyper("min_lr", var_dtype)
+            total_steps = tf.cast(self.total_steps, var_dtype)
+            warmup_steps = total_steps * tf.cast(self.warmup_proportion, var_dtype)
+            min_lr = tf.cast(self.min_lr, var_dtype)
             decay_steps = tf.maximum(total_steps - warmup_steps, 1)
             decay_rate = (min_lr - lr_t) / decay_steps
             lr_t = tf.where(
@@ -213,7 +241,7 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
         )
 
         if self.rectify:
-            sma_threshold = self._get_hyper("sma_threshold", var_dtype)
+            sma_threshold = tf.cast(self.sma_threshold, var_dtype)
             var_t = tf.where(
                 sma_t >= sma_threshold,
                 r_t * m_corr_t / (v_corr_t + epsilon_t),
@@ -236,17 +264,17 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
         var_dtype = var.dtype.base_dtype
         lr_t = self._decayed_lr(var_dtype)
         wd_t = self._decayed_wd(var_dtype)
-        beta_1_t = self._get_hyper("beta_1", var_dtype)
-        beta_2_t = self._get_hyper("beta_2", var_dtype)
+        beta_1_t = tf.cast(self.beta_1, var_dtype)
+        beta_2_t = tf.cast(self.beta_2, var_dtype)
         epsilon_t = tf.convert_to_tensor(self.epsilon, var_dtype)
         local_step = tf.cast(self.iterations + 1, var_dtype)
         beta_1_power = tf.math.pow(beta_1_t, local_step)
         beta_2_power = tf.math.pow(beta_2_t, local_step)
 
         if self._initial_total_steps > 0:
-            total_steps = self._get_hyper("total_steps", var_dtype)
-            warmup_steps = total_steps * self._get_hyper("warmup_proportion", var_dtype)
-            min_lr = self._get_hyper("min_lr", var_dtype)
+            total_steps = tf.cast(self.total_steps, var_dtype)
+            warmup_steps = total_steps * tf.cast(self.warmup_proportion, var_dtype)
+            min_lr = tf.cast(self.min_lr, var_dtype)
             decay_steps = tf.maximum(total_steps - warmup_steps, 1)
             decay_rate = (min_lr - lr_t) / decay_steps
             lr_t = tf.where(
@@ -288,7 +316,7 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
         )
 
         if self.rectify:
-            sma_threshold = self._get_hyper("sma_threshold", var_dtype)
+            sma_threshold = tf.cast(self.sma_threshold, var_dtype)
             var_t = tf.where(
                 sma_t >= sma_threshold,
                 r_t * m_corr_t / (v_corr_t + epsilon_t),
@@ -309,24 +337,24 @@ class AdaBeliefOptimizer(tf.keras.optimizers.Optimizer):
             updates.append(vhat_t)
         return tf.group(*updates)
 
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "learning_rate": self._serialize_hyperparameter("learning_rate"),
-                "beta_1": self._serialize_hyperparameter("beta_1"),
-                "beta_2": self._serialize_hyperparameter("beta_2"),
-                "decay": self._serialize_hyperparameter("decay"),
-                "weight_decay": self._serialize_hyperparameter("weight_decay"),
-                "sma_threshold": self._serialize_hyperparameter("sma_threshold"),
-                "epsilon": self.epsilon,
-                "amsgrad": self.amsgrad,
-                "rectify": self.rectify,
-                "total_steps": self._serialize_hyperparameter("total_steps"),
-                "warmup_proportion": self._serialize_hyperparameter(
-                    "warmup_proportion"
-                ),
-                "min_lr": self._serialize_hyperparameter("min_lr"),
-            }
-        )
-        return config
+    # def get_config(self):
+    #     config = super().get_config()
+    #     config.update(
+    #         {
+    #             "learning_rate": self._serialize_hyperparameter("learning_rate"),
+    #             "beta_1": self._serialize_hyperparameter("beta_1"),
+    #             "beta_2": self._serialize_hyperparameter("beta_2"),
+    #             "decay": self._serialize_hyperparameter("decay"),
+    #             "weight_decay": self._serialize_hyperparameter("weight_decay"),
+    #             "sma_threshold": self._serialize_hyperparameter("sma_threshold"),
+    #             "epsilon": self.epsilon,
+    #             "amsgrad": self.amsgrad,
+    #             "rectify": self.rectify,
+    #             "total_steps": self._serialize_hyperparameter("total_steps"),
+    #             "warmup_proportion": self._serialize_hyperparameter(
+    #                 "warmup_proportion"
+    #             ),
+    #             "min_lr": self._serialize_hyperparameter("min_lr"),
+    #         }
+    #     )
+    #     return config

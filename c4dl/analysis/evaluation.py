@@ -5,14 +5,11 @@ import os
 import numpy as np
 from scipy.integrate import trapezoid
 
-try:
-    from ..features import batch
-except (ImportError, ModuleNotFoundError):
-    pass
+from c4dl.features import batch
 
 
-def confusion_matrix(model, batch_gen, dataset='valid', thresholds=[0.5]):
-    batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
+def confusion_matrix(model, batch_seq, thresholds=[0.5]):
+    # batch_seq = batch.BatchSequence(batch_gen, dataset=dataset)
     tp = np.zeros(len(thresholds), dtype=np.uint64)
     fp = np.zeros(len(thresholds), dtype=np.uint64)
     fn = np.zeros(len(thresholds), dtype=np.uint64)
@@ -29,29 +26,39 @@ def confusion_matrix(model, batch_gen, dataset='valid', thresholds=[0.5]):
         (X,Y) = batch_seq[i]
         Y_pred = model.predict(X)
         Y = Y[0].astype(bool)
+
+        # print(f"Y_pred \n{Y_pred}, Y \n{Y}")
+        # print(f"Y_pred shape {Y_pred.shape}, Y shape {Y.shape}")
         
         with concurrent.futures.ThreadPoolExecutor(num_threads) as executor:
             for (i,threshold) in enumerate(thresholds):            
                 executor.submit(acc, Y_pred, Y, i, threshold)
 
-    N = len(batch_seq) * np.prod(Y_pred.shape)
+    # Convert to uint64 first
+    batch_seq_len = np.uint64(len(batch_seq))  
+    shape_prod = np.prod(Y_pred.shape, dtype=np.uint64)
+
+    # Then compute total number of samples
+    N = batch_seq_len * shape_prod
     tn = N - tp - fp - fn
 
-    return np.array(((tp, fn), (fp, tn))) / N
+    return np.array(((tp, fn), (fp, tn))) / N # normalized confusion matrix for all thresholds
+    # We need only 0.5 threshold confusion matrix
 
 
-def conf_matrix_models(model, batch_gen, weight_files, out_dir, dataset='valid'):
+def conf_matrix_models(model, batch_seq, args, out_dir):
     thresholds = np.arange(0, 1.0001, 0.001)
-    for fn in weight_files:
-        model.load_weights(fn)
-        conf_matrix = confusion_matrix(model, batch_gen,
-            thresholds=thresholds, dataset=dataset)
-        fn_root = fn.split("/")[-1].split(".")[0]
-        np.save(
-            os.path.join(out_dir, "conf_matrix-{}.npy".format(fn_root)), 
-            conf_matrix
-        )
-
+    
+    # for fn in weight_files:
+    #     model.load_weights(fn)
+    conf_matrix = confusion_matrix(model, batch_seq, thresholds=thresholds)
+    # fn_root = fn.split("/")[-1].split(".")[0]
+    fn_root = args.sources
+    np.save(
+        os.path.join(out_dir, "conf_matrix-{}.npy".format(fn_root)), 
+        conf_matrix
+    )
+    
 
 def conf_matrix_leadtimes(model, batch_gen, dataset='valid', thresholds=[0.5],
     num_leadtimes=12):
