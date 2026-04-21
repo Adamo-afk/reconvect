@@ -1,0 +1,36 @@
+# =============================================================================
+# COALITION-4 Nowcasting System — Requirements
+# =============================================================================
+#
+# IMPORTANT: This project requires Python 3.10 and a conda environment.
+# TensorFlow < 2.11 is one of the last versions with native Windows GPU
+# support. CUDA and cuDNN must be installed via conda BEFORE pip installing
+# TensorFlow:
+#
+#   conda create -n tfenv python=3.10
+#   conda activate tfenv
+#   conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
+#   pip install -r requirements.txt
+#
+# =============================================================================
+
+# Deep learning
+tensorflow<2.11
+
+# Scientific computing
+numpy
+scipy
+scikit-learn
+
+# Geospatial / meteorological
+pyresample
+pyproj
+netCDF4
+xarray
+
+# Visualization
+matplotlib
+
+# Data processing
+pandas
+dask

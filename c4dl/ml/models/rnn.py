@@ -1,7 +1,7 @@
 from tensorflow.keras.layers import Layer, Conv2D
 import tensorflow as tf
-from .blocks import ConvBlock, GRUResBlock
-from .layers import Warp
+from c4dl.ml.models.blocks import ConvBlock, GRUResBlock
+from c4dl.ml.models.layers import Warp
 
 class CustomGateGRU(Layer):
     def __init__(self, 
@@ -36,22 +36,6 @@ class CustomGateGRU(Layer):
             return h
         else:
             return last_h
-        
-
-        """
-        h_all = []
-        for t in range(self.time_steps):
-            x = xt[:,t,...]
-            xh = tf.concat((x,h), axis=-1)
-            z = self.update_gate(xh)
-            r = self.reset_gate(xh)
-            o = self.output_gate(tf.concat((x,r*h), axis=-1))
-            h = z*h + (1-z)*tf.math.tanh(o)
-            if self.return_sequences:
-                h_all.append(h)
-
-        return tf.stack(h_all,axis=1) if self.return_sequences else h
-        """
 
 class ConvGRU(Layer):
     def __init__(self, channels, conv_size=(3,3),
@@ -96,22 +80,41 @@ class ResGRU(ConvGRU):
         return_sequences=False, time_steps=1,
         **kwargs):
 
-        dropout = kwargs.pop("dropout", 0.0)
-        norm = kwargs.pop("norm", None)
+        # Store parameters for get_config
+        self.channels = channels
+        self.conv_size = conv_size
+        self.return_sequences = return_sequences
+        self.time_steps = time_steps
+        
+        # Store dropout and norm before popping them
+        self.dropout = kwargs.pop("dropout", 0.0)
+        self.norm = kwargs.pop("norm", None)
+    
+        
         super(ConvGRU, self).__init__(**kwargs)
 
         self.update_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='sigmoid', padding='same', dropout=dropout,
-            norm=norm)
+            final_activation='sigmoid', padding='same', dropout=self.dropout,
+            norm=self.norm)
         self.reset_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='sigmoid', padding='same', dropout=dropout,
-            norm=norm)
+            final_activation='sigmoid', padding='same', dropout=self.dropout,
+            norm=self.norm)
         self.output_gate = GRUResBlock(channels, conv_size=conv_size,
-            final_activation='linear', padding='same', dropout=dropout,
-            norm=norm)
+            final_activation='linear', padding='same', dropout=self.dropout,
+            norm=self.norm)
 
-        self.return_sequences = return_sequences
-        self.time_steps = time_steps
+    def get_config(self):
+        config = super().get_config()  # Gets Layer's base config
+        config.update({
+            "channels": self.channels,
+            "conv_size": self.conv_size,
+            "return_sequences": self.return_sequences,
+            "time_steps": self.time_steps,
+            "dropout": self.dropout,
+            "norm": self.norm,
+        })
+        
+        return config
 
 
 class TrajGRU(ConvGRU):

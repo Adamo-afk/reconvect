@@ -1,0 +1,23 @@
+=========================================== test_nc.py ===========================================
+python test_nc.py -rad -cp nearest
+python test_nc.py -pp -cp nearest -nsamples 3
+python test_nc.py -pp -cp nearest -target_dt "2024-06-13 13:30"
+
+=========================================== training_cscs.py ===========================================
+python training_cscs.py kd_ft --sources lightning-rlsnd --target CPCH --kd_ft_years 2020 2025 -ro_gen -upscale save
+python training_cscs.py kd_ft --sources lightning-rlsnd --target CPCH --kd_ft_years 2020 2025 -dev -distill
+python training_cscs.py kd_ft --sources lightning-rlsnd --target CPCH --kd_ft_years 2020 2025 -dev -swiss_eval -gen_pred 
+python training_cscs.py kd_ft --sources hail-rls --target BZC --kd_ft_years 2020 2025 -ro_gen -upscale load -stitch -visual_h 16 -visual_m 30 -plot_ts first
+python training_cscs.py kd_ft --sources hail-rls --target BZC --kd_ft_years 2020 2025 -dev -ro_eval -gen_pred
+
+Plotting
+plotting regridded data -> python training_cscs.py kd_ft -plot_regrid --products HZC -visual_h 16 -visual_m 30
+
+Validation of fine-tuned model
+valid -> batch_idx = 2, sample_idx = 2
+test -> batch_idx = 1, sample_idx = 7
+train -> batch_idx = 2, sample_idx = 7
+
+=========================================== pipeline_msg_mtg.py ===========================================
+python -B pipeline_msg_mtg.py -sat mtg -s 2025/05/15-1000 -e 2025/05/15-1200
+python optical_flow_interpolation.py -d ./MTG

@@ -1,6 +1,6 @@
 import gc
 import os
-
+import sys
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
@@ -10,10 +10,43 @@ from tensorflow.keras.layers import Conv2D, Conv2DTranspose, UpSampling2D
 from tensorflow.keras.layers import TimeDistributed, Lambda, Add
 from tensorflow.keras.optimizers import Adam
 
-from .blocks import ConvBlock, ResBlock
-from ...features.batch import BatchSequence
-from .optimizers import AdaBeliefOptimizer
-from .rnn import ConvGRU, ResGRU
+# from .blocks import ConvBlock, ResBlock
+# from ...features.batch import BatchSequence
+# from .optimizers import AdaBeliefOptimizer
+# from .rnn import ConvGRU, ResGRU
+
+# file_paths = [os.path.join(os.path.split(os.getcwd())[0], "ml\\models"),
+#               os.path.join(os.path.split(os.getcwd())[0], "features")
+#               ]
+
+# for file_path in file_paths:
+#     sys.path.append(file_path)
+
+from c4dl.ml.models.blocks import ConvBlock, ResBlock
+from c4dl.features.batch import BatchSequence
+from c4dl.ml.models.optimizers import AdaBeliefOptimizer
+from c4dl.ml.models.rnn import ResGRU
+
+class CastLayer(Layer):
+    def call(self, x):
+        return tf.cast(x, tf.float32)
+
+
+class RepeatLayer(Layer):
+
+    def __init__(self, timesteps, **kwargs):
+        super(RepeatLayer, self).__init__(**kwargs)
+        self.timesteps = timesteps  # Set timesteps as a class attribute
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "timesteps": self.timesteps,
+        })
+        return config
+
+    def call(self, x):
+        return tf.repeat(x, axis=1, repeats=self.timesteps)
 
 
 file_dir = os.path.dirname(os.path.abspath(__file__))
@@ -69,22 +102,28 @@ def create_inputs(
             dtype=dtype
         )
         inputs.append(ip)
+        
         if dtype != np.float32:
-            ip = tf.cast(ip, tf.float32)
+            # ip = tf.cast(ip, tf.float32)
+            ip = CastLayer()(ip)
         #for half precision
         #if dtype != np.float16:
         #    ip = tf.cast(ip, tf.float16)
         
         if timeframe == "static": # expand static variable in time dimension
-            ip_past = tf.repeat(ip, axis=1, repeats=past_timesteps)
+            # ip_past = tf.repeat(ip, axis=1, repeats=past_timesteps)
+            ip_past = RepeatLayer(timesteps=past_timesteps)(ip)
             add_input("past", shape_divisor, ip_past)
             if future_timesteps != past_timesteps:
-                ip_future = tf.repeat(ip, axis=1, repeats=future_timesteps)
+                # ip_future = tf.repeat(ip, axis=1, repeats=future_timesteps)
+                ip_future = RepeatLayer(timesteps=future_timesteps)(ip)
             else:
                 ip_future = ip_past
             add_input("future", shape_divisor, ip_future)
         else:
             add_input(timeframe, shape_divisor, ip)
+
+    print("Created input layers")
 
     return (inputs, inputs_by_shape)
 
@@ -119,6 +158,7 @@ def rnn_model(
     for timeframe in inputs_by_shape:
         xt_by_time[timeframe] = {
             s: concat(axis=-1)(inputs_by_shape[timeframe][s])
+            # s: Concatenate(axis=-1)(inputs_by_shape[timeframe][s])
             for s in inputs_by_shape[timeframe]
         }
     
@@ -137,17 +177,16 @@ def rnn_model(
                 del xt[s]
 
             for s in xt:
-                stride = 2 if (s == 1) else 1 # do not downsample lores data
+                stride = 2 if (s == 1) else 1 # do not downsample low res data
                 xt[s] = ResBlock(channels, time_dist=True, stride=stride,
                     dropout=dropout, norm=norm)(xt[s])
                 
                 initial_state = Lambda(lambda y: tf.zeros_like(y[:,0,...]))(xt[s])
                 # TODO: future steps should iterate backwards in time?
                 
-                xt[s] = ResGRU(                
-                    channels, return_sequences=True,
+                xt[s] = ResGRU(channels, return_sequences=True,
                     time_steps=past_timesteps if timeframe=="past" else future_timesteps,
-                )([xt[s],initial_state])                
+                )([xt[s], initial_state])                
 
             if timeframe == "past":
                 intermediate.append(ConvBlock(channels)(xt[1][:,-1,...]))
@@ -429,42 +468,146 @@ def make_rain_loss_hist_cumul(bins, rain_thresh=0.1, num_timesteps=12):
         return xent
     return rain_loss_hist_cumul
 
-
-
-def create_weighted_binary_crossentropy(ones_fraction):
-    zeros_fraction = 1-ones_fraction
-    weights = (
-        1./(2*zeros_fraction),
-        1./(2*ones_fraction)
-    )
-
-    @tf.function
-    def weighted_binary_crossentropy(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        loss = tf.losses.binary_crossentropy(y_true, y_pred)
-        # Apply the weights
-        w = (1 - y_true) * weights[0] + y_true * weights[1]
-        weighted_loss = w[...,0] * loss
-        # Return the mean error
-        return weighted_loss
-
-    return weighted_binary_crossentropy
-
-
-def create_weighted_focal_loss(ones_fraction, gamma=2.0):
-    wce = create_weighted_binary_crossentropy(tf.constant(ones_fraction))
+# def create_weighted_binary_crossentropy(ones_fraction):
     
-    @tf.function
-    def weighted_focal_loss(y_true, y_pred):
+#     zeros_fraction = 1-int(ones_fraction)
+#     weights = (
+#         1./(2*zeros_fraction),
+#         1./(2*int(ones_fraction))
+#     )
+
+#     @tf.function
+#     def weighted_binary_crossentropy(y_true, y_pred):
+#         y_true = tf.cast(y_true, tf.float32)
+#         y_pred = tf.cast(y_pred, tf.float32)
+#         loss = tf.losses.binary_crossentropy(y_true, y_pred)
+#         # Apply the weights
+#         w = (1 - y_true) * weights[0] + y_true * weights[1]
+#         weighted_loss = w[...,0] * loss
+#         # Return the mean error
+#         return weighted_loss
+
+#     return weighted_binary_crossentropy
+
+
+# def create_weighted_focal_loss(ones_fraction, gamma=2.0):
+#     wce = create_weighted_binary_crossentropy(ones_fraction)
+    
+#     @tf.function
+#     def weighted_focal_loss(y_true, y_pred):
+#         y_true = tf.cast(y_true, tf.float32)
+#         y_pred = tf.cast(y_pred, tf.float32)
+#         y_pred = 0.001 + y_pred*0.998 # scale to inhibit exploding gradients
+#         ce = wce(y_true, y_pred)
+#         pt = tf.where(y_true==1, y_pred, 1-y_pred)
+#         return (1-pt[...,0])**gamma * ce
+
+#     return weighted_focal_loss
+
+class WeightedFocalLoss(tf.keras.losses.Loss):
+    """
+    Custom Weighted Focal Loss that can be properly serialized/deserialized.
+    """
+    
+    def __init__(self, ones_fraction=0.5, gamma=2.0, name='weighted_focal_loss', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ones_fraction = float(ones_fraction)
+        self.gamma = float(gamma)
+        
+        # Calculate weights
+        zeros_fraction = 1.0 - self.ones_fraction
+        self.weight_0 = 1.0 / (2.0 * zeros_fraction)  # weight for class 0 (no lightning)
+        self.weight_1 = 1.0 / (2.0 * ones_fraction)   # weight for class 1 (lightning)
+    
+    def call(self, y_true, y_pred):
+        """
+        Compute the weighted focal loss.
+        
+        Args:
+            y_true: Ground truth labels
+            y_pred: Predicted probabilities
+            
+        Returns:
+            Weighted focal loss value
+        """
+        # Cast to float32
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
-        y_pred = 0.001 + y_pred*0.998 # scale to inhibit exploding gradients
-        ce = wce(y_true, y_pred)
-        pt = tf.where(y_true==1, y_pred, 1-y_pred)
-        return (1-pt[...,0])**gamma * ce
+        
+        # Clip predictions to prevent log(0)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        
+        # Calculate binary cross entropy
+        bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+        
+        # Apply class weights
+        weights = (1 - y_true) * self.weight_0 + y_true * self.weight_1
+        weighted_bce = weights * bce
+        
+        # Calculate focal loss components
+        pt = tf.where(y_true == 1, y_pred, 1 - y_pred)
+        focal_weight = tf.pow(1 - pt, self.gamma)
+        
+        # Apply focal weighting
+        focal_loss = focal_weight * weighted_bce
+        
+        # Return mean loss (handle potential extra dimensions)
+        return tf.reduce_mean(focal_loss)
+    
+    def get_config(self):
+        """Return the config of the loss function for serialization."""
+        config = super().get_config()
+        config.update({
+            'ones_fraction': self.ones_fraction,
+            'gamma': self.gamma
+        })
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        """Create loss function from config during deserialization."""
+        return cls(**config)
 
-    return weighted_focal_loss
+
+class WeightedBinaryCrossentropy(tf.keras.losses.Loss):
+    """
+    Custom Weighted Binary Crossentropy that can be properly serialized.
+    """
+    
+    def __init__(self, ones_fraction=0.5, name='weighted_binary_crossentropy', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ones_fraction = float(ones_fraction)
+        
+        # Calculate weights
+        zeros_fraction = 1.0 - self.ones_fraction
+        self.weight_0 = 1.0 / (2.0 * zeros_fraction)
+        self.weight_1 = 1.0 / (2.0 * ones_fraction)
+    
+    def call(self, y_true, y_pred):
+        """Compute weighted binary crossentropy."""
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        
+        # Clip predictions
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        
+        # Binary cross entropy
+        bce = -y_true * tf.math.log(y_pred) - (1 - y_true) * tf.math.log(1 - y_pred)
+        
+        # Apply weights
+        weights = (1 - y_true) * self.weight_0 + y_true * self.weight_1
+        weighted_bce = weights * bce
+        
+        return tf.reduce_mean(weighted_bce)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({'ones_fraction': self.ones_fraction})
+        return config
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 def create_weighted_mse(ones_fraction):
@@ -502,9 +645,9 @@ def compile_model(
     opt_kwargs={}
 ):
     metric_names = {
-        "weighted_binary_crossentropy": create_weighted_binary_crossentropy(
+        "weighted_binary_crossentropy": WeightedFocalLoss(
             event_occurrence),
-        "weighted_focal_loss": create_weighted_focal_loss(
+        "weighted_focal_loss": WeightedFocalLoss(
             event_occurrence, gamma=wfc_gamma),
         "prob_binary_crossentropy": prob_binary_crossentropy,
         "weighted_mse": create_weighted_mse(event_occurrence),
@@ -516,8 +659,10 @@ def compile_model(
         "false_pos": false_pos,
         "false_neg": false_neg
     }
+
     loss = metric_names.get(loss, loss)
     metrics = [metric_names.get(m,m) for m in metrics]
+    print(f"\nMetrics are: {metrics}\n")
     if optimizer == "adabelief":
         optimizer = AdaBeliefOptimizer(**opt_kwargs)
     model.compile(loss=loss,
@@ -528,10 +673,12 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
     init_strategy=True, compile_kwargs={}, **kwargs):
 
     (past_timesteps, future_timesteps) = batch_gen.timesteps
+    print("Created timestamps")
 
     # construct input specs from a sample batch
     input_specs = []
-    (X, _) = batch_gen.batch(0)
+    (X, _) = batch_gen.batch(0) # BATCH REPRESENTS THE PROBLEM OF MODEL LAYER MISMATCH
+    print("Constructed input specs from sample batch")
     max_size = max(x.shape[2] for x in X)
     pred_names = batch_gen.pred_names_past + \
         batch_gen.pred_names_future + \
@@ -557,6 +704,7 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
         }
         input_specs.append(input_spec)
 
+    print("Selecting strategy")
     if init_strategy and len(tf.config.list_physical_devices('GPU')) > 1:
         # initialize multi-GPU strategy
         strategy = tf.distribute.MirroredStrategy()
@@ -570,8 +718,11 @@ def init_model(batch_gen, model_func=rnn_model, compile=True,
             input_specs=input_specs,
             **kwargs
         )
+
+        print("Started compiling the model...")
         if compile:
             compile_model(model, **compile_kwargs)
+            print("Compiled the model")
 
     gc.collect()
     
@@ -590,7 +741,7 @@ def combined_model(models, output_names):
     return comb_model
 
 
-def train_model(model, strategy, batch_gen,
+def train_model(model, strategy, batch_gen, epochs,
     weight_fn="model.h5", monitor="val_loss"):
 
     fn = os.path.join(file_dir, "../../../models", weight_fn)
@@ -598,10 +749,10 @@ def train_model(model, strategy, batch_gen,
     validation_steps = len(batch_gen.time_coords["valid"]) // batch_gen.batch_size
 
     with strategy.scope():        
-        checkpoint = tf.keras.callbacks.ModelCheckpoint(
-            fn, save_weights_only=True, save_best_only=True, mode="min",
-            monitor=monitor
-        )
+        # checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        #     fn, save_weights_only=True, save_best_only=True, mode="min",
+        #     monitor=monitor
+        # )
         reducelr = tf.keras.callbacks.ReduceLROnPlateau(
             patience=3, mode="min", factor=0.2, monitor=monitor,
             verbose=1, min_delta=0.0
@@ -610,14 +761,31 @@ def train_model(model, strategy, batch_gen,
             patience=6, mode="min", restore_best_weights=True,
             monitor=monitor
         )
-        callbacks = [checkpoint, reducelr, earlystop]
+        # callbacks = [checkpoint, reducelr, earlystop]
+        callbacks = [reducelr, earlystop]
 
         batch_seq_train = BatchSequence(batch_gen, dataset='train')
         batch_seq_valid = BatchSequence(batch_gen, dataset='valid')
 
+        print("Getting the first data point for training...")
+        # # Get the first data point as tuple of (data, target)
+        data = batch_seq_train.__getitem__(0)[0] # extract the data
+        target_data = batch_seq_train.__getitem__(0)[1] # extract the target
+
+        list_of_arrays = []
+        for i, array in enumerate(data):
+            # list_of_arrays.append(np.expand_dims(np.array(array), axis=0))
+            list_of_arrays.append(np.array(array))
+
+        train_dataset = tf.data.Dataset.from_tensor_slices(
+            (tuple(list_of_arrays), np.array(target_data)[0])
+        )
+
+        train_dataset = train_dataset.batch(batch_size=1).prefetch(buffer_size=tf.data.AUTOTUNE)
+
         model.fit(
-            batch_seq_train,
-            epochs=100,
+            train_dataset,
+            epochs=epochs,
             steps_per_epoch=steps_per_epoch,
             validation_data=batch_seq_valid,
             validation_steps=validation_steps,
