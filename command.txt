@@ -20,4 +20,3 @@ train -> batch_idx = 2, sample_idx = 7
 
 =========================================== pipeline_msg_mtg.py ===========================================
 python -B pipeline_msg_mtg.py -sat mtg -s 2025/05/15-1000 -e 2025/05/15-1200
-python optical_flow_interpolation.py -d ./MTG
