@@ -310,51 +310,52 @@ def false_neg(y_true, y_pred):
 # Model construction
 # ============================================================================
 
-def build_coalition_model(mode, past_timesteps=3, future_timesteps=3,
-                          dropout=0, norm=None, ones_fraction=0.0106):
-    """Build the COALITION encoder-forecaster model.
+def build_coalition_model(input_shapes, label_type, past_timesteps=3,
+                          future_timesteps=3, dropout=0, norm=None,
+                          ones_fraction=0.0106):
+    """Build the COALITION encoder-forecaster model dynamically.
+
+    The model architecture adapts to whatever inputs the dataset provides.
+    Input shapes are read from the dataset metadata so adding or removing
+    input groups (e.g. dropping NWCSAF) requires no code changes here.
 
     Args:
-        mode: one of msg_lightning, msg_radar, mtg_lightning, mtg_radar
+        input_shapes: dict from metadata.json["input_shapes"], e.g.
+            {"past_hr": [3, 256, 256, 10], "past_mr": [3, 128, 128, 4],
+             "past_lr": [3, 64, 64, 8]}
+        label_type: "lightning" or "radar" (determines loss + output head)
         past_timesteps: number of input timesteps
         future_timesteps: number of output timesteps
         dropout: dropout rate
         norm: normalization type (None, "batch", "layer")
-        ones_fraction: lightning occurrence rate (for focal loss, ignored for radar)
+        ones_fraction: lightning occurrence rate (for focal loss)
 
     Returns:
         compiled Keras Model
     """
-    # Input shapes per mode (from create_datasets.py output signatures)
-    if mode.startswith("msg"):
-        if "lightning" in mode:
-            hr_ch, lr_ch = 9, 13
-            label_type = "lightning"
-        else:
-            hr_ch, lr_ch = 9, 13
-            label_type = "radar"
-        inputs_hr = Input(shape=(past_timesteps, 256, 256, hr_ch), name="past_hr")
-        inputs_lr = Input(shape=(past_timesteps, 64, 64, lr_ch), name="past_lr")
-        all_inputs = [inputs_hr, inputs_lr]
-        # xt tracks branches by shape_divisor:  1=HR(256), 4=LR(64)
-        xt = {1: inputs_hr, 4: inputs_lr}
-        input_divisors = {1, 4}
+    # Determine the highest resolution (HR) to compute shape divisors
+    max_res = max(shape[1] for shape in input_shapes.values())
 
-    elif mode.startswith("mtg"):
-        if "lightning" in mode:
-            hr_ch, mr_ch, lr_ch = 10, 4, 8
-            label_type = "lightning"
-        else:
-            hr_ch, mr_ch, lr_ch = 10, 4, 8
-            label_type = "radar"
-        inputs_hr = Input(shape=(past_timesteps, 256, 256, hr_ch), name="past_hr")
-        inputs_mr = Input(shape=(past_timesteps, 128, 128, mr_ch), name="past_mr")
-        inputs_lr = Input(shape=(past_timesteps, 64, 64, lr_ch), name="past_lr")
-        all_inputs = [inputs_hr, inputs_mr, inputs_lr]
-        xt = {1: inputs_hr, 2: inputs_mr, 4: inputs_lr}
-        input_divisors = {1, 2, 4}
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
+    # Build Input layers and assign to resolution branches
+    all_inputs = []
+    xt = {}
+    input_divisors = set()
+
+    for name in sorted(input_shapes.keys()):
+        shape = input_shapes[name]  # [T, H, W, C]
+        res = shape[1]
+        channels = shape[-1]
+        divisor = max_res // res  # 1 for HR, 2 for MR, 4 for LR
+
+        inp = Input(shape=(past_timesteps, res, res, channels), name=name)
+        all_inputs.append(inp)
+        xt[divisor] = Concatenate(axis=-1)([xt[divisor], inp]) \
+            if divisor in xt else inp
+        input_divisors.add(divisor)
+
+    print(f"  Dynamic model: {len(all_inputs)} inputs, "
+          f"divisors={sorted(input_divisors)}, "
+          f"max_res={max_res}")
 
     block_channels = [32, 64, 128]
 
@@ -528,23 +529,33 @@ class WallTimeCallback(tf.keras.callbacks.Callback):
 # ============================================================================
 
 def train(mode, data_root, epochs, batch_size, output_dir,
-          dropout=0.1, norm=None):
+          dropout=0.1, norm=None, dataset_dir=None):
     """Main training function.
 
     Args:
-        mode: msg_lightning, msg_radar, mtg_lightning, mtg_radar
-        data_root: path to our_data/ containing datasets/{mode}/ and lightning_fraction.json
+        mode: msg_lightning, msg_radar, mtg_lightning, mtg_radar (used for
+              naming only when dataset_dir is provided explicitly)
+        data_root: path to our_data/ containing datasets/{mode}/ and
+                   lightning_fraction.json
         epochs: number of training epochs
         batch_size: training batch size
         output_dir: where to save model + history
         dropout: dropout rate
         norm: normalization type
+        dataset_dir: explicit path to the dataset directory. When provided,
+                     overrides the default data_root/datasets/{mode} path.
+                     This allows training on custom dataset variants (e.g.
+                     datasets built without NWCSAF).
     """
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_dir = data_root / "datasets" / mode
+    if dataset_dir is not None:
+        dataset_dir = Path(dataset_dir)
+    else:
+        dataset_dir = data_root / "datasets" / mode
+
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
 
@@ -553,14 +564,34 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         if not d.exists():
             raise FileNotFoundError(f"Dataset not found: {d}")
 
-    # Load metadata
-    # Determine label type from mode name
-    label_type = "lightning" if "lightning" in mode else "radar"
+    # Load metadata from the training split (always present)
+    meta_path = train_dir / "metadata.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(
+            f"metadata.json not found in {train_dir}. "
+            f"Regenerate datasets with create_datasets.py.")
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    input_shapes = meta["input_shapes"]  # e.g. {"past_hr": [3,256,256,10], ...}
+    label_type = meta.get("label_type", "lightning" if "lightning" in mode else "radar")
+    past_timesteps = next(iter(input_shapes.values()))[0]
+    # future timesteps = label timesteps
+    label_shape = meta.get("label_shape", [3, 256, 256, 1])
+    future_timesteps = label_shape[0]
 
     print("=" * 70)
     print(f"COALITION-4 Training — Mode: {mode}")
     print("=" * 70)
+    print(f"  Dataset:       {dataset_dir}")
     print(f"  Label type:    {label_type}")
+    print(f"  Inputs:        {list(input_shapes.keys())}")
+    for name, shape in input_shapes.items():
+        print(f"    {name}: {shape}")
+    print(f"  Label shape:   {label_shape}")
+    print(f"  Past steps:    {past_timesteps}")
+    print(f"  Future steps:  {future_timesteps}")
     print(f"  Epochs:        {epochs}")
     print(f"  Batch size:    {batch_size}")
     print(f"  Dropout:       {dropout}")
@@ -583,15 +614,16 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     val_ds = load_dataset(val_dir, batch_size, shuffle=False)
     print("  Datasets loaded")
 
-    # Build model
+    # Build model dynamically from metadata
     print("\nBuilding model...")
     model = build_coalition_model(
-        mode=mode,
-        past_timesteps=3,
-        future_timesteps=3,
+        input_shapes=input_shapes,
+        label_type=label_type,
+        past_timesteps=past_timesteps,
+        future_timesteps=future_timesteps,
         dropout=dropout,
         norm=norm,
-        ones_fraction=ones_fraction
+        ones_fraction=ones_fraction,
     )
     model.summary(print_fn=lambda x: print(f"  {x}"))
     print()
@@ -658,12 +690,17 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["msg_lightning", "msg_radar", "mtg_lightning", "mtg_radar"],
-        help="Model variant to train"
+        help="Model variant name (e.g. mtg_lightning, mtg_lightning_no_nwcsaf). "
+             "Used for naming the saved model and history files."
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
         help="Root directory containing datasets/ and lightning_fraction.json"
+    )
+    parser.add_argument(
+        "--dataset_dir", type=str, default=None,
+        help="Explicit path to the dataset directory (overrides data_root/datasets/{mode}). "
+             "Use this to train on custom dataset variants, e.g. datasets without NWCSAF."
     )
     parser.add_argument(
         "--output_dir", type=str, default="./models",
@@ -695,6 +732,7 @@ def main():
         output_dir=args.output_dir,
         dropout=args.dropout,
         norm=args.norm,
+        dataset_dir=args.dataset_dir,
     )
 
 
