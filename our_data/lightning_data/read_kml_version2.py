@@ -35,6 +35,8 @@ from datetime import datetime, timedelta
 import multiprocessing
 import time
 import re
+import sys
+import json
 import netCDF4 as nc
 from pathlib import Path
 import argparse
@@ -48,11 +50,29 @@ import os
 DEFAULT_DATA_ROOT = r"F:\nowcasting\coalition4-rcnn\our_data\lightning_data"
 DEFAULT_OUTPUT_ROOT = r"F:\nowcasting\coalition4-rcnn\our_data\lightning_data"
 
-# Fixed 15-minute grid: 96 steps from 00:15 to 23:45
-TIME_STEP_MINUTES = 15
+# Time step is read from the project-level timestep_config.json so that
+# lightning aggregation matches the pipeline cadence chosen by
+# validate_timestep.py. Module-level constants are populated at import time;
+# callers may override via override_timestep() in tests.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 
-# Number of time steps per day (00:15 through 23:45)
-STEPS_PER_DAY = 96
+
+def _load_step_minutes():
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    return int(cfg["step_minutes"])
+
+
+TIME_STEP_MINUTES = _load_step_minutes()
+STEPS_PER_DAY = 1440 // TIME_STEP_MINUTES
 
 
 # =============================================================================
@@ -131,8 +151,13 @@ def grid_accumulate(i, j, grid=None, weights=None, weighted_grid=None):
         np.add.at(weighted_grid, (i[valid_mask], j[valid_mask]), weights[valid_mask])
 
 
-def lightning_for_time(lightning_df, time, interval=timedelta(minutes=15)):
-    """Extract lightning data for the interval [time - interval, time)."""
+def lightning_for_time(lightning_df, time, interval=None):
+    """Extract lightning data for the interval [time - interval, time).
+
+    If interval is None, defaults to the configured TIME_STEP_MINUTES.
+    """
+    if interval is None:
+        interval = timedelta(minutes=TIME_STEP_MINUTES)
     start_time = time - interval
     end_time = time
     mask = (lightning_df['timestamp'] >= start_time) & (lightning_df['timestamp'] < end_time)

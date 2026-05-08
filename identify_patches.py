@@ -35,6 +35,7 @@ Usage (run from F:\\nowcasting\\coalition4-rcnn):
 import numpy as np
 import os
 import re
+import sys
 import json
 import csv
 import argparse
@@ -45,6 +46,34 @@ from netCDF4 import Dataset
 from pyresample import geometry, kd_tree
 
 from c4dl.projection import GridProjection, romania_grid_area
+
+
+# Path to the timestep configuration file produced by validate_timestep.py
+PROJECT_ROOT = Path(__file__).resolve().parent
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+
+
+def load_valid_minutes():
+    """
+    Read the radar minute filter from timestep_config.json.
+
+    Returns a set of two-digit minute strings (e.g. {'00','10','30','40'} for
+    step=15 with 10-min radar). Errors out if the config is missing.
+    """
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    flt = cfg["products"].get("radar", {}).get("filter")
+    if flt is None:
+        print(f"ERROR: radar filter missing from {TIMESTEP_CONFIG_PATH}", file=sys.stderr)
+        sys.exit(2)
+    return {f"{m:02d}" for m in flt}
 
 import matplotlib
 matplotlib.use('Agg')  # non-interactive backend for saving
@@ -362,20 +391,28 @@ def plot_patch_grid(regridded, binary_mask, active_patches, date_str, time_str,
 # File discovery
 # =============================================================================
 
-# Valid 15-minute time steps (minutes past the hour)
-QUARTER_HOUR_MINUTES = {'00', '15', '30', '45'}
+# Valid radar minutes are loaded lazily (and cached) from timestep_config.json
+# so identify_patches.py works at any cadence selected by validate_timestep.py.
+_VALID_RADAR_MINUTES = None
 
 
-def is_quarter_hour(filename):
+def _radar_minutes():
+    global _VALID_RADAR_MINUTES
+    if _VALID_RADAR_MINUTES is None:
+        _VALID_RADAR_MINUTES = load_valid_minutes()
+    return _VALID_RADAR_MINUTES
+
+
+def is_on_grid(filename):
     """
-    Check if a radar filename's timestamp falls on the 15-minute grid
-    (:00, :15, :30, :45).
+    Check if a radar filename's timestamp falls on the configured cadence
+    grid (e.g. {:00, :10, :30, :40} for step=15 with 10-min radar).
 
     Handles:
-        nc4_2025-05-15-Romania_0115_RZC.nc  → parts[2] = '0115' → '15' ✓
-        nc4_2025-05-15-Romania_0110_RZC.nc  → parts[2] = '0110' → '10' ✗
-        202406131215something.nc             → basename[10:12] = '15' ✓
+        nc4_2025-05-15-Romania_0110_RZC.nc  → parts[2] = '0110' → '10'
+        202406131215something.nc             → basename[10:12] = '15'
     """
+    valid_minutes = _radar_minutes()
     basename = os.path.splitext(os.path.basename(filename))[0]
     parts = basename.split('_')
 
@@ -383,21 +420,24 @@ def is_quarter_hour(filename):
     if parts[0] == 'nc4' and len(parts) >= 3:
         time_str = parts[2]
         if len(time_str) == 4 and time_str.isdigit():
-            return time_str[2:4] in QUARTER_HOUR_MINUTES
+            return time_str[2:4] in valid_minutes
 
     # Old raw format: first 12 chars = YYYYMMDDHHMM
     if len(basename) >= 12 and basename[:12].isdigit():
-        return basename[10:12] in QUARTER_HOUR_MINUTES
+        return basename[10:12] in valid_minutes
 
     return True  # include if pattern not recognized
 
 
 def discover_rzc_files(data_root):
     """
-    Discover RZC NetCDF files on the 15-minute grid (:00, :15, :30, :45).
+    Discover RZC NetCDF files on the configured cadence grid.
+
+    The valid minute set is read from our_data/timestep_config.json, so
+    a step=15 / cadence=10 setup keeps minutes {:00, :10, :30, :40} while
+    step=10 keeps every native minute. Files at off-grid timestamps are skipped.
 
     Scans: {data_root}/radar_data/RZC/nc4_*-Romania_RZC/*.nc
-    Files at non-quarter-hour timestamps are skipped.
 
     Returns:
         list[tuple]: Sorted list of (date_str, filepath) pairs
@@ -424,7 +464,7 @@ def discover_rzc_files(data_root):
 
         nc_files = sorted(f for f in os.listdir(day_dir) if f.endswith('.nc'))
         for nc_file in nc_files:
-            if not is_quarter_hour(nc_file):
+            if not is_on_grid(nc_file):
                 filtered += 1
                 continue
             filepath = os.path.join(day_dir, nc_file)

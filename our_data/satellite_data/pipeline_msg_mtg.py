@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import gc
 import json
 import eumdac
@@ -8,6 +9,7 @@ import shutil
 import math
 import numpy as np
 import xarray as xr
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from netCDF4 import Dataset as NC4Dataset
 try:
@@ -16,6 +18,42 @@ except ImportError:
     print("WARNING: hdf5plugin not installed. FCI L1c reading may fail. "
           "Install with: pip install hdf5plugin")
 from satpy import Scene, find_files_and_readers
+
+
+# =============================================================================
+# Timestep configuration
+# =============================================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+
+
+def load_timestep_filter(product_key="mtg"):
+    """
+    Load the minute filter for a product from timestep_config.json.
+
+    Returns (set of int minutes, step_minutes). Errors out with a clear
+    message if the config is missing — the pipeline must not run without an
+    explicit cadence decision.
+    """
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    flt = cfg["products"].get(product_key, {}).get("filter")
+    if flt is None:
+        print(
+            f"ERROR: product '{product_key}' has no minute filter in {TIMESTEP_CONFIG_PATH}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return set(flt), cfg["step_minutes"]
 
 
 # =============================================================================
@@ -192,9 +230,15 @@ CHANNELS_2KM = {'ir_38', 'wv_63', 'wv_73', 'ir_87', 'ir_97',
 
 
 # =============================================================================
-# MSG SEVIRI functions (original logic preserved)
+# MSG SEVIRI functions — DISABLED
+# -----------------------------------------------------------------------------
+# The COALITION-4 Romanian adaptation has converged on MTG FCI L1C as the only
+# satellite source. The MSG branch is preserved as a docstring block for
+# reference but is not exercised by the CLI. Re-enable by uncommenting if you
+# need to revive the MSG ingestion path.
 # =============================================================================
 
+_MSG_DISABLED = r'''
 def extract_date_time(filename):
     """Extract date and time from MSG SEVIRI NAT filename."""
     parts = filename.split('-')
@@ -354,11 +398,13 @@ def fetch_and_process_sat(start_str, end_str, base_dir, variable):
     skipped = len(all_products) - processed_count
     print(f"\nMSG: processed {processed_count} products "
           f"(skipped {skipped} non-15-min products)")
-    
+
     try:
         os.rmdir(temp_dir)
     except OSError:
         pass
+'''
+# end MSG-disabled block
 
 
 # =============================================================================
@@ -774,16 +820,13 @@ def fetch_and_process_mtg_all_variables(start_str, end_str, base_dir, variables,
     Fetch and process MTG FCI data for ALL requested variables.
 
     Downloads and processes products at native 10-min cadence, optionally
-    filtered to only keep specific minutes within each hour.
-
-    Default minute_filter selects :00, :10, :30, :50 — the native timestamps
-    closest to the 15-min pipeline grid (:00, :15, :30, :45). This avoids
-    optical flow interpolation and the errors it introduces.
+    filtered to only keep specific minutes within each hour. The filter is
+    typically derived from the project-level timestep_config.json by the
+    CLI; when invoked programmatically with minute_filter=None, all native
+    timesteps are kept.
 
     When chunk_filter is provided (default: ROMANIA_CHUNKS), only downloads
     the spatial chunks covering the study area — ~87% bandwidth reduction.
-
-    For FCI FDHSI over a full day with default filter: ~96 products (24h * 4/hour).
 
     Args:
         start_str (str): Start datetime in format 'yyyy/mm/dd-hhmm'
@@ -794,12 +837,12 @@ def fetch_and_process_mtg_all_variables(start_str, end_str, base_dir, variables,
         chunk_filter (set or None): Set of chunk numbers to download.
                                      Default: ROMANIA_CHUNKS.
                                      Pass None for full disk.
-        minute_filter (set or None): Set of allowed minutes (as int, e.g. {0,10,30,50}).
-                                      Default: {0, 10, 30, 50}.
+        minute_filter (set or None): Set of allowed minutes (as int, e.g. {0,10,30,40}).
+                                      None = keep all native timesteps.
                                       Pass None to keep all timesteps.
     """
-    if minute_filter is None:
-        minute_filter = {0, 10, 30, 50}
+    # minute_filter=None means "keep all native timesteps" (no filtering).
+    # The CLI populates it from timestep_config.json when not overridden.
 
     start, end = parse_date_range(start_str, end_str)
     if start is None:
@@ -934,14 +977,15 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description='Download and process MSG SEVIRI or MTG FCI satellite data'
+        description='Download and process MTG FCI L1C satellite data'
     )
     parser.add_argument(
         '--satellite', '-sat',
         type=str,
-        required=True,
-        choices=['msg', 'mtg'],
-        help='Satellite to process: msg (SEVIRI RSS) or mtg (FCI FDHSI)'
+        default='mtg',
+        choices=['mtg'],
+        help='Satellite to process. Only mtg (FCI FDHSI) is currently supported; '
+             'the MSG branch is disabled in this build.'
     )
     parser.add_argument(
         '--start', '-s',
@@ -965,7 +1009,7 @@ if __name__ == "__main__":
         '--output_dir', '-o',
         type=str,
         default=None,
-        help='Output directory (default: ./MSG or ./MTG in current directory)'
+        help='Output directory (default: ./MTG in the current working directory)'
     )
     parser.add_argument(
         '--full_disk',
@@ -982,9 +1026,9 @@ if __name__ == "__main__":
         type=str,
         nargs='+',
         default=None,
-        help="MTG only: minute values to keep (e.g. 00 10 30 50). "
-             "Default: 00 10 30 50 (nearest to 15-min grid). "
-             "Use 'all' to download every timestep."
+        help="Override the minute filter (e.g. 00 10 30 40). "
+             "Default: read from our_data/timestep_config.json (set via "
+             "validate_timestep.py). Use 'all' to keep every native timestep."
     )
 
     args = parser.parse_args()
@@ -1010,41 +1054,44 @@ if __name__ == "__main__":
     if args.satellite == 'mtg':
         print(f"Romania chunk filter: {sorted(ROMANIA_CHUNKS)}")
         print(f"Max parallel workers: {MAX_WORKERS}")
-        
+
         # Discovery mode
         if args.discover_chunks:
             discover_chunk_numbers(args.start, args.end)
         else:
             # Load variables from file
             mtg_variables = load_variables_from_file(products_file, satellite='mtg')
-            
+
             if not mtg_variables:
                 print("ERROR: No valid MTG variables found in products file.")
             else:
                 chunk_filter = None if args.full_disk else ROMANIA_CHUNKS
-                # Build minute filter
+                # Build minute filter — explicit CLI override beats config.
                 if args.timesteps is not None and args.timesteps != ['all']:
                     mtg_minute_filter = {int(m) for m in args.timesteps}
+                    print(f"Minute filter (CLI override): {sorted(mtg_minute_filter)}")
                 elif args.timesteps == ['all']:
                     mtg_minute_filter = None
+                    print("Minute filter: none (keeping every native timestep)")
                 else:
-                    mtg_minute_filter = {0, 10, 30, 50}  # default
+                    mtg_minute_filter, mtg_step = load_timestep_filter("mtg")
+                    print(f"Minute filter (timestep_config.json, step={mtg_step} min): "
+                          f"{sorted(mtg_minute_filter)}")
 
                 fetch_and_process_mtg_all_variables(
                     args.start, args.end, data_dir, mtg_variables,
                     chunk_filter=chunk_filter,
                     minute_filter=mtg_minute_filter
                 )
-    
-    elif args.satellite == 'msg':
-        # Load variables from file
-        msg_variables = load_variables_from_file(products_file, satellite='msg')
-        
-        if not msg_variables:
-            print("ERROR: No valid MSG variables found in products file.")
-        else:
-            for data_var in msg_variables:
-                var_dir = os.path.join(data_dir, data_var)
-                os.makedirs(var_dir, exist_ok=True)
-                fetch_and_process_sat(args.start, args.end, var_dir, data_var)
+
+    # MSG branch is disabled — see _MSG_DISABLED block above.
+    # elif args.satellite == 'msg':
+    #     msg_variables = load_variables_from_file(products_file, satellite='msg')
+    #     if not msg_variables:
+    #         print("ERROR: No valid MSG variables found in products file.")
+    #     else:
+    #         for data_var in msg_variables:
+    #             var_dir = os.path.join(data_dir, data_var)
+    #             os.makedirs(var_dir, exist_ok=True)
+    #             fetch_and_process_sat(args.start, args.end, var_dir, data_var)
                 

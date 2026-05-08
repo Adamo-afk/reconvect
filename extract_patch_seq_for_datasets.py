@@ -383,9 +383,12 @@ Usage (run from F:\\nowcasting\\coalition4-rcnn):
 
 import csv
 import os
+import sys
+import json
 import argparse
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 # =============================================================================
@@ -397,11 +400,31 @@ DEFAULT_DATA_ROOT = os.path.join(
 )
 
 N_PATCHES = 18
-STEP_MINUTES = 15
 
-# Temporal window
-DEFAULT_PAST_STEPS = 2     # 2 × 15 min = 30 min before T
-DEFAULT_FUTURE_STEPS = 3   # 3 × 15 min = 45 min after T
+# STEP_MINUTES is loaded from the project-level timestep_config.json so
+# sequence extraction always matches the cadence chosen by validate_timestep.py.
+PROJECT_ROOT = Path(__file__).resolve().parent
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+
+
+def _load_step_minutes():
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    return int(cfg["step_minutes"])
+
+
+STEP_MINUTES = _load_step_minutes()
+
+# Temporal window (in steps; the wall-clock duration scales with STEP_MINUTES)
+DEFAULT_PAST_STEPS = 2     # 2 × STEP_MINUTES before T
+DEFAULT_FUTURE_STEPS = 3   # 3 × STEP_MINUTES after T
 
 # Czibula split fractions
 DEFAULT_TEST_FRAC = 0.10
@@ -609,21 +632,33 @@ def split_sequences_czibula(all_sequences, test_frac, val_frac, block_hours):
 # Output
 # =============================================================================
 
+def step_column_name(offset):
+    """Index-encoded column name for a given step offset.
+
+    Examples: -2 -> 'idx_t-2', 0 -> 'idx_t0', +1 -> 'idx_t+1'.
+    Step *indices* are used (rather than minute offsets) so the CSV format
+    remains stable across different timestep_config.json choices.
+    """
+    if offset < 0:
+        return f'idx_t{offset}'
+    if offset == 0:
+        return 'idx_t0'
+    return f'idx_t+{offset}'
+
+
 def save_sequences(results, output_path, past_steps, future_steps):
-    """Save sequence results to CSV with per-timestep npy index columns."""
+    """Save sequence results to CSV with per-timestep npy index columns.
+
+    Column names use step *indices* (idx_t-2, idx_t-1, idx_t0, idx_t+1, ...)
+    rather than minute offsets, so the schema is independent of the cadence
+    chosen via validate_timestep.py. Convert back to minutes via
+    `STEP_MINUTES * offset` when needed.
+    """
     if not results:
         print(f"  No qualifying sequences for {output_path}")
         return 0
 
-    # Build column names for each timestep in the window
-    step_columns = []
-    for offset in range(-past_steps, future_steps + 1):
-        if offset < 0:
-            step_columns.append(f'idx_t{offset * 15}')
-        elif offset == 0:
-            step_columns.append('idx_t0')
-        else:
-            step_columns.append(f'idx_t+{offset * 15}')
+    step_columns = [step_column_name(o) for o in range(-past_steps, future_steps + 1)]
 
     with open(output_path, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -722,11 +757,13 @@ def main():
     )
     parser.add_argument(
         "--past", type=int, default=DEFAULT_PAST_STEPS,
-        help=f"Past 15-min steps required (default: {DEFAULT_PAST_STEPS})"
+        help=f"Past steps required ({STEP_MINUTES}-min cadence) "
+             f"(default: {DEFAULT_PAST_STEPS})"
     )
     parser.add_argument(
         "--future", type=int, default=DEFAULT_FUTURE_STEPS,
-        help=f"Future 15-min steps required (default: {DEFAULT_FUTURE_STEPS})"
+        help=f"Future steps required ({STEP_MINUTES}-min cadence) "
+             f"(default: {DEFAULT_FUTURE_STEPS})"
     )
     parser.add_argument(
         "--test_frac", type=float, default=DEFAULT_TEST_FRAC,
@@ -801,6 +838,20 @@ def main():
         os.path.join(args.data_root, 'test_data.csv'),
         args.past, args.future
     )
+
+    # Drop a sidecar metadata file so create_datasets.py can recover step
+    # minutes and window length without re-parsing column names.
+    seq_meta = {
+        "step_minutes": STEP_MINUTES,
+        "past_steps": args.past,
+        "future_steps": args.future,
+        "step_columns": [step_column_name(o)
+                         for o in range(-args.past, args.future + 1)],
+    }
+    seq_meta_path = os.path.join(args.data_root, 'sequence_meta.json')
+    with open(seq_meta_path, 'w') as f:
+        json.dump(seq_meta, f, indent=2)
+    print(f"  Saved sequence metadata -> {seq_meta_path}")
 
     # Summary
     print_summary(train, val, test, args.past, args.future, args.block_hours)
