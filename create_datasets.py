@@ -4,19 +4,25 @@ create_datasets.py — COALITION-4 Romanian Adaptation
 Creates train, validation, and test TF datasets from pre-extracted .npy patches.
 
 Usage:
-    python create_datasets.py --mode msg_lightning --data_root ./our_data
-    python create_datasets.py --mode msg_radar --data_root ./our_data
     python create_datasets.py --mode mtg_lightning --data_root ./our_data
     python create_datasets.py --mode mtg_radar --data_root ./our_data
+    python create_datasets.py --mode mtg_radar_continuous --data_root ./our_data
+
+The training cadence is read from our_data/timestep_config.json (set via
+validate_timestep.py) and the per-sample window from our_data/sequence_meta.json
+(written by extract_patch_seq_for_datasets.py). MSG modes are disabled in this
+build — see comments in get_mode_config().
 
 Inputs:
     - train_data.csv, validation_data.csv, test_data.csv in data_root/
+    - sequence_meta.json in data_root/ (step_minutes, past_steps, future_steps)
     - .npy patch files in data_root/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
 
 Outputs:
     - Saved tf.data.Dataset in data_root/datasets/{mode}/train/
     - Saved tf.data.Dataset in data_root/datasets/{mode}/validation/
     - Saved tf.data.Dataset in data_root/datasets/{mode}/test/
+    - metadata.json per split (input_shapes, label_type, step_minutes, ...)
 """
 
 import argparse
@@ -261,27 +267,29 @@ def get_mode_config(mode):
     # Common: radar + lightning at HR
     hr_base = {**HR_RADAR_CONFIG, **HR_LIGHTNING_CONFIG}
 
-    if mode == "msg_lightning":
-        return {
-            "past_hr": (hr_base, 256, "HR"),
-            "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-            "past_mr": None,
-            "label_var": "occurrence",
-            "label_transform": label_transform_occurrence,
-            "label_suffix": "HR",
-            "label_type": "lightning",
-        }
-    elif mode == "msg_radar":
-        return {
-            "past_hr": (hr_base, 256, "HR"),
-            "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-            "past_mr": None,
-            "label_var": "RZC",
-            "label_transform": label_transform_rzc_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
-    elif mode == "mtg_lightning":
+    # MSG modes are disabled in this build — see _MSG_DISABLED block in
+    # pipeline_msg_mtg.py for context. Re-enable both at once if needed.
+    # if mode == "msg_lightning":
+    #     return {
+    #         "past_hr": (hr_base, 256, "HR"),
+    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
+    #         "past_mr": None,
+    #         "label_var": "occurrence",
+    #         "label_transform": label_transform_occurrence,
+    #         "label_suffix": "HR",
+    #         "label_type": "lightning",
+    #     }
+    # elif mode == "msg_radar":
+    #     return {
+    #         "past_hr": (hr_base, 256, "HR"),
+    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
+    #         "past_mr": None,
+    #         "label_var": "RZC",
+    #         "label_transform": label_transform_rzc_multiclass,
+    #         "label_suffix": "HR",
+    #         "label_type": "radar",
+    #     }
+    if mode == "mtg_lightning":
         hr_with_vis = {**hr_base, **MTG_HR_SAT_CONFIG}
         return {
             "past_hr": (hr_with_vis, 256, "HR"),
@@ -303,16 +311,16 @@ def get_mode_config(mode):
             "label_suffix": "HR",
             "label_type": "radar",
         }
-    elif mode == "msg_radar_continuous":
-        return {
-            "past_hr": (hr_base, 256, "HR"),
-            "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-            "past_mr": None,
-            "label_var": "RZC",
-            "label_transform": label_transform_rzc_continuous,
-            "label_suffix": "HR",
-            "label_type": "radar_continuous",
-        }
+    # elif mode == "msg_radar_continuous":
+    #     return {
+    #         "past_hr": (hr_base, 256, "HR"),
+    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
+    #         "past_mr": None,
+    #         "label_var": "RZC",
+    #         "label_transform": label_transform_rzc_continuous,
+    #         "label_suffix": "HR",
+    #         "label_type": "radar_continuous",
+    #     }
     elif mode == "mtg_radar_continuous":
         hr_with_vis = {**hr_base, **MTG_HR_SAT_CONFIG}
         return {
@@ -325,20 +333,51 @@ def get_mode_config(mode):
             "label_type": "radar_continuous",
         }
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use: msg_lightning, msg_radar, "
-                         f"mtg_lightning, mtg_radar, "
-                         f"msg_radar_continuous, mtg_radar_continuous")
+        raise ValueError(
+            f"Unknown mode: {mode}. Use: mtg_lightning, mtg_radar, "
+            f"mtg_radar_continuous. (MSG modes are currently disabled.)"
+        )
 
 
 # ============================================================================
 # Timestep utilities
 # ============================================================================
+#
+# Dataset layout is driven by sequence_meta.json (written by
+# extract_patch_seq_for_datasets.py) which records the chosen step_minutes,
+# past_steps, and future_steps. INPUT_COLS / LABEL_COLS / T_OFFSETS / N_INPUT
+# / N_LABEL are populated at module load time from that file so all loaders
+# see the same schema regardless of cadence.
 
-INPUT_COLS  = ["idx_t-30", "idx_t-15", "idx_t0"]
-LABEL_COLS  = ["idx_t+15", "idx_t+30", "idx_t+45"]
-T_OFFSETS   = [-30, -15, 0, 15, 30, 45]  # minutes relative to reference_utc
-N_INPUT     = len(INPUT_COLS)
-N_LABEL     = len(LABEL_COLS)
+PROJECT_ROOT_FOR_SEQ = Path(__file__).resolve().parent
+SEQUENCE_META_PATH = PROJECT_ROOT_FOR_SEQ / "our_data" / "sequence_meta.json"
+
+
+def _load_sequence_meta():
+    if not SEQUENCE_META_PATH.exists():
+        print(
+            f"ERROR: sequence_meta.json not found at {SEQUENCE_META_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>\n"
+            f"    python extract_patch_seq_for_datasets.py",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return json.loads(SEQUENCE_META_PATH.read_text())
+
+
+_SEQ = _load_sequence_meta()
+STEP_MINUTES = int(_SEQ["step_minutes"])
+PAST_STEPS = int(_SEQ["past_steps"])
+FUTURE_STEPS = int(_SEQ["future_steps"])
+
+# Input columns are the past + current step indices; labels are the future ones.
+INPUT_COLS = [_SEQ["step_columns"][i] for i in range(PAST_STEPS + 1)]
+LABEL_COLS = [_SEQ["step_columns"][i] for i in range(PAST_STEPS + 1, len(_SEQ["step_columns"]))]
+# Minute offsets relative to reference_utc (T) — derived from step indices.
+T_OFFSETS = [k * STEP_MINUTES for k in range(-PAST_STEPS, FUTURE_STEPS + 1)]
+N_INPUT = len(INPUT_COLS)
+N_LABEL = len(LABEL_COLS)
 
 
 def reference_to_hhmm(reference_utc_str, offset_minutes):
@@ -649,6 +688,11 @@ def create_and_save_datasets(data_root, mode, output_root=None):
             "label_channels": LABEL_CHANNELS[mode_config["label_type"]],
             "input_shapes": {k: list(v.shape) for k, v in sig[0].items()},
             "label_shape": list(sig[1].shape),
+            "step_minutes": STEP_MINUTES,
+            "past_steps": PAST_STEPS,
+            "future_steps": FUTURE_STEPS,
+            "input_cols": INPUT_COLS,
+            "label_cols": LABEL_COLS,
         }
         meta_path = split_dir / "metadata.json"
         with open(meta_path, "w") as f:
@@ -672,9 +716,8 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["msg_lightning", "msg_radar", "mtg_lightning", "mtg_radar",
-                 "msg_radar_continuous", "mtg_radar_continuous"],
-        help="Dataset mode (satellite source + label type)"
+        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous"],
+        help="Dataset mode (MSG modes are disabled in this build)."
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",

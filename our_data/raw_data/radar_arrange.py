@@ -5,10 +5,14 @@ Reads radar products from their raw source directories and organizes them
 into the same naming convention used by the satellite pipeline, so that
 COALITION-4's data loaders can consume both satellite and radar data uniformly.
 
-Only timesteps matching the COALITION-4 cadence are kept. By default this
-selects :00, :10, :30, :50 — the native 10-min radar timestamps closest to
-the 15-min pipeline grid (:00, :15, :30, :45). This avoids optical flow
-interpolation errors that would be introduced by synthesizing :15 and :45.
+Only timesteps matching the configured pipeline cadence are kept. The minute
+filter is read from `our_data/timestep_config.json`, which is produced by
+`validate_timestep.py`. Run `python validate_timestep.py --step_minutes <N>`
+once before running this script to pick a training cadence.
+
+For step=15 with 10-min radar, the resulting filter is {00, 10, 30, 40} —
+nearest-neighbour selection from the native cadence with no optical flow
+interpolation.
 
 Source structure (raw):
     {source_root}/{raw_name}/
@@ -31,34 +35,40 @@ Product mapping (raw_name -> COALITION_NAME):
     eht          -> EZC-20
 
 Usage:
-    # Arrange all products (default: only :00, :10, :30, :50 timesteps)
-    python radar_arrange.py
+    # Set the cadence first (only needs to be done once per pipeline run)
+    python validate_timestep.py --step_minutes 15
+
+    # Arrange all products (filter read from timestep_config.json)
+    python our_data/raw_data/radar_arrange.py
 
     # Custom paths
-    python radar_arrange.py -s D:/radar/netcdf -t F:/nowcasting/coalition4-rcnn/our_data/radar_data
+    python our_data/raw_data/radar_arrange.py --source_root D:/radar/netcdf --target_root our_data/radar_data
 
-    # Keep all timesteps (no filtering)
-    python radar_arrange.py --timesteps all
+    # Keep all native timesteps (override config)
+    python our_data/raw_data/radar_arrange.py --timesteps all
 
-    # Custom timestep filter (minutes within each hour)
-    python radar_arrange.py --timesteps 00 10 20 30 40 50
+    # Custom timestep filter (override config)
+    python our_data/raw_data/radar_arrange.py --timesteps 00 10 20 30 40 50
 
     # Specific products only
-    python radar_arrange.py --products rain_rate reflectivity
+    python our_data/raw_data/radar_arrange.py --products rain_rate reflectivity
 
     # Copy instead of move
-    python radar_arrange.py --copy
+    python our_data/raw_data/radar_arrange.py --copy
 
     # Dry run (preview without file operations)
-    python radar_arrange.py --dry-run
+    python our_data/raw_data/radar_arrange.py --dry-run
 """
 
 import os
 import re
+import sys
+import json
 import shutil
 import argparse
 from datetime import datetime
 from collections import defaultdict
+from pathlib import Path
 
 
 # =============================================================================
@@ -86,9 +96,37 @@ PRODUCT_MAP = {
 # Regex to extract date (8 digits) and time (4 digits) from the filename start
 FILENAME_PATTERN = re.compile(r'^(\d{8})(\d{4})')
 
-# Default timestep filter: nearest native 10-min timestamps to the 15-min grid.
-# :00->:00, :15->:10, :30->:30, :45->:50
-DEFAULT_MINUTE_FILTER = {'00', '10', '30', '50'}
+# Path to the timestep configuration file produced by validate_timestep.py
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+
+
+def load_timestep_filter(product_key="radar"):
+    """
+    Load the minute filter for a given product from timestep_config.json.
+
+    Returns a set of two-digit minute strings (e.g. {'00', '10', '30', '40'}).
+    Errors out with a clear message if the config file is missing — pipeline
+    scripts must not run without an explicit cadence decision.
+    """
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    flt = cfg["products"].get(product_key, {}).get("filter")
+    if flt is None:
+        print(
+            f"ERROR: product '{product_key}' has no minute filter in {TIMESTEP_CONFIG_PATH}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return {f"{m:02d}" for m in flt}, cfg["step_minutes"]
 
 
 # =============================================================================
@@ -276,8 +314,8 @@ def main():
         type=str,
         nargs="+",
         default=None,
-        help="Minute values to keep (e.g. 00 10 30 50). "
-             "Default: 00 10 30 50 (nearest to 15-min grid). "
+        help="Override the minute filter (e.g. 00 10 30 40). "
+             "Default: read from our_data/timestep_config.json (set via validate_timestep.py). "
              "Use 'all' to keep every timestep."
     )
     parser.add_argument(
@@ -293,13 +331,16 @@ def main():
 
     args = parser.parse_args()
 
-    # Build minute filter
+    # Build minute filter — explicit CLI override takes precedence; otherwise
+    # read from timestep_config.json (which errors if missing).
     if args.timesteps is not None and args.timesteps != ['all']:
         minute_filter = set(args.timesteps)
+        step_minutes = None
     elif args.timesteps == ['all']:
         minute_filter = None
+        step_minutes = None
     else:
-        minute_filter = DEFAULT_MINUTE_FILTER
+        minute_filter, step_minutes = load_timestep_filter("radar")
 
     # Determine which products to process
     if args.products:
@@ -320,6 +361,8 @@ def main():
     print(f"Source root : {args.source_root}")
     print(f"Target root : {args.target_root}")
     print(f"Products    : {len(products)}")
+    if step_minutes is not None:
+        print(f"Step        : {step_minutes} min (from timestep_config.json)")
     print(f"Timesteps   : {sorted(minute_filter) if minute_filter else 'all'}")
     print(f"Mode        : {'COPY' if args.copy else 'MOVE'}")
     if args.dry_run:
