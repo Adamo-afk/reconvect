@@ -770,15 +770,15 @@ reducing regridding to a fast numpy array lookup.
 Products handled:
     - Radar:     RZC, BZC, CZC, EZC-20, LZC, CPCH       → .npy
     - MSG:       VIS006, IR_039, IR_108, WV_062, WV_073   → .npy
-    - MTG:       vis_06, ir_38, ir_105, wv_63, wv_73      → .npy
+    - MTG:       vis_06, ir_38, ir_105, wv_63, wv_73      → .npy (use inspect_mtg.py for .nc)
     - Lightning: density, current, occurrence (already on grid)   → .npy
     - NWCSAF:    ctth_alti, ctth_tempe, cmic_phase, cmic_cot     → .nc
 
 Input paths:
     our_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.nc
     our_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.nc
-    our_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.nc
-    our_data/satellite_data/MTG/coordinates/{lat,lon}_{1km,2km}.npy
+    our_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
+    our_data/satellite_data/MTG/mtg_constants.json
     our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.nc
     our_data/nwcsaf_data/{date}-Romania/*.nc
 
@@ -802,7 +802,6 @@ Usage (run from F:\\nowcasting\\coalition4-rcnn):
 import numpy as np
 import xarray as xr
 import os
-import re
 import argparse
 import threading
 import time as timer_module
@@ -841,8 +840,6 @@ MTG_1KM_CHANNELS = {'vis_06'}
 MTG_2KM_CHANNELS = {'ir_38', 'ir_105', 'wv_63', 'wv_73'}
 
 LIGHTNING_PRODUCTS = ['density', 'current', 'occurrence']
-
-QUARTER_HOUR_MINUTES = {'00', '15', '30', '45'}
 
 # Maximum parallel workers for day-folder processing
 MAX_WORKERS = 6
@@ -914,22 +911,6 @@ def init_romania_grid():
     target_lons, target_lats = grid_projection.inverse(y, x)
     print(f"  Target grid shape: {target_lats.shape}")
     return target_lats, target_lons
-
-
-def is_quarter_hour(filename):
-    """Check if a filename's timestamp is on the 15-minute grid."""
-    basename = os.path.splitext(os.path.basename(filename))[0]
-    parts = basename.split('_')
-    if len(parts) >= 3 and parts[0] == 'nc4':
-        time_str = parts[2]
-        if len(time_str) == 4 and time_str.isdigit():
-            return time_str[2:4] in QUARTER_HOUR_MINUTES
-    if len(basename) >= 12 and basename[:12].isdigit():
-        return basename[10:12] in QUARTER_HOUR_MINUTES
-    match = re.search(r'_(\d{8})_(\d{4})', basename)
-    if match:
-        return match.group(2)[2:4] in QUARTER_HOUR_MINUTES
-    return True
 
 
 def ensure_dir(path):
@@ -1207,13 +1188,77 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
 # MTG satellite
 # =============================================================================
 
+def _read_mtg_source_grid_from_constants(constants_path, resolution):
+    """
+    Reconstruct source lat/lon grids from the mtg_constants.json file.
+
+    Reads the geostationary projection parameters and 1-D scanning
+    angles, then applies the pyproj inverse geostationary projection
+    to produce 2-D lat/lon arrays.
+
+    Args:
+        constants_path (str): Path to mtg_constants.json.
+        resolution (str): '1km' or '2km'.
+
+    Returns:
+        tuple: (lat_2d, lon_2d) as float64 numpy arrays.
+    """
+    import json as _json
+
+    with open(constants_path, 'r') as f:
+        constants = _json.load(f)
+
+    proj_params = constants['projection']
+    res_data = constants[resolution]
+
+    if res_data is None:
+        raise ValueError(f"No {resolution} data in {constants_path}")
+
+    h = float(proj_params['perspective_point_height'])
+    a = float(proj_params['semi_major_axis'])
+    b = float(proj_params['semi_minor_axis'])
+    lon_0 = float(proj_params['longitude_of_projection_origin'])
+    sweep = str(proj_params.get('sweep_angle_axis', 'y'))
+
+    x_rad = np.array(res_data['x_geos'], dtype=np.float64)
+    y_rad = np.array(res_data['y_geos'], dtype=np.float64)
+
+    # Convert scanning angles (radians) to projection coordinates (meters)
+    x_m = x_rad * h
+    y_m = y_rad * h
+    xx, yy = np.meshgrid(x_m, y_m)
+
+    # Inverse geostationary projection → lon, lat
+    proj = pyproj.Proj(
+        proj='geos', h=h, a=a, b=b, lon_0=lon_0, sweep=sweep
+    )
+    lon_2d, lat_2d = proj(xx, yy, inverse=True)
+
+    # Off-disk pixels come back as inf; replace with NaN
+    invalid = np.isinf(lat_2d) | np.isinf(lon_2d)
+    lat_2d[invalid] = np.nan
+    lon_2d[invalid] = np.nan
+
+    return lat_2d.astype(np.float64), lon_2d.astype(np.float64)
+
+
 def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid MTG channels. KD-tree built once per resolution (1km/2km),
-    day folders in parallel.
+    Regrid MTG channels from pipeline-produced .npy files.
+
+    Source grid: reconstructed from mtg_constants.json (projection
+    parameters + 1-D scanning angle arrays).
+
+    KD-tree built once per resolution (1km/2km), reused across all
+    channels sharing that resolution.
+
+    Output: .npy files containing the regridded 2-D array on the
+    768×1536 EPSG:31700 grid. The grid coordinates (lat/lon) are
+    saved once as romania_grid_lats.npy and romania_grid_lons.npy.
+    Use inspect_mtg.py to reconstruct full .nc files for GIS viewing.
     """
     mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')
-    coord_dir = os.path.join(mtg_dir, 'coordinates')
+    constants_path = os.path.join(mtg_dir, 'mtg_constants.json')
     regridded_base = os.path.join(
         data_root, 'regridded_data', 'satellite_data', 'MTG'
     )
@@ -1222,35 +1267,63 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
         print(f"  MTG directory not found: {mtg_dir}")
         return
 
-    # Precompute mappings per resolution
+    if not os.path.isfile(constants_path):
+        print(f"  ERROR: mtg_constants.json not found at {constants_path}")
+        print(f"  Run pipeline_msg_mtg.py first to generate it.")
+        return
+
+    # Save target grid coordinates once for later inspection
+    grid_lats_path = os.path.join(regridded_base, 'romania_grid_lats.npy')
+    grid_lons_path = os.path.join(regridded_base, 'romania_grid_lons.npy')
+    if not os.path.isfile(grid_lats_path):
+        ensure_dir(regridded_base)
+        np.save(grid_lats_path, target_lats)
+        np.save(grid_lons_path, target_lons)
+        print(f"  Saved Romania grid coordinates: {target_lats.shape}")
+
+    # Build KD-tree mappings per resolution from the constants file
     mapping_cache = {}
+
     for res in ['1km', '2km']:
-        lat_path = os.path.join(coord_dir, f'lat_{res}.npy')
-        lon_path = os.path.join(coord_dir, f'lon_{res}.npy')
-        if os.path.isfile(lat_path) and os.path.isfile(lon_path):
-            src_lats = np.load(lat_path).astype(np.float64)
-            src_lons = np.load(lon_path).astype(np.float64)
+        # Check if any requested channel needs this resolution
+        channels_at_res = (
+            MTG_1KM_CHANNELS if res == '1km' else MTG_2KM_CHANNELS
+        )
+        has_channels = any(
+            os.path.isdir(os.path.join(mtg_dir, ch))
+            for ch in channels_at_res
+        )
+        if not has_channels:
+            continue
 
-            # Clean NaN values (geostationary off-disk pixels)
-            nan_mask = np.isnan(src_lats) | np.isnan(src_lons)
-            n_nan = int(nan_mask.sum())
-            if n_nan > 0:
-                print(f"  MTG {res}: cleaning {n_nan} NaN pixels "
-                      f"({n_nan / nan_mask.size * 100:.1f}%)")
-                src_lats[nan_mask] = 0.0
-                src_lons[nan_mask] = 0.0
-
-            src_lats = np.clip(src_lats, -90.0, 90.0)
-            src_lons = np.clip(src_lons, -180.0, 180.0)
-
-            print(f"  Building MTG {res} mapping "
-                  f"(shape: {src_lats.shape})...")
-            mapping_cache[res] = PrecomputedMapping(
-                src_lats, src_lons, target_lats, target_lons
+        print(f"  Extracting MTG {res} source grid from constants...")
+        try:
+            src_lats, src_lons = _read_mtg_source_grid_from_constants(
+                constants_path, res
             )
-        else:
-            print(f"  WARNING: MTG {res} coordinates not found at {coord_dir}")
+        except Exception as e:
+            print(f"  ERROR reading {res} source grid: {e}")
+            continue
 
+        # Clean NaN values (off-disk pixels)
+        nan_mask = np.isnan(src_lats) | np.isnan(src_lons)
+        n_nan = int(nan_mask.sum())
+        if n_nan > 0:
+            print(f"  MTG {res}: {n_nan} off-disk pixels "
+                  f"({n_nan / nan_mask.size * 100:.1f}%) → zeroed for KD-tree")
+            src_lats[nan_mask] = 0.0
+            src_lons[nan_mask] = 0.0
+
+        src_lats = np.clip(src_lats, -90.0, 90.0)
+        src_lons = np.clip(src_lons, -180.0, 180.0)
+
+        print(f"  Building MTG {res} KD-tree "
+              f"(source shape: {src_lats.shape})...")
+        mapping_cache[res] = PrecomputedMapping(
+            src_lats, src_lons, target_lats, target_lons
+        )
+
+    # Process each channel
     for channel in MTG_CHANNELS:
         channel_dir = os.path.join(mtg_dir, channel)
         if not os.path.isdir(channel_dir):
@@ -1259,7 +1332,7 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
 
         res = '1km' if channel in MTG_1KM_CHANNELS else '2km'
         if res not in mapping_cache:
-            print(f"  Skipping {channel}: no {res} mapping")
+            print(f"  Skipping {channel}: no {res} mapping available")
             continue
 
         mapping = mapping_cache[res]
@@ -1274,44 +1347,48 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
             if not os.path.isdir(day_path):
                 continue
             out_dir = os.path.join(regridded_base, channel, day_folder)
-            nc_files = sorted(
-                f for f in os.listdir(day_path) if f.endswith('.nc')
+            npy_files = sorted(
+                f for f in os.listdir(day_path) if f.endswith('.npy')
             )
-            if nc_files:
-                day_jobs.append((day_folder, day_path, out_dir, nc_files))
+            if npy_files:
+                day_jobs.append((day_folder, day_path, out_dir, npy_files))
 
         if not day_jobs:
             print(f"    No day folders found for {channel}")
             continue
 
-        # Worker function
+        # Worker function — reads .npy, regrids, saves .npy.
+        # The cadence filter is enforced upstream by pipeline_msg_mtg.py
+        # (via timestep_config.json), so no minute filtering is needed here.
         def process_mtg_day(job, _mapping=mapping, _channel=channel):
-            day_folder, day_path, out_dir, nc_files = job
-            new, skipped, filtered = 0, 0, 0
-            for nc_file in nc_files:
-                if not is_quarter_hour(nc_file):
-                    filtered += 1
-                    continue
-                npy_file = nc_file.replace('.nc', '.npy')
+            day_folder, day_path, out_dir, npy_files = job
+            new, skipped = 0, 0
+            for npy_file in npy_files:
                 out_path = os.path.join(out_dir, npy_file)
                 if output_exists(out_path):
                     skipped += 1
                     continue
+
                 try:
-                    filepath = os.path.join(day_path, nc_file)
-                    with _nc_lock:
-                        with Dataset(filepath, 'r') as ds:
-                            var_name = find_data_variable(ds, _channel)
-                            if var_name is None:
-                                continue
-                            sat_data = ds.variables[var_name][:]
-                    regridded = _mapping.apply(sat_data)
+                    filepath = os.path.join(day_path, npy_file)
+                    sat_data = np.load(filepath)
+
+                    if isinstance(sat_data, np.ma.MaskedArray):
+                        sat_data = sat_data.filled(np.nan)
+                    sat_data = np.asarray(sat_data, dtype=np.float32)
+
+                    if sat_data.ndim == 3:
+                        sat_data = np.squeeze(sat_data, axis=0)
+
+                    regridded = _mapping.apply(sat_data, fill_value=np.nan)
+
                     ensure_dir(out_dir)
                     np.save(out_path, regridded)
                     new += 1
+
                 except Exception as e:
-                    print(f"    ERROR {nc_file}: {e}")
-            return day_folder, new, skipped, filtered
+                    print(f"    ERROR {npy_file}: {e}")
+            return day_folder, new, skipped
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             futures = {
@@ -1319,11 +1396,11 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
                 for job in day_jobs
             }
             for future in as_completed(futures):
-                day_folder, new, skipped, filtered = future.result()
+                day_folder, new, skipped = future.result()
                 total = new + skipped
-                if total > 0 or filtered > 0:
+                if total > 0:
                     print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{filtered} filtered, {total} used")
+                          f"{total} used")
 
 
 # =============================================================================
@@ -1698,5 +1775,3 @@ if __name__ == "__main__":
         instrument=instrument,
         date_filter=args.date,
     )
-
-

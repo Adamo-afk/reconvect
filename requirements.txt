@@ -27,6 +27,11 @@ pyresample
 pyproj
 netCDF4
 xarray
+geopandas        # read_kml_version2.py reads LINET KMLs via GeoPandas
+
+# MTG FCI L1C data pipeline (pipeline_msg_mtg.py, inspect_mtg.py)
+paramiko         # SFTP transfer from anm@192.168.11.223 — required by pipeline_msg_mtg.py
+hdf5plugin       # CharLS plugin required to read FCI L1C compressed chunks
 
 # Visualization
 matplotlib
