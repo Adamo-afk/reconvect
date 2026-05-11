@@ -77,19 +77,19 @@ coalition4-rcnn/
 │   │   │   ├── WV_062/...
 │   │   │   └── WV_073/...
 │   │   ├── MTG/
-│   │   │   ├── coordinates/           # Shared lat/lon grids (auto-generated on first run)
-│   │   │   │   ├── lat_1km.npy
-│   │   │   │   ├── lon_1km.npy
-│   │   │   │   ├── lat_2km.npy
-│   │   │   │   └── lon_2km.npy
-│   │   │   ├── vis_06/nc4_{date}-Romania_vis_06/*.nc
+│   │   │   ├── mtg_constants.json     # Grid constants (geos projection + x/y scan angles)
+│   │   │   │                          #   written by pipeline_msg_mtg.py on first run
+│   │   │   ├── vis_06/nc4_{date}-Romania_vis_06/*.npy  # per-channel arrays on geos grid
 │   │   │   ├── ir_38/...
 │   │   │   ├── ir_105/...
 │   │   │   ├── wv_63/...
 │   │   │   └── wv_73/...
-│   │   ├── pipeline_msg_mtg.py        # MTG FCI download + processing pipeline
+│   │   ├── pipeline_msg_mtg.py        # MTG FCI L1C SFTP + Satpy processing pipeline
+│   │   ├── inspect_mtg.py             # Reconstruct .nc and plot raw / regridded MTG data
+│   │   ├── summarize_raw_chunks.py    # CSV report of downloaded FCI chunks per date
 │   │   ├── check_chunk_names.py       # Diagnostic: inspect FCI chunk NetCDF structure
-│   │   └── check_chunk_contents.py    # Diagnostic: read FCI chunk radiance data
+│   │   ├── check_chunk_contents.py    # Diagnostic: read FCI chunk radiance data
+│   │   └── _raw_chunks/               # Cache of downloaded FCI chunk files (gitignored)
 │   ├── lightning_data/
 │   │   ├── kml_data/{date}/{date}.kml
 │   │   ├── density/nc4_{date}-Romania_density/*.nc
@@ -334,28 +334,86 @@ python our_data/lightning_data/visualize_lightning_stats.py --data_root our_data
 
 ### Data Acquisition and Arrangement
 
-#### MTG FCI L1C Satellite Data Pipeline
+#### MTG FCI L1C Satellite Data Pipeline (SFTP)
 
-The full MTG FCI L1C pipeline — download from EUMETSAT, chunk filtering for Romania, coordinate extraction, and variable assembly — is handled by a single script:
+`pipeline_msg_mtg.py` was rewritten to pull FCI L1C from the ANM internal storage via SFTP (instead of EUMETSAT Data Store / `eumdac`) and to read chunks directly with `netCDF4` + `hdf5plugin` (instead of going through Satpy).
 
 ```bash
-cd our_data/satellite_data
+# 1. Pick the training cadence first (writes our_data/timestep_config.json)
+python validate_timestep.py --step_minutes 15
 
-# Set EUMETSAT credentials as environment variables
-export EUMETSAT_CONSUMER_KEY="your_key"
-export EUMETSAT_CONSUMER_SECRET="your_secret"
-
-# Download and process FCI data for a time range
-python pipeline_msg_mtg.py
+# 2. Download + process MTG FCI L1C for a time range
+python our_data/satellite_data/pipeline_msg_mtg.py \
+    --start 2026/02/01-0000 \
+    --end   2026/04/01-0000 \
+    --password_file password.txt
 ```
 
-Configuration is done by editing the variables at the bottom of `pipeline_msg_mtg.py`: `start_str`, `end_str`, `collection` (`fci_fdhsi` for Full Disk High Spectral Imagery or `fci_hrfi` for High Resolution Fast Imagery), and `base_dir`. The script downloads FCI L1C (Level 1C, geolocated and radiometrically calibrated radiances) data and:
+**Required arguments:**
 
-1. Authenticates with the EUMETSAT Data Store via `eumdac`
-2. Discovers which FCI L1C chunks cover Romania
-3. Downloads only the relevant chunks (dramatically reducing bandwidth)
-4. Extracts lat/lon coordinate grids on first run (`coordinates/lat_1km.npy`, etc.) using inverse geostationary projection from FCI scanning angles
-5. Processes each variable (vis_06, ir_105, etc.) in parallel, converting L1C radiances to NetCDF in the COALITION-4 directory structure
+| Flag | Description |
+|------|-------------|
+| `--start`, `--end` | Date/time range in `yyyy/mm/dd-hhmm` (UTC). Use `2026/04/01-0000` to include all of March 31. |
+| `--password_file`, `-pw` | Text file containing the SSH password for `anm@192.168.11.223` on a single line. Keep out of git. |
+
+**Optional flags:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--products_file`, `-pf` | JSON file listing MTG channels under the `"mtg"` key. | `satellite_products.json` |
+| `--output_dir`, `-o` | Output directory for processed channels. | `./MTG` in CWD |
+| `--full_disk` | Download all 40 chunks instead of Romania-only. | off |
+| `--timesteps` | Override the minute filter (e.g. `00 10 30 40`) or pass `all` for every native :00/.../:50. | read from `timestep_config.json` |
+| `--skip_download` | Skip SFTP and process files already in `<output_dir>/_raw_chunks/`. | off |
+| `--workers`, `-w` | Parallel workers for repeat-cycle processing. | `10` |
+
+**What changed under the hood:**
+
+1. **Data source**: EUMETSAT Data Store (`eumdac`) → SFTP from `anm@192.168.11.223:/ShortTermStorage/GEOSTATIONARY/MTG/FCI/`. Date, chunk number, and minute-of-hour filters are applied **server-side** via SSH `ls` with glob patterns before anything is transferred.
+2. **Chunk filter**: `{34, 35, 36, 37, 38}` (±1 buffer) → `{35, 36}` based on the Météo-France FCI scan diagram. Halves transfer volume vs. the previous default.
+3. **Processing**: manual `netCDF4.Dataset` reading is kept but the custom `fci_scanning_angles_to_latlon()` inverse projection and the `ProcessPoolExecutor` chunk-stitching pipeline are replaced by a single `process_repeat_cycle()` function that:
+   - opens each chunk with `netCDF4` (hdf5plugin provides CharLS decompression),
+   - reads `data[<channel>]/measured/effective_radiance` with `scale_factor` / `add_offset` auto-applied,
+   - concatenates Romania chunks vertically,
+   - writes one `.npy` per channel + a sidecar `MTG/mtg_constants.json` describing the geos projection (perspective height, semi-major/minor axes, sub-satellite longitude, sweep axis) and the 1-D scanning angles `x_geos`, `y_geos`.
+4. **No more coordinate `.npy` files**: the old `coordinates/lat_{1,2}km.npy` and `lon_{1,2}km.npy` are gone. `regrid.py` rebuilds the source lat/lon arrays on demand from `mtg_constants.json` via `pyproj.Proj(proj='geos', ...)`.
+5. **Old code preserved, inert**: the original `eumdac` + manual stitching path lives at the bottom of the file inside a `_DATASTORE_MANUAL_DISABLED` raw-string block; the previously-disabled MSG SEVIRI code is still in `_MSG_DISABLED`. Both parse but never execute — only the MTG-via-SFTP path is active.
+
+> **Network**: you must be on a network with route to `192.168.11.223` (ANM internal/VPN) and have read access to the FCI storage path. The script fails fast if SFTP can't connect or the password file is missing.
+
+#### MTG Helper Scripts
+
+**`summarize_raw_chunks.py`** — scan `_raw_chunks/` and emit a CSV showing how many repeat cycles and chunk files are present per date. Useful to confirm a download is complete before processing.
+
+```bash
+python our_data/satellite_data/summarize_raw_chunks.py
+python our_data/satellite_data/summarize_raw_chunks.py --raw_dir path/to/_raw_chunks --output summary.csv
+```
+
+**`inspect_mtg.py`** — reconstruct a CF-compliant NetCDF from a pipeline `.npy` (using `mtg_constants.json` for the geos grid) or from a regridded `.npy` (using `romania_grid_lats/lons.npy`), and optionally plot it with matplotlib. Use this to open the data in Panoply / QGIS or to sanity-check a frame.
+
+```bash
+# Plot pipeline output (geostationary grid)
+python our_data/satellite_data/inspect_mtg.py --raw \
+    --npy MTG/vis_06/nc4_2026-02-13-Romania_vis_06/nc4_2026-02-13-Romania_0930_vis_06.npy \
+    --constants MTG/mtg_constants.json
+
+# Plot regridded output (Romania EPSG:31700 grid)
+python our_data/satellite_data/inspect_mtg.py --regridded \
+    --npy regridded_data/satellite_data/MTG/vis_06/.../nc4_..._0930_vis_06.npy
+
+# Save .nc without plotting
+python our_data/satellite_data/inspect_mtg.py --raw --npy <path> --constants <path> --save_nc --no_plot
+```
+
+#### `regrid.py` — MTG branch updates
+
+Two changes were needed to align `regrid.py` with the new pipeline output:
+
+1. **Source grid reconstruction**: previously `regrid_satellite_mtg()` loaded the precomputed `coordinates/lat_{1,2}km.npy` / `lon_{1,2}km.npy` files written by the old pipeline. Those files no longer exist. The new code reads `our_data/satellite_data/MTG/mtg_constants.json`, builds a `pyproj.Proj(proj='geos', h=..., a=..., b=..., lon_0=..., sweep=...)` from the embedded projection parameters, and reconstructs 2-D source lat/lon arrays from `x_geos` / `y_geos` once per resolution. The KD-tree (`PrecomputedMapping`) caching strategy is unchanged.
+2. **Input format**: MTG inputs are `.npy` arrays under `satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy` instead of `.nc`. Radar, MSG (disabled), lightning, and NWCSAF paths are untouched.
+
+The regrid output for MTG remains `.npy` on the Romania 1536×768 grid. Use `inspect_mtg.py --regridded` to get a CF NetCDF for any single regridded sample.
 
 #### Timestep Selection (no interpolation)
 
