@@ -132,6 +132,7 @@ coalition4-rcnn/
 ├── evaluation/                        # Evaluation outputs (not tracked in git)
 │   └── eval_{mode}/
 │
+├── product_cadences.json              # Native cadence per data product (input to Step 0)
 ├── validate_timestep.py               # Step 0: Validate cadence → timestep_config.json
 ├── identify_patches.py                # Step 1: DBSCAN → patch_index.csv/json
 ├── regrid.py                          # Step 2: Reproject all products to Romania grid
@@ -193,7 +194,24 @@ conda activate tfenv
 #### Step 0 — Set the training cadence
 
 The pipeline supports any training step that is at least as coarse as the
-highest native data cadence (currently **10 min**, set by radar / MTG / NWCSAF).
+highest native data cadence. Native cadences are declared in
+[`product_cadences.json`](product_cadences.json) at the project root:
+
+```json
+{
+  "radar":     10,
+  "mtg":       10,
+  "nwcsaf":    10,
+  "lightning": null
+}
+```
+
+A `null` value marks a continuous product (no minute filter is needed —
+lightning strokes are aggregated into the chosen window). If you add a
+new data source or its native cadence changes, edit this file rather than
+the validator script. The validator reads the file at startup; it does not
+inspect any data folders. Override with `--cadences_file path/to/other.json`.
+
 Run the validator once before any other pipeline step:
 
 ```bash
@@ -206,10 +224,11 @@ python validate_timestep.py --print                  # show current config
 
 The script writes `our_data/timestep_config.json` with the chosen
 `step_minutes`, the per-product `minute_filter` (the native minutes to keep
-when arranging or downloading), and the `steps_per_day`. All downstream scripts
-(`radar_arrange.py`, `pipeline_msg_mtg.py`, `read_kml_version2.py`,
-`identify_patches.py`, `extract_patch_seq_for_datasets.py`, `create_datasets.py`)
-**read this file** and refuse to run if it is missing.
+when arranging or downloading), the `steps_per_day`, and a
+`cadences_source` pointer back to the JSON file it loaded. All downstream
+scripts (`radar_arrange.py`, `pipeline_msg_mtg.py`, `read_kml_version2.py`,
+`identify_patches.py`, `extract_patch_seq_for_datasets.py`,
+`create_datasets.py`) **read this file** and refuse to run if it is missing.
 
 For step=15 with 10-min radar/MTG/NWCSAF the resulting filter is `{00, 10, 30, 40}`,
 giving an alternating 10–20–10–20 spacing between consecutive samples (no optical

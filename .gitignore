@@ -73,6 +73,9 @@ desktop.ini
 *.json
 *.html
 
+# Tracked config files (whitelist exceptions to *.json)
+!product_cadences.json
+
 # =============================================================================
 # Model checkpoint files
 # =============================================================================

@@ -7,11 +7,18 @@ script makes the cadence explicit and validated up front so that arrange,
 download, regrid, patch-extract, sequence-extract, dataset-build and training
 scripts all consume the same configuration instead of duplicating constants.
 
-Native cadences (highest-frequency = lowest minutes between samples):
-    radar     : 10 min  (raw composites at :00 :10 :20 :30 :40 :50)
-    MTG FCI   : 10 min  (FDHSI / HRFI native)
-    NWCSAF    : 10 min  (tied to underlying MTG cadence in EURMLAND-NR)
-    lightning : continuous (KML strokes; aggregated into the chosen window)
+Native cadences are read from `product_cadences.json` (alongside this script):
+
+    {
+        "radar":     10,
+        "mtg":       10,
+        "nwcsaf":    10,
+        "lightning": null    # continuous — no minute filter
+    }
+
+Override the cadences file with --cadences_file. The script does not inspect
+any data folders; product cadences are a property of the source, not of what
+happens to be on disk.
 
 For each non-continuous product, the chosen step must be >= the product's
 native cadence — otherwise we'd need data we don't have. The step does not
@@ -24,13 +31,14 @@ Output (default: our_data/timestep_config.json):
         "step_minutes": 15,
         "steps_per_day": 96,
         "max_native_cadence_minutes": 10,
-        "minute_filter": [0, 10, 30, 50],   # union across products
+        "minute_filter": [0, 10, 30, 40],   # union across products
         "products": {
-            "radar":     {"cadence_minutes": 10, "filter": [0, 10, 30, 50]},
-            "mtg":       {"cadence_minutes": 10, "filter": [0, 10, 30, 50]},
-            "nwcsaf":    {"cadence_minutes": 10, "filter": [0, 10, 30, 50]},
+            "radar":     {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
+            "mtg":       {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
+            "nwcsaf":    {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
             "lightning": {"cadence_minutes": null, "filter": null}
         },
+        "cadences_source": "/abs/path/to/product_cadences.json",
         "created_utc": "..."
     }
 
@@ -39,6 +47,7 @@ Usage:
     python validate_timestep.py --step_minutes 10
     python validate_timestep.py --step_minutes 5    # ERROR
     python validate_timestep.py --step_minutes 15 --output_path some/path.json
+    python validate_timestep.py --step_minutes 15 --cadences_file other.json
     python validate_timestep.py --print              # show current config
 """
 
@@ -52,15 +61,50 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-# Native cadences in minutes. None = continuous (no minute filter required).
-PRODUCT_CADENCES = {
-    "radar":     10,
-    "mtg":       10,
-    "nwcsaf":    10,
-    "lightning": None,
-}
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CADENCES_PATH = SCRIPT_DIR / "product_cadences.json"
+DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "our_data" / "timestep_config.json"
 
-DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "our_data" / "timestep_config.json"
+
+def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
+    """
+    Load the product → native-cadence mapping from a JSON file.
+
+    Keys prefixed with '_' (e.g. '_comment') are ignored so the file can
+    document itself. Values must be a positive integer (minutes) or null
+    (continuous data, no minute filter needed).
+    """
+    if not cadences_path.exists():
+        raise FileNotFoundError(
+            f"Product cadences file not found: {cadences_path}\n"
+            f"Expected JSON of the form:\n"
+            f'  {{"radar": 10, "mtg": 10, "nwcsaf": 10, "lightning": null}}'
+        )
+
+    raw = json.loads(cadences_path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{cadences_path}: expected a JSON object, got {type(raw).__name__}"
+        )
+
+    cadences: dict[str, int | None] = {}
+    for key, value in raw.items():
+        if key.startswith("_"):
+            continue  # skip comment/metadata keys
+        if value is None:
+            cadences[key] = None
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(
+                f"{cadences_path}: product '{key}' has invalid cadence "
+                f"{value!r} (expected positive integer or null)"
+            )
+        cadences[key] = value
+
+    if not cadences:
+        raise ValueError(f"{cadences_path}: no products defined")
+
+    return cadences
 
 
 def compute_minute_filter(step_minutes: int, cadence_minutes: int) -> list[int]:
@@ -96,7 +140,8 @@ def compute_minute_filter(step_minutes: int, cadence_minutes: int) -> list[int]:
     return sorted(selected)
 
 
-def validate(step_minutes: int) -> dict:
+def validate(step_minutes: int, product_cadences: dict[str, int | None],
+             cadences_source: str | None = None) -> dict:
     """
     Validate the requested step against all product cadences and return a
     structured config dict ready for serialisation.
@@ -112,7 +157,12 @@ def validate(step_minutes: int) -> dict:
             f"Use a step that fits cleanly into 24h, e.g. 5, 10, 15, 20, 30, 60."
         )
 
-    discrete = {p: c for p, c in PRODUCT_CADENCES.items() if c is not None}
+    discrete = {p: c for p, c in product_cadences.items() if c is not None}
+    if not discrete:
+        raise ValueError(
+            "All products are declared continuous in the cadences file. "
+            "At least one product must have a positive cadence to validate against."
+        )
     max_cadence = max(discrete.values())
 
     if step_minutes < max_cadence:
@@ -125,7 +175,7 @@ def validate(step_minutes: int) -> dict:
 
     products = {}
     union_filter = set()
-    for name, cadence in PRODUCT_CADENCES.items():
+    for name, cadence in product_cadences.items():
         if cadence is None:
             products[name] = {"cadence_minutes": None, "filter": None}
             continue
@@ -139,6 +189,7 @@ def validate(step_minutes: int) -> dict:
         "max_native_cadence_minutes": max_cadence,
         "minute_filter": sorted(union_filter),
         "products": products,
+        "cadences_source": cadences_source,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -168,8 +219,13 @@ def main() -> int:
         help="Desired training step in minutes (e.g. 10, 15, 20, 30)."
     )
     parser.add_argument(
+        "--cadences_file", type=str, default=str(DEFAULT_CADENCES_PATH),
+        help=f"Path to the product cadences JSON file "
+             f"(default: {DEFAULT_CADENCES_PATH})."
+    )
+    parser.add_argument(
         "--output_path", type=str, default=str(DEFAULT_OUTPUT_PATH),
-        help=f"Where to write the config (default: {DEFAULT_OUTPUT_PATH})"
+        help=f"Where to write the config (default: {DEFAULT_OUTPUT_PATH})."
     )
     parser.add_argument(
         "--print", dest="print_only", action="store_true",
@@ -190,8 +246,19 @@ def main() -> int:
     if args.step_minutes is None:
         parser.error("--step_minutes is required (or use --print)")
 
+    cadences_path = Path(args.cadences_file)
     try:
-        config = validate(args.step_minutes)
+        cadences = load_product_cadences(cadences_path)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        config = validate(
+            args.step_minutes,
+            product_cadences=cadences,
+            cadences_source=str(cadences_path.resolve()),
+        )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
