@@ -66,26 +66,36 @@ TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 REMOTE_HOST = "64.225.128.186"
 REMOTE_USER = "claudiu"
 
-# Local product key -> (remote subdirectory under /eumetsatdata, local subdir)
+# Default base directory holding the per-product subdirectories on the
+# remote VM. Some EWC images mount the data at /eumetsatdata, others at
+# /home/eumetsatdata — override with --remote_base.
+DEFAULT_REMOTE_BASE = "/eumetsatdata"
+
+# Local product key -> (remote subdirectory name, local subdir)
 PRODUCTS = {
     "opera_reflectivity":  {
-        "remote_dir": "/eumetsatdata/opera-reflectivity",
-        "local_dir":  "reflectivity",
+        "remote_subdir": "opera-reflectivity",
+        "local_dir":     "reflectivity",
     },
     "opera_rainfall_rate": {
-        "remote_dir": "/eumetsatdata/opera-rainfall-rate",
-        "local_dir":  "rainfall_rate",
+        "remote_subdir": "opera-rainfall-rate",
+        "local_dir":     "rainfall_rate",
     },
 }
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent
 
-# Filename timestamp parser: extract a 12- to 14-digit YYYYMMDDHHMM[SS]
-# substring. Common OPERA filename styles include
-#   T_PAAH21_C_LFPW_20250615120000.h5
-#   odc.20250615120000.h5
-#   composite_201801011500.h5
-TIMESTAMP_PATTERN = re.compile(r'(\d{12,14})')
+# Filename timestamp parsers — OPERA uses two common conventions:
+#   1. ISO with separators (current EWC dump):
+#        2026-05-11T120500Z-reflectivity-composite-opera.h5
+#   2. Compact (legacy / EUMETSAT):
+#        T_PAAH21_C_LFPW_20250615120000.h5
+#        odc.20250615120000.h5
+#        composite_201801011500.h5
+TIMESTAMP_PATTERN_ISO = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z?'
+)
+TIMESTAMP_PATTERN_COMPACT = re.compile(r'(\d{12,14})')
 
 
 # =============================================================================
@@ -145,18 +155,32 @@ def parse_opera_timestamp(filename: str) -> datetime.datetime | None:
     """
     Extract the sensing timestamp from an OPERA filename.
 
-    Accepts any filename containing a 12-14 digit YYYYMMDDHHMM[SS] run.
-    Seconds (if present) are dropped — we only need minute resolution
-    for filtering.
+    Supports two filename conventions:
+
+      ISO:     2026-05-11T000500Z-reflectivity-composite-opera.h5
+      Compact: T_PAAH21_C_LFPW_20250615120000.h5
+
+    ISO is tried first because the dashes/`T` would prevent the compact
+    pattern from matching anyway. Seconds (if present) are dropped — we
+    only need minute resolution for filtering.
     """
-    match = TIMESTAMP_PATTERN.search(filename)
-    if not match:
-        return None
-    ts = match.group(1)[:12]  # YYYYMMDDHHMM
-    try:
-        return datetime.datetime.strptime(ts, '%Y%m%d%H%M')
-    except ValueError:
-        return None
+    m = TIMESTAMP_PATTERN_ISO.search(filename)
+    if m:
+        try:
+            return datetime.datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)),
+            )
+        except ValueError:
+            pass
+    m = TIMESTAMP_PATTERN_COMPACT.search(filename)
+    if m:
+        ts = m.group(1)[:12]  # YYYYMMDDHHMM
+        try:
+            return datetime.datetime.strptime(ts, '%Y%m%d%H%M')
+        except ValueError:
+            pass
+    return None
 
 
 def read_password(password_file: str) -> str:
@@ -183,26 +207,34 @@ def daterange(start_dt: datetime.datetime,
 # =============================================================================
 
 def download_opera(
-    password_file: str,
     cache_dir: Path,
     start_dt: datetime.datetime,
     end_dt: datetime.datetime,
     products: list[str],
     minute_filters: dict[str, set[int] | None],
+    password_file: str | None = None,
+    ssh_key: str | None = None,
     remote_host: str = REMOTE_HOST,
     remote_user: str = REMOTE_USER,
+    remote_base: str = DEFAULT_REMOTE_BASE,
 ) -> dict:
     """
     Download OPERA files via SFTP, applying date / minute filters before
     transfer.
 
+    Authentication: exactly one of `password_file` or `ssh_key` must be set.
+
     Args:
-        password_file:    path to text file with the SSH password
         cache_dir:        local root (our_data/opera_data/)
         start_dt, end_dt: inclusive sensing-time range
         products:         list of product keys (subset of PRODUCTS)
         minute_filters:   {product_key: set of allowed minutes or None}
                           None = keep every native timestep for that product
+        password_file:    path to text file with the SSH password (or None)
+        ssh_key:          path to SSH private key (e.g. ~/.ssh/id_ed25519)
+                          (or None)
+        remote_base:      remote dir holding the per-product subdirectories
+                          (typically `/eumetsatdata` or `/home/eumetsatdata`)
     Returns:
         stats dict
     """
@@ -216,14 +248,20 @@ def download_opera(
         'remote_dirs_missing': 0,
     }
 
-    password = read_password(password_file)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Connecting to {remote_user}@{remote_host}...")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        ssh.connect(remote_host, username=remote_user, password=password)
+        if ssh_key:
+            ssh.connect(
+                remote_host, username=remote_user,
+                key_filename=os.path.expanduser(ssh_key),
+            )
+        else:
+            password = read_password(password_file)
+            ssh.connect(remote_host, username=remote_user, password=password)
     except Exception as e:
         print(f"ERROR: SSH connection failed: {e}", file=sys.stderr)
         return stats
@@ -240,15 +278,15 @@ def download_opera(
 
     for product in products:
         cfg = PRODUCTS[product]
-        remote_base = cfg["remote_dir"]
+        product_root = f"{remote_base.rstrip('/')}/{cfg['remote_subdir']}"
         local_base = cache_dir / cfg["local_dir"]
         mfilter = minute_filters.get(product)
 
-        print(f"\nListing remote {product} under {remote_base} ...")
+        print(f"\nListing remote {product} under {product_root} ...")
 
         for d in daterange(start_dt, end_dt):
             remote_dir = (
-                f"{remote_base}/{d.strftime('%Y')}/"
+                f"{product_root}/{d.strftime('%Y')}/"
                 f"{d.strftime('%m')}/{d.strftime('%d')}"
             )
             local_dir = local_base / d.strftime('%Y') / d.strftime('%m') / d.strftime('%d')
@@ -256,8 +294,12 @@ def download_opera(
             try:
                 remote_files = sftp.listdir(remote_dir)
             except (FileNotFoundError, IOError) as e:
+                # paramiko reports both "no such file" and "permission denied"
+                # as IOError; surface the underlying message so the user can
+                # tell why the listdir failed.
                 stats['remote_dirs_missing'] += 1
-                print(f"  [{d}] remote dir missing: {remote_dir}", file=sys.stderr)
+                print(f"  [{d}] cannot list {remote_dir}: {e}",
+                      file=sys.stderr)
                 continue
 
             for filename in remote_files:
@@ -322,8 +364,14 @@ def main() -> int:
                         help='Start datetime (yyyy/mm/dd-hhmm)')
     parser.add_argument('--end', '-e', type=str, required=True,
                         help='End datetime (yyyy/mm/dd-hhmm), inclusive.')
-    parser.add_argument('--password_file', '-pw', type=str, required=True,
-                        help='Path to text file containing the SSH password.')
+
+    auth = parser.add_mutually_exclusive_group(required=True)
+    auth.add_argument('--password_file', '-pw', type=str, default=None,
+                      help='Path to text file containing the SSH password.')
+    auth.add_argument('--ssh_key', '-i', type=str, default=None,
+                      help='Path to SSH private key (e.g. ~/.ssh/id_ed25519). '
+                           'Mutually exclusive with --password_file.')
+
     parser.add_argument('--cache_dir', '-c', type=str,
                         default=str(DEFAULT_CACHE_DIR),
                         help=f'Local OPERA root '
@@ -342,6 +390,12 @@ def main() -> int:
                         help=f'Remote SSH host (default: {REMOTE_HOST})')
     parser.add_argument('--remote_user', type=str, default=REMOTE_USER,
                         help=f'Remote SSH user (default: {REMOTE_USER})')
+    parser.add_argument('--remote_base', type=str,
+                        default=DEFAULT_REMOTE_BASE,
+                        help=f'Remote directory containing the per-product '
+                             f'subdirs (default: {DEFAULT_REMOTE_BASE}). Try '
+                             f'/home/eumetsatdata if the default returns '
+                             f'"No such file".')
 
     args = parser.parse_args()
 
@@ -380,6 +434,8 @@ def main() -> int:
     print("OPERA Radar SFTP Pipeline")
     print("=" * 70)
     print(f"Remote host    : {args.remote_user}@{args.remote_host}")
+    print(f"Auth           : {'ssh_key (' + args.ssh_key + ')' if args.ssh_key else 'password_file (' + args.password_file + ')'}")
+    print(f"Remote base    : {args.remote_base}")
     print(f"Date range     : {args.start} → {args.end}")
     print(f"Products       : {products}")
     for p in products:
@@ -388,14 +444,16 @@ def main() -> int:
     print()
 
     stats = download_opera(
-        password_file=args.password_file,
         cache_dir=cache_dir,
         start_dt=start_dt,
         end_dt=end_dt,
         products=products,
         minute_filters=minute_filters,
+        password_file=args.password_file,
+        ssh_key=args.ssh_key,
         remote_host=args.remote_host,
         remote_user=args.remote_user,
+        remote_base=args.remote_base,
     )
 
     print()

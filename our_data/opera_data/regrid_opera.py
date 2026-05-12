@@ -118,7 +118,12 @@ PRODUCTS = {
 }
 
 DEFAULT_WORKERS = 4
-TIMESTAMP_PATTERN = re.compile(r'(\d{12,14})')
+
+# Filename timestamp parsers — see pipeline_opera.py for the conventions.
+TIMESTAMP_PATTERN_ISO = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z?'
+)
+TIMESTAMP_PATTERN_COMPACT = re.compile(r'(\d{12,14})')
 
 # h5py is not always thread-safe across all builds; serialise reads.
 _h5_lock = threading.Lock()
@@ -142,16 +147,32 @@ def init_romania_grid():
 # =============================================================================
 
 def parse_opera_filename(path: Path):
-    """Return (date_str 'YYYY-MM-DD', hhmm 'HHMM') from an OPERA filename."""
-    match = TIMESTAMP_PATTERN.search(path.name)
-    if not match:
-        return None, None
-    ts = match.group(1)[:12]
-    try:
-        dt = datetime.datetime.strptime(ts, '%Y%m%d%H%M')
-    except ValueError:
-        return None, None
-    return dt.strftime('%Y-%m-%d'), dt.strftime('%H%M')
+    """
+    Return (date_str 'YYYY-MM-DD', hhmm 'HHMM') from an OPERA filename.
+
+    Supports ISO (`2026-05-11T000500Z-...`) and compact
+    (`...20260511000500.h5`) conventions; ISO is tried first.
+    """
+    name = path.name
+    m = TIMESTAMP_PATTERN_ISO.search(name)
+    if m:
+        try:
+            dt = datetime.datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)),
+            )
+            return dt.strftime('%Y-%m-%d'), dt.strftime('%H%M')
+        except ValueError:
+            pass
+    m = TIMESTAMP_PATTERN_COMPACT.search(name)
+    if m:
+        ts = m.group(1)[:12]
+        try:
+            dt = datetime.datetime.strptime(ts, '%Y%m%d%H%M')
+            return dt.strftime('%Y-%m-%d'), dt.strftime('%H%M')
+        except ValueError:
+            pass
+    return None, None
 
 
 def _decode_attr(value):

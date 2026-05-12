@@ -616,7 +616,7 @@ python our_data/opera_data/pipeline_opera.py \
 | Flag | Description |
 |------|-------------|
 | `--start`, `--end` | Date/time range in `yyyy/mm/dd-hhmm` (UTC), end inclusive. |
-| `--password_file`, `-pw` | Text file with the SSH password for `claudiu@64.225.128.186`. Keep out of git. |
+| `--password_file`, `-pw` *or* `--ssh_key`, `-i` | **Exactly one** of: text file with the SSH password for `claudiu@64.225.128.186`, **or** a path to a private key (e.g. `~/.ssh/id_ed25519` — matching the `scp -i` example). Mutually exclusive. |
 
 **Optional flags:**
 
@@ -627,8 +627,20 @@ python our_data/opera_data/pipeline_opera.py \
 | `--timesteps` | Override the per-product minute filter (one filter applied to all chosen products); `all` keeps every native timestep | per-product filter from `timestep_config.json` |
 | `--remote_host` | Override the SSH host | `64.225.128.186` |
 | `--remote_user` | Override the SSH user | `claudiu` |
+| `--remote_base` | Remote directory holding the per-product subdirs. Switch to `/home/eumetsatdata` (or any other path) if the default isn't where the data lives on the VM. | `/eumetsatdata` |
 
 Only `.h5` files are transferred; OPERA-internal metadata or index files in the same directory are skipped. Per-file `[i/total] Downloading <filename>` progress, identical to the MTG / NWCSAF pipelines.
+
+**Supported filename conventions** (the timestamp parser tries both):
+
+- ISO (current EWC dump): `2026-05-11T000500Z-reflectivity-composite-opera.h5`
+- Compact (legacy / EUMETSAT): `T_PAAH21_C_LFPW_20250615120000.h5`, `composite_201801011500.h5`
+
+**Troubleshooting**
+
+- `cannot list /eumetsatdata/opera-reflectivity/...: [Errno 2] No such file` → the data is mounted under a different prefix. Try `--remote_base /home/eumetsatdata`.
+- `cannot list ...: Permission denied` → password auth is being rejected. Switch to `--ssh_key ~/.ssh/id_ed25519`.
+- Per-date `cannot list ...` messages with the right base path mean the remote dirs simply don't exist for those dates (incomplete archive). That's an upstream data gap, not a script issue.
 
 ##### Step 2 — Coverage report (`summarize_opera_data.py`)
 
