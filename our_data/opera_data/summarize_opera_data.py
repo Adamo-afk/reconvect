@@ -46,7 +46,10 @@ PRODUCTS = {
     "opera_rainfall_rate": {"subdir": "rainfall_rate", "default_cadence": 15},
 }
 
-TIMESTAMP_PATTERN = re.compile(r'(\d{12,14})')
+TIMESTAMP_PATTERN_ISO = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z?'
+)
+TIMESTAMP_PATTERN_COMPACT = re.compile(r'(\d{12,14})')
 
 
 # =============================================================================
@@ -91,14 +94,24 @@ def load_minute_filter(product_key: str):
 # =============================================================================
 
 def parse_opera_timestamp(filename: str) -> datetime.datetime | None:
-    match = TIMESTAMP_PATTERN.search(filename)
-    if not match:
-        return None
-    ts = match.group(1)[:12]
-    try:
-        return datetime.datetime.strptime(ts, '%Y%m%d%H%M')
-    except ValueError:
-        return None
+    """Supports ISO (`2026-05-11T000500Z-...`) and compact (`...20260511000500.h5`)."""
+    m = TIMESTAMP_PATTERN_ISO.search(filename)
+    if m:
+        try:
+            return datetime.datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                int(m.group(4)), int(m.group(5)), int(m.group(6)),
+            )
+        except ValueError:
+            pass
+    m = TIMESTAMP_PATTERN_COMPACT.search(filename)
+    if m:
+        ts = m.group(1)[:12]
+        try:
+            return datetime.datetime.strptime(ts, '%Y%m%d%H%M')
+        except ValueError:
+            pass
+    return None
 
 
 def expected_hhmm(minute_filter: set[int]) -> list[str]:
