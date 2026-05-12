@@ -456,17 +456,55 @@ def build_block_boundaries(block_hours):
 # Patch index loader
 # =============================================================================
 
-def load_patch_index(data_root):
+def resolve_index_source(data_root, source):
     """
-    Load patch_index.csv into a structured dict.
+    Resolve the CSV path + effective step minutes for the chosen activity source.
+
+    Returns: (csv_path, effective_step_minutes)
+
+    - source='radar': reads our_data/patch_index/patch_index.csv with the
+      cadence from timestep_config.json (STEP_MINUTES).
+    - source='lightning': reads our_data/lightning_periods/lightning_patches.csv
+      with the cadence from lightning_periods_config.json (aggregation_minutes).
+    """
+    if source == 'radar':
+        return (
+            os.path.join(data_root, 'patch_index', 'patch_index.csv'),
+            STEP_MINUTES,
+        )
+    if source == 'lightning':
+        lp_dir = os.path.join(data_root, 'lightning_periods')
+        cfg_path = os.path.join(lp_dir, 'lightning_periods_config.json')
+        if not os.path.isfile(cfg_path):
+            print(
+                f"ERROR: {cfg_path} not found.\n"
+                f"Run from the project root:\n"
+                f"    python identify_lightning_periods.py",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        lp_cfg = json.loads(Path(cfg_path).read_text())
+        return (
+            os.path.join(lp_dir, 'lightning_patches.csv'),
+            int(lp_cfg['aggregation_minutes']),
+        )
+    raise ValueError(f"Unknown source: {source}")
+
+
+def load_patch_index(data_root, source='radar'):
+    """
+    Load the per-(date, time) patch-activity index for the chosen source.
 
     Returns:
         dict: {(date_str, time_str): [sorted list of active patch numbers]}
     """
-    csv_path = os.path.join(data_root, 'patch_index', 'patch_index.csv')
+    csv_path, _ = resolve_index_source(data_root, source)
     if not os.path.isfile(csv_path):
-        print(f"ERROR: patch_index.csv not found at {csv_path}")
-        print("Run identify_patches.py first.")
+        print(f"ERROR: {csv_path} not found")
+        if source == 'radar':
+            print("Run identify_patches.py first.")
+        else:
+            print("Run identify_lightning_periods.py first.")
         return {}
 
     index = {}
@@ -491,18 +529,25 @@ def load_patch_index(data_root):
 # Sequence analysis (full 24h scan)
 # =============================================================================
 
-def find_all_sequences(index, past_steps, future_steps):
+def find_all_sequences(index, past_steps, future_steps,
+                       step_minutes=None):
     """
     Find all qualifying sequences across all dates and all 24 hours.
 
     A patch qualifies at reference timestep T if it is active at every step
-    from T - past_steps*15min to T + future_steps*15min (inclusive).
+    from T - past_steps*step_minutes to T + future_steps*step_minutes
+    (inclusive).
 
-    Returns:
-        list[dict]: One entry per valid (date, reference_time) pair,
-            chronologically ordered.
+    Args:
+        index: dict from load_patch_index()
+        past_steps, future_steps: window size in step units
+        step_minutes: spacing between adjacent steps (default: module-level
+            STEP_MINUTES from timestep_config.json; pass aggregation_minutes
+            when consuming a lightning_patches.csv index).
     """
-    step = timedelta(minutes=STEP_MINUTES)
+    if step_minutes is None:
+        step_minutes = STEP_MINUTES
+    step = timedelta(minutes=step_minutes)
     offsets = list(range(-past_steps, future_steps + 1))
     results = []
 
@@ -778,8 +823,20 @@ def main():
         help=f"Temporal block size in hours; must divide 24 evenly "
              f"(default: {DEFAULT_BLOCK_HOURS})"
     )
+    parser.add_argument(
+        "--source", type=str, default='radar',
+        choices=['radar', 'lightning'],
+        help="Activity source. 'radar' (default) reads patch_index.csv from "
+             "identify_patches.py and uses step_minutes from "
+             "timestep_config.json. 'lightning' reads lightning_patches.csv "
+             "from identify_lightning_periods.py and uses aggregation_minutes "
+             "from lightning_periods_config.json as the step interval."
+    )
 
     args = parser.parse_args()
+
+    # Resolve effective cadence + index path from the chosen source
+    _, effective_step_minutes = resolve_index_source(args.data_root, args.source)
 
     train_frac = 1.0 - args.test_frac - args.val_frac
     n_blocks = 24 // args.block_hours if 24 % args.block_hours == 0 else '?'
@@ -787,18 +844,20 @@ def main():
     print("=" * 70)
     print("COALITION-4 Sequence Extractor (Czibula temporal block split)")
     print("=" * 70)
-    print(f"Data root  : {args.data_root}")
-    print(f"Window     : {args.past} past + current + {args.future} future "
+    print(f"Data root        : {args.data_root}")
+    print(f"Activity source  : {args.source}")
+    print(f"Step interval    : {effective_step_minutes} min")
+    print(f"Window           : {args.past} past + current + {args.future} future "
           f"= {args.past + 1 + args.future} steps "
-          f"({(args.past + 1 + args.future) * STEP_MINUTES} min)")
-    print(f"Blocks     : {args.block_hours}h ({n_blocks} blocks/day)")
-    print(f"Split      : test {args.test_frac:.0%} / "
+          f"({(args.past + 1 + args.future) * effective_step_minutes} min)")
+    print(f"Blocks           : {args.block_hours}h ({n_blocks} blocks/day)")
+    print(f"Split            : test {args.test_frac:.0%} / "
           f"val {args.val_frac:.0%} / "
           f"train {train_frac:.0%} per block")
 
     # Load patch index
-    print("\nLoading patch index...")
-    index = load_patch_index(args.data_root)
+    print(f"\nLoading {args.source} patch index...")
+    index = load_patch_index(args.data_root, source=args.source)
     if not index:
         return
 
@@ -807,11 +866,14 @@ def main():
 
     # Find all qualifying sequences (full 24h)
     print("\nAnalyzing temporal continuity (all 24h)...")
-    all_sequences = find_all_sequences(index, args.past, args.future)
+    all_sequences = find_all_sequences(
+        index, args.past, args.future,
+        step_minutes=effective_step_minutes,
+    )
     print(f"  {len(all_sequences)} qualifying sequences found")
 
     if not all_sequences:
-        print("No qualifying sequences. Check patch_index.csv.")
+        print(f"No qualifying sequences. Check the {args.source} index CSV.")
         return
 
     # Split using Czibula method
@@ -841,8 +903,14 @@ def main():
 
     # Drop a sidecar metadata file so create_datasets.py can recover step
     # minutes and window length without re-parsing column names.
+    # `step_minutes` is the *effective* spacing between adjacent steps (i.e.
+    # aggregation_minutes when source=lightning), so downstream consumers can
+    # treat it uniformly. `source_step_minutes_native` is the configured
+    # cadence from timestep_config.json — preserved for traceability.
     seq_meta = {
-        "step_minutes": STEP_MINUTES,
+        "source": args.source,
+        "step_minutes": effective_step_minutes,
+        "source_step_minutes_native": STEP_MINUTES,
         "past_steps": args.past,
         "future_steps": args.future,
         "step_columns": [step_column_name(o)
