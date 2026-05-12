@@ -98,7 +98,10 @@ coalition4-rcnn/
 │   │   ├── read_kml_version2.py       # KML → 15-min NetCDF lightning maps
 │   │   └── visualize_lightning_stats.py  # Lightning activity bar plots and CSV
 │   ├── nwcsaf_data/
-│   │   ├── {date}-Romania/S_NWC_{CMIC|CTTH}_*.nc
+│   │   ├── {date}-Romania/S_NWC_{CMIC|CTTH}_*.nc   # arranged per-date dirs
+│   │   ├── _raw_data/                  # SFTP cache of downloaded SAFNWC files (gitignored)
+│   │   ├── pipeline_nwcsaf.py         # NWCSAF L2 SFTP + filter + per-date arrange
+│   │   ├── summarize_raw_data.py      # CSV + missing-timesteps report for _raw_data/
 │   │   └── process_nwcsaf.py          # Extract lat/lon from NWCSAF NetCDF files
 │   ├── raw_data/
 │   │   ├── radar_arrange.py           # Arrange raw radar files to COALITION-4 structure
@@ -433,6 +436,69 @@ Two changes were needed to align `regrid.py` with the new pipeline output:
 2. **Input format**: MTG inputs are `.npy` arrays under `satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy` instead of `.nc`. Radar, MSG (disabled), lightning, and NWCSAF paths are untouched.
 
 The regrid output for MTG remains `.npy` on the Romania 1536×768 grid. Use `inspect_mtg.py --regridded` to get a CF NetCDF for any single regridded sample.
+
+#### NWCSAF L2 Data Pipeline (SFTP + arrange)
+
+`pipeline_nwcsaf.py` mirrors `pipeline_msg_mtg.py` but for SAFNWC L2 cloud products (CMIC + CTTH). It connects via SFTP, applies the same filters as `nwcsaf_arrange.py` (PLAX exclusion, date range, minute cadence), and arranges the result into per-date COALITION-4 directories — all in one command.
+
+```bash
+# 1. Pick the training cadence first (writes our_data/timestep_config.json)
+python validate_timestep.py --step_minutes 15
+
+# 2. Download + arrange NWCSAF for a date range
+python our_data/nwcsaf_data/pipeline_nwcsaf.py \
+    --start 2026/03/13-0000 \
+    --end   2026/05/11-2359 \
+    --password_file password.txt
+```
+
+**Required arguments:**
+
+| Flag | Description |
+|------|-------------|
+| `--start`, `--end` | Date/time range in `yyyy/mm/dd-hhmm` (UTC). End is *inclusive*. |
+| `--password_file`, `-pw` | Text file containing the SSH password for `safnwc@192.168.11.212` on a single line. Keep out of git. **This is a different account from MTG (`anm@192.168.11.223`).** |
+
+**Optional flags:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--cache_dir`, `-c` | Flat SFTP cache (kept around for resumability) | `our_data/nwcsaf_data/_raw_data/` |
+| `--arranged_root`, `-a` | Root under which `{YYYY-MM-DD}-Romania/` dirs are created | `our_data/nwcsaf_data/` |
+| `--products` | Products to ingest: `cmic`, `ctth`, or both | `cmic ctth` |
+| `--timesteps` | Override the minute filter (e.g. `00 10 30 40`) or pass `all` for every native :00/.../:50 | read from `timestep_config.json` |
+| `--skip_download` | Skip SFTP and only re-arrange what is already in the cache | off |
+| `--no_arrange` | Skip the per-date arrange step (download only) | off |
+| `--hardlinks` | Hard-link rather than copy when arranging — saves disk space on the same volume, falls back to copy when unsupported | off |
+
+**Two-stage workflow inside the script:**
+
+1. **SFTP download** — connects to `safnwc@192.168.11.212`, lists `/home/safnwc/prod_arch/CMIC/` and `/home/safnwc/prod_arch/CTTH/` via server-side `ls *YYYYMMDDT*.nc` globs, then drops anything that fails date / minute / product / PLAX filters before transferring. Already-present files in the cache are skipped. Lands matching files flat in `_raw_data/` with `[i/total] Downloading <filename>` / `[i/total] Already local: <filename>` progress per file (same format as the MTG pipeline).
+2. **Arrange from cache** — non-destructively copies (or hard-links) each cached file into `{arranged_root}/{YYYY-MM-DD}-Romania/`. Re-applies the same filters defensively.
+
+The legacy [`our_data/raw_data/nwcsaf_arrange.py`](our_data/raw_data/nwcsaf_arrange.py) remains for the "I already have CMIC/CTTH subdirs locally" use case and is unchanged.
+
+#### NWCSAF Helper Script
+
+**`summarize_raw_data.py`** — scan `_raw_data/`, group files by date, and report:
+
+- **Per-date CSV/table** with CMIC + CTTH file counts, `complete_pairs` (timesteps where both products are present), `incomplete_pairs`, `expected` (`len(minute_filter) × 24`), and `coverage_pct`.
+- **Missing-timesteps JSON** with three categorisations per date — `missing_completely_times`, `partial_times` (one product missing), and `per_product_missing` — plus an overall summary.
+
+The "expected" count is derived from `timestep_config.json` (or `--timesteps NN NN ...` override), so coverage stays meaningful no matter which cadence was chosen.
+
+```bash
+# Defaults: read cadence from timestep_config.json
+python our_data/nwcsaf_data/summarize_raw_data.py
+
+# Check completeness against every native :00 / .../ :50 timestep
+python our_data/nwcsaf_data/summarize_raw_data.py --timesteps all
+
+# Custom paths
+python our_data/nwcsaf_data/summarize_raw_data.py \
+    --raw_dir D:/backup/nwcsaf_raw --output backup_summary.csv \
+    --missing backup_missing.json
+```
 
 #### Timestep Selection (no interpolation)
 
