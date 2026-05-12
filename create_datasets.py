@@ -370,6 +370,15 @@ _SEQ = _load_sequence_meta()
 STEP_MINUTES = int(_SEQ["step_minutes"])
 PAST_STEPS = int(_SEQ["past_steps"])
 FUTURE_STEPS = int(_SEQ["future_steps"])
+# Source of the activity index used by extract_patch_seq_for_datasets.py:
+# 'radar' (default, patch_index.csv) or 'lightning' (lightning_patches.csv).
+SEQ_SOURCE = _SEQ.get("source", "radar")
+# Native source cadence (step_minutes from timestep_config.json). For the
+# lightning source, STEP_MINUTES above is the aggregation window, while this
+# is the underlying lightning-map cadence.
+SOURCE_STEP_MINUTES_NATIVE = int(
+    _SEQ.get("source_step_minutes_native", STEP_MINUTES)
+)
 
 # Input columns are the past + current step indices; labels are the future ones.
 INPUT_COLS = [_SEQ["step_columns"][i] for i in range(PAST_STEPS + 1)]
@@ -689,6 +698,8 @@ def create_and_save_datasets(data_root, mode, output_root=None):
             "input_shapes": {k: list(v.shape) for k, v in sig[0].items()},
             "label_shape": list(sig[1].shape),
             "step_minutes": STEP_MINUTES,
+            "source_step_minutes_native": SOURCE_STEP_MINUTES_NATIVE,
+            "sequence_source": SEQ_SOURCE,
             "past_steps": PAST_STEPS,
             "future_steps": FUTURE_STEPS,
             "input_cols": INPUT_COLS,
