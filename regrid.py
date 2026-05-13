@@ -1286,24 +1286,27 @@ def _nwcsaf_day_worker(job):
                 if os.path.exists(out_path):
                     continue
                 data = raw_data[var]
+                # Cast to float32 BEFORE filling the mask. NWCSAF stores
+                # cmic_phase as a uint8 MaskedArray; calling .filled(np.nan)
+                # on the uint8 view raises "Cannot convert fill_value nan
+                # to dtype uint8". Casting first promotes both the data
+                # and the mask's fill-value to a NaN-capable dtype.
                 if isinstance(data, np.ma.MaskedArray):
-                    data = data.filled(np.nan)
-                data = np.asarray(data)
+                    data = data.astype(np.float32).filled(np.nan)
+                else:
+                    data = np.asarray(data, dtype=np.float32)
                 if data.ndim == 3:
                     data = np.squeeze(data, axis=0)
                 if data.ndim != 2:
                     continue
                 dtype = NWCSAF_VAR_SPEC[var]["dtype"]
                 if dtype == np.int8:
-                    data = np.nan_to_num(
-                        data.astype(np.float32), nan=0.0,
-                    )
+                    data = np.nan_to_num(data, nan=0.0)
                     regridded = mapping.apply(data, fill_value=0)
                     regridded = np.round(regridded).astype(np.int8)
                 else:
                     data = np.nan_to_num(
-                        data.astype(np.float32),
-                        nan=0.0, posinf=1e6, neginf=-1e6,
+                        data, nan=0.0, posinf=1e6, neginf=-1e6,
                     )
                     regridded = mapping.apply(data, fill_value=np.nan)
                     regridded = regridded.astype(np.float32)
