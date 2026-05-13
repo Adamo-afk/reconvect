@@ -300,6 +300,12 @@ python regrid.py --radar --date 2025-05-15      # single date
 
 Reads the patch index and regridded data, extracts active patches, applies resolution-dependent pooling (none for HR, 2×2 for MTG LR, 4×4 for MSG/NWCSAF LR).
 
+**Wired with the rest of the pipeline.** Two pieces of context are consulted automatically:
+
+1. **`timestep_config.json`** — for the per-product minute filter. The patch index uses OPERA's 15-min grid (`:00, :15, :30, :45`), but MTG/NWCSAF live on the alternating 10-20 grid (`:00, :10, :30, :40`). The finder snaps the requested HHMM to the nearest minute in each product's filter — OPERA `:15` reads MTG `:10`, OPERA `:45` reads MTG `:40`, OPERA `:00 / :30` exact. The snap is deterministic (it's a function of the filter, not a fuzzy ±tolerance search) and falls back to exact match if the config or product entry is missing.
+
+2. **`train_data.csv` / `validation_data.csv` / `test_data.csv`** — the post-intersect filtered CSVs (from Step 4.2). Only timesteps referenced by at least one surviving sequence row are processed; the rest are skipped to avoid wasted work on slots that won't end up in any sample. Pass `--sequence_csvs none` to disable and process every entry in `patch_index.csv` (legacy behaviour).
+
 ```bash
 python extract_patches.py
 python extract_patches.py --date 2025-05-15
