@@ -103,29 +103,96 @@ it directly)
 
 c4dl/projection.py
     GridProjection + romania_grid_area — used by regrid.py,
-    identify_patches.py and read_kml_version2.py to define the EPSG:31700
-    1536x768 target grid for Romania.
+    identify_patches.py and our_data/lightning_data/read_kml_version2.py
+    to define the EPSG:31700 1536x768 target grid for Romania.
 
-c4dl/ml/models/  (blocks.py, models.py, rnn.py, optimizers.py, ...)
-    ResBlock / ConvGRU / model factories — used by train_models.py to
-    build the COALITION recurrent-convolutional architecture dynamically
-    from each dataset's metadata.json. Also imported by
-    feature_importance_analysis.py for activation hooks.
+c4dl/ml/models/  (only the files listed below)
+    Custom Keras layer / loss / metric / optimizer classes that the
+    *saved* model checkpoints reference by name. The trained .keras
+    files won't deserialise without them, so `feature_importance_analysis.py`
+    imports them and feeds them to `tf.keras.models.load_model(...,
+    custom_objects=...)`. Specifically:
 
-c4dl/analysis/
-    Loss / metric / Shapley helpers reused by evaluate_coalition.py and
-    feature_importance_analysis.py.
+      - blocks.py    : ConvBlock, ResBlock
+      - models.py    : CastLayer, RepeatLayer, iou_metric, dice_metric,
+                       true_pos, true_neg, false_pos, false_neg,
+                       make_rain_loss_hist, prob_binary_crossentropy,
+                       WeightedBinaryCrossentropy, WeightedFocalLoss
+      - rnn.py       : ResGRU
+      - optimizers.py: AdaBeliefOptimizer
+      - layers.py    : ReflectionPadding2D, Warp (transitive dependency
+                       of blocks.py and rnn.py)
+
+    train_models.py and evaluate_coalition.py do NOT import these — both
+    carry their own self-contained copies of ConvBlock / ResBlock /
+    ResGRU / WeightedFocalLoss (with explicit "no c4dl dependency"
+    comments). So c4dl.ml.models is load-bearing only for
+    feature_importance_analysis.py's checkpoint reload path.
+
+c4dl/features/batch.py
+    BatchSequence — transitive dependency pulled in by
+    c4dl/ml/models/models.py at import time. Not used directly by any
+    active script.
+
+More legacy code that lives in its original location
+----------------------------------------------------
+(Correction to the earlier draft of this file: the items below were
+previously listed as "not legacy" but are not imported by any active
+root-level script.)
+
+c4dl/ml/models/attention.py
+    Attention-layer building blocks from an earlier architecture
+    experiment. Not referenced by anything in the active pipeline
+    (feature_importance_analysis.py mentions "attention" only in a
+    docstring describing Grad-CAM's spatial attention behaviour).
+
+c4dl/analysis/  (shapley.py, calibration.py, ensemble.py, evaluation.py,
+                 parameter.py)
+    Loss / metric / Shapley / calibration helpers from the original
+    MeteoSwiss analysis pipeline. No active root-level script imports
+    them. feature_importance_analysis.py mentions
+    c4dl.analysis.shapley.load_scores only in a comment — the actual
+    Shapley logic is reimplemented inline in that file. The remaining
+    consumers (c4dl.visualization.plots, scripts/plots_lightning.py)
+    are themselves legacy.
 
 c4dl/visualization/plots.py
-    Plot helpers reused by evaluate_coalition.py.
+    Plot helpers from the original pipeline. Only consumers are
+    c4dl.analysis.evaluation (transitive) and scripts/plots_lightning.py
+    (legacy). The active diagnostic plots are produced inline by
+    evaluate_coalition.py (training curves, metrics per lead-time,
+    reliability, ROC, PR, confusion matrix) and
+    feature_importance_analysis.py (Grad-CAM grids, Xi heatmaps,
+    Shapley bars, prediction diagnostics).
 
 c4dl/utils.py
-    Generic numerical helpers (still imported by several modules).
+    Generic numerical helpers from the original pipeline. Not imported
+    by any active root-level script — the helpers active scripts need
+    were either inlined or replaced by numpy / scipy primitives.
 
 Removing legacy code
 --------------------
-Anything in this file outside the "NOT legacy" section can be deleted at
-any time without breaking the active pipeline; the dependencies are
-contained. If you do decide to remove c4dl/datasets/msgccs4.py, remember
-to delete legacy/process_nwcsaf.py at the same time (msgccs4 is the only
-consumer left).
+Anything outside the "NOT legacy" section above can be deleted at any
+time without breaking the active pipeline; the dependencies are
+contained. If you do decide to remove c4dl/datasets/msgccs4.py,
+remember to delete legacy/process_nwcsaf.py at the same time (msgccs4
+is the only remaining consumer).
+
+Cleanup order, if you want to walk this out:
+
+  1. Delete the scripts/ folder (no other active code imports it).
+  2. Delete the knowledge_distillation/ folder (no other active code
+     imports it).
+  3. Delete c4dl/features/test_nc.py and c4dl/features/regions.py
+     (only scripts/ uses them).
+  4. Delete every file in c4dl/datasets/ — none are imported by the
+     active pipeline once steps 1-3 are done.
+  5. Delete legacy/ (process_nwcsaf.py is left orphaned once
+     c4dl/datasets/msgccs4.py is gone).
+  6. Delete c4dl/analysis/, c4dl/visualization/, c4dl/utils.py,
+     c4dl/ml/models/attention.py.
+
+After that, c4dl/ contains exactly: projection.py, ml/models/blocks.py,
+ml/models/models.py, ml/models/rnn.py, ml/models/optimizers.py,
+ml/models/layers.py, features/batch.py — every one of them load-bearing
+for the active pipeline.
