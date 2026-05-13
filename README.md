@@ -144,7 +144,7 @@ coalition4-rcnn/
 │   ├── intersect_product_coverage.json # Manifest from Step 4.2
 │   ├── normalization_stats.json       # Per-variable mean/std (generated in Step 4.3)
 │   ├── train_data.csv                 # Training sequences (80% per temporal block)
-│   ├── train_data_consistent.csv      # Step 4.2 filter applied (drop-in replacement)
+│   ├── train_data_consistent.csv      # Step 4.2 filter applied (filtered version of train_data.csv)
 │   ├── validation_data.csv            # Validation sequences (10% per temporal block)
 │   ├── test_data.csv                  # Test sequences (10% per temporal block)
 │   └── lightning_fraction.json        # Positive pixel fraction for focal loss
@@ -350,11 +350,11 @@ python regrid.py --radar --date 2025-05-15      # single date
 
 Reads the patch index and regridded data, extracts active patches, applies resolution-dependent pooling (none for HR, 2×2 for MTG LR, 4×4 for MSG/NWCSAF LR).
 
-**Wired with the rest of the pipeline.** Two pieces of context are consulted automatically:
+Two pieces of context are read automatically:
 
-1. **`timestep_config.json`** — for the per-product minute filter. The patch index uses OPERA's 15-min grid (`:00, :15, :30, :45`), but MTG/NWCSAF live on the alternating 10-20 grid (`:00, :10, :30, :40`). The finder snaps the requested HHMM to the nearest minute in each product's filter — OPERA `:15` reads MTG `:10`, OPERA `:45` reads MTG `:40`, OPERA `:00 / :30` exact. The snap is deterministic (it's a function of the filter, not a fuzzy ±tolerance search) and falls back to exact match if the config or product entry is missing.
+1. **`timestep_config.json`** — provides the per-product minute filter. The patch index uses OPERA's 15-min grid (`:00, :15, :30, :45`), but MTG/NWCSAF files are written at `:00, :10, :30, :40`. The file finder maps the requested HHMM to the nearest minute in each product's filter — OPERA `:15` reads MTG `:10`, OPERA `:45` reads MTG `:40`, OPERA `:00 / :30` use exact match. The mapping is a direct function of the filter (not a ±tolerance search). If the config or a product entry is missing, the finder uses exact match.
 
-2. **`train_data.csv` / `validation_data.csv` / `test_data.csv`** — the post-intersect filtered CSVs (from Step 4.2). Only timesteps referenced by at least one surviving sequence row are processed; the rest are skipped to avoid wasted work on slots that won't end up in any sample. Pass `--sequence_csvs none` to disable and process every entry in `patch_index.csv` (legacy behaviour).
+2. **`train_data.csv` / `validation_data.csv` / `test_data.csv`** — the filtered CSVs from Step 4.2. Only timesteps referenced by at least one surviving sequence row are processed; the rest are skipped. Pass `--sequence_csvs none` to process every entry in `patch_index.csv` instead.
 
 ```bash
 python extract_patches.py
@@ -551,7 +551,7 @@ python compute_normalization_stats.py --no_split_filter
 | **OPERA — `opera_reflectivity`** (max reflectivity, dBZ) | `opera_data/` | linear z-score | Like CZC: dBZ is already logarithmic, Gaussian-ish where signal is present. |
 | **OPERA — `opera_rainfall_rate`** (mm/h) | `opera_data/` | clip 0.01 → `log10` → z-score | Like RZC: heavy-tailed, zero-inflated. Same floor and transform family for consistency across both rain-rate sources. |
 
-When `--with_percentiles` is passed, each variable block additionally carries `p01`, `p50`, `p99`, and `mad` (median absolute deviation) — useful for sanity-checking against the mean/std, and as drop-in robust alternatives if a variable is flagged `near_constant: true`.
+When `--with_percentiles` is passed, each variable block additionally carries `p01`, `p50`, `p99`, and `mad` (median absolute deviation) — useful for sanity-checking against the mean/std, and as robust alternatives if a variable is flagged `near_constant: true`.
 
 #### Step 5 — Build TF datasets
 
@@ -591,7 +591,7 @@ The `--mode` argument behaves differently in each of the three pipeline scripts.
 
 | Script | `--mode` | Resolved as | If you want a new input combination |
 |---|---|---|---|
-| `create_datasets.py` | **required**, restricted to the names in `get_mode_config()` | Picks the HR / MR / LR variable recipe + label transform | Add a branch in `get_mode_config()` — there is no CLI escape hatch (the per-variable transforms exist as a registry, but the group composition is hardcoded) |
+| `create_datasets.py` | **required**, restricted to the names in `get_mode_config()` | Picks the HR / MR / LR variable recipe + label transform | Add a branch in `get_mode_config()` — there is no CLI alternative (the per-variable transforms exist as a registry, but the group composition is hardcoded) |
 | `train_models.py` | **required**, but a free-form string | Used only for the saved-model folder name and the default dataset path `{data_root}/datasets/{mode}` | Pass any string. Combine with `--dataset_dir` to point at a dataset that doesn't follow the `{mode}` naming convention |
 | `evaluate_coalition.py` | **required**, restricted to a `choices=[...]` list | Used for the eval output folder name and the dataset path | Add the new name to the `choices=[...]` list in `main()` |
 
@@ -683,7 +683,7 @@ python our_data/satellite_data/pipeline_msg_mtg.py \
 | `--skip_download` | Skip SFTP and process files already in `<output_dir>/_raw_chunks/`. | off |
 | `--workers`, `-w` | Parallel workers for repeat-cycle processing. | `10` |
 
-**What changed under the hood:**
+**Key differences from the previous implementation:**
 
 1. **Data source**: EUMETSAT Data Store (`eumdac`) → SFTP from `anm@192.168.11.223:/ShortTermStorage/GEOSTATIONARY/MTG/FCI/`. Date, chunk number, and minute-of-hour filters are applied **server-side** via SSH `ls` with glob patterns before anything is transferred.
 2. **Chunk filter**: `{34, 35, 36, 37, 38}` (±1 buffer) → `{35, 36}` based on the Météo-France FCI scan diagram. Halves transfer volume vs. the previous default.
@@ -733,7 +733,7 @@ The regrid output for MTG remains `.npy` on the Romania 1536×768 grid. Use `ins
 
 #### NWCSAF L2 Data Pipeline (SFTP + arrange)
 
-`pipeline_nwcsaf.py` mirrors `pipeline_msg_mtg.py` but for SAFNWC L2 cloud products (CMIC + CTTH). It connects via SFTP, applies the standard filters (PLAX exclusion, date range, minute cadence), and arranges the result into per-date COALITION-4 directories — all in one command.
+`pipeline_nwcsaf.py` mirrors `pipeline_msg_mtg.py` but for SAFNWC L2 cloud products (CMIC + CTTH). It connects via SFTP, applies the standard filters (PLAX exclusion, date range, minute cadence), and arranges the result into per-date COALITION-4 directories in a single command.
 
 ```bash
 # 1. Pick the training cadence first (writes our_data/timestep_config.json)
@@ -876,7 +876,7 @@ OPERA reprojection lives inside the unified `regrid.py` (the old standalone `reg
 # Both OPERA products
 python regrid.py --opera
 
-# All products in one go (radar + MTG + lightning + NWCSAF + OPERA)
+# All products in a single run (radar + MTG + lightning + NWCSAF + OPERA)
 python regrid.py --all
 
 # Single date / custom worker count
@@ -934,7 +934,7 @@ python our_data/raw_data/radar_arrange.py --source_root our_data/raw_data/radar/
 python our_data/raw_data/radar_arrange.py --source_root our_data/raw_data/radar/netcdf --target_root our_data/radar_data --timesteps all
 
 # NWCSAF: see the dedicated section "NWCSAF L2 Data Pipeline (SFTP + arrange)"
-# above — pipeline_nwcsaf.py handles download + per-date arrange in one step.
+# above — pipeline_nwcsaf.py handles download + per-date arrange in a single run.
 
 # Lightning: date-based filenames (dd_mm_yyyy.kml)
 python our_data/raw_data/lightning_arrange.py --source_root our_data/raw_data/lightning --target_root our_data/lightning_data
