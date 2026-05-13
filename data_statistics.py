@@ -19,6 +19,7 @@ Usage:
 
 import numpy as np
 import csv
+import json
 import os
 import argparse
 from collections import defaultdict, Counter
@@ -42,6 +43,33 @@ DEFAULT_DATA_ROOT = os.path.join(
 N_PATCHES = 18
 N_COLS = 6
 N_ROWS = 3
+
+
+def _load_step_minutes(data_root):
+    """Read `step_minutes` from `our_data/timestep_config.json`.
+
+    Falls back to 15 minutes if the file is missing or unreadable, which
+    is the historical hardcoded default. We prefer `sequence_meta.json`
+    when present because it records the cadence actually used to build
+    `patch_index.csv` (for lightning-source runs the aggregation can
+    differ from the timestep_config value).
+    """
+    for fname in ('sequence_meta.json', 'timestep_config.json'):
+        path = os.path.join(data_root, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, 'r') as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        # `sequence_meta.json` uses `source_step_minutes_native` for the
+        # native cadence of patch_index.csv; fall back to `step_minutes`.
+        val = (cfg.get('source_step_minutes_native')
+               or cfg.get('step_minutes'))
+        if val:
+            return int(val)
+    return 15
 
 COLORS = {
     'primary': '#2196F3',
@@ -217,21 +245,29 @@ def plot_spatial_heatmap(patch_data, out_dir):
 # Plot 3: Daily activity timeline
 # =============================================================================
 
-def plot_daily_timeline(patch_data, out_dir):
+def plot_daily_timeline(patch_data, out_dir, step_minutes=15):
     """
     Heatmap: dates (y) × hours (x), colored by number of active patches.
     Exposes data gaps, missing days, and convective clustering.
+
+    The grid resolution adapts to `step_minutes` so each row of
+    `patch_index.csv` maps to exactly one slot — previously the 96-slot
+    grid was hardcoded for a 15-min cadence and silently aliased entries
+    at finer cadences (e.g. :00 and :10 both wrote to slot 0).
     """
     dates = sorted(set(r['date'] for r in patch_data))
     n_dates = len(dates)
     date_idx = {d: i for i, d in enumerate(dates)}
 
-    # Grid: (n_dates, 24 hours × 4 quarter-hours = 96 slots)
-    grid = np.zeros((n_dates, 96))
+    # 1440 min / step_minutes slots per day. For step=15 -> 96 slots; for
+    # step=10 -> 144 slots; for step=30 -> 48 slots.
+    slots_per_day = 24 * 60 // step_minutes
+    grid = np.zeros((n_dates, slots_per_day))
     for row in patch_data:
         di = date_idx[row['date']]
-        slot = row['hour'] * 4 + row['minute'] // 15
-        grid[di, slot] = row['n_active']
+        slot = (row['hour'] * 60 + row['minute']) // step_minutes
+        if 0 <= slot < slots_per_day:
+            grid[di, slot] = row['n_active']
 
     fig, ax = plt.subplots(figsize=(14, max(4, n_dates * 0.35)))
     cmap = LinearSegmentedColormap.from_list('act', ['#fafafa', '#bbdefb', '#1565c0'])
@@ -239,8 +275,9 @@ def plot_daily_timeline(patch_data, out_dir):
     cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
     cbar.set_label('Active patches', fontsize=10)
 
-    # X-axis: show every 2 hours
-    xticks = [h * 4 for h in range(0, 24, 2)]
+    # X-axis: show every 2 hours — slot index per hour scales with cadence.
+    slots_per_hour = 60 // step_minutes
+    xticks = [h * slots_per_hour for h in range(0, 24, 2)]
     ax.set_xticks(xticks)
     ax.set_xticklabels([f'{h:02d}:00' for h in range(0, 24, 2)], fontsize=8)
 
@@ -438,6 +475,12 @@ def main():
     dates = sorted(set(r['date'] for r in patch_data))
     print(f"  {len(patch_data)} active timesteps across {len(dates)} dates")
 
+    # Cadence is read from sequence_meta.json / timestep_config.json so
+    # the daily-timeline grid sizes itself correctly for any --step_minutes
+    # validate_timestep.py was run with.
+    step_minutes = _load_step_minutes(args.data_root)
+    print(f"  step_minutes: {step_minutes} (from config)")
+
     print("\nLoading sequences.csv...")
     seq_data = load_sequences(seq_path)
     if seq_data:
@@ -451,7 +494,7 @@ def main():
 
     plot_diurnal_cycle(patch_data, out_dir)
     plot_spatial_heatmap(patch_data, out_dir)
-    plot_daily_timeline(patch_data, out_dir)
+    plot_daily_timeline(patch_data, out_dir, step_minutes=step_minutes)
     plot_active_distribution(patch_data, out_dir)
 
     if seq_data:
