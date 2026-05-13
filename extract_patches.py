@@ -26,6 +26,7 @@ import numpy as np
 import os
 import re
 import csv
+import json
 import argparse
 from pathlib import Path
 
@@ -189,6 +190,102 @@ def read_patch_index(data_root):
 
 
 # =============================================================================
+# Per-product timestamp snap (sourced from timestep_config.json)
+# =============================================================================
+#
+# Different products have different native cadences. With a 15-min training
+# step, `validate_timestep.py` writes a per-product `filter` listing exactly
+# which minute marks each product is available at:
+#
+#   opera_rainfall_rate.filter = [0, 15, 30, 45]   ← OPERA, the patch index driver
+#   mtg.filter / nwcsaf.filter = [0, 10, 30, 40]   ← 10-min products at 15-min step
+#
+# The patch index runs on OPERA's grid (:00, :15, :30, :45). When we ask
+# for MTG's `vis_06` at OPERA :15, no file exists at that exact minute —
+# MTG only wrote :00, :10, :30, :40. Rather than a fuzzy ±tolerance search,
+# the filter IS the source of truth: we snap the requested HHMM to the
+# nearest minute the product actually has, then load that file. So OPERA
+# :15 -> MTG :10, OPERA :45 -> MTG :40, and OPERA :00 / :30 are exact.
+
+_TIMESTEP_CONFIG_PATH = os.path.join(
+    DEFAULT_DATA_ROOT, 'timestep_config.json',
+)
+_PRODUCT_FILTER_CACHE: dict[str, set[int]] = {}
+
+
+def _load_product_filter(product_key: str) -> set[int] | None:
+    """Return the minute filter for `product_key` from timestep_config.json.
+
+    Cached after first read. Returns `None` if the config is missing or the
+    product isn't listed there — in which case the caller falls back to an
+    exact-match lookup, preserving the legacy behaviour.
+    """
+    if product_key in _PRODUCT_FILTER_CACHE:
+        cached = _PRODUCT_FILTER_CACHE[product_key]
+        return cached if cached else None
+    try:
+        with open(_TIMESTEP_CONFIG_PATH, 'r') as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        _PRODUCT_FILTER_CACHE[product_key] = set()
+        return None
+    flt = cfg.get('products', {}).get(product_key, {}).get('filter')
+    if not flt:
+        _PRODUCT_FILTER_CACHE[product_key] = set()
+        return None
+    s = {int(m) for m in flt}
+    _PRODUCT_FILTER_CACHE[product_key] = s
+    return s
+
+
+# Map the PRODUCT_GROUPS keys to the timestep_config product names used to
+# look up minute filters. OPERA's filter is identical across its two
+# products (both at 15-min cadence), so we just point at one of them.
+_FILTER_PRODUCT_KEY = {
+    'radar':         'radar',
+    'satellite_MSG': None,        # legacy / not in current config — skip snap
+    'satellite_MTG': 'mtg',
+    'lightning':     None,        # cadence_minutes is null — skip snap
+    'nwcsaf':        'nwcsaf',
+    'opera':         'opera_rainfall_rate',
+}
+
+
+def _snap_hhmm_to_filter(hhmm: str, filter_minutes: set[int]) -> str:
+    """Snap `hhmm` to the nearest minute mark in `filter_minutes`.
+
+    The minute is matched against the per-hour filter (0–59). If the nearest
+    mark crosses the hour boundary (e.g. requested :58, filter has :00), the
+    hour is adjusted with wrap-around at midnight. Ties prefer the earlier
+    minute so OPERA :15 snaps deterministically to MTG :10 rather than :20
+    (when MTG happens to have both).
+    """
+    h, m = int(hhmm[:2]), int(hhmm[2:])
+    best = min(filter_minutes, key=lambda fm: (
+        min(abs(fm - m), 60 - abs(fm - m)),  # primary: circular distance
+        fm,                                  # tiebreaker: earlier minute wins
+    ))
+    diff = best - m
+    if diff > 30:
+        diff -= 60   # snapped forward across the hour — really one hour back
+    elif diff < -30:
+        diff += 60   # snapped backward — one hour forward
+    total = (h * 60 + m + diff) % (24 * 60)
+    return f"{total // 60:02d}{total % 60:02d}"
+
+
+def _resolve_hhmm(hhmm: str, group: str) -> str:
+    """Snap a requested HHMM to the group's available cadence grid."""
+    product_key = _FILTER_PRODUCT_KEY.get(group)
+    if product_key is None:
+        return hhmm
+    flt = _load_product_filter(product_key)
+    if not flt:
+        return hhmm
+    return _snap_hhmm_to_filter(hhmm, flt)
+
+
+# =============================================================================
 # File discovery per product
 # =============================================================================
 
@@ -198,8 +295,11 @@ def find_regridded_file_radar(data_root, variable, date_str, time_str):
 
     Path: regridded_data/radar_data/{var}/nc4_{date}-Romania_{var}/
           nc4_{date}-Romania_{HHMM}_{var}.npy
+
+    HHMM is snapped to the radar minute filter from timestep_config.json
+    so a request at e.g. :15 maps to the nearest available :10.
     """
-    hhmm = time_str.replace(':', '')
+    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'radar')
     day_folder = f"nc4_{date_str}-Romania_{variable}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
     path = os.path.join(
@@ -216,8 +316,13 @@ def find_regridded_file_satellite(data_root, instrument, channel,
 
     Path: regridded_data/satellite_data/{MSG|MTG}/{channel}/
           nc4_{date}-Romania_{channel}/nc4_{date}-Romania_{HHMM}_{channel}.npy
+
+    HHMM is snapped to the instrument's minute filter — MTG/MSG at 10-min
+    cadence have {00, 10, 30, 40}; OPERA at 15-min has {00, 15, 30, 45};
+    snapping resolves the mismatch when these are mixed in one sample.
     """
-    hhmm = time_str.replace(':', '')
+    group = f"satellite_{instrument}"
+    hhmm = _resolve_hhmm(time_str.replace(':', ''), group)
     day_folder = f"nc4_{date_str}-Romania_{channel}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{channel}.npy"
     path = os.path.join(
@@ -233,8 +338,11 @@ def find_regridded_file_lightning(data_root, product, date_str, time_str):
 
     Path: regridded_data/lightning_data/{product}/nc4_{date}-Romania_{product}/
           lightning_{product}_{YYYYMMDD}_{HHMM}.npy
+
+    Lightning has no minute filter in timestep_config.json (cadence_minutes
+    is null), so the HHMM is used exactly as supplied.
     """
-    hhmm = time_str.replace(':', '')
+    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'lightning')
     date_compact = date_str.replace('-', '')
     day_folder = f"nc4_{date_str}-Romania_{product}"
     filename = f"lightning_{product}_{date_compact}_{hhmm}.npy"
@@ -253,14 +361,17 @@ def find_regridded_file_nwcsaf(data_root, variable, date_str, time_str):
 
     Path: regridded_data/nwcsaf_data/{variable}/nc4_{date}-Romania_{variable}/
           nc4_{date}-Romania_{HHMM}_{variable}.npy
+
+    HHMM is snapped to the NWCSAF minute filter (same shape as MTG's).
     """
-    hhmm = time_str.replace(':', '')
+    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'nwcsaf')
     day_folder = f"nc4_{date_str}-Romania_{variable}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
-    return os.path.join(
+    path = os.path.join(
         data_root, 'regridded_data', 'nwcsaf_data', variable,
         day_folder, filename,
     )
+    return path if os.path.isfile(path) else None
 
 
 def find_regridded_file_opera(data_root, variable, date_str, time_str):
@@ -271,9 +382,12 @@ def find_regridded_file_opera(data_root, variable, date_str, time_str):
 
     Path: regridded_data/opera_data/{short}/nc4_{date}-Romania_{short}/
           nc4_{date}-Romania_{HHMM}_{short}.npy
+
+    The patch index is on OPERA's grid so the snap is a no-op here, but
+    it's still applied for consistency.
     """
     short = OPERA_VAR_TO_DISK.get(variable, variable)
-    hhmm = time_str.replace(':', '')
+    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'opera')
     day_folder = f"nc4_{date_str}-Romania_{short}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{short}.npy"
     path = os.path.join(
