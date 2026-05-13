@@ -580,7 +580,7 @@ def process_single_opera_file(filepath):
 
 
 def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
-                 source='radar'):
+                 source='radar', start_date=None, end_date=None):
     """
     Run the full patch identification pipeline.
 
@@ -591,6 +591,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
         save_plots: If True, save a PNG for each active timestamp
         source: 'radar' (RZC source NetCDFs, regrid in-script) or
                 'opera' (pre-regridded OPERA rainfall_rate .npy files).
+        start_date: Optional inclusive lower bound YYYY-MM-DD
+        end_date:   Optional inclusive upper bound YYYY-MM-DD
     """
     print("=" * 70)
     print("COALITION-4 Patch Identification Pipeline")
@@ -614,6 +616,15 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     if date_filter:
         all_files = [(d, f) for d, f in all_files if d == date_filter]
         print(f"Filtering to date: {date_filter}")
+
+    # YYYY-MM-DD strings are lexicographically orderable, so a simple
+    # string compare implements the inclusive range filter correctly.
+    if start_date:
+        all_files = [(d, f) for d, f in all_files if d >= start_date]
+        print(f"Start date : {start_date}")
+    if end_date:
+        all_files = [(d, f) for d, f in all_files if d <= end_date]
+        print(f"End date   : {end_date}")
 
     if not all_files:
         print(f"\nNo {source_label} files found.")
@@ -789,7 +800,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--date", type=str, default=None,
-        help="Process a single date (YYYY-MM-DD)"
+        help="Process a single date (YYYY-MM-DD). Mutually exclusive with "
+             "--start / --end."
+    )
+    parser.add_argument(
+        "--start", type=str, default=None,
+        help="Inclusive lower bound date filter (YYYY-MM-DD)."
+    )
+    parser.add_argument(
+        "--end", type=str, default=None,
+        help="Inclusive upper bound date filter (YYYY-MM-DD)."
     )
     parser.add_argument(
         "--threshold", type=float, default=DBSCAN_THRESHOLD,
@@ -822,6 +842,11 @@ if __name__ == "__main__":
     if args.plot and args.date is None:
         parser.error("--plot requires --date to avoid generating thousands of PNGs")
 
+    # --date is the single-date shortcut; combining it with --start/--end is
+    # ambiguous, so disallow it.
+    if args.date and (args.start or args.end):
+        parser.error("--date is mutually exclusive with --start / --end")
+
     # Override globals if CLI args provided
     DBSCAN_THRESHOLD = args.threshold
     DBSCAN_EPS = args.eps
@@ -833,5 +858,7 @@ if __name__ == "__main__":
         date_filter=args.date,
         save_plots=args.plot,
         source=args.source,
+        start_date=args.start,
+        end_date=args.end,
     )
     
