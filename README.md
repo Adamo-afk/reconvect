@@ -556,6 +556,26 @@ Custom modes (e.g. without NWCSAF) can be defined by adding a new configuration 
 
 Output: `our_data/datasets/{mode}/train|validation|test/` (each with `metadata.json`)
 
+##### When `--mode` is required vs. optional
+
+The `--mode` argument behaves differently in each of the three pipeline scripts. **Only `train_models.py` is truly dynamic** — the dataset name there is just a label. The other two need a name that matches a hardcoded recipe.
+
+| Script | `--mode` | Resolved as | If you want a new input combination |
+|---|---|---|---|
+| `create_datasets.py` | **required**, restricted to the names in `get_mode_config()` | Picks the HR / MR / LR variable recipe + label transform | Add a branch in `get_mode_config()` — there is no CLI escape hatch (the per-variable transforms exist as a registry, but the group composition is hardcoded) |
+| `train_models.py` | **required**, but a free-form string | Used only for the saved-model folder name and the default dataset path `{data_root}/datasets/{mode}` | Pass any string. Combine with `--dataset_dir` to point at a dataset that doesn't follow the `{mode}` naming convention |
+| `evaluate_coalition.py` | **required**, restricted to a `choices=[...]` list | Used for the eval output folder name and the dataset path | Add the new name to the `choices=[...]` list in `main()` |
+
+So **the only "skippable" use** of `--mode` is on `train_models.py` when paired with `--dataset_dir`:
+
+```bash
+# Re-train any saved dataset under whatever model label you want
+python train_models.py --mode my_label \
+    --dataset_dir our_data/datasets/mtg_opera_full
+```
+
+For `create_datasets.py` and `evaluate_coalition.py`, the mode name **must** exist in code — adding a new product combination still requires a one-line edit in each. `train_models.py` is unaffected: it reads `metadata.json` and adapts to whatever inputs the dataset declares.
+
 #### Step 6 — Train
 
 Builds the COALITION recurrent-convolutional architecture (ResBlock + ConvGRU encoder-decoder) dynamically from the dataset's `metadata.json`. The model architecture adapts automatically to whatever inputs are present — number of input groups, channel counts, and resolutions are all read from metadata rather than hardcoded. This means training with different input configurations (e.g., with/without NWCSAF, MSG vs MTG) requires no code changes; only the dataset needs to change.
