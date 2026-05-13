@@ -38,126 +38,293 @@ import tensorflow as tf
 
 
 # ============================================================================
-# Transform functions (Table A1 from Leinonen et al. 2022)
-# Applied to physical float values at dataset creation time.
+# Per-variable transforms (data-driven via normalization_stats.json)
 # ============================================================================
+#
+# Variables that use linear z-score `(x - mean) / std` or log-then-z-score
+# `(log10(clip(x)) - mean) / std` look their `mean` / `std` up from
+# `our_data/normalization_stats.json` (produced by
+# `compute_normalization_stats.py`). The JSON is loaded lazily on the first
+# call and cached. There is NO fallback to the Leinonen Swiss constants:
+# if the JSON is missing, or if a required variable is missing from it,
+# the call raises a clear error pointing the user at the stats script.
+#
+# Variables that use simple physical scaling (BZC, VIS, EZC = x/k) or are
+# categorical/binary (occurrence, cmic_phase) are NOT driven by the JSON.
+# Their transforms are hardcoded because the scaling factor is a property
+# of the physical units, not the training distribution.
 
+_NORMALIZATION_STATS_CACHE: dict | None = None
+_NORMALIZATION_PATH: Path | None = None
+_NORMALIZATION_WARNED: set[str] = set()
+
+
+def _load_normalization_stats(force: bool = False) -> dict:
+    """Load normalization_stats.json (lazy, cached). Errors if absent."""
+    global _NORMALIZATION_STATS_CACHE, _NORMALIZATION_PATH
+    if _NORMALIZATION_STATS_CACHE is not None and not force:
+        return _NORMALIZATION_STATS_CACHE
+    # _NORMALIZATION_PATH defaults to our_data/normalization_stats.json next
+    # to this script; override via set_normalization_stats_path() at runtime.
+    if _NORMALIZATION_PATH is None:
+        _NORMALIZATION_PATH = (
+            Path(__file__).resolve().parent / "our_data"
+            / "normalization_stats.json"
+        )
+    if not _NORMALIZATION_PATH.exists():
+        raise FileNotFoundError(
+            f"normalization_stats.json not found at "
+            f"{_NORMALIZATION_PATH}. Build it once before running "
+            f"create_datasets.py:\n"
+            f"    python compute_normalization_stats.py"
+        )
+    _NORMALIZATION_STATS_CACHE = json.loads(_NORMALIZATION_PATH.read_text())
+    return _NORMALIZATION_STATS_CACHE
+
+
+def set_normalization_stats_path(path: str | Path) -> None:
+    """Override the location of normalization_stats.json before any transform
+    runs. Useful for testing or for running create_datasets.py against a
+    non-default data_root."""
+    global _NORMALIZATION_PATH, _NORMALIZATION_STATS_CACHE
+    _NORMALIZATION_PATH = Path(path)
+    _NORMALIZATION_STATS_CACHE = None
+
+
+def _norm(var: str) -> dict:
+    """Return the per-variable stats dict; raise if missing.
+
+    A variable can be missing from the JSON either because
+    `compute_normalization_stats.py` was not given that variable, or
+    because no training files matched. In both cases, fail loudly with
+    instructions rather than silently fall back to a Swiss constant.
+    """
+    stats = _load_normalization_stats()
+    block = stats.get("variables", {}).get(var)
+    if block is None:
+        raise KeyError(
+            f"Variable {var!r} is missing from normalization_stats.json "
+            f"at {_NORMALIZATION_PATH}. Re-run compute_normalization_stats.py "
+            f"and confirm {var!r} appears in the output (no spec entry or "
+            f"no training files would suppress it)."
+        )
+    # First-time encounter warnings: near-constant
+    if (block.get("near_constant") and
+            var not in _NORMALIZATION_WARNED):
+        _NORMALIZATION_WARNED.add(var)
+        print(
+            f"WARNING [{var}]: {block.get('near_constant_warning', '')} "
+            f"({_NORMALIZATION_PATH.name})",
+            file=sys.stderr,
+        )
+    return block
+
+
+def _apply_log_zscore(x: np.ndarray, var: str) -> np.ndarray:
+    """`(log10(clip(x, clip_min)) - mean) / std` with fill + missing handling."""
+    spec = _norm(var)
+    fill = spec["fill"]
+    clip_min = spec.get("clip_min", fill)
+    missing_above = spec.get("missing_above")
+    mean = spec["mean"]
+    std = spec["std"]
+    x = np.where(np.isnan(x), fill, x)
+    if missing_above is not None:
+        x = np.where(x > missing_above, fill, x)
+    x = np.clip(x, clip_min, None)
+    return (np.log10(x) - mean) / std
+
+
+def _apply_linear_zscore(x: np.ndarray, var: str) -> np.ndarray:
+    """`(x - mean) / std` with fill + missing handling."""
+    spec = _norm(var)
+    fill = spec["fill"]
+    missing_above = spec.get("missing_above")
+    mean = spec["mean"]
+    std = spec["std"]
+    x = np.where(np.isnan(x), fill, x)
+    if missing_above is not None:
+        x = np.where(x > missing_above, fill, x)
+    return (x - mean) / std
+
+
+# ---- Radar ----
 def transform_rzc(x):
-    """RZC rain rate: [log10(x) + 0.051] / 0.528, fill=0.01 mm/h"""
-    x = np.where(np.isnan(x), 0.01, x)
-    x = np.clip(x, 0.01, None)
-    return (np.log10(x) + 0.051) / 0.528
+    """RZC rain rate: log10 + z-score; heavy-tailed, zero-inflated."""
+    return _apply_log_zscore(x, "RZC")
 
 
 def transform_czc(x):
-    """CZC composite reflectivity: (x - 21.3) / 8.71, fill=-5 dBZ"""
-    x = np.where(np.isnan(x), -5.0, x)
-    return (x - 21.3) / 8.71
+    """CZC composite reflectivity (dBZ): linear z-score."""
+    return _apply_linear_zscore(x, "CZC")
+
+
+def transform_lzc(x):
+    """LZC liquid water content: log10 + z-score; heavy-tailed."""
+    return _apply_log_zscore(x, "LZC")
 
 
 def transform_ezc(x):
-    """EZC-20 echo-top height: x / 1.97, fill=0"""
+    """EZC-20 echo-top height: simple physical scaling (x / 1.97), fill=0.
+
+    Hardcoded scale — not data-driven. Echo-top is a physical altitude
+    measure; the divisor expresses an empirically chosen unit conversion
+    rather than a statistical centring, so it stays out of the JSON.
+    """
     x = np.where(np.isnan(x), 0.0, x)
     return x / 1.97
 
 
-def transform_lzc(x):
-    """LZC liquid water content: [log10(x) + 0.274] / 0.135, fill=0.5"""
-    x = np.where(np.isnan(x), 0.5, x)
-    x = np.clip(x, 0.5, None)
-    return (np.log10(x) + 0.274) / 0.135
-
-
 def transform_bzc(x):
-    """BZC base reflectivity: x / 100"""
+    """BZC base reflectivity: simple physical scaling (x / 100), fill=0.
+
+    Hardcoded. BZC stores integer-coded dBZ * 100 in the source files
+    so the `/100` recovers the physical unit; this is a unit conversion,
+    not a statistical normalisation.
+    """
     x = np.where(np.isnan(x), 0.0, x)
     return x / 100.0
 
 
 def transform_cpch(x):
-    """CPCH precipitation: log10(x), fill=0.01, threshold=0.1"""
+    """CPCH precipitation: log10(x) only, fill=0.01, threshold=0.1.
+
+    Hardcoded — pure log transform (no z-score). The threshold drops
+    sub-noise rates to the fill value to keep the log finite.
+    """
     x = np.where(np.isnan(x), 0.01, x)
     x = np.where(x < 0.1, 0.01, x)
     x = np.clip(x, 0.01, None)
     return np.log10(x)
 
 
+# ---- Lightning ----
 def transform_lightning_density(x):
-    """Lightning density: [log10(x) + 0.593] / 0.640, fill=1e-4"""
-    x = np.where(np.isnan(x), 1e-4, x)
-    x = np.clip(x, 1e-4, None)
-    return (np.log10(x) + 0.593) / 0.640
+    """Lightning density: log10 + z-score."""
+    return _apply_log_zscore(x, "density")
 
 
 def transform_lightning_current(x):
-    """Lightning current: [log10(x) - 0.0718] / 0.731, fill=1e-8"""
-    x = np.where(np.isnan(x), 1e-8, x)
-    x = np.clip(x, 1e-8, None)
-    return (np.log10(x) - 0.0718) / 0.731
+    """Lightning current: log10 + z-score."""
+    return _apply_log_zscore(x, "current")
 
 
 def transform_occurrence(x):
-    """Lightning occurrence: binary 0/1, cast to float32"""
+    """Lightning occurrence: binary 0/1 — no normalisation.
+
+    Hardcoded. The variable is already on its natural scale {0, 1};
+    z-scoring it would destroy the binary interpretation.
+    """
     x = np.where(np.isnan(x), 0.0, x)
     return np.clip(x, 0.0, 1.0)
 
 
+# ---- Satellite (per-channel data-driven stats) ----
 def transform_vis(x):
-    """Solar visible channels (VIS006, vis_06, etc.): x / 100"""
+    """Solar visible channels (VIS006, vis_06, ...): x / 100.
+
+    Hardcoded — same unit-conversion logic as BZC: the source data is
+    stored as integer reflectance % * 100, so `/100` recovers a value
+    already in a sensible model-friendly range. No z-score needed.
+    """
     x = np.where(np.isnan(x), 0.0, x)
     return x / 100.0
 
 
 def transform_ir039(x):
-    """IR-039 / ir_38 (solar+thermal): (x - 274) / 17.5"""
-    x = np.where(np.isnan(x), 274.0, x)
-    return (x - 274.0) / 17.5
+    """MSG IR_039 / MTG ir_38 (solar+thermal): linear z-score."""
+    # MSG and MTG share the transform body but use different per-channel
+    # stats. The two configs below bind the right variable name.
+    return _apply_linear_zscore(x, "IR_039")
 
 
-def transform_thermal(x):
-    """Thermal IR/WV channels: (x - 250) / 10"""
-    x = np.where(np.isnan(x), 250.0, x)
-    return (x - 250.0) / 10.0
+def transform_ir38(x):
+    """MTG ir_38: linear z-score."""
+    return _apply_linear_zscore(x, "ir_38")
 
 
+def transform_ir108(x):
+    """MSG IR_108 thermal channel: linear z-score."""
+    return _apply_linear_zscore(x, "IR_108")
+
+
+def transform_ir105(x):
+    """MTG ir_105 thermal channel: linear z-score."""
+    return _apply_linear_zscore(x, "ir_105")
+
+
+def transform_wv062(x):
+    """MSG WV_062 water-vapour channel: linear z-score."""
+    return _apply_linear_zscore(x, "WV_062")
+
+
+def transform_wv63(x):
+    """MTG wv_63 water-vapour channel: linear z-score."""
+    return _apply_linear_zscore(x, "wv_63")
+
+
+def transform_wv073(x):
+    """MSG WV_073 water-vapour channel: linear z-score."""
+    return _apply_linear_zscore(x, "WV_073")
+
+
+def transform_wv73(x):
+    """MTG wv_73 water-vapour channel: linear z-score."""
+    return _apply_linear_zscore(x, "wv_73")
+
+
+# ---- NWCSAF ----
 def transform_ctth_alti(x):
-    """Cloud-top height: (x - 5260) / 2810, fill=-1000, missing=65535"""
-    x = np.where(np.isnan(x), -1000.0, x)
-    x = np.where(x > 60000, -1000.0, x)  # handle 65535 missing
-    return (x - 5260.0) / 2810.0
+    """NWCSAF cloud-top altitude: linear z-score (sentinel 65535 dropped)."""
+    return _apply_linear_zscore(x, "ctth_alti")
 
 
 def transform_ctth_tempe(x):
-    """Cloud-top temperature: (x - 260) / 19.1, fill=330, missing=65535"""
-    x = np.where(np.isnan(x), 330.0, x)
-    x = np.where(x > 60000, 330.0, x)
-    return (x - 260.0) / 19.1
+    """NWCSAF cloud-top temperature: linear z-score (sentinel 65535 dropped)."""
+    return _apply_linear_zscore(x, "ctth_tempe")
 
 
 def transform_cmic_phase(x):
-    """Cloud-top phase: one-hot encode. Input categories: 1,2,3,4 + 0/NaN=missing.
-    Returns (H, W, 5) array with channels: [no_cloud, liquid, ice, mixed, missing].
+    """Cloud-top phase: one-hot.
+
+    Hardcoded. Categorical variable with five classes — no continuous
+    normalisation makes sense.
     """
     x = np.where(np.isnan(x), 0.0, x)
     x = np.round(x).astype(np.int32)
     h, w = x.shape
     one_hot = np.zeros((h, w, 5), dtype=np.float32)
-    # Map: 0→missing(ch4), 1→no_cloud(ch0), 2→liquid(ch1), 3→ice(ch2), 4→mixed(ch3)
     mapping = {0: 4, 1: 0, 2: 1, 3: 2, 4: 3}
     for val, ch in mapping.items():
         one_hot[:, :, ch] = (x == val).astype(np.float32)
-    # Anything not in mapping → missing channel
     known = np.isin(x, list(mapping.keys()))
     one_hot[:, :, 4] = np.where(~known, 1.0, one_hot[:, :, 4])
     return one_hot
 
 
 def transform_cmic_cot(x):
-    """Cloud optical thickness: [log10(x) - 0.94] / 0.588, fill=0.1, missing=65535"""
-    x = np.where(np.isnan(x), 0.1, x)
-    x = np.where(x > 60000, 0.1, x)
-    x = np.clip(x, 0.1, None)
-    return (np.log10(x) - 0.94) / 0.588
+    """NWCSAF cloud optical thickness: log10 + z-score (sentinel dropped)."""
+    return _apply_log_zscore(x, "cmic_cot")
+
+
+# ---- OPERA radar (new) ----
+def transform_opera_reflectivity(x):
+    """OPERA max reflectivity (dBZ): linear z-score.
+
+    Reflectivity is already on a logarithmic decibel scale and is roughly
+    Gaussian-distributed in non-zero regions, so linear z-scoring is
+    appropriate.
+    """
+    return _apply_linear_zscore(x, "opera_reflectivity")
+
+
+def transform_opera_rainfall_rate(x):
+    """OPERA instantaneous rain rate (mm/h): log10 + z-score.
+
+    Heavy-tailed, zero-inflated, same family as RZC; clip-then-log
+    flattens the distribution before z-scoring.
+    """
+    return _apply_log_zscore(x, "opera_rainfall_rate")
 
 
 # Label transforms
@@ -227,9 +394,9 @@ HR_LIGHTNING_CONFIG = {
 MSG_SAT_CONFIG = {
     "VIS006": (transform_vis, None),
     "IR_039": (transform_ir039, None),
-    "IR_108": (transform_thermal, None),
-    "WV_062": (transform_thermal, None),
-    "WV_073": (transform_thermal, None),
+    "IR_108": (transform_ir108, None),
+    "WV_062": (transform_wv062, None),
+    "WV_073": (transform_wv073, None),
 }
 
 MTG_HR_SAT_CONFIG = {
@@ -237,10 +404,19 @@ MTG_HR_SAT_CONFIG = {
 }
 
 MTG_MR_SAT_CONFIG = {
-    "ir_38":  (transform_ir039, None),
-    "ir_105": (transform_thermal, None),
-    "wv_63":  (transform_thermal, None),
-    "wv_73":  (transform_thermal, None),
+    "ir_38":  (transform_ir38, None),
+    "ir_105": (transform_ir105, None),
+    "wv_63":  (transform_wv63, None),
+    "wv_73":  (transform_wv73, None),
+}
+
+# OPERA radar — defined for future modes; not wired into any active mode
+# in get_mode_config() yet (add an `opera_radar` mode there when needed).
+OPERA_HR_CONFIG = {
+    "opera_reflectivity": (transform_opera_reflectivity, None),
+}
+OPERA_MR_CONFIG = {
+    "opera_rainfall_rate": (transform_opera_rainfall_rate, None),
 }
 
 NWCSAF_CONFIG = {
@@ -642,6 +818,11 @@ def create_and_save_datasets(data_root, mode, output_root=None):
     else:
         output_root = Path(output_root)
 
+    # Point the lazy stats loader at this run's data_root before any
+    # transform fires; required because the transforms can be called
+    # from worker threads later.
+    set_normalization_stats_path(data_root / "normalization_stats.json")
+
     mode_config = get_mode_config(mode)
     save_dir = output_root / mode
 
@@ -651,6 +832,7 @@ def create_and_save_datasets(data_root, mode, output_root=None):
     print("=" * 70)
     print(f"Data root:    {data_root}")
     print(f"Patches dir:  {patches_dir}")
+    print(f"Stats file:   {data_root / 'normalization_stats.json'}")
     print(f"Output dir:   {save_dir}")
     print(f"Label:        {mode_config['label_var']}")
     print()
