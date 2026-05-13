@@ -232,32 +232,70 @@ conda activate tfenv
 
 The pipeline supports any training step that is at least as coarse as the
 highest native data cadence. Native cadences are declared in
-[`product_cadences.json`](product_cadences.json) at the project root:
+[`product_cadences.json`](product_cadences.json) at the project root and
+cover every product family the pipeline knows about (radar, MTG, NWCSAF,
+the two OPERA products, and lightning).
 
-```json
-{
-  "radar":     10,
-  "mtg":       10,
-  "nwcsaf":    10,
-  "lightning": null
-}
-```
+**Lightning** is special: it has no native scan cadence — LINET strokes
+are individual observed events, not raster scans. The lightning maps that
+feed the model are produced by binning strokes into windows whose width
+mirrors whichever paired product the experiment uses:
 
-A `null` value marks a continuous product (no minute filter is needed —
-lightning strokes are aggregated into the chosen window). If you add a
-new data source or its native cadence changes, edit this file rather than
-the validator script. The validator reads the file at startup; it does not
-inspect any data folders. Override with `--cadences_file path/to/other.json`.
+- When **radar** is in the configuration, lightning bins align to the
+  radar cadence (`step_minutes` resolved against the radar `filter` set).
+- When **OPERA** replaces radar, lightning bins align to the OPERA
+  cadence — although the current Shapley study deliberately runs
+  **without lightning** so the comparison is OPERA vs MTG vs NWCSAF only.
+- In any other combination the validator picks the most common cadence of
+  the active products and aligns lightning bins to it.
+
+OPERA composites are scanned with the 15-min product family (NIMBUS,
+CIRRUS, ODYSSEY) — see the *OPERA composite acquisition window* note
+just below for the exact `[NT-X, NT+Y]` data windows each composite type
+uses, and why the 10-min products are filtered to the alternating
+`{:00, :10, :30, :40}` pattern when paired with a 15-min training step.
+
+If you add a new data source or its native cadence changes, edit
+`product_cadences.json` rather than the validator script. The validator
+reads the file at startup; it does not inspect any data folders. Override
+with `--cadences_file path/to/other.json`. Comment out products you are
+not using (rename with a leading underscore) if they would otherwise
+raise the floor beyond what you need — e.g. drop OPERA's 15-min floor
+back to 10 min when running a radar-only experiment.
 
 Run the validator once before any other pipeline step:
 
 ```bash
-python validate_timestep.py --step_minutes 15        # 15-min cadence
-python validate_timestep.py --step_minutes 10        # 10-min cadence (native)
-python validate_timestep.py --step_minutes 30        # 30-min cadence
+python validate_timestep.py --step_minutes 15        # 15-min cadence (required when OPERA is in the mix)
+python validate_timestep.py --step_minutes 10        # 10-min cadence (radar/MTG/NWCSAF only; OPERA must be commented out)
+python validate_timestep.py --step_minutes 30        # 30-min cadence (any product set)
 python validate_timestep.py --step_minutes 5         # ERROR (below 10-min native)
 python validate_timestep.py --print                  # show current config
 ```
+
+##### Why the alternating 10–20–10–20 filter for 10-min products at a 15-min step?
+
+OPERA composites are produced over fixed temporal windows centred on the
+quarter-hour. The data-time-window contract from EUMETNET differs by
+composite generation:
+
+- **NIMBUS** (15-min composites): data window is `[NT − 12 min, NT + 7 min]`
+  around each nominal time `HH:00, HH:15, HH:30, HH:45`. NIMBUS takes the
+  input scan closest to NT.
+- **CIRRUS**: temporal coverage `[NT − 10 min, NT]` where NT is the
+  composite's Nominal Time. Updated every 5 minutes (288× per day).
+- **Old ODYSSEY** (legacy): 15-min scanning interval `[NT − 10 min,
+  NT + 5 min]`.
+
+In all three cases the OPERA nominal grid is the strict `{:00, :15, :30,
+:45}` set, and the 10-minute products that feed the same training sample
+(radar, MTG, NWCSAF) need to land within roughly ±5 min of those nominal
+times so the composite's temporal window matches the satellite/radar
+acquisition. The minute filter `{:00, :10, :30, :40}` is exactly that
+choice — at every 15-min step, it picks the 10-min slot whose acquisition
+is closest to the OPERA nominal time, giving an alternating 10–20–10–20
+spacing between consecutive samples. The `extract_patches.py` cadence
+snap (see Step 3) translates between the two grids automatically.
 
 The script writes `our_data/timestep_config.json` with the chosen
 `step_minutes`, the per-product `minute_filter` (the native minutes to keep
