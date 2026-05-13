@@ -53,12 +53,17 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 
 
-def load_valid_minutes():
+def load_valid_minutes(source='radar'):
     """
-    Read the radar minute filter from timestep_config.json.
+    Read the per-source minute filter from timestep_config.json.
 
-    Returns a set of two-digit minute strings (e.g. {'00','10','30','40'} for
-    step=15 with 10-min radar). Errors out if the config is missing.
+    For `source='radar'` returns the `products.radar.filter` set (e.g.
+    `{'00','10','30','40'}` for step=15 with 10-min radar). For
+    `source='opera'` returns `products.opera_rainfall_rate.filter`
+    (the DBSCAN driver) — typically `{'00','15','30','45'}` for the
+    15-min cadence.
+
+    Errors out if the config or the requested product is missing.
     """
     if not TIMESTEP_CONFIG_PATH.exists():
         print(
@@ -69,9 +74,16 @@ def load_valid_minutes():
         )
         sys.exit(2)
     cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
-    flt = cfg["products"].get("radar", {}).get("filter")
+    product_key = (
+        'opera_rainfall_rate' if source == 'opera' else 'radar'
+    )
+    flt = cfg["products"].get(product_key, {}).get("filter")
     if flt is None:
-        print(f"ERROR: radar filter missing from {TIMESTEP_CONFIG_PATH}", file=sys.stderr)
+        print(
+            f"ERROR: {product_key!r} filter missing from "
+            f"{TIMESTEP_CONFIG_PATH}",
+            file=sys.stderr,
+        )
         sys.exit(2)
     return {f"{m:02d}" for m in flt}
 
@@ -404,28 +416,31 @@ def plot_patch_grid(regridded, binary_mask, active_patches, date_str, time_str,
 # File discovery
 # =============================================================================
 
-# Valid radar minutes are loaded lazily (and cached) from timestep_config.json
-# so identify_patches.py works at any cadence selected by validate_timestep.py.
-_VALID_RADAR_MINUTES = None
+# Valid minutes per source are loaded lazily (and cached) from
+# timestep_config.json so identify_patches.py works at any cadence
+# selected by validate_timestep.py. Keyed by source ('radar' or 'opera').
+_VALID_MINUTES_CACHE: dict[str, set[str]] = {}
 
 
-def _radar_minutes():
-    global _VALID_RADAR_MINUTES
-    if _VALID_RADAR_MINUTES is None:
-        _VALID_RADAR_MINUTES = load_valid_minutes()
-    return _VALID_RADAR_MINUTES
+def _valid_minutes_for(source):
+    cached = _VALID_MINUTES_CACHE.get(source)
+    if cached is None:
+        cached = load_valid_minutes(source)
+        _VALID_MINUTES_CACHE[source] = cached
+    return cached
 
 
-def is_on_grid(filename):
+def is_on_grid(filename, source='radar'):
     """
-    Check if a radar filename's timestamp falls on the configured cadence
-    grid (e.g. {:00, :10, :30, :40} for step=15 with 10-min radar).
+    Check if a filename's timestamp falls on the configured cadence grid
+    for the given source (radar uses `products.radar.filter`, OPERA uses
+    `products.opera_rainfall_rate.filter`).
 
     Handles:
         nc4_2025-05-15-Romania_0110_RZC.nc  → parts[2] = '0110' → '10'
         202406131215something.nc             → basename[10:12] = '15'
     """
-    valid_minutes = _radar_minutes()
+    valid_minutes = _valid_minutes_for(source)
     basename = os.path.splitext(os.path.basename(filename))[0]
     parts = basename.split('_')
 
@@ -530,7 +545,7 @@ def discover_opera_files(data_root):
         for f in sorted(os.listdir(day_dir)):
             if not f.endswith('.npy'):
                 continue
-            if not is_on_grid(f):
+            if not is_on_grid(f, source='opera'):
                 filtered += 1
                 continue
             results.append((date_str, os.path.join(day_dir, f)))
