@@ -21,11 +21,12 @@ from collections import defaultdict
 from pathlib import Path
 
 
-# Default path (relative to coalition4-rcnn project root)
-DEFAULT_RAW_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    'our_data', 'satellite_data', 'MTG', '_raw_chunks'
-)
+# Default path: anchor to the project root (two levels up from this script,
+# which lives at our_data/satellite_data/) so the same default works whether
+# you run from the project root or from the script's own directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_RAW_DIR = str(PROJECT_ROOT / 'our_data' / 'satellite_data'
+                      / 'MTG' / '_raw_chunks')
 
 
 def parse_fci_filename(filename):
