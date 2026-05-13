@@ -1833,6 +1833,13 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
     nx_2d, ny_2d = np.meshgrid(nx, ny)
     print(f"    NWCSAF grid: {ny_2d.shape} ({gdal_proj[:40]}...)")
 
+    # NWCSAF stores the geostationary projection with ellipsoid radii
+    # normalised by satellite distance (+a / +b ~ 0.178), which PROJ 9.x
+    # rejects as a "non-Earth body" mixed with the EPSG:4326 Earth CRS.
+    # Setting PROJ_IGNORE_CELESTIAL_BODY=YES is the documented PROJ escape
+    # hatch — see the error message PROJ itself emits when this trips.
+    os.environ.setdefault('PROJ_IGNORE_CELESTIAL_BODY', 'YES')
+
     geos_proj = pyproj.Proj(gdal_proj)
     transformer = pyproj.Transformer.from_proj(
         geos_proj, pyproj.Proj('epsg:4326'), always_xy=True
