@@ -88,7 +88,7 @@ import json
 import re
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -101,6 +101,20 @@ DEFAULT_DATA_ROOT = PROJECT_ROOT / "our_data"
 
 # Default column to read when the user doesn't supply one
 DEFAULT_COLUMN = "coverage_pct"
+
+# Regexes for the filename forms that show up in `regrid_<cat>.log`.
+# Each one captures (date, hhmm). Order matters — the most specific
+# pattern is tried first.
+_ERROR_FILENAME_PATTERNS = (
+    # OPERA ISO: 2026-03-27T174500Z-rainfall_rate-composite-opera.h5
+    re.compile(r'(?P<date>\d{4}-\d{2}-\d{2})T(?P<hhmm>\d{4})\d{2}Z'),
+    # NWCSAF compact ISO: S_NWC_CMIC_..._20260314T084000Z.nc
+    re.compile(r'_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})T(?P<hhmm>\d{4})\d{2}Z'),
+    # Radar / MTG / NWCSAF outputs: nc4_2026-04-14-Romania_1610_vis_06.npy
+    re.compile(r'(?P<date>\d{4}-\d{2}-\d{2})-Romania_(?P<hhmm>\d{4})_'),
+    # Lightning outputs: lightning_density_20260314_0840.npy
+    re.compile(r'_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})_(?P<hhmm>\d{4})'),
+)
 
 # Matches a Python-like identifier — used to tell a column name apart from
 # the tail of a Windows path when splitting `KEY=PATH:COLUMN`.
@@ -234,27 +248,102 @@ def intersect(coverage_by_product: dict[str, dict[str, float]],
 # CSV filtering
 # =============================================================================
 
+def parse_error_log(log_path: Path) -> set[tuple[str, str]]:
+    """Read a `regrid_<category>.log` file and return the (date, hhmm) pairs.
+
+    Lines that don't begin with `ERROR ` or whose filename can't be parsed
+    are silently ignored — defensive against partial / hand-edited logs.
+    """
+    pairs: set[tuple[str, str]] = set()
+    if not log_path.exists():
+        print(f"  ERROR log not found, skipping: {log_path}")
+        return pairs
+    with open(log_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line.startswith("ERROR "):
+                continue
+            # `ERROR <filename>: <message>` — pull the filename out
+            after = line[len("ERROR "):]
+            fname = after.split(":", 1)[0].strip()
+            for pat in _ERROR_FILENAME_PATTERNS:
+                m = pat.search(fname)
+                if not m:
+                    continue
+                groups = m.groupdict()
+                if "date" in groups:
+                    date_str = groups["date"]
+                else:
+                    date_str = f"{groups['y']}-{groups['m']}-{groups['d']}"
+                pairs.add((date_str, groups["hhmm"]))
+                break
+    return pairs
+
+
+def _row_timesteps(row: dict, idx_cols: list[str]) -> set[tuple[str, str]]:
+    """Compute the set of (date, HHMM) timesteps a sequence row covers.
+
+    `idx_cols` are the per-step columns like `idx_t-30`, `idx_t0`,
+    `idx_t+45` — the numeric suffix is the minute offset from
+    `reference_utc`. Day rollover is handled via a real datetime add.
+    """
+    date_str = row.get("date", "").strip()
+    ref = row.get("reference_utc", "").strip()
+    if not date_str or not ref:
+        return set()
+    try:
+        ref_dt = datetime.strptime(f"{date_str}T{ref}", "%Y-%m-%dT%H:%M")
+    except ValueError:
+        return set()
+    out: set[tuple[str, str]] = set()
+    for col in idx_cols:
+        m = re.match(r"^idx_t(?P<sign>[+-]?)(?P<n>\d+)$", col)
+        if not m:
+            continue
+        offset = int(m.group("n"))
+        if m.group("sign") == "-":
+            offset = -offset
+        step_dt = ref_dt + timedelta(minutes=offset)
+        out.add((step_dt.strftime("%Y-%m-%d"),
+                 step_dt.strftime("%H%M")))
+    return out
+
+
 def filter_csv(input_csv: Path, output_csv: Path,
-               kept_dates: set[str]) -> tuple[int, int]:
-    """Copy `input_csv` to `output_csv`, dropping rows whose date isn't kept."""
+               kept_dates: set[str],
+               error_pairs: set[tuple[str, str]] | None = None,
+               ) -> tuple[int, int, int]:
+    """Copy `input_csv` to `output_csv`, dropping rows whose date isn't kept
+    OR whose timesteps overlap with `error_pairs` (regrid ERROR set).
+
+    Returns (rows_in, rows_kept, rows_dropped_for_errors).
+    """
     if not input_csv.exists():
         print(f"  SKIP {input_csv} (not found)")
-        return 0, 0
-    rows_in = rows_kept = 0
+        return 0, 0, 0
+    rows_in = rows_kept = rows_dropped_for_errors = 0
     output_csv.parent.mkdir(parents=True, exist_ok=True)
+    error_pairs = error_pairs or set()
     with open(input_csv, "r", newline="") as f_in, \
          open(output_csv, "w", newline="") as f_out:
         reader = csv.DictReader(f_in)
         if reader.fieldnames is None or "date" not in reader.fieldnames:
             sys.exit(f"ERROR: {input_csv}: missing `date` column")
+        idx_cols = [c for c in reader.fieldnames if c.startswith("idx_t")]
         writer = csv.DictWriter(f_out, fieldnames=reader.fieldnames)
         writer.writeheader()
         for row in reader:
             rows_in += 1
-            if row.get("date", "").strip() in kept_dates:
-                writer.writerow(row)
-                rows_kept += 1
-    return rows_in, rows_kept
+            if row.get("date", "").strip() not in kept_dates:
+                continue
+            if error_pairs:
+                steps = _row_timesteps(row, idx_cols)
+                if steps & error_pairs:
+                    rows_dropped_for_errors += 1
+                    continue
+            writer.writerow(row)
+            rows_kept += 1
+    return rows_in, rows_kept, rows_dropped_for_errors
 
 
 # =============================================================================
@@ -313,8 +402,29 @@ def main() -> int:
              "/ test_data.csv files. Originals are renamed to "
              "*_original.csv before being replaced.",
     )
+    parser.add_argument(
+        "--errors_log", action="append", default=[], metavar="PATH",
+        help="Path to a `regrid_<category>.log` file (or `errors.txt`) "
+             "produced by regrid.py. Sequence rows whose timesteps "
+             "intersect any (date, HHMM) parsed from these logs are "
+             "dropped in addition to the per-date coverage filter. "
+             "Repeat for each log (radar, MTG, NWCSAF, OPERA, ...).",
+    )
 
     args = parser.parse_args()
+
+    # Collect all (date, HHMM) error pairs from the supplied logs.
+    error_pairs: set[tuple[str, str]] = set()
+    error_log_summaries: list[dict] = []
+    for raw in args.errors_log:
+        log_path = Path(raw)
+        pairs = parse_error_log(log_path)
+        error_pairs |= pairs
+        error_log_summaries.append({
+            "path":  str(log_path),
+            "pairs": len(pairs),
+        })
+        print(f"  errors_log {log_path}: {len(pairs)} (date, HHMM) pairs")
 
     # Parse summary triples
     coverage_by_product: dict[str, dict[str, float]] = {}
@@ -380,7 +490,9 @@ def main() -> int:
         if args.in_place:
             backup_csv = input_csv.with_name(input_csv.stem + "_original" + input_csv.suffix)
             tmp_csv = output_dir / f"{split}_data_consistent.tmp"
-            rows_in, rows_kept = filter_csv(input_csv, tmp_csv, kept_dates)
+            rows_in, rows_kept, rows_dropped_err = filter_csv(
+                input_csv, tmp_csv, kept_dates, error_pairs,
+            )
             if input_csv.exists():
                 if not backup_csv.exists():
                     shutil.copy2(input_csv, backup_csv)
@@ -389,20 +501,25 @@ def main() -> int:
             out_path = input_csv
         else:
             out_path = output_dir / f"{split}_data_consistent.csv"
-            rows_in, rows_kept = filter_csv(input_csv, out_path, kept_dates)
+            rows_in, rows_kept, rows_dropped_err = filter_csv(
+                input_csv, out_path, kept_dates, error_pairs,
+            )
 
         split_summaries[split] = {
-            "input":     str(input_csv),
-            "output":    str(out_path),
-            "rows_in":   rows_in,
-            "rows_kept": rows_kept,
+            "input":              str(input_csv),
+            "output":             str(out_path),
+            "rows_in":            rows_in,
+            "rows_kept":          rows_kept,
+            "rows_dropped_error": rows_dropped_err,
         }
         if rows_in:
             pct = rows_kept / rows_in * 100
         else:
             pct = 0
+        extra = (f" ({rows_dropped_err} dropped for regrid errors)"
+                 if rows_dropped_err else "")
         print(f"  {split:10s}: {rows_kept}/{rows_in} rows kept "
-              f"({pct:.1f}%)  ->  {out_path}")
+              f"({pct:.1f}%){extra}  ->  {out_path}")
 
     # Manifest
     manifest_path = output_dir / "intersect_product_coverage.json"
@@ -413,6 +530,8 @@ def main() -> int:
         "in_place":     bool(args.in_place),
         "sources":      source_by_product,
         "thresholds":   threshold_by_product,
+        "error_logs":   error_log_summaries,
+        "n_error_pairs": len(error_pairs),
         "n_dates_seen": len(rows),
         "n_dates_kept": len(kept_dates),
         "splits":       split_summaries,
