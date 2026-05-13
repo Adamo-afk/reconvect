@@ -818,7 +818,7 @@ import threading
 import time as timer_module
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from netCDF4 import Dataset
 from pyresample import geometry, kd_tree
 import pyproj
@@ -1118,6 +1118,235 @@ def _read_radar_data(filepath):
     return datamap
 
 
+# =============================================================================
+# Module-level workers for ProcessPoolExecutor
+# =============================================================================
+#
+# Each `regrid_*` function below runs its day folders through a fresh
+# `ProcessPoolExecutor`. The workers MUST be defined at module level so
+# they can be pickled to child processes (nested functions can't be).
+#
+# The PrecomputedMapping is large (a few MB of KD-tree index arrays). To
+# avoid re-pickling it on every job, we pass it once to each worker via
+# the pool's `initializer=_init_worker` and stash it in `_WORKER_STATE`.
+# Workers fetch their constants from that dict.
+
+_WORKER_STATE: dict = {}
+
+
+def _init_worker(state):
+    """Per-process initializer — populates `_WORKER_STATE` with the
+    mapping plus any other per-batch constants (channel, product, base
+    output directory, ...) shared across all jobs in a single pool. The
+    state dict is passed as a single positional argument because
+    `ProcessPoolExecutor.initargs` is positional-only."""
+    _WORKER_STATE.clear()
+    _WORKER_STATE.update(state)
+
+
+def _radar_day_worker(job):
+    mapping = _WORKER_STATE['mapping']
+    day_folder, day_path, out_dir, nc_files = job
+    new, skipped = 0, 0
+    for nc_file in nc_files:
+        npy_file = nc_file.replace('.nc', '.npy')
+        out_path = os.path.join(out_dir, npy_file)
+        if output_exists(out_path):
+            skipped += 1
+            continue
+        try:
+            filepath = os.path.join(day_path, nc_file)
+            datamap = _read_radar_data(filepath)
+            regridded = mapping.apply(datamap)
+            regridded = np.flipud(regridded)
+            ensure_dir(out_dir)
+            np.save(out_path, regridded)
+            new += 1
+        except Exception as e:
+            print(f"    ERROR {nc_file}: {e}")
+    return day_folder, new, skipped
+
+
+def _msg_day_worker(job):
+    mapping = _WORKER_STATE['mapping']
+    channel = _WORKER_STATE['channel']
+    day_folder, day_path, out_dir, nc_files = job
+    new, skipped = 0, 0
+    for nc_file in nc_files:
+        npy_file = nc_file.replace('.nc', '.npy')
+        out_path = os.path.join(out_dir, npy_file)
+        if output_exists(out_path):
+            skipped += 1
+            continue
+        try:
+            filepath = os.path.join(day_path, nc_file)
+            with Dataset(filepath, 'r') as ds:
+                var_name = find_data_variable(ds, channel)
+                if var_name is None:
+                    continue
+                sat_data = ds.variables[var_name][:]
+            regridded = mapping.apply(sat_data)
+            ensure_dir(out_dir)
+            np.save(out_path, regridded)
+            new += 1
+        except Exception as e:
+            print(f"    ERROR {nc_file}: {e}")
+    return day_folder, new, skipped
+
+
+def _mtg_day_worker(job):
+    mapping = _WORKER_STATE['mapping']
+    day_folder, day_path, out_dir, npy_files = job
+    new, skipped = 0, 0
+    for npy_file in npy_files:
+        out_path = os.path.join(out_dir, npy_file)
+        if output_exists(out_path):
+            skipped += 1
+            continue
+        try:
+            filepath = os.path.join(day_path, npy_file)
+            sat_data = np.load(filepath)
+            if isinstance(sat_data, np.ma.MaskedArray):
+                sat_data = sat_data.filled(np.nan)
+            sat_data = np.asarray(sat_data, dtype=np.float32)
+            if sat_data.ndim == 3:
+                sat_data = np.squeeze(sat_data, axis=0)
+            regridded = mapping.apply(sat_data, fill_value=np.nan)
+            ensure_dir(out_dir)
+            np.save(out_path, regridded)
+            new += 1
+        except Exception as e:
+            print(f"    ERROR {npy_file}: {e}")
+    return day_folder, new, skipped
+
+
+def _lightning_day_worker(job):
+    day_folder, day_path, out_dir, nc_files = job
+    new, skipped = 0, 0
+    for nc_file in nc_files:
+        npy_file = nc_file.replace('.nc', '.npy')
+        out_path = os.path.join(out_dir, npy_file)
+        if output_exists(out_path):
+            skipped += 1
+            continue
+        try:
+            filepath = os.path.join(day_path, nc_file)
+            with Dataset(filepath, 'r') as ds:
+                datamap = ds.variables['datamap'][:]
+            if isinstance(datamap, np.ma.MaskedArray):
+                datamap = datamap.filled(0.0)
+            if datamap.ndim == 3:
+                datamap = np.squeeze(datamap, axis=0)
+            ensure_dir(out_dir)
+            np.save(out_path, datamap.astype(np.float32))
+            new += 1
+        except Exception as e:
+            print(f"    ERROR {nc_file}: {e}")
+    return day_folder, new, skipped
+
+
+def _nwcsaf_day_worker(job):
+    mapping = _WORKER_STATE['mapping']
+    regridded_base = _WORKER_STATE['regridded_base']
+    day_folder, day_path, nc_files = job
+    new, skipped, errors = 0, 0, 0
+    for nc_file in nc_files:
+        date_str, hhmm, product = _parse_nwcsaf_filename(nc_file)
+        if product is None:
+            continue
+        vars_in_file = [
+            v for v, spec in NWCSAF_VAR_SPEC.items()
+            if spec["product"] == product
+        ]
+        if not vars_in_file:
+            continue
+
+        all_outputs = []
+        for var in vars_in_file:
+            out_dir = os.path.join(
+                regridded_base, var, f"nc4_{date_str}-Romania_{var}"
+            )
+            out_name = f"nc4_{date_str}-Romania_{hhmm}_{var}.npy"
+            all_outputs.append((var, out_dir, os.path.join(out_dir, out_name)))
+        if all(os.path.exists(p) for _, _, p in all_outputs):
+            skipped += 1
+            continue
+
+        try:
+            filepath = os.path.join(day_path, nc_file)
+            with Dataset(filepath, 'r') as ds:
+                raw_data = {
+                    var: ds.variables[var][:] for var in vars_in_file
+                    if var in ds.variables
+                }
+
+            for var, out_dir, out_path in all_outputs:
+                if var not in raw_data:
+                    continue
+                if os.path.exists(out_path):
+                    continue
+                data = raw_data[var]
+                if isinstance(data, np.ma.MaskedArray):
+                    data = data.filled(np.nan)
+                data = np.asarray(data)
+                if data.ndim == 3:
+                    data = np.squeeze(data, axis=0)
+                if data.ndim != 2:
+                    continue
+                dtype = NWCSAF_VAR_SPEC[var]["dtype"]
+                if dtype == np.int8:
+                    data = np.nan_to_num(
+                        data.astype(np.float32), nan=0.0,
+                    )
+                    regridded = mapping.apply(data, fill_value=0)
+                    regridded = np.round(regridded).astype(np.int8)
+                else:
+                    data = np.nan_to_num(
+                        data.astype(np.float32),
+                        nan=0.0, posinf=1e6, neginf=-1e6,
+                    )
+                    regridded = mapping.apply(data, fill_value=np.nan)
+                    regridded = regridded.astype(np.float32)
+                ensure_dir(out_dir)
+                np.save(out_path, regridded)
+            new += 1
+        except Exception as e:
+            errors += 1
+            print(f"    ERROR {nc_file}: {e}")
+    return day_folder, new, skipped, errors
+
+
+def _opera_day_worker(job):
+    mapping = _WORKER_STATE['mapping']
+    product = _WORKER_STATE['product']
+    regridded_base = _WORKER_STATE['regridded_base']
+    date_str, day_path, h5_files = job
+    new, skipped, errors = 0, 0, 0
+    out_dir = os.path.join(
+        regridded_base, product, f"nc4_{date_str}-Romania_{product}"
+    )
+    for h5_file in h5_files:
+        _, hhmm = _parse_opera_filename(h5_file)
+        if hhmm is None:
+            errors += 1
+            continue
+        out_name = f"nc4_{date_str}-Romania_{hhmm}_{product}.npy"
+        out_path = os.path.join(out_dir, out_name)
+        if os.path.exists(out_path):
+            skipped += 1
+            continue
+        try:
+            physical = _read_opera_data(os.path.join(day_path, h5_file))
+            regridded = mapping.apply(physical, fill_value=np.nan)
+            ensure_dir(out_dir)
+            np.save(out_path, regridded.astype(np.float32))
+            new += 1
+        except Exception as e:
+            errors += 1
+            print(f"    [{product}] ERROR {h5_file}: {e}")
+    return date_str, new, skipped, errors
+
+
 def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
     """
     Regrid all radar products. KD-tree built once, day folders in parallel.
@@ -1178,32 +1407,16 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
             )
             mapping_cache[grid_key] = mapping
 
-        # Worker function for one day folder
-        def process_radar_day(job, _mapping=mapping):
-            day_folder, day_path, out_dir, nc_files = job
-            new, skipped = 0, 0
-            for nc_file in nc_files:
-                npy_file = nc_file.replace('.nc', '.npy')
-                out_path = os.path.join(out_dir, npy_file)
-                if output_exists(out_path):
-                    skipped += 1
-                    continue
-                try:
-                    filepath = os.path.join(day_path, nc_file)
-                    datamap = _read_radar_data(filepath)
-                    regridded = _mapping.apply(datamap)
-                    regridded = np.flipud(regridded)
-                    ensure_dir(out_dir)
-                    np.save(out_path, regridded)
-                    new += 1
-                except Exception as e:
-                    print(f"    ERROR {nc_file}: {e}")
-            return day_folder, new, skipped
-
-        # Run day folders in parallel
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        # Run day folders in parallel — the worker is module-level
+        # (`_radar_day_worker`) and reads the shared mapping from
+        # `_WORKER_STATE`, populated once per worker by `_init_worker`.
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_init_worker,
+            initargs=({'mapping': mapping},),
+        ) as pool:
             futures = {
-                pool.submit(process_radar_day, job): job[0]
+                pool.submit(_radar_day_worker, job): job[0]
                 for job in day_jobs
             }
             for future in as_completed(futures):
@@ -1282,35 +1495,13 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
             lat_grid, lon_grid, target_lats, target_lons
         )
 
-        # Worker function
-        def process_msg_day(job, _mapping=mapping, _channel=channel):
-            day_folder, day_path, out_dir, nc_files = job
-            new, skipped = 0, 0
-            for nc_file in nc_files:
-                npy_file = nc_file.replace('.nc', '.npy')
-                out_path = os.path.join(out_dir, npy_file)
-                if output_exists(out_path):
-                    skipped += 1
-                    continue
-                try:
-                    filepath = os.path.join(day_path, nc_file)
-                    with _nc_lock:
-                        with Dataset(filepath, 'r') as ds:
-                            var_name = find_data_variable(ds, _channel)
-                            if var_name is None:
-                                continue
-                            sat_data = ds.variables[var_name][:]
-                    regridded = _mapping.apply(sat_data)
-                    ensure_dir(out_dir)
-                    np.save(out_path, regridded)
-                    new += 1
-                except Exception as e:
-                    print(f"    ERROR {nc_file}: {e}")
-            return day_folder, new, skipped
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_init_worker,
+            initargs=({'mapping': mapping, 'channel': channel},),
+        ) as pool:
             futures = {
-                pool.submit(process_msg_day, job): job[0]
+                pool.submit(_msg_day_worker, job): job[0]
                 for job in day_jobs
             }
             for future in as_completed(futures):
@@ -1486,42 +1677,15 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
             print(f"    No day folders found for {channel}")
             continue
 
-        # Worker function — reads .npy, regrids, saves .npy.
         # The cadence filter is enforced upstream by pipeline_msg_mtg.py
         # (via timestep_config.json), so no minute filtering is needed here.
-        def process_mtg_day(job, _mapping=mapping, _channel=channel):
-            day_folder, day_path, out_dir, npy_files = job
-            new, skipped = 0, 0
-            for npy_file in npy_files:
-                out_path = os.path.join(out_dir, npy_file)
-                if output_exists(out_path):
-                    skipped += 1
-                    continue
-
-                try:
-                    filepath = os.path.join(day_path, npy_file)
-                    sat_data = np.load(filepath)
-
-                    if isinstance(sat_data, np.ma.MaskedArray):
-                        sat_data = sat_data.filled(np.nan)
-                    sat_data = np.asarray(sat_data, dtype=np.float32)
-
-                    if sat_data.ndim == 3:
-                        sat_data = np.squeeze(sat_data, axis=0)
-
-                    regridded = _mapping.apply(sat_data, fill_value=np.nan)
-
-                    ensure_dir(out_dir)
-                    np.save(out_path, regridded)
-                    new += 1
-
-                except Exception as e:
-                    print(f"    ERROR {npy_file}: {e}")
-            return day_folder, new, skipped
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_init_worker,
+            initargs=({'mapping': mapping},),
+        ) as pool:
             futures = {
-                pool.submit(process_mtg_day, job): job[0]
+                pool.submit(_mtg_day_worker, job): job[0]
                 for job in day_jobs
             }
             for future in as_completed(futures):
@@ -1574,35 +1738,17 @@ def regrid_lightning(data_root, date_filter=None):
             print(f"    No day folders found for {product}")
             continue
 
-        # Worker function
-        def process_lightning_day(job):
-            day_folder, day_path, out_dir, nc_files = job
-            new, skipped = 0, 0
-            for nc_file in nc_files:
-                npy_file = nc_file.replace('.nc', '.npy')
-                out_path = os.path.join(out_dir, npy_file)
-                if output_exists(out_path):
-                    skipped += 1
-                    continue
-                try:
-                    filepath = os.path.join(day_path, nc_file)
-                    with _nc_lock:
-                        with Dataset(filepath, 'r') as ds:
-                            datamap = ds.variables['datamap'][:]
-                    if isinstance(datamap, np.ma.MaskedArray):
-                        datamap = datamap.filled(0.0)
-                    if datamap.ndim == 3:
-                        datamap = np.squeeze(datamap, axis=0)
-                    ensure_dir(out_dir)
-                    np.save(out_path, datamap.astype(np.float32))
-                    new += 1
-                except Exception as e:
-                    print(f"    ERROR {nc_file}: {e}")
-            return day_folder, new, skipped
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        # Lightning has no regrid step (already on the Romania grid) —
+        # the worker just reads NetCDF and writes `.npy`. No mapping
+        # to share, but we still hand `_init_worker` an empty state so
+        # `_WORKER_STATE` is in a known shape inside the pool.
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_init_worker,
+            initargs=({},),
+        ) as pool:
             futures = {
-                pool.submit(process_lightning_day, job): job[0]
+                pool.submit(_lightning_day_worker, job): job[0]
                 for job in day_jobs
             }
             for future in as_completed(futures):
@@ -1720,80 +1866,13 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
             }, f, indent=2)
         print(f"    Wrote {constants_path}")
 
-    def process_nwcsaf_day(job, _mapping=mapping):
-        day_folder, day_path, nc_files = job
-        new, skipped, errors = 0, 0, 0
-        for nc_file in nc_files:
-            date_str, hhmm, product = _parse_nwcsaf_filename(nc_file)
-            if product is None:
-                continue
-            # Which variables we extract depends on the product file
-            vars_in_file = [
-                v for v, spec in NWCSAF_VAR_SPEC.items()
-                if spec["product"] == product
-            ]
-            if not vars_in_file:
-                continue
-
-            # Skip-if-every-output-already-exists check (per source file).
-            all_outputs = []
-            for var in vars_in_file:
-                out_dir = os.path.join(
-                    regridded_base, var, f"nc4_{date_str}-Romania_{var}"
-                )
-                out_name = f"nc4_{date_str}-Romania_{hhmm}_{var}.npy"
-                all_outputs.append((var, out_dir, os.path.join(out_dir, out_name)))
-            if all(os.path.exists(p) for _, _, p in all_outputs):
-                skipped += 1
-                continue
-
-            try:
-                filepath = os.path.join(day_path, nc_file)
-                with _nc_lock:
-                    with Dataset(filepath, 'r') as ds:
-                        raw_data = {
-                            var: ds.variables[var][:] for var in vars_in_file
-                            if var in ds.variables
-                        }
-
-                for var, out_dir, out_path in all_outputs:
-                    if var not in raw_data:
-                        continue
-                    if os.path.exists(out_path):
-                        continue
-                    data = raw_data[var]
-                    if isinstance(data, np.ma.MaskedArray):
-                        data = data.filled(np.nan)
-                    data = np.asarray(data)
-                    if data.ndim == 3:
-                        data = np.squeeze(data, axis=0)
-                    if data.ndim != 2:
-                        continue
-                    dtype = NWCSAF_VAR_SPEC[var]["dtype"]
-                    if dtype == np.int8:
-                        # Categorical: NaN → 0 ("no cloud / missing"), then int8.
-                        data = np.nan_to_num(
-                            data.astype(np.float32), nan=0.0,
-                        )
-                        regridded = _mapping.apply(data, fill_value=0)
-                        regridded = np.round(regridded).astype(np.int8)
-                    else:
-                        data = np.nan_to_num(
-                            data.astype(np.float32),
-                            nan=0.0, posinf=1e6, neginf=-1e6,
-                        )
-                        regridded = _mapping.apply(data, fill_value=np.nan)
-                        regridded = regridded.astype(np.float32)
-                    ensure_dir(out_dir)
-                    np.save(out_path, regridded)
-                new += 1
-            except Exception as e:
-                errors += 1
-                print(f"    ERROR {nc_file}: {e}")
-        return day_folder, new, skipped, errors
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(process_nwcsaf_day, j): j[0] for j in day_jobs}
+    with ProcessPoolExecutor(
+        max_workers=MAX_WORKERS,
+        initializer=_init_worker,
+        initargs=({'mapping': mapping,
+                   'regridded_base': regridded_base},),
+    ) as pool:
+        futures = {pool.submit(_nwcsaf_day_worker, j): j[0] for j in day_jobs}
         for future in as_completed(futures):
             day_folder, new, skipped, errors = future.result()
             total = new + skipped
@@ -1900,36 +1979,14 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
             src_lats, src_lons, target_lats, target_lons,
         )
 
-        # Worker — per-day batch, one .npy written per .h5
-        def process_opera_day(job, _mapping=mapping, _product=product):
-            date_str, day_path, h5_files = job
-            new, skipped, errors = 0, 0, 0
-            out_dir = os.path.join(
-                regridded_base, _product, f"nc4_{date_str}-Romania_{_product}"
-            )
-            for h5_file in h5_files:
-                _, hhmm = _parse_opera_filename(h5_file)
-                if hhmm is None:
-                    errors += 1
-                    continue
-                out_name = f"nc4_{date_str}-Romania_{hhmm}_{_product}.npy"
-                out_path = os.path.join(out_dir, out_name)
-                if os.path.exists(out_path):
-                    skipped += 1
-                    continue
-                try:
-                    physical = _read_opera_data(os.path.join(day_path, h5_file))
-                    regridded = _mapping.apply(physical, fill_value=np.nan)
-                    ensure_dir(out_dir)
-                    np.save(out_path, regridded.astype(np.float32))
-                    new += 1
-                except Exception as e:
-                    errors += 1
-                    print(f"    [{_product}] ERROR {h5_file}: {e}")
-            return date_str, new, skipped, errors
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(process_opera_day, j): j[0] for j in day_jobs}
+        with ProcessPoolExecutor(
+            max_workers=MAX_WORKERS,
+            initializer=_init_worker,
+            initargs=({'mapping': mapping,
+                       'product': product,
+                       'regridded_base': regridded_base},),
+        ) as pool:
+            futures = {pool.submit(_opera_day_worker, j): j[0] for j in day_jobs}
             for future in as_completed(futures):
                 date_str, new, skipped, errors = future.result()
                 total = new + skipped
