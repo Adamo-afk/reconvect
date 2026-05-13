@@ -174,7 +174,7 @@ class NWCSAFCCS4Reader(DatasetReader):
 
     def read_fields_from_archive(self, time, variable, filename):
 
-        from our_data.nwcsaf_data.process_nwcsaf import read_and_scale_nwcsaf_variable
+        from legacy.process_nwcsaf import read_and_scale_nwcsaf_variable
 
         # if variables is None:
         #     variables = self.variables
