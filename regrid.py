@@ -1134,6 +1134,30 @@ def _read_radar_data(filepath):
 _WORKER_STATE: dict = {}
 
 
+def _write_regrid_log(regridded_root, category, all_errors):
+    """Write a single-line-per-error log named after the regrid category.
+
+    Format matches `errors.txt`:
+        ERROR <filename>: <message>
+
+    The log is written under `regridded_root` (typically
+    `our_data/regridded_data/`) so it sits next to the regridded outputs.
+    Always overwrites — the log reflects the state of the most recent
+    run, not a cumulative history. If no errors occurred, the log is
+    still written but empty so downstream consumers can `open()` it
+    unconditionally.
+    """
+    ensure_dir(regridded_root)
+    log_path = os.path.join(regridded_root, f"regrid_{category}.log")
+    with open(log_path, 'w', encoding='utf-8') as f:
+        for fname, msg in all_errors:
+            f.write(f"ERROR {fname}: {msg}\n")
+    n = len(all_errors)
+    if n > 0:
+        print(f"    Wrote {n} error line(s) to {log_path}")
+    return log_path
+
+
 def _init_worker(state):
     """Per-process initializer — populates `_WORKER_STATE` with the
     mapping plus any other per-batch constants (channel, product, base
@@ -1148,6 +1172,7 @@ def _radar_day_worker(job):
     mapping = _WORKER_STATE['mapping']
     day_folder, day_path, out_dir, nc_files = job
     new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     for nc_file in nc_files:
         npy_file = nc_file.replace('.nc', '.npy')
         out_path = os.path.join(out_dir, npy_file)
@@ -1163,8 +1188,8 @@ def _radar_day_worker(job):
             np.save(out_path, regridded)
             new += 1
         except Exception as e:
-            print(f"    ERROR {nc_file}: {e}")
-    return day_folder, new, skipped
+            errors.append((nc_file, str(e)))
+    return day_folder, new, skipped, errors
 
 
 def _msg_day_worker(job):
@@ -1172,6 +1197,7 @@ def _msg_day_worker(job):
     channel = _WORKER_STATE['channel']
     day_folder, day_path, out_dir, nc_files = job
     new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     for nc_file in nc_files:
         npy_file = nc_file.replace('.nc', '.npy')
         out_path = os.path.join(out_dir, npy_file)
@@ -1190,14 +1216,15 @@ def _msg_day_worker(job):
             np.save(out_path, regridded)
             new += 1
         except Exception as e:
-            print(f"    ERROR {nc_file}: {e}")
-    return day_folder, new, skipped
+            errors.append((nc_file, str(e)))
+    return day_folder, new, skipped, errors
 
 
 def _mtg_day_worker(job):
     mapping = _WORKER_STATE['mapping']
     day_folder, day_path, out_dir, npy_files = job
     new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     for npy_file in npy_files:
         out_path = os.path.join(out_dir, npy_file)
         if output_exists(out_path):
@@ -1216,13 +1243,14 @@ def _mtg_day_worker(job):
             np.save(out_path, regridded)
             new += 1
         except Exception as e:
-            print(f"    ERROR {npy_file}: {e}")
-    return day_folder, new, skipped
+            errors.append((npy_file, str(e)))
+    return day_folder, new, skipped, errors
 
 
 def _lightning_day_worker(job):
     day_folder, day_path, out_dir, nc_files = job
     new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     for nc_file in nc_files:
         npy_file = nc_file.replace('.nc', '.npy')
         out_path = os.path.join(out_dir, npy_file)
@@ -1241,15 +1269,16 @@ def _lightning_day_worker(job):
             np.save(out_path, datamap.astype(np.float32))
             new += 1
         except Exception as e:
-            print(f"    ERROR {nc_file}: {e}")
-    return day_folder, new, skipped
+            errors.append((nc_file, str(e)))
+    return day_folder, new, skipped, errors
 
 
 def _nwcsaf_day_worker(job):
     mapping = _WORKER_STATE['mapping']
     regridded_base = _WORKER_STATE['regridded_base']
     day_folder, day_path, nc_files = job
-    new, skipped, errors = 0, 0, 0
+    new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     for nc_file in nc_files:
         date_str, hhmm, product = _parse_nwcsaf_filename(nc_file)
         if product is None:
@@ -1314,8 +1343,7 @@ def _nwcsaf_day_worker(job):
                 np.save(out_path, regridded)
             new += 1
         except Exception as e:
-            errors += 1
-            print(f"    ERROR {nc_file}: {e}")
+            errors.append((nc_file, str(e)))
     return day_folder, new, skipped, errors
 
 
@@ -1324,14 +1352,15 @@ def _opera_day_worker(job):
     product = _WORKER_STATE['product']
     regridded_base = _WORKER_STATE['regridded_base']
     date_str, day_path, h5_files = job
-    new, skipped, errors = 0, 0, 0
+    new, skipped = 0, 0
+    errors: list[tuple[str, str]] = []
     out_dir = os.path.join(
         regridded_base, product, f"nc4_{date_str}-Romania_{product}"
     )
     for h5_file in h5_files:
         _, hhmm = _parse_opera_filename(h5_file)
         if hhmm is None:
-            errors += 1
+            errors.append((h5_file, "filename did not match the expected pattern"))
             continue
         out_name = f"nc4_{date_str}-Romania_{hhmm}_{product}.npy"
         out_path = os.path.join(out_dir, out_name)
@@ -1345,8 +1374,7 @@ def _opera_day_worker(job):
             np.save(out_path, regridded.astype(np.float32))
             new += 1
         except Exception as e:
-            errors += 1
-            print(f"    [{product}] ERROR {h5_file}: {e}")
+            errors.append((h5_file, str(e)))
     return date_str, new, skipped, errors
 
 
@@ -1364,6 +1392,10 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
     # Cache mappings by source grid shape to avoid rebuilding
     # when multiple products share the same grid
     mapping_cache = {}
+
+    # Collect errors across all products so we can write one
+    # `regrid_radar.log` at the end.
+    all_errors: list[tuple[str, str]] = []
 
     for product in RADAR_PRODUCTS:
         product_dir = os.path.join(radar_dir, product)
@@ -1423,11 +1455,17 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
                 for job in day_jobs
             }
             for future in as_completed(futures):
-                day_folder, new, skipped = future.result()
+                day_folder, new, skipped, errs = future.result()
                 total = new + skipped
-                if total > 0:
+                if total > 0 or errs:
                     print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{total} total")
+                          f"{total} total, {len(errs)} errors")
+                all_errors.extend(errs)
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'radar', all_errors,
+    )
 
 
 # =============================================================================
@@ -1446,6 +1484,8 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
     if not os.path.isdir(msg_dir):
         print(f"  MSG directory not found: {msg_dir}")
         return
+
+    all_errors: list[tuple[str, str]] = []
 
     for channel in MSG_CHANNELS:
         channel_dir = os.path.join(msg_dir, channel)
@@ -1508,11 +1548,17 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
                 for job in day_jobs
             }
             for future in as_completed(futures):
-                day_folder, new, skipped = future.result()
+                day_folder, new, skipped, errs = future.result()
                 total = new + skipped
-                if total > 0:
+                if total > 0 or errs:
                     print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{total} total")
+                          f"{total} total, {len(errs)} errors")
+                all_errors.extend(errs)
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'satellite_MSG', all_errors,
+    )
 
 
 # =============================================================================
@@ -1606,6 +1652,7 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
 
     # Build KD-tree mappings per resolution from the constants file
     mapping_cache = {}
+    all_errors: list[tuple[str, str]] = []
 
     for res in ['1km', '2km']:
         # Check if any requested channel needs this resolution
@@ -1692,11 +1739,17 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
                 for job in day_jobs
             }
             for future in as_completed(futures):
-                day_folder, new, skipped = future.result()
+                day_folder, new, skipped, errs = future.result()
                 total = new + skipped
-                if total > 0:
+                if total > 0 or errs:
                     print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{total} used")
+                          f"{total} used, {len(errs)} errors")
+                all_errors.extend(errs)
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'satellite_MTG', all_errors,
+    )
 
 
 # =============================================================================
@@ -1713,6 +1766,8 @@ def regrid_lightning(data_root, date_filter=None):
     if not os.path.isdir(lightning_dir):
         print(f"  Lightning directory not found: {lightning_dir}")
         return
+
+    all_errors: list[tuple[str, str]] = []
 
     for product in LIGHTNING_PRODUCTS:
         product_dir = os.path.join(lightning_dir, product)
@@ -1755,11 +1810,17 @@ def regrid_lightning(data_root, date_filter=None):
                 for job in day_jobs
             }
             for future in as_completed(futures):
-                day_folder, new, skipped = future.result()
+                day_folder, new, skipped, errs = future.result()
                 total = new + skipped
-                if total > 0:
+                if total > 0 or errs:
                     print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{total} total")
+                          f"{total} total, {len(errs)} errors")
+                all_errors.extend(errs)
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'lightning', all_errors,
+    )
 
 
 # =============================================================================
@@ -1876,6 +1937,8 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
             }, f, indent=2)
         print(f"    Wrote {constants_path}")
 
+    all_errors: list[tuple[str, str]] = []
+
     with ProcessPoolExecutor(
         max_workers=MAX_WORKERS,
         initializer=_init_worker,
@@ -1884,11 +1947,17 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
     ) as pool:
         futures = {pool.submit(_nwcsaf_day_worker, j): j[0] for j in day_jobs}
         for future in as_completed(futures):
-            day_folder, new, skipped, errors = future.result()
+            day_folder, new, skipped, errs = future.result()
             total = new + skipped
-            if total > 0 or errors > 0:
+            if total > 0 or errs:
                 print(f"    {day_folder}: {new} new, {skipped} cached, "
-                      f"{errors} errors")
+                      f"{len(errs)} errors")
+            all_errors.extend(errs)
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'nwcsaf', all_errors,
+    )
 
 
 # =============================================================================
@@ -1937,6 +2006,7 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
 
     ensure_dir(regridded_base)
     constants = {}
+    all_errors: list[tuple[str, str]] = []
 
     for product, cfg in OPERA_PRODUCTS.items():
         product_dir = os.path.join(opera_dir, cfg["remote_subdir"])
@@ -1978,6 +2048,8 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
             src_lats, src_lons, meta = _read_opera_source_grid(first_file)
         except Exception as e:
             print(f"  [{product}] ERROR reading source grid: {e}")
+            all_errors.append((day_jobs[0][2][0],
+                               f"source-grid read failed: {e}"))
             continue
         constants[product] = meta
         nan_mask = np.isnan(src_lats) | np.isnan(src_lons)
@@ -1998,17 +2070,23 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
         ) as pool:
             futures = {pool.submit(_opera_day_worker, j): j[0] for j in day_jobs}
             for future in as_completed(futures):
-                date_str, new, skipped, errors = future.result()
+                date_str, new, skipped, errs = future.result()
                 total = new + skipped
-                if total > 0 or errors > 0:
+                if total > 0 or errs:
                     print(f"    [{product}] {date_str}: {new} new, "
-                          f"{skipped} cached, {errors} errors")
+                          f"{skipped} cached, {len(errs)} errors")
+                all_errors.extend(errs)
 
     if constants:
         constants_path = os.path.join(regridded_base, 'opera_constants.json')
         with open(constants_path, 'w') as f:
             json.dump(constants, f, indent=2)
         print(f"  Wrote {constants_path}")
+
+    _write_regrid_log(
+        os.path.join(data_root, 'regridded_data'),
+        'opera', all_errors,
+    )
 
 
 # =============================================================================
