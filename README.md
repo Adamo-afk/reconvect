@@ -2,16 +2,17 @@
 
 Adaptation of the [COALITION-4](https://doi.org/10.1175/MWR-D-22-0084.1) deep learning nowcasting system (Leinonen et al., 2022, MeteoSwiss) for Romanian meteorological conditions. Developed at Romania's National Meteorological Administration (ANM) as part of the EUMETSAT Training Placement Scheme.
 
-The system uses a recurrent-convolutional encoder-decoder architecture operating on the EPSG:31700 Stereo70 projection of Romania to produce 45-minute lightning and radar reflectivity nowcasts from multi-source meteorological inputs.
+The system uses a recurrent-convolutional encoder-decoder architecture operating on the EPSG:31700 Stereo70 projection of Romania to produce 45-minute precipitation and lightning nowcasts from multi-source meteorological inputs.
 
 ## Project Overview
 
-Two parallel training configurations are supported for MSG vs MTG satellite comparison:
+Three training configurations are supported. The first two compare MSG vs MTG with the legacy ANM-radar precipitation target; the third replaces the legacy radar with the pan-European **OPERA** composite and is the basis for the NWCSAF Shapley study (whether NWCSAF adds skill on top of radar + MTG).
 
-- **MSG experiment**: Radar + LINET lightning + MSG SEVIRI (5 channels, 3 km) + NWCSAF
-- **MTG experiment**: Radar + LINET lightning + MTG FCI (5 channels, 1–2 km) + NWCSAF
+- **MSG experiment**: ANM radar + LINET lightning + MSG SEVIRI (5 channels, 3 km) + NWCSAF
+- **MTG experiment**: ANM radar + LINET lightning + MTG FCI (5 channels, 1–2 km) + NWCSAF
+- **MTG + OPERA experiment** (NWCSAF Shapley study): **OPERA** precipitation composite (reflectivity + instantaneous rainfall rate, 2 km, 15 min) + MTG FCI + NWCSAF. The label is `opera_rainfall_rate` multi-class (5 bins, same thresholds as the radar configuration). No lightning. Four coalition modes (`mtg_opera_radar_only / _mtgmr / _nwcsaf / _full`) are trained to compute classical Shapley values for MTG IR/WV and NWCSAF, with OPERA always present.
 
-Both share the same radar targets, lightning labels, and NWCSAF cloud products. Only the satellite input branch differs, enabling a clean comparison between the two imagers.
+The first two share the same radar targets, lightning labels, and NWCSAF cloud products; only the satellite input branch differs. The OPERA configuration switches the radar source: same downstream pipeline (regridding to EPSG:31700, DBSCAN-driven patch index, sequence extraction, normalization, dataset creation, training, evaluation), but driven by OPERA's pre-regridded HDF5 instead of the legacy ANM-radar NetCDF.
 
 ## Environment Setup
 
@@ -182,9 +183,20 @@ coalition4-rcnn/
 
 | Category | Grid Resolution | Patch Size | Pooling | Products |
 |----------|----------------|------------|---------|----------|
-| HR (1 km) | 1536×768 | 256×256 | None | Radar (RZC, BZC, CZC, EZC-20, LZC, CPCH), Lightning (density, current, occurrence), MTG vis_06 |
-| LR (2 km) | 1536×768 | 128×128 | 2×2 avg | MTG IR/WV (ir_38, ir_105, wv_63, wv_73) |
+| HR (1 km) | 1536×768 | 256×256 | None | Radar (RZC, BZC, CZC, EZC-20, LZC, CPCH), Lightning (density, current, occurrence), MTG vis_06, OPERA rainfall_rate (HR alias for the label head) |
+| LR (2 km) | 1536×768 | 128×128 | 2×2 avg | MTG IR/WV (ir_38, ir_105, wv_63, wv_73), OPERA (reflectivity, rainfall_rate) |
 | LR (3 km) | 1536×768 | 64×64 | 4×4 avg | MSG (VIS006, IR_039, IR_108, WV_062, WV_073), NWCSAF (ctth_alti, ctth_tempe, cmic_phase, cmic_cot) |
+
+### Data Sources
+
+| Source | Products | Native cadence | Native resolution | Role | Pipeline entry point |
+|---|---|---|---|---|---|
+| **ANM radar** (legacy) | RZC, BZC, CZC, EZC-20, LZC, CPCH | 10 min | ~1 km | Precipitation target + features (MSG/MTG experiments) | `our_data/raw_data/radar_arrange.py` |
+| **LINET lightning** | density, current, occurrence | 5 min (aggregated to step) | Native KML → 1 km grid | Lightning target + features | `our_data/raw_data/lightning_arrange.py`, `our_data/lightning_data/read_kml_version2.py` |
+| **MSG SEVIRI** *(disabled in active build)* | VIS006, IR_039, IR_108, WV_062, WV_073 | 15 min | 3 km | Satellite features (LR branch) | `our_data/satellite_data/pipeline_msg_mtg.py` |
+| **MTG FCI L1C** | vis_06, ir_38, ir_105, wv_63, wv_73 | 10 min | 1 km (vis_06) / 2 km (IR/WV) | Satellite features (HR + MR branches) | `our_data/satellite_data/pipeline_msg_mtg.py` |
+| **NWCSAF L2** | ctth_alti, ctth_tempe, cmic_phase, cmic_cot | 10 min | 3 km | Cloud-product features (LR branch) | `our_data/nwcsaf_data/pipeline_nwcsaf.py` |
+| **OPERA composite** | reflectivity (dBZ), rainfall_rate (mm/h) | 15 min | 2 km | Precipitation target + features for the **MTG+OPERA experiment** (replaces ANM radar) | `our_data/opera_data/pipeline_opera.py` |
 
 ### Satellite Channel Selection
 
