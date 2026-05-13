@@ -3,7 +3,7 @@ pipeline_opera.py — SFTP/SCP download of OPERA radar data from the EWC VM.
 
 Two products:
 
-    opera_reflectivity   Maximum reflectivity (dBZ), 1 km, 5-min cadence
+    opera_reflectivity   Maximum reflectivity (dBZ), 1 km, 15-min cadence
     opera_rainfall_rate  Instantaneous rain rate (mm/h), 2 km, 15-min cadence
 
 Remote layout on `claudiu@64.225.128.186`:
