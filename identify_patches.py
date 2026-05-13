@@ -213,8 +213,7 @@ def regrid_to_romania(datamap, source_lats, source_lons, target_lats, target_lon
 # DBSCAN → binary mask
 # =============================================================================
 
-def dbscan_binary_mask(datamap, threshold=DBSCAN_THRESHOLD,
-                       eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES):
+def dbscan_binary_mask(datamap, threshold=None, eps=None, min_samples=None):
     """
     Run DBSCAN on the regridded radar data and produce a binary mask.
 
@@ -223,13 +222,27 @@ def dbscan_binary_mask(datamap, threshold=DBSCAN_THRESHOLD,
 
     Args:
         datamap: 2D array (768×1536) of regridded RZC values
-        threshold: minimum RZC value to consider
-        eps: DBSCAN neighborhood radius
-        min_samples: DBSCAN minimum cluster size
+        threshold: minimum RZC value to consider. Defaults to the
+            current module-level `DBSCAN_THRESHOLD` so CLI overrides
+            (which reassign that global) actually take effect.
+        eps: DBSCAN neighborhood radius. Defaults to `DBSCAN_EPS`.
+        min_samples: DBSCAN minimum cluster size. Defaults to
+            `DBSCAN_MIN_SAMPLES`.
 
     Returns:
         np.ndarray: Binary mask (768×1536), dtype uint8
     """
+    # Resolve defaults at call time, not at module-import time. Using
+    # `threshold=DBSCAN_THRESHOLD` in the signature would freeze the
+    # default to whatever `DBSCAN_THRESHOLD` was when the function was
+    # defined (Python evaluates defaults once), making `--threshold`
+    # silently ineffective even after the CLI rebinds the global.
+    if threshold is None:
+        threshold = DBSCAN_THRESHOLD
+    if eps is None:
+        eps = DBSCAN_EPS
+    if min_samples is None:
+        min_samples = DBSCAN_MIN_SAMPLES
     # Find pixels above threshold
     points = np.where(datamap > threshold)
 
