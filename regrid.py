@@ -767,12 +767,17 @@ Optimization: the KD-tree is built ONCE per source geometry (not per file).
 All files sharing the same source grid reuse the precomputed index mapping,
 reducing regridding to a fast numpy array lookup.
 
-Products handled:
+Products handled — every family writes `.npy`. The Romania grid coordinates
+(`romania_grid_lats.npy`, `romania_grid_lons.npy`) and per-source projection
+constants (`{mtg,nwcsaf,opera}_constants.json`) are written **once** as
+sidecars so the regridded arrays remain self-recoverable for inspection.
+
     - Radar:     RZC, BZC, CZC, EZC-20, LZC, CPCH       → .npy
-    - MSG:       VIS006, IR_039, IR_108, WV_062, WV_073   → .npy
-    - MTG:       vis_06, ir_38, ir_105, wv_63, wv_73      → .npy (use inspect_mtg.py for .nc)
-    - Lightning: density, current, occurrence (already on grid)   → .npy
-    - NWCSAF:    ctth_alti, ctth_tempe, cmic_phase, cmic_cot     → .nc
+    - MSG:       VIS006, IR_039, IR_108, WV_062, WV_073 → .npy   (disabled)
+    - MTG:       vis_06, ir_38, ir_105, wv_63, wv_73    → .npy
+    - Lightning: density, current, occurrence (already on grid) → .npy
+    - NWCSAF:    ctth_alti, ctth_tempe, cmic_phase (int8), cmic_cot → .npy
+    - OPERA:     reflectivity, rainfall_rate            → .npy
 
 Input paths:
     our_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.nc
@@ -781,13 +786,18 @@ Input paths:
     our_data/satellite_data/MTG/mtg_constants.json
     our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.nc
     our_data/nwcsaf_data/{date}-Romania/*.nc
+    our_data/opera_data/{reflectivity|rainfall_rate}/{YYYY}/{MM}/{DD}/*.h5
 
 Output paths:
+    our_data/regridded_data/romania_grid_{lats,lons}.npy             (shared)
     our_data/regridded_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
     our_data/regridded_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
     our_data/regridded_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
     our_data/regridded_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
-    our_data/regridded_data/nwcsaf_data/{date}-Romania/*.nc
+    our_data/regridded_data/nwcsaf_data/{var}/nc4_{date}-Romania_{var}/*.npy
+    our_data/regridded_data/nwcsaf_data/nwcsaf_constants.json
+    our_data/regridded_data/opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
+    our_data/regridded_data/opera_data/opera_constants.json
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
     python regrid_data.py --radar
@@ -799,9 +809,10 @@ Usage (run from F:\\nowcasting\\coalition4-rcnn):
     python regrid_data.py --radar --date 2024-06-13
 """
 
+import json
 import numpy as np
-import xarray as xr
 import os
+import re
 import argparse
 import threading
 import time as timer_module
@@ -812,10 +823,136 @@ from netCDF4 import Dataset
 from pyresample import geometry, kd_tree
 import pyproj
 
+try:
+    import h5py
+except ImportError:
+    h5py = None  # only required by the OPERA path; checked at call time
+
 from c4dl.projection import GridProjection, romania_grid_area
 
 # Global lock for netCDF4/HDF5 reads (C library is not thread-safe)
 _nc_lock = threading.Lock()
+_h5_lock = threading.Lock()  # h5py builds aren't always thread-safe
+
+
+# =============================================================================
+# OPERA HDF5 helpers (used by regrid_opera and shared with inspect tools)
+# =============================================================================
+
+# Filename timestamp parsers — see pipeline_opera.py for the conventions:
+#   ISO     (current EWC dump): 2026-05-11T000500Z-reflectivity-composite-opera.h5
+#   Compact (legacy / EUMETSAT): T_PAAH21_C_LFPW_20250615120000.h5
+_OPERA_TIMESTAMP_PATTERN_ISO = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})Z?'
+)
+_OPERA_TIMESTAMP_PATTERN_COMPACT = re.compile(r'(\d{12,14})')
+
+
+def _parse_opera_filename(name: str):
+    """Return (date_str 'YYYY-MM-DD', hhmm 'HHMM') from an OPERA filename."""
+    m = _OPERA_TIMESTAMP_PATTERN_ISO.search(name)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5)), int(m.group(6)))
+            return dt.strftime('%Y-%m-%d'), dt.strftime('%H%M')
+        except ValueError:
+            pass
+    m = _OPERA_TIMESTAMP_PATTERN_COMPACT.search(name)
+    if m:
+        ts = m.group(1)[:12]
+        try:
+            dt = datetime.strptime(ts, '%Y%m%d%H%M')
+            return dt.strftime('%Y-%m-%d'), dt.strftime('%H%M')
+        except ValueError:
+            pass
+    return None, None
+
+
+def _decode_h5_attr(value):
+    """Decode an HDF5 attribute that may be bytes or a 0-d array."""
+    if hasattr(value, 'item'):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', errors='replace')
+    return value
+
+
+def _read_opera_source_grid(h5_path):
+    """
+    Build a 2-D source lat/lon grid from an OPERA HDF5 file's /where metadata.
+    Returns (lats, lons, projection_metadata_dict).
+    """
+    if h5py is None:
+        raise RuntimeError("h5py is required for OPERA regridding; "
+                           "install via `pip install h5py`.")
+    with h5py.File(h5_path, 'r') as f:
+        where = f['/where'].attrs
+        projdef = _decode_h5_attr(where['projdef'])
+        xsize = int(_decode_h5_attr(where['xsize']))
+        ysize = int(_decode_h5_attr(where['ysize']))
+        xscale = float(_decode_h5_attr(where['xscale']))
+        yscale = float(_decode_h5_attr(where['yscale']))
+        ll_lon = float(_decode_h5_attr(where['LL_lon']))
+        ll_lat = float(_decode_h5_attr(where['LL_lat']))
+        ur_lon = float(_decode_h5_attr(where['UR_lon']))
+        ur_lat = float(_decode_h5_attr(where['UR_lat']))
+
+    src_proj = pyproj.Proj(projdef)
+    geographic = pyproj.Proj('epsg:4326')
+    to_xy = pyproj.Transformer.from_proj(geographic, src_proj, always_xy=True)
+    ll_x, _ = to_xy.transform(ll_lon, ll_lat)   # x of lower-left corner (m)
+    _, ur_y = to_xy.transform(ur_lon, ur_lat)   # y of upper-right corner (m)
+
+    x_centres = ll_x + (np.arange(xsize) + 0.5) * xscale
+    y_centres = ur_y - (np.arange(ysize) + 0.5) * yscale
+    xx, yy = np.meshgrid(x_centres, y_centres)
+
+    to_geo = pyproj.Transformer.from_proj(src_proj, geographic, always_xy=True)
+    lons, lats = to_geo.transform(xx, yy)
+    invalid = np.isinf(lons) | np.isinf(lats) | np.isnan(lons) | np.isnan(lats)
+    lons = np.where(invalid, 0.0, lons).astype(np.float64)
+    lats = np.where(invalid, 0.0, lats).astype(np.float64)
+
+    metadata = {
+        "projdef":  projdef,
+        "xsize":    xsize,
+        "ysize":    ysize,
+        "xscale":   xscale,
+        "yscale":   yscale,
+        "LL_lon":   ll_lon,
+        "LL_lat":   ll_lat,
+        "UR_lon":   ur_lon,
+        "UR_lat":   ur_lat,
+    }
+    return lats, lons, metadata
+
+
+def _read_opera_data(h5_path):
+    """
+    Read the raw data and apply gain/offset + nodata/undetect masks.
+    Returns a float32 2-D array (NaN where nodata, 0 where undetect).
+    """
+    if h5py is None:
+        raise RuntimeError("h5py is required for OPERA regridding; "
+                           "install via `pip install h5py`.")
+    with _h5_lock, h5py.File(h5_path, 'r') as f:
+        ds = f['/dataset1/data1']
+        what = ds['what'].attrs if 'what' in ds else None
+        gain = float(_decode_h5_attr(what['gain'])) if what is not None else 1.0
+        offset = float(_decode_h5_attr(what['offset'])) if what is not None else 0.0
+        nodata = (float(_decode_h5_attr(what['nodata']))
+                  if what is not None and 'nodata' in what else None)
+        undetect = (float(_decode_h5_attr(what['undetect']))
+                    if what is not None and 'undetect' in what else None)
+        raw = np.asarray(ds['data'], dtype=np.float32)
+
+    physical = gain * raw + offset
+    if undetect is not None:
+        physical = np.where(raw == undetect, 0.0, physical)
+    if nodata is not None:
+        physical = np.where(raw == nodata, np.nan, physical)
+    return physical
 
 
 # =============================================================================
@@ -1253,9 +1390,10 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
     channels sharing that resolution.
 
     Output: .npy files containing the regridded 2-D array on the
-    768×1536 EPSG:31700 grid. The grid coordinates (lat/lon) are
-    saved once as romania_grid_lats.npy and romania_grid_lons.npy.
-    Use inspect_mtg.py to reconstruct full .nc files for GIS viewing.
+    768×1536 EPSG:31700 grid. The shared Romania-grid lat/lon arrays
+    are written once by run() at regridded_data/romania_grid_{lats,lons}.npy
+    (not per-product). Use inspect_mtg.py to reconstruct full .nc files
+    for GIS viewing.
     """
     mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')
     constants_path = os.path.join(mtg_dir, 'mtg_constants.json')
@@ -1271,15 +1409,6 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
         print(f"  ERROR: mtg_constants.json not found at {constants_path}")
         print(f"  Run pipeline_msg_mtg.py first to generate it.")
         return
-
-    # Save target grid coordinates once for later inspection
-    grid_lats_path = os.path.join(regridded_base, 'romania_grid_lats.npy')
-    grid_lons_path = os.path.join(regridded_base, 'romania_grid_lons.npy')
-    if not os.path.isfile(grid_lats_path):
-        ensure_dir(regridded_base)
-        np.save(grid_lats_path, target_lats)
-        np.save(grid_lons_path, target_lons)
-        print(f"  Saved Romania grid coordinates: {target_lats.shape}")
 
     # Build KD-tree mappings per resolution from the constants file
     mapping_cache = {}
@@ -1485,13 +1614,41 @@ def regrid_lightning(data_root, date_filter=None):
 
 
 # =============================================================================
-# NWCSAF (saves as .nc)
+# NWCSAF (per-variable .npy, mirroring the radar / MTG layout)
 # =============================================================================
+
+# Which NWCSAF product file holds each variable, and the variable's dtype.
+NWCSAF_VAR_SPEC = {
+    "ctth_alti":  {"product": "CTTH", "dtype": np.float32},
+    "ctth_tempe": {"product": "CTTH", "dtype": np.float32},
+    "cmic_phase": {"product": "CMIC", "dtype": np.int8},     # categorical
+    "cmic_cot":   {"product": "CMIC", "dtype": np.float32},
+}
+
+# S_NWC_{PRODUCT}_{SAT}_{REGION}_{YYYYMMDD}T{HHMMSS}Z[suffix].nc
+_NWCSAF_NAME_PATTERN = re.compile(
+    r'^S_NWC_(?P<product>CMIC|CTTH)_[^_]+_[^_]+_'
+    r'(?P<date>\d{8})T(?P<hhmm>\d{4})\d{2}Z'
+)
+
+
+def _parse_nwcsaf_filename(name):
+    """Return (date_str 'YYYY-MM-DD', hhmm 'HHMM', product) or (None, None, None)."""
+    m = _NWCSAF_NAME_PATTERN.match(name)
+    if not m:
+        return None, None, None
+    d = m.group("date")
+    return (f"{d[:4]}-{d[4:6]}-{d[6:8]}", m.group("hhmm"), m.group("product"))
+
 
 def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid NWCSAF files. KD-tree built once from first file,
-    day folders in parallel.
+    Regrid NWCSAF CMIC + CTTH files to per-variable .npy on the Romania grid.
+
+    KD-tree built once from the first file; day folders processed in parallel.
+    `cmic_phase` is saved as int8 (NaN replaced with 0 = "no cloud / missing")
+    so the categorical codes survive intact on disk. All other variables are
+    saved as float32.
     """
     nwcsaf_dir = os.path.join(data_root, 'nwcsaf_data')
     regridded_base = os.path.join(data_root, 'regridded_data', 'nwcsaf_data')
@@ -1500,7 +1657,7 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
         print("  NWCSAF directory not found")
         return
 
-    # Collect day folders
+    # Collect day folders (input layout: {date}-Romania/S_NWC_*.nc)
     day_jobs = []
     for day_folder in sorted(os.listdir(nwcsaf_dir)):
         if date_filter and date_filter not in day_folder:
@@ -1508,48 +1665,40 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
         day_path = os.path.join(nwcsaf_dir, day_folder)
         if not os.path.isdir(day_path):
             continue
-        out_dir = os.path.join(regridded_base, day_folder)
         nc_files = sorted(
             f for f in os.listdir(day_path) if f.endswith('.nc')
         )
         if nc_files:
-            day_jobs.append((day_folder, day_path, out_dir, nc_files))
+            day_jobs.append((day_folder, day_path, nc_files))
 
     if not day_jobs:
         print("    No NWCSAF day folders found")
         return
 
-    # Build mapping from first file in first day folder (sequential)
-    # NWCSAF files store coordinates as geostationary projection (nx/ny in meters),
-    # not lat/lon. We compute lat/lon using pyproj.
-    first_filepath = os.path.join(day_jobs[0][1], day_jobs[0][3][0])
-    print(f"    Building NWCSAF mapping from {day_jobs[0][3][0]}...")
+    # Build KD-tree once from the first file
+    first_filepath = os.path.join(day_jobs[0][1], day_jobs[0][2][0])
+    print(f"    Building NWCSAF mapping from {day_jobs[0][2][0]}...")
     with _nc_lock:
         with Dataset(first_filepath, 'r') as ds:
             nx = np.asarray(ds.variables['nx'][:], dtype=np.float64)
             ny = np.asarray(ds.variables['ny'][:], dtype=np.float64)
             gdal_proj = ds.getncattr('gdal_projection')
 
-    # Build 2D grids from 1D coordinate arrays
     nx_2d, ny_2d = np.meshgrid(nx, ny)
     print(f"    NWCSAF grid: {ny_2d.shape} ({gdal_proj[:40]}...)")
 
-    # Convert geostationary projection → lat/lon
     geos_proj = pyproj.Proj(gdal_proj)
     transformer = pyproj.Transformer.from_proj(
         geos_proj, pyproj.Proj('epsg:4326'), always_xy=True
     )
     lon_grid, lat_grid = transformer.transform(nx_2d, ny_2d)
-
-    # Clean inf/NaN (off-disk pixels in geostationary projection)
     invalid = ~(np.isfinite(lat_grid) & np.isfinite(lon_grid))
-    n_invalid = int(invalid.sum())
-    if n_invalid > 0:
+    if invalid.any():
+        n_invalid = int(invalid.sum())
         print(f"    Cleaned {n_invalid} off-disk pixels "
               f"({n_invalid / invalid.size * 100:.1f}%)")
         lat_grid[invalid] = 0.0
         lon_grid[invalid] = 0.0
-
     lat_grid = np.clip(lat_grid, -90.0, 90.0)
     lon_grid = np.clip(lon_grid, -180.0, 180.0)
 
@@ -1557,106 +1706,241 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
         lat_grid, lon_grid, target_lats, target_lons
     )
 
-    # Worker function
-    def process_nwcsaf_day(job, _mapping=mapping,
-                           _target_lats=target_lats,
-                           _target_lons=target_lons):
-        day_folder, day_path, out_dir, nc_files = job
-        new, skipped = 0, 0
+    # Write the per-source projection constants once so consumers can
+    # rebuild the source grid later without re-opening a CMIC/CTTH file.
+    ensure_dir(regridded_base)
+    constants_path = os.path.join(regridded_base, 'nwcsaf_constants.json')
+    if not os.path.isfile(constants_path):
+        with open(constants_path, 'w') as f:
+            json.dump({
+                "gdal_projection": gdal_proj,
+                "source_grid_shape": list(ny_2d.shape),
+                "note": "lat/lon arrays for the Romania target grid live at "
+                        "regridded_data/romania_grid_{lats,lons}.npy",
+            }, f, indent=2)
+        print(f"    Wrote {constants_path}")
+
+    def process_nwcsaf_day(job, _mapping=mapping):
+        day_folder, day_path, nc_files = job
+        new, skipped, errors = 0, 0, 0
         for nc_file in nc_files:
-            out_path = os.path.join(out_dir, nc_file)
-            if output_exists(out_path):
+            date_str, hhmm, product = _parse_nwcsaf_filename(nc_file)
+            if product is None:
+                continue
+            # Which variables we extract depends on the product file
+            vars_in_file = [
+                v for v, spec in NWCSAF_VAR_SPEC.items()
+                if spec["product"] == product
+            ]
+            if not vars_in_file:
+                continue
+
+            # Skip-if-every-output-already-exists check (per source file).
+            all_outputs = []
+            for var in vars_in_file:
+                out_dir = os.path.join(
+                    regridded_base, var, f"nc4_{date_str}-Romania_{var}"
+                )
+                out_name = f"nc4_{date_str}-Romania_{hhmm}_{var}.npy"
+                all_outputs.append((var, out_dir, os.path.join(out_dir, out_name)))
+            if all(os.path.exists(p) for _, _, p in all_outputs):
                 skipped += 1
                 continue
+
             try:
                 filepath = os.path.join(day_path, nc_file)
-
-                # Read all data under lock (HDF5 not thread-safe)
                 with _nc_lock:
                     with Dataset(filepath, 'r') as ds:
-                        exclude = {'nx', 'ny', 'time'}
-                        exclude |= {v for v in ds.variables if 'pal' in v}
-                        var_names = [
-                            v for v in ds.variables if v not in exclude
-                        ]
+                        raw_data = {
+                            var: ds.variables[var][:] for var in vars_in_file
+                            if var in ds.variables
+                        }
 
-                        raw_data = {}
-                        for var_name in var_names:
-                            raw_data[var_name] = ds.variables[var_name][:]
-
-                # Process outside lock (numpy is thread-safe)
-                regridded_dict = {}
-                for var_name, data in raw_data.items():
+                for var, out_dir, out_path in all_outputs:
+                    if var not in raw_data:
+                        continue
+                    if os.path.exists(out_path):
+                        continue
+                    data = raw_data[var]
+                    if isinstance(data, np.ma.MaskedArray):
+                        data = data.filled(np.nan)
+                    data = np.asarray(data)
                     if data.ndim == 3:
                         data = np.squeeze(data, axis=0)
-                    elif data.ndim == 1:
-                        if isinstance(data, np.ma.MaskedArray):
-                            data = data.filled(0.0)
-                        regridded_dict[var_name] = np.asarray(
-                            data, dtype=np.float32
-                        )
+                    if data.ndim != 2:
                         continue
-                    elif data.ndim != 2:
-                        continue
-
-                    if isinstance(data, np.ma.MaskedArray):
-                        fill_val = getattr(
-                            data, 'fill_value',
-                            np.float32(-3.4028235e+38)
+                    dtype = NWCSAF_VAR_SPEC[var]["dtype"]
+                    if dtype == np.int8:
+                        # Categorical: NaN → 0 ("no cloud / missing"), then int8.
+                        data = np.nan_to_num(
+                            data.astype(np.float32), nan=0.0,
                         )
-                        data = data.filled(fill_val)
-
-                    data = np.asarray(data, dtype=np.float32)
-                    data = np.nan_to_num(
-                        data, nan=0.0, posinf=1e6, neginf=-1e6
-                    )
-                    regridded = _mapping.apply(data)
-                    regridded_dict[var_name] = regridded
-
-                if regridded_dict:
-                    _save_nwcsaf_nc(
-                        regridded_dict, _target_lats, _target_lons,
-                        out_dir, nc_file
-                    )
-                    new += 1
-
+                        regridded = _mapping.apply(data, fill_value=0)
+                        regridded = np.round(regridded).astype(np.int8)
+                    else:
+                        data = np.nan_to_num(
+                            data.astype(np.float32),
+                            nan=0.0, posinf=1e6, neginf=-1e6,
+                        )
+                        regridded = _mapping.apply(data, fill_value=np.nan)
+                        regridded = regridded.astype(np.float32)
+                    ensure_dir(out_dir)
+                    np.save(out_path, regridded)
+                new += 1
             except Exception as e:
+                errors += 1
                 print(f"    ERROR {nc_file}: {e}")
-        return day_folder, new, skipped
+        return day_folder, new, skipped, errors
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {
-            pool.submit(process_nwcsaf_day, job): job[0]
-            for job in day_jobs
-        }
+        futures = {pool.submit(process_nwcsaf_day, j): j[0] for j in day_jobs}
         for future in as_completed(futures):
-            day_folder, new, skipped = future.result()
+            day_folder, new, skipped, errors = future.result()
             total = new + skipped
-            if total > 0:
+            if total > 0 or errors > 0:
                 print(f"    {day_folder}: {new} new, {skipped} cached, "
-                      f"{total} total")
+                      f"{errors} errors")
 
 
-def _save_nwcsaf_nc(data_dict, lats, lons, out_dir, filename):
-    """Save regridded NWCSAF data as a single NetCDF file."""
-    ensure_dir(out_dir)
-    out_path = os.path.join(out_dir, filename)
+# =============================================================================
+# OPERA radar (per-variable .npy, day-folder parallelism)
+# =============================================================================
 
-    data_vars = {}
-    for var_name, data in data_dict.items():
-        if data.ndim == 2:
-            data_vars[var_name] = (['y', 'x'], data)
-        elif data.ndim == 1:
-            data_vars[var_name] = ([f'{var_name}_dim'], data)
+OPERA_PRODUCTS = {
+    "reflectivity": {
+        "remote_subdir": "reflectivity",
+        "long_name":     "Maximum reflectivity",
+        "units":         "dBZ",
+    },
+    "rainfall_rate": {
+        "remote_subdir": "rainfall_rate",
+        "long_name":     "Instantaneous rainfall rate",
+        "units":         "mm h-1",
+    },
+}
 
-    ds = xr.Dataset(
-        data_vars,
-        coords={
-            'latitude': (['y', 'x'], lats),
-            'longitude': (['y', 'x'], lons)
-        }
-    )
-    ds.to_netcdf(out_path)
+
+def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
+    """
+    Regrid OPERA HDF5 files to per-product .npy on the Romania grid.
+
+    Source layout: our_data/opera_data/{product}/{YYYY}/{MM}/{DD}/*.h5
+    Output layout: our_data/regridded_data/opera_data/{product}/
+                       nc4_{date}-Romania_{product}/
+                           nc4_{date}-Romania_{HHMM}_{product}.npy
+
+    One KD-tree mapping is built per product from that product's first
+    available `.h5` file (1 km grid for reflectivity, 2 km for rain rate).
+    Day folders for each product are processed in parallel.
+    """
+    if h5py is None:
+        print("  h5py not installed; skipping OPERA regridding "
+              "(pip install h5py).")
+        return
+
+    opera_dir = os.path.join(data_root, 'opera_data')
+    regridded_base = os.path.join(data_root, 'regridded_data', 'opera_data')
+
+    if not os.path.isdir(opera_dir):
+        print(f"  OPERA directory not found: {opera_dir}")
+        return
+
+    ensure_dir(regridded_base)
+    constants = {}
+
+    for product, cfg in OPERA_PRODUCTS.items():
+        product_dir = os.path.join(opera_dir, cfg["remote_subdir"])
+        if not os.path.isdir(product_dir):
+            print(f"  [{product}] no source dir at {product_dir}; skipping")
+            continue
+
+        # Walk {YYYY}/{MM}/{DD}/ and collect per-day batches
+        day_jobs = []
+        for year in sorted(os.listdir(product_dir)):
+            year_path = os.path.join(product_dir, year)
+            if not os.path.isdir(year_path) or not year.isdigit():
+                continue
+            for month in sorted(os.listdir(year_path)):
+                month_path = os.path.join(year_path, month)
+                if not os.path.isdir(month_path) or not month.isdigit():
+                    continue
+                for day in sorted(os.listdir(month_path)):
+                    day_path = os.path.join(month_path, day)
+                    if not os.path.isdir(day_path) or not day.isdigit():
+                        continue
+                    date_str = f"{year}-{month}-{day}"
+                    if date_filter and date_filter != date_str:
+                        continue
+                    h5_files = sorted(
+                        f for f in os.listdir(day_path) if f.endswith('.h5')
+                    )
+                    if h5_files:
+                        day_jobs.append((date_str, day_path, h5_files))
+
+        if not day_jobs:
+            print(f"  [{product}] no day folders found")
+            continue
+
+        # Build the KD-tree once for this product
+        first_file = os.path.join(day_jobs[0][1], day_jobs[0][2][0])
+        print(f"  [{product}] building mapping from {day_jobs[0][2][0]}...")
+        try:
+            src_lats, src_lons, meta = _read_opera_source_grid(first_file)
+        except Exception as e:
+            print(f"  [{product}] ERROR reading source grid: {e}")
+            continue
+        constants[product] = meta
+        nan_mask = np.isnan(src_lats) | np.isnan(src_lons)
+        if nan_mask.any():
+            src_lats[nan_mask] = 0.0
+            src_lons[nan_mask] = 0.0
+        print(f"  [{product}] source grid: {src_lats.shape}")
+        mapping = PrecomputedMapping(
+            src_lats, src_lons, target_lats, target_lons,
+        )
+
+        # Worker — per-day batch, one .npy written per .h5
+        def process_opera_day(job, _mapping=mapping, _product=product):
+            date_str, day_path, h5_files = job
+            new, skipped, errors = 0, 0, 0
+            out_dir = os.path.join(
+                regridded_base, _product, f"nc4_{date_str}-Romania_{_product}"
+            )
+            for h5_file in h5_files:
+                _, hhmm = _parse_opera_filename(h5_file)
+                if hhmm is None:
+                    errors += 1
+                    continue
+                out_name = f"nc4_{date_str}-Romania_{hhmm}_{_product}.npy"
+                out_path = os.path.join(out_dir, out_name)
+                if os.path.exists(out_path):
+                    skipped += 1
+                    continue
+                try:
+                    physical = _read_opera_data(os.path.join(day_path, h5_file))
+                    regridded = _mapping.apply(physical, fill_value=np.nan)
+                    ensure_dir(out_dir)
+                    np.save(out_path, regridded.astype(np.float32))
+                    new += 1
+                except Exception as e:
+                    errors += 1
+                    print(f"    [{_product}] ERROR {h5_file}: {e}")
+            return date_str, new, skipped, errors
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {pool.submit(process_opera_day, j): j[0] for j in day_jobs}
+            for future in as_completed(futures):
+                date_str, new, skipped, errors = future.result()
+                total = new + skipped
+                if total > 0 or errors > 0:
+                    print(f"    [{product}] {date_str}: {new} new, "
+                          f"{skipped} cached, {errors} errors")
+
+    if constants:
+        constants_path = os.path.join(regridded_base, 'opera_constants.json')
+        with open(constants_path, 'w') as f:
+            json.dump(constants, f, indent=2)
+        print(f"  Wrote {constants_path}")
 
 
 # =============================================================================
@@ -1675,9 +1959,19 @@ def run(data_root, mode, instrument=None, date_filter=None):
 
     t_start = timer_module.time()
 
-    needs_grid = mode in ('radar', 'satellite', 'nwcsaf', 'all')
+    needs_grid = mode in ('radar', 'satellite', 'nwcsaf', 'opera', 'all')
     if needs_grid:
         target_lats, target_lons = init_romania_grid()
+        # Write the shared Romania-grid coordinate arrays once at the root
+        # of regridded_data/ so every product can consume them as a sidecar.
+        regridded_root = os.path.join(data_root, 'regridded_data')
+        ensure_dir(regridded_root)
+        grid_lats_path = os.path.join(regridded_root, 'romania_grid_lats.npy')
+        grid_lons_path = os.path.join(regridded_root, 'romania_grid_lons.npy')
+        if not os.path.isfile(grid_lats_path):
+            np.save(grid_lats_path, target_lats)
+            np.save(grid_lons_path, target_lons)
+            print(f"  Wrote Romania grid coords -> {regridded_root}")
     else:
         target_lats = target_lons = None
 
@@ -1712,6 +2006,12 @@ def run(data_root, mode, instrument=None, date_filter=None):
         print("NWCSAF products")
         print(f"{'='*70}")
         regrid_nwcsaf(data_root, target_lats, target_lons, date_filter)
+
+    if mode in ('opera', 'all'):
+        print(f"\n{'='*70}")
+        print("OPERA radar products")
+        print(f"{'='*70}")
+        regrid_opera(data_root, target_lats, target_lons, date_filter)
 
     elapsed = timer_module.time() - t_start
     print(f"\n{'='*70}")
@@ -1750,6 +2050,8 @@ if __name__ == "__main__":
                        help="Cache lightning data as .npy")
     group.add_argument("--nwcsaf", action="store_true",
                        help="Regrid NWCSAF products")
+    group.add_argument("--opera", action="store_true",
+                       help="Regrid OPERA radar products (HDF5 -> .npy)")
     group.add_argument("--all", action="store_true",
                        help="Regrid all products")
 
@@ -1766,6 +2068,8 @@ if __name__ == "__main__":
         mode, instrument = 'lightning', None
     elif args.nwcsaf:
         mode, instrument = 'nwcsaf', None
+    elif args.opera:
+        mode, instrument = 'opera', None
     elif args.all:
         mode, instrument = 'all', None
 

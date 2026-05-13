@@ -42,7 +42,7 @@ DEFAULT_DATA_DIR = Path(__file__).resolve().parent  # our_data/opera_data
 
 # product_key -> (local subdirectory, native cadence in minutes if config missing)
 PRODUCTS = {
-    "opera_reflectivity":  {"subdir": "reflectivity",  "default_cadence": 5},
+    "opera_reflectivity":  {"subdir": "reflectivity",  "default_cadence": 15},
     "opera_rainfall_rate": {"subdir": "rainfall_rate", "default_cadence": 15},
 }
 
@@ -375,7 +375,7 @@ def main() -> int:
         '--timesteps', type=str, nargs='+', default=None,
         help='Override the per-product minute filter (one filter applied to '
              "all chosen products; e.g. 00 15 30 45). 'all' uses the native "
-             'product cadence (5 min for reflectivity, 15 min for '
+             'product cadence (15 min for both reflectivity and '
              'rainfall_rate). Default: per-product filter from '
              'timestep_config.json.',
     )

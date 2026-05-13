@@ -289,8 +289,13 @@ def transform_cmic_phase(x):
 
     Hardcoded. Categorical variable with five classes — no continuous
     normalisation makes sense.
+
+    Input is expected to be int8 codes 0–4 from regrid.py (NaN replaced
+    with 0 = "no cloud / missing" at regrid time, so this function no
+    longer needs to handle NaN). 4×4 LR pooling in extract_patches.py
+    can still produce fractional values when a block mixes categories,
+    so a final round-to-nearest still happens here before the one-hot.
     """
-    x = np.where(np.isnan(x), 0.0, x)
     x = np.round(x).astype(np.int32)
     h, w = x.shape
     one_hot = np.zeros((h, w, 5), dtype=np.float32)

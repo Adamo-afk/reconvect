@@ -28,7 +28,6 @@ import re
 import csv
 import argparse
 from pathlib import Path
-from netCDF4 import Dataset
 
 
 # =============================================================================
@@ -229,44 +228,20 @@ def find_regridded_file_lightning(data_root, product, date_str, time_str):
 
 def find_regridded_file_nwcsaf(data_root, variable, date_str, time_str):
     """
-    Find a regridded NWCSAF .nc file and return (filepath, variable_name).
+    Find a regridded NWCSAF `.npy` file. After the unification in regrid.py,
+    each NWCSAF variable is stored as its own per-variable `.npy` mirroring
+    the radar / MTG layout — no more multi-variable `.nc` files.
 
-    NWCSAF files contain multiple variables. We need to find the right file
-    (CMIC or CTTH) based on the variable name.
-
-    Path: regridded_data/nwcsaf_data/{date}-Romania/
-          S_NWC_{PRODUCT}_*.nc
+    Path: regridded_data/nwcsaf_data/{variable}/nc4_{date}-Romania_{variable}/
+          nc4_{date}-Romania_{HHMM}_{variable}.npy
     """
     hhmm = time_str.replace(':', '')
-    day_folder = f"{date_str}-Romania"
-    nwcsaf_dir = os.path.join(
-        data_root, 'regridded_data', 'nwcsaf_data', day_folder
+    day_folder = f"nc4_{date_str}-Romania_{variable}"
+    filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
+    return os.path.join(
+        data_root, 'regridded_data', 'nwcsaf_data', variable,
+        day_folder, filename,
     )
-
-    if not os.path.isdir(nwcsaf_dir):
-        return None
-
-    # Map variable to NWCSAF product prefix
-    var_to_product = {
-        'ctth_alti': 'CTTH', 'ctth_tempe': 'CTTH',
-        'cmic_phase': 'CMIC', 'cmic_cot': 'CMIC',
-    }
-    product_prefix = var_to_product.get(variable)
-    if product_prefix is None:
-        return None
-
-    # Build expected timestamp string: YYYYMMDDTHHMMSS
-    date_compact = date_str.replace('-', '')
-    time_compact = f"{hhmm}00"
-    timestamp_str = f"{date_compact}T{time_compact}"
-
-    # Search for matching file
-    for nc_file in os.listdir(nwcsaf_dir):
-        if (nc_file.startswith(f'S_NWC_{product_prefix}_') and
-                timestamp_str in nc_file and nc_file.endswith('.nc')):
-            return os.path.join(nwcsaf_dir, nc_file)
-
-    return None
 
 
 def find_regridded_file(data_root, variable, group, date_str, time_str):
@@ -303,33 +278,16 @@ def find_regridded_file(data_root, variable, group, date_str, time_str):
 
 def load_regridded(filepath, variable=None, group=None):
     """
-    Load a regridded data file.
-
-    For .npy files: returns the 2D array directly.
-    For NWCSAF .nc files: reads the specified variable from the NetCDF.
+    Load a regridded `.npy` file. All product families now write `.npy`;
+    multi-variable NWCSAF `.nc` files were removed when regrid.py was
+    unified, so `variable` and `group` are no longer used here.
 
     Returns:
-        np.ndarray: 2D array (768×1536)
+        np.ndarray: 2D array (768×1536) as float32.
     """
-    if filepath.endswith('.npy'):
-        data = np.load(filepath)
-    elif filepath.endswith('.nc'):
-        with Dataset(filepath, 'r') as ds:
-            if variable in ds.variables:
-                data = ds.variables[variable][:]
-            else:
-                raise ValueError(
-                    f"Variable '{variable}' not found in {filepath}. "
-                    f"Available: {list(ds.variables.keys())}"
-                )
-
-        if isinstance(data, np.ma.MaskedArray):
-            data = data.filled(0.0)
-        if data.ndim == 3:
-            data = np.squeeze(data, axis=0)
-    else:
+    if not filepath.endswith('.npy'):
         raise ValueError(f"Unknown file format: {filepath}")
-
+    data = np.load(filepath)
     return np.asarray(data, dtype=np.float32)
 
 
