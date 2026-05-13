@@ -8,6 +8,12 @@ Usage:
     python create_datasets.py --mode mtg_radar --data_root ./our_data
     python create_datasets.py --mode mtg_radar_continuous --data_root ./our_data
 
+OPERA Shapley study (4-model coalition, "is NWCSAF useful?"):
+    python create_datasets.py --mode mtg_opera_radar_only --data_root ./our_data
+    python create_datasets.py --mode mtg_opera_mtgmr      --data_root ./our_data
+    python create_datasets.py --mode mtg_opera_nwcsaf     --data_root ./our_data
+    python create_datasets.py --mode mtg_opera_full       --data_root ./our_data
+
 The training cadence is read from our_data/timestep_config.json (set via
 validate_timestep.py) and the per-sample window from our_data/sequence_meta.json
 (written by extract_patch_seq_for_datasets.py). MSG modes are disabled in this
@@ -356,6 +362,27 @@ def label_transform_rzc_multiclass(x):
     return one_hot
 
 
+def label_transform_opera_rainfall_multiclass(x):
+    """OPERA instantaneous rain rate → 5-class one-hot label.
+
+    Uses the same bin boundaries as `label_transform_rzc_multiclass`
+    (<10, 10–20, 20–30, 30–40, ≥40 mm/h) so that COALITION-4 trained on
+    OPERA labels stays comparable with the RZC-trained baseline. The
+    label patch is loaded from `opera_rainfall_rate_hr` (HR alias of the
+    same regridded file) so the output shape matches the 256×256 HR head.
+    """
+    x = np.where(np.isnan(x), 0.0, x)
+    x = np.clip(x, 0.0, None)
+    h, w = x.shape
+    one_hot = np.zeros((h, w, 5), dtype=np.float32)
+    one_hot[:, :, 0] = (x < 10.0).astype(np.float32)
+    one_hot[:, :, 1] = ((x >= 10.0) & (x < 20.0)).astype(np.float32)
+    one_hot[:, :, 2] = ((x >= 20.0) & (x < 30.0)).astype(np.float32)
+    one_hot[:, :, 3] = ((x >= 30.0) & (x < 40.0)).astype(np.float32)
+    one_hot[:, :, 4] = (x >= 40.0).astype(np.float32)
+    return one_hot
+
+
 def label_transform_rzc_continuous(x):
     """RZC rain rate → continuous label in [0, 1] via min-max normalization.
     NaN → 0, clip to [0, 70], divide by 70.
@@ -415,12 +442,11 @@ MTG_MR_SAT_CONFIG = {
     "wv_73":  (transform_wv73, None),
 }
 
-# OPERA radar — defined for future modes; not wired into any active mode
-# in get_mode_config() yet (add an `opera_radar` mode there when needed).
-OPERA_HR_CONFIG = {
-    "opera_reflectivity": (transform_opera_reflectivity, None),
-}
+# OPERA radar — both products are 2 km native (MR tier with 2× pool). The
+# `opera_rainfall_rate` channel doubles as the label source at the future
+# steps; here it is loaded as a past-input feature.
 OPERA_MR_CONFIG = {
+    "opera_reflectivity":  (transform_opera_reflectivity, None),
     "opera_rainfall_rate": (transform_opera_rainfall_rate, None),
 }
 
@@ -513,10 +539,59 @@ def get_mode_config(mode):
             "label_suffix": "HR",
             "label_type": "radar_continuous",
         }
+    # ------------------------------------------------------------------
+    # OPERA-driven modes for the NWCSAF Shapley study (4-model coalition).
+    # OPERA is always present in MR; MTG IR/WV and NWCSAF are toggled.
+    # HR carries only MTG vis_06 (no legacy radar/lightning channels).
+    # Label is `opera_rainfall_rate_hr` (HR alias) so the 256×256 head
+    # stays compatible with the existing decoder.
+    # ------------------------------------------------------------------
+    elif mode == "mtg_opera_radar_only":
+        return {
+            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
+            "past_mr": (OPERA_MR_CONFIG, 128, "LR"),
+            "past_lr": None,
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+    elif mode == "mtg_opera_mtgmr":
+        return {
+            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
+            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
+            "past_lr": None,
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+    elif mode == "mtg_opera_nwcsaf":
+        return {
+            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
+            "past_mr": (OPERA_MR_CONFIG, 128, "LR"),
+            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+    elif mode == "mtg_opera_full":
+        return {
+            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
+            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
+            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
     else:
         raise ValueError(
             f"Unknown mode: {mode}. Use: mtg_lightning, mtg_radar, "
-            f"mtg_radar_continuous. (MSG modes are currently disabled.)"
+            f"mtg_radar_continuous, mtg_opera_radar_only, mtg_opera_mtgmr, "
+            f"mtg_opera_nwcsaf, mtg_opera_full. "
+            f"(MSG modes are currently disabled.)"
         )
 
 
@@ -914,7 +989,9 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous"],
+        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
+                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
+                 "mtg_opera_nwcsaf", "mtg_opera_full"],
         help="Dataset mode (MSG modes are disabled in this build)."
     )
     parser.add_argument(
