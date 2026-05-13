@@ -551,33 +551,6 @@ python compute_normalization_stats.py --no_split_filter
 | **OPERA — `opera_reflectivity`** (max reflectivity, dBZ) | `opera_data/` | linear z-score | Like CZC: dBZ is already logarithmic, Gaussian-ish where signal is present. |
 | **OPERA — `opera_rainfall_rate`** (mm/h) | `opera_data/` | clip 0.01 → `log10` → z-score | Like RZC: heavy-tailed, zero-inflated. Same floor and transform family for consistency across both rain-rate sources. |
 
-**Output: `our_data/normalization_stats.json`**
-
-```jsonc
-{
-  "computed_utc": "...",
-  "regrid_root":  "...",
-  "training_filter": { "train_csv": "...", "n_rows": 12345, "n_unique_keys": 67890 },
-  "policy": { "training_set_only": true, "scope": "...", "missing_handling": "...", ... },
-  "variables": {
-    "RZC": {
-      "source":         "radar",
-      "transform":      "log_zscore",
-      "n_files_used":   1234,
-      "n_valid_pixels": 987654321,
-      "min":            -2.0,
-      "max":             1.85,
-      "mean":           -0.123,    // log10(rain_mm_h), training distribution
-      "std":             0.487,
-      "fill":            0.01,
-      "clip_min":        0.01,
-      "near_constant":   false
-    },
-    ...
-  }
-}
-```
-
 When `--with_percentiles` is passed, each variable block additionally carries `p01`, `p50`, `p99`, and `mad` (median absolute deviation) — useful for sanity-checking against the mean/std, and as drop-in robust alternatives if a variable is flagged `near_constant: true`.
 
 #### Step 5 — Build TF datasets
