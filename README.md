@@ -104,7 +104,7 @@ coalition4-rcnn/
 │   │   ├── summarize_raw_data.py      # CSV + missing-timesteps report for _raw_data/
 │   │   └── process_nwcsaf.py          # Extract lat/lon from NWCSAF NetCDF files
 │   ├── opera_data/
-│   │   ├── reflectivity/{YYYY}/{MM}/{DD}/*.h5      # OPERA max-reflectivity HDF5 (1 km, 15 min)
+│   │   ├── reflectivity/{YYYY}/{MM}/{DD}/*.h5      # OPERA max-reflectivity HDF5 (2 km, 15 min)
 │   │   ├── rainfall_rate/{YYYY}/{MM}/{DD}/*.h5     # OPERA rain-rate HDF5 (2 km, 15 min)
 │   │   ├── pipeline_opera.py          # SFTP/SCP download from EWC VM with cadence filtering
 │   │   └── summarize_opera_data.py    # CSV + missing-timesteps report
@@ -270,9 +270,13 @@ Runs DBSCAN on RZC rain rate data at 15-minute resolution. Produces a patch inde
 ```bash
 python identify_patches.py
 python identify_patches.py --date 2025-05-15 --plot    # single date with diagnostic plots
+
+# OPERA-driven DBSCAN (uses pre-regridded opera_rainfall_rate; same 10 mm/h threshold as RZC)
+python identify_patches.py --source opera
+python identify_patches.py --source opera --start 2026-03-13 --end 2026-05-11
 ```
 
-Output: `our_data/patch_index/patch_index.csv` and `patch_index.json`
+Output: `our_data/patch_index/patch_index.csv` and `patch_index.json`. The `--source opera` flag reads from `regridded_data/opera_data/rainfall_rate/` instead of regridding RZC on the fly; OPERA-source runs require `regrid.py --opera` to have been run first.
 
 #### Step 2 — Reproject all products to the Romania grid
 
@@ -526,13 +530,28 @@ When `--with_percentiles` is passed, each variable block additionally carries `p
 Transforms patches using the **data-driven** mean / std from
 `our_data/normalization_stats.json` (Step 4.3) and saves as `tf.data.Dataset` for each mode. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
 
-Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`. The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
+Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, and the four OPERA-driven modes for the NWCSAF Shapley study: `mtg_opera_radar_only`, `mtg_opera_mtgmr`, `mtg_opera_nwcsaf`, `mtg_opera_full`. The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
 
 ```bash
 python create_datasets.py --mode mtg_lightning --data_root ./our_data
 python create_datasets.py --mode mtg_radar --data_root ./our_data
 python create_datasets.py --mode mtg_radar_continuous --data_root ./our_data
+
+# OPERA Shapley study (4-model coalition, "is NWCSAF useful?")
+python create_datasets.py --mode mtg_opera_radar_only --data_root ./our_data
+python create_datasets.py --mode mtg_opera_mtgmr      --data_root ./our_data
+python create_datasets.py --mode mtg_opera_nwcsaf     --data_root ./our_data
+python create_datasets.py --mode mtg_opera_full       --data_root ./our_data
 ```
+
+The OPERA modes replace radar (RZC and friends) with OPERA `opera_reflectivity` + `opera_rainfall_rate` in the MR branch (2 km, `pool=2`), drop the lightning HR channels, and use `opera_rainfall_rate_hr` (HR alias of the same regridded file) as the 5-class multi-class label (same bin edges as RZC: `<10`, `10–20`, `20–30`, `30–40`, `≥40 mm/h`). The four modes form a Shapley coalition over MTG IR/WV and NWCSAF:
+
+| Mode | HR | MR | LR |
+|---|---|---|---|
+| `mtg_opera_radar_only` | MTG `vis_06` | OPERA | — |
+| `mtg_opera_mtgmr`      | MTG `vis_06` | OPERA + MTG IR/WV | — |
+| `mtg_opera_nwcsaf`     | MTG `vis_06` | OPERA | NWCSAF |
+| `mtg_opera_full`       | MTG `vis_06` | OPERA + MTG IR/WV | NWCSAF |
 
 Custom modes (e.g. without NWCSAF) can be defined by adding a new configuration in `create_datasets.py` that omits `past_lr` from the input groups. The training script requires no code changes — it reads whatever inputs are in the dataset.
 
@@ -731,7 +750,7 @@ OPERA is an alternative radar source with two products:
 
 | Product | Native resolution | Cadence | File format |
 |---|---|---|---|
-| Maximum reflectivity (dBZ) | 1 km | 15 min | HDF5 (`.h5`) |
+| Maximum reflectivity (dBZ) | 2 km | 15 min | HDF5 (`.h5`) |
 | Instantaneous rainfall rate (mm/h) | 2 km | 15 min | HDF5 (`.h5`) |
 
 Both products are listed in `product_cadences.json` as `opera_reflectivity: 15` and `opera_rainfall_rate: 15`. They raise the validator floor to 15 min when OPERA is in use — comment them out (rename with a leading underscore) in the cadences file if you're not using OPERA and want a finer training step.

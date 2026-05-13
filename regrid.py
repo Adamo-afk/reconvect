@@ -1830,7 +1830,8 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
                            nc4_{date}-Romania_{HHMM}_{product}.npy
 
     One KD-tree mapping is built per product from that product's first
-    available `.h5` file (1 km grid for reflectivity, 2 km for rain rate).
+    available `.h5` file (both reflectivity and rainfall_rate are on the
+    2 km grid).
     Day folders for each product are processed in parallel.
     """
     if h5py is None:

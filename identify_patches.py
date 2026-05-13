@@ -476,41 +476,111 @@ def discover_rzc_files(data_root):
     return results
 
 
+def discover_opera_files(data_root):
+    """
+    Discover the regridded OPERA rainfall-rate `.npy` files.
+
+    Unlike the RZC path (which reads raw source NetCDFs and regrids
+    on the fly inside this script), the OPERA branch consumes the
+    output of `regrid.py --opera`. The arrays are already on the
+    Romania 1536×768 grid, so the DBSCAN step skips the per-file
+    regridding done for RZC.
+
+    Scans: {data_root}/regridded_data/opera_data/rainfall_rate/
+                nc4_{date}-Romania_rainfall_rate/*.npy
+
+    Returns:
+        list[tuple]: Sorted list of (date_str, filepath) pairs.
+    """
+    opera_dir = os.path.join(
+        data_root, 'regridded_data', 'opera_data', 'rainfall_rate'
+    )
+    if not os.path.isdir(opera_dir):
+        print(f"OPERA rainfall_rate dir not found: {opera_dir}")
+        print("  Run `python regrid.py --opera` first.")
+        return []
+
+    results = []
+    filtered = 0
+    date_dir_pattern = re.compile(
+        r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_rainfall_rate$'
+    )
+
+    for entry in sorted(os.listdir(opera_dir)):
+        match = date_dir_pattern.match(entry)
+        if not match:
+            continue
+        date_str = match.group(1)
+        day_dir = os.path.join(opera_dir, entry)
+        if not os.path.isdir(day_dir):
+            continue
+        for f in sorted(os.listdir(day_dir)):
+            if not f.endswith('.npy'):
+                continue
+            if not is_on_grid(f):
+                filtered += 1
+                continue
+            results.append((date_str, os.path.join(day_dir, f)))
+
+    if filtered > 0:
+        print(f"Filtered {filtered} off-grid OPERA files")
+    return results
+
+
+def parse_opera_filename(filepath):
+    """Parse `nc4_{YYYY-MM-DD}-Romania_{HHMM}_rainfall_rate.npy`."""
+    name = os.path.basename(filepath)
+    m = re.match(
+        r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_(\d{4})_rainfall_rate\.npy$', name
+    )
+    if not m:
+        return None, None, None
+    date_str = m.group(1)
+    hhmm = m.group(2)
+    time_str = f"{hhmm[:2]}:{hhmm[2:]}"
+    iso_str = f"{date_str}T{time_str}:00.000000000"
+    return date_str, time_str, iso_str
+
+
 # =============================================================================
 # Pipeline
 # =============================================================================
 
 def process_single_file(filepath, target_lats, target_lons):
     """
-    Full pipeline for a single RZC file:
-        read → regrid → DBSCAN → binary mask → identify patches
-
-    Args:
-        filepath: Path to RZC NetCDF file
-        target_lats, target_lons: Romania grid coordinate arrays
-
-    Returns:
-        tuple: (date_str, time_str, iso_str, active_patches, regridded, binary_mask)
+    Full pipeline for a single RZC source file:
+        read → regrid → DBSCAN → binary mask → identify patches.
     """
     date_str, time_str, iso_str = parse_radar_filename(filepath)
-
-    # Read raw radar data
     datamap, src_lats, src_lons = read_radar_netcdf(filepath)
-
-    # Regrid to Romania 1536×768
     regridded = regrid_to_romania(datamap, src_lats, src_lons,
                                   target_lats, target_lons)
-
-    # DBSCAN → binary mask
     binary_mask = dbscan_binary_mask(regridded)
-
-    # Identify active patches
     active_patches = identify_active_patches(binary_mask)
-
     return date_str, time_str, iso_str, active_patches, regridded, binary_mask
 
 
-def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False):
+def process_single_opera_file(filepath):
+    """
+    Pipeline for one pre-regridded OPERA rainfall-rate `.npy`:
+        load → DBSCAN → binary mask → identify patches.
+
+    The array is already on the Romania 1536×768 grid (output of
+    `regrid.py --opera`), so no per-file regridding is needed.
+    """
+    date_str, time_str, iso_str = parse_opera_filename(filepath)
+    if date_str is None:
+        return None
+    regridded = np.load(filepath)
+    # NaN may appear for off-grid pixels; DBSCAN expects finite values.
+    regridded = np.nan_to_num(regridded, nan=0.0)
+    binary_mask = dbscan_binary_mask(regridded)
+    active_patches = identify_active_patches(binary_mask)
+    return date_str, time_str, iso_str, active_patches, regridded, binary_mask
+
+
+def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
+                 source='radar'):
     """
     Run the full patch identification pipeline.
 
@@ -519,10 +589,13 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False):
         output_dir: Where to save CSV + JSON
         date_filter: Optional YYYY-MM-DD to process a single date
         save_plots: If True, save a PNG for each active timestamp
+        source: 'radar' (RZC source NetCDFs, regrid in-script) or
+                'opera' (pre-regridded OPERA rainfall_rate .npy files).
     """
     print("=" * 70)
     print("COALITION-4 Patch Identification Pipeline")
     print("=" * 70)
+    print(f"Source     : {source}")
     print(f"Data root  : {data_root}")
     print(f"Output dir : {output_dir}")
     print(f"Grid       : {GRID_WIDTH}×{GRID_HEIGHT} → {N_COLS}×{N_ROWS} patches of {PATCH_SIZE}×{PATCH_SIZE}")
@@ -531,24 +604,33 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False):
         print(f"Plots      : enabled")
 
     # Discover files
-    all_files = discover_rzc_files(data_root)
+    if source == 'opera':
+        all_files = discover_opera_files(data_root)
+        source_label = "OPERA rainfall_rate"
+    else:
+        all_files = discover_rzc_files(data_root)
+        source_label = "RZC"
+
     if date_filter:
         all_files = [(d, f) for d, f in all_files if d == date_filter]
         print(f"Filtering to date: {date_filter}")
 
     if not all_files:
-        print("\nNo RZC files found.")
+        print(f"\nNo {source_label} files found.")
         return
 
     dates = sorted(set(d for d, _ in all_files))
-    print(f"Found {len(all_files)} RZC files across {len(dates)} dates")
+    print(f"Found {len(all_files)} {source_label} files across {len(dates)} dates")
 
-    # Build target coordinate grids (once)
-    print("\nInitializing Romania grid projection...")
-    grid_projection = GridProjection(romania_grid_area)
-    y, x = np.mgrid[:grid_projection.area.height, :grid_projection.area.width]
-    target_lons, target_lats = grid_projection.inverse(y, x)
-    print(f"Target grid shape: {target_lats.shape}")
+    # The RZC path needs target lat/lon for its per-file regridding.
+    # The OPERA path consumes pre-regridded data, so target_lats/lons are unused.
+    target_lats = target_lons = None
+    if source == 'radar':
+        print("\nInitializing Romania grid projection...")
+        grid_projection = GridProjection(romania_grid_area)
+        y, x = np.mgrid[:grid_projection.area.height, :grid_projection.area.width]
+        target_lons, target_lats = grid_projection.inverse(y, x)
+        print(f"Target grid shape: {target_lats.shape}")
 
     # Plot output directory
     plot_dir = os.path.join(output_dir, 'plots') if save_plots else None
@@ -559,9 +641,13 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False):
 
     for i, (date_str, filepath) in enumerate(all_files):
         try:
-            d, t, iso, active, regridded, binary_mask = process_single_file(
-                filepath, target_lats, target_lons
-            )
+            if source == 'opera':
+                out = process_single_opera_file(filepath)
+            else:
+                out = process_single_file(filepath, target_lats, target_lons)
+            if out is None:
+                continue
+            d, t, iso, active, regridded, binary_mask = out
             results.append((d, t, iso, active))
 
             if active:
@@ -721,6 +807,14 @@ if __name__ == "__main__":
         "--plot", action="store_true",
         help="Save a PNG for each active timestamp (requires --date)"
     )
+    parser.add_argument(
+        "--source", type=str, default='radar', choices=['radar', 'opera'],
+        help="Activity driver: 'radar' (legacy RZC source NetCDFs, "
+             "regridded in-script) or 'opera' (pre-regridded OPERA "
+             "rainfall_rate .npy from regrid.py --opera). Same DBSCAN "
+             "threshold semantics — both interpret values as rain rate "
+             "in mm/h. Default: radar."
+    )
 
     args = parser.parse_args()
 
@@ -738,5 +832,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         date_filter=args.date,
         save_plots=args.plot,
+        source=args.source,
     )
     

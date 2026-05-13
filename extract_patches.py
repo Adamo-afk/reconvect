@@ -86,6 +86,16 @@ NWCSAF_PRODUCTS = {
     'cmic_cot':   ('nwcsaf', 'LR', 4),
 }
 
+# OPERA: max reflectivity (dBZ) + rainfall_rate (mm/h), 2 km native → 2× pool.
+# `opera_rainfall_rate_hr` is an alias of `opera_rainfall_rate` extracted at
+# HR (no pooling, 256×256) so it can be used as the multi-class label target
+# in OPERA-driven modes. Both aliases point to the same source `.npy`.
+OPERA_PRODUCTS = {
+    'opera_reflectivity':     ('opera', 'LR', 2),
+    'opera_rainfall_rate':    ('opera', 'LR', 2),
+    'opera_rainfall_rate_hr': ('opera', 'HR', 1),
+}
+
 # Group name → CLI flag mapping
 PRODUCT_GROUPS = {
     'radar':         RADAR_PRODUCTS,
@@ -93,6 +103,15 @@ PRODUCT_GROUPS = {
     'satellite_MTG': MTG_PRODUCTS,
     'lightning':     LIGHTNING_PRODUCTS,
     'nwcsaf':        NWCSAF_PRODUCTS,
+    'opera':         OPERA_PRODUCTS,
+}
+
+# Map canonical (prefixed) OPERA variable name → on-disk folder/short name.
+# Both rainfall variants resolve to the same regridded file.
+OPERA_VAR_TO_DISK = {
+    'opera_reflectivity':     'reflectivity',
+    'opera_rainfall_rate':    'rainfall_rate',
+    'opera_rainfall_rate_hr': 'rainfall_rate',
 }
 
 
@@ -244,6 +263,26 @@ def find_regridded_file_nwcsaf(data_root, variable, date_str, time_str):
     )
 
 
+def find_regridded_file_opera(data_root, variable, date_str, time_str):
+    """
+    Find a regridded OPERA .npy file. The on-disk folder uses the short
+    product name (reflectivity / rainfall_rate) while the variable name
+    passed in by extract_patches uses the `opera_` prefix.
+
+    Path: regridded_data/opera_data/{short}/nc4_{date}-Romania_{short}/
+          nc4_{date}-Romania_{HHMM}_{short}.npy
+    """
+    short = OPERA_VAR_TO_DISK.get(variable, variable)
+    hhmm = time_str.replace(':', '')
+    day_folder = f"nc4_{date_str}-Romania_{short}"
+    filename = f"nc4_{date_str}-Romania_{hhmm}_{short}.npy"
+    path = os.path.join(
+        data_root, 'regridded_data', 'opera_data',
+        short, day_folder, filename
+    )
+    return path if os.path.isfile(path) else None
+
+
 def find_regridded_file(data_root, variable, group, date_str, time_str):
     """
     Dispatch to the correct file finder based on product group.
@@ -267,6 +306,10 @@ def find_regridded_file(data_root, variable, group, date_str, time_str):
         )
     elif group == 'nwcsaf':
         return find_regridded_file_nwcsaf(
+            data_root, variable, date_str, time_str
+        )
+    elif group == 'opera':
+        return find_regridded_file_opera(
             data_root, variable, date_str, time_str
         )
     return None
@@ -471,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--products", nargs='+',
         choices=['radar', 'satellite_MSG', 'satellite_MTG',
-                 'lightning', 'nwcsaf'],
+                 'lightning', 'nwcsaf', 'opera'],
         default=None,
         help="Product groups to extract (default: all)"
     )

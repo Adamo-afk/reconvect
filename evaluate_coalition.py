@@ -1328,7 +1328,9 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["msg_lightning", "msg_radar", "mtg_lightning", "mtg_radar"],
+        choices=["msg_lightning", "msg_radar", "mtg_lightning", "mtg_radar",
+                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
+                 "mtg_opera_nwcsaf", "mtg_opera_full"],
         help="Model variant to evaluate"
     )
     parser.add_argument(
