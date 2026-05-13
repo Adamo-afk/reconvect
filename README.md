@@ -406,16 +406,15 @@ Designed to work with **any combination of products** — pass only the `--summa
 ```bash
 # Full configuration — every product required at 100% per date
 python intersect_product_coverage.py \
-    --summary mtg=raw_chunks_summary.csv:coverage_pct \
-    --summary nwcsaf=nwcsaf_summary.csv:coverage_pct \
-    --summary opera_refl=opera_summary.csv:opera_reflectivity_coverage_pct \
-    --summary opera_rain=opera_summary.csv:opera_rainfall_rate_coverage_pct \
+    --summary mtg=raw_chunks_summary.csv \
+    --summary nwcsaf=nwcsaf_summary.csv \
+    --summary opera=opera_summary.csv \
     --summary lightning=lightning_summary.csv:kept \
     --threshold lightning=1
 
 # Smaller experiment — only radar + MTG, 80% threshold acceptable
 python intersect_product_coverage.py \
-    --summary mtg=raw_chunks_summary.csv:coverage_pct \
+    --summary mtg=raw_chunks_summary.csv \
     --min_coverage 80
 ```
 
@@ -425,7 +424,7 @@ python intersect_product_coverage.py \
 |---|---|
 | `KEY` | Free-form label for the product (used in the manifest + decisions CSV) |
 | `PATH` | Per-product summary CSV produced by a `summarize_*.py` script |
-| `COLUMN` | Column to read (default `coverage_pct`). Use `kept` for the lightning boolean, or `opera_reflectivity_coverage_pct` / `opera_rainfall_rate_coverage_pct` for OPERA's per-product columns. |
+| `COLUMN` | Column to read (default `coverage_pct` — works for MTG, NWCSAF, and OPERA). Use `kept` for the lightning boolean, or `opera_reflectivity_coverage_pct` / `opera_rainfall_rate_coverage_pct` to gate on a single OPERA product instead of the intersection of both. |
 
 Per-product threshold override via `--threshold KEY=VALUE` — needed when one product uses a 0–100 percentage and another uses a 0/1 flag.
 

@@ -29,9 +29,12 @@ without lightning, with/without OPERA — all valid.
 
     --summary KEY=PATH[:COLUMN]
 
-Default COLUMN is `coverage_pct`. Use `:kept` for the lightning
-summary's boolean flag, or `:opera_reflectivity_coverage_pct` /
-`:opera_rainfall_rate_coverage_pct` for OPERA's per-product columns.
+Default COLUMN is `coverage_pct` and works for every standard
+`summarize_*.py` output (MTG, NWCSAF, OPERA). Use `:kept` for the
+lightning summary's boolean flag, or one of OPERA's diagnostic
+per-product columns (`:opera_reflectivity_coverage_pct` /
+`:opera_rainfall_rate_coverage_pct`) only when you want to gate on a
+single OPERA product instead of the intersection.
 
 Per-product thresholds default to `--min_coverage` (default 100.0,
 "full coverage required"). Override per product with
@@ -63,11 +66,11 @@ filtered files as `train_data.csv` / `validation_data.csv` /
 
 Examples
 --------
-    # MTG + NWCSAF + OPERA reflectivity + lightning — full coverage required
+    # MTG + NWCSAF + OPERA (both products) + lightning — full coverage required
     python intersect_product_coverage.py \\
-        --summary mtg=raw_chunks_summary.csv:coverage_pct \\
-        --summary nwcsaf=nwcsaf_summary.csv:coverage_pct \\
-        --summary opera_refl=opera_summary.csv:opera_reflectivity_coverage_pct \\
+        --summary mtg=raw_chunks_summary.csv \\
+        --summary nwcsaf=nwcsaf_summary.csv \\
+        --summary opera=opera_summary.csv \\
         --summary lightning=lightning_summary.csv:kept \\
         --threshold lightning=1
 

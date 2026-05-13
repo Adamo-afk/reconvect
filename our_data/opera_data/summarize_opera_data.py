@@ -187,10 +187,12 @@ def summarize(data_dir: Path,
     for date_str in sorted(all_dates):
         row = {'date': date_str}
         date_detail: dict = {}
+        kept_by_product: dict[str, set[str]] = {}
         for p in products:
             present = present_by_product[p].get(date_str, set())
             expected = expected_set_by_product[p]
             kept = present & expected
+            kept_by_product[p] = kept
             off_grid = len(present - expected)
             missing = sorted(expected - present)
             coverage = (len(kept) / len(expected) * 100) if expected else 0.0
@@ -204,6 +206,27 @@ def summarize(data_dir: Path,
                 'off_grid':         sorted(present - expected),
                 'missing':          missing,
             }
+
+        # Unified coverage = intersection of all requested products on the
+        # minute grid. Matches the NWCSAF "complete_pairs / expected" idea
+        # so `intersect_product_coverage.py` can read this CSV with the
+        # default `:coverage_pct` column and no per-product override.
+        if products:
+            present_intersection = set.intersection(*kept_by_product.values())
+            expected_intersection = set.intersection(
+                *(expected_set_by_product[p] for p in products)
+            )
+        else:
+            present_intersection = set()
+            expected_intersection = set()
+        unified = (
+            len(present_intersection) / len(expected_intersection) * 100
+            if expected_intersection else 0.0
+        )
+        row['complete_intersection'] = len(present_intersection)
+        row['expected_intersection'] = len(expected_intersection)
+        row['coverage_pct']          = round(unified, 1)
+
         rows.append(row)
         detail[date_str] = date_detail
 
@@ -287,6 +310,9 @@ def save_csv(rows: list[dict], products: list[str], output_path: str) -> None:
             f'{p}_files', f'{p}_on_grid', f'{p}_off_grid',
             f'{p}_expected', f'{p}_coverage_pct',
         ])
+    fieldnames.extend([
+        'complete_intersection', 'expected_intersection', 'coverage_pct',
+    ])
 
     with open(output_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
