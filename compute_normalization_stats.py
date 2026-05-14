@@ -104,6 +104,18 @@ DEFAULT_REGRID_ROOT = DEFAULT_DATA_ROOT / "reprojected_data"
 DEFAULT_OUTPUT = DEFAULT_DATA_ROOT / "normalization_stats.json"
 DEFAULT_TRAIN_CSV = DEFAULT_DATA_ROOT / "train_data.csv"
 DEFAULT_SEQUENCE_META = DEFAULT_DATA_ROOT / "sequence_meta.json"
+DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
+
+# Map a NORMALIZATION_SPEC source name to the matching product key in
+# timestep_config.json. OPERA has two entries in the config (reflectivity /
+# rainfall_rate) but they share the same filter, so either one works.
+_SOURCE_TO_TSCONFIG_PRODUCT = {
+    "radar":     "radar",
+    "mtg":       "mtg",
+    "nwcsaf":    "nwcsaf",
+    "opera":     "opera_rainfall_rate",
+    "lightning": "lightning",
+}
 
 # Per-variable normalization spec.
 #
@@ -281,6 +293,55 @@ def load_sequence_meta(path: Path) -> dict:
             f"first so the window definition is available."
         )
     return json.loads(path.read_text())
+
+
+def load_product_filters(timestep_config_path: Path
+                         ) -> dict[str, set[int]]:
+    """Read every product's minute filter from timestep_config.json.
+
+    Returns a dict mapping NORMALIZATION_SPEC source names ('radar',
+    'mtg', 'nwcsaf', 'opera', 'lightning') to the set of valid
+    minute-of-hour values. Missing or null filters become empty sets
+    (treated as 'no snap' downstream).
+    """
+    if not timestep_config_path.exists():
+        return {}
+    cfg = json.loads(timestep_config_path.read_text())
+    out: dict[str, set[int]] = {}
+    for source, ts_key in _SOURCE_TO_TSCONFIG_PRODUCT.items():
+        block = cfg.get("products", {}).get(ts_key, {})
+        flt = block.get("filter")
+        out[source] = set(int(m) for m in flt) if flt else set()
+    return out
+
+
+def snap_hhmm(hhmm: str, filter_minutes: set[int]) -> str:
+    """Snap a 4-digit HHMM string to the nearest minute in the filter,
+    with hour-boundary wrap. Tie-break prefers the earlier minute.
+    Mirrors the snap rule used in extract_patches.py / intersect."""
+    h, m = int(hhmm[:2]), int(hhmm[2:])
+    best = min(filter_minutes, key=lambda fm: (
+        min(abs(fm - m), 60 - abs(fm - m)),
+        fm,
+    ))
+    diff = best - m
+    if diff > 30:
+        diff -= 60
+    elif diff < -30:
+        diff += 60
+    total = (h * 60 + m + diff) % (24 * 60)
+    return f"{total // 60:02d}{total % 60:02d}"
+
+
+def snap_keys_to_filter(keys: set[tuple[str, str]],
+                        filter_minutes: set[int]) -> set[tuple[str, str]]:
+    """Snap every (date, HHMM) in `keys` to the per-product cadence grid.
+
+    Empty filter = no snap (continuous / event-based product).
+    """
+    if not filter_minutes:
+        return keys
+    return {(d, snap_hhmm(h, filter_minutes)) for d, h in keys}
 
 
 def expand_training_window(date_str: str, ref_utc: str,
@@ -470,31 +531,48 @@ def _walk_opera(root: Path, var: str,
 
 
 def discover_inputs(reproject_root: Path, var: str,
-                    training_keys: set[tuple[str, str]]
+                    training_keys: set[tuple[str, str]],
+                    product_filters: dict[str, set[int]] | None = None,
                     ) -> list:
     """
-    Dispatcher: returns either list[Path] (radar/mtg/lightning) or
-    list[(Path, internal_var_name)] (nwcsaf/opera).
+    Dispatcher: walks the product's reprojected subtree and returns the
+    list of `.npy` paths matching the training keys.
+
+    `training_keys` is on the master grid (e.g. {:00, :15, :30, :45}
+    when step=15). Different products live on different minute grids:
+    MTG / NWCSAF / radar at {:00, :10, :30, :40}; OPERA at the master
+    grid. Without a snap, the matcher would skip MTG/NWCSAF files at
+    :10 and :40 even though `extract_patches.py` loads them at runtime
+    (via its cadence snap). To keep the stats aligned with the files
+    actually used in training, snap the training keys to each product's
+    filter from `timestep_config.json` before matching.
     """
     spec = NORMALIZATION_SPEC[var]
     source = spec["source"]
+
+    keys = training_keys
+    if training_keys and product_filters is not None:
+        flt = product_filters.get(source)
+        if flt:
+            keys = snap_keys_to_filter(training_keys, flt)
+
     if source == "radar":
-        return _walk_radar_or_mtg(reproject_root / "radar_data", var, training_keys)
+        return _walk_radar_or_mtg(reproject_root / "radar_data", var, keys)
     if source == "mtg":
         return _walk_radar_or_mtg(
-            reproject_root / "satellite_data" / "MTG", var, training_keys,
+            reproject_root / "satellite_data" / "MTG", var, keys,
         )
     if source == "lightning":
         return _walk_lightning(
-            reproject_root / "lightning_data", var, training_keys,
+            reproject_root / "lightning_data", var, keys,
         )
     if source == "nwcsaf":
         return _walk_nwcsaf(
-            reproject_root / "nwcsaf_data", var, training_keys,
+            reproject_root / "nwcsaf_data", var, keys,
         )
     if source == "opera":
         return _walk_opera(
-            reproject_root / "opera_data", var, training_keys,
+            reproject_root / "opera_data", var, keys,
         )
     raise ValueError(f"Unknown source: {source!r}")
 
@@ -626,6 +704,13 @@ def main() -> int:
                         help='Reservoir sample size for percentile / MAD '
                              '(default: 200000). Ignored unless '
                              '--with_percentiles.')
+    parser.add_argument('--timestep_config', type=str,
+                        default=str(DEFAULT_TIMESTEP_CONFIG),
+                        help=f'Path to timestep_config.json (default: '
+                             f'{DEFAULT_TIMESTEP_CONFIG}). Used to snap '
+                             f'training keys onto each product\'s cadence '
+                             f'grid so 10-min products (MTG/NWCSAF) get '
+                             f'their :10/:40 files counted, not just :00/:30.')
     parser.add_argument('--output', '-o', type=str,
                         default=str(DEFAULT_OUTPUT),
                         help=f'Output JSON path (default: {DEFAULT_OUTPUT})')
@@ -664,6 +749,11 @@ def main() -> int:
         train_n_rows = (sum(1 for _ in open(train_csv))
                         if train_csv.exists() else 0) - 1
 
+    # Per-product minute filters from timestep_config.json. Used to snap
+    # training keys onto each product's own cadence grid so MTG/NWCSAF
+    # files at :10 and :40 are matched (not only :00/:30).
+    product_filters = load_product_filters(Path(args.timestep_config))
+
     print("=" * 70)
     print("Normalization Stats Computation")
     print("=" * 70)
@@ -679,7 +769,8 @@ def main() -> int:
     variable_results: dict[str, dict] = {}
     for var in sorted(variables):
         spec = NORMALIZATION_SPEC[var]
-        items = discover_inputs(reproject_root, var, training_keys)
+        items = discover_inputs(reproject_root, var, training_keys,
+                                product_filters=product_filters)
         print(f"  {var:22s}: {len(items)} file(s) match")
         result = compute_variable_stats(
             var, items, spec, args.sample_fraction,
