@@ -452,21 +452,27 @@ def _walk_nwcsaf(root: Path, var: str,
 
 def _walk_opera(root: Path, var: str,
                 training_keys: set[tuple[str, str]]
-                ) -> list[tuple[Path, str]]:
+                ) -> list[Path]:
     """
-    `reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/nc4_{date}-Romania_{HHMM}_{product}.nc`
-    The internal NetCDF variable name follows the reproject_opera.py
-    convention: 'max_reflectivity' or 'rainfall_rate'.
+    Reproject writes OPERA as `.npy` (one file per variable, same layout as
+    radar / MTG / lightning):
+
+      reprojected_data/opera_data/{product}/
+          nc4_{date}-Romania_{product}/nc4_{date}-Romania_{HHMM}_{product}.npy
+
+    `var` is the canonical name used in the stats spec
+    (`opera_reflectivity` / `opera_rainfall_rate`); the on-disk folder
+    name is the short form (`reflectivity` / `rainfall_rate`).
     """
     product_subdir = "reflectivity" if var == "opera_reflectivity" else "rainfall_rate"
-    nc_var = "max_reflectivity" if var == "opera_reflectivity" else "rainfall_rate"
     var_root = root / product_subdir
     if not var_root.is_dir():
         return []
     pattern = re.compile(
-        r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_(\d{4})_' + re.escape(product_subdir) + r'\.nc$'
+        r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_(\d{4})_'
+        + re.escape(product_subdir) + r'\.npy$'
     )
-    out: list[tuple[Path, str]] = []
+    out: list[Path] = []
     for day_dir in sorted(var_root.iterdir()):
         if not day_dir.is_dir():
             continue
@@ -478,7 +484,7 @@ def _walk_opera(root: Path, var: str,
             hhmm = m.group(2)
             if training_keys and (date_str, hhmm) not in training_keys:
                 continue
-            out.append((f, nc_var))
+            out.append(f)
     return out
 
 
@@ -513,12 +519,17 @@ def discover_inputs(reproject_root: Path, var: str,
 
 
 def load_array(item, source: str) -> np.ndarray | None:
-    """Load a 2-D array for one file, with per-source quirks."""
+    """Load a 2-D array for one file, with per-source quirks.
+
+    After the reproject pipeline unification, every product writes
+    `.npy` (radar / mtg / lightning / nwcsaf / opera). Only `nwcsaf`
+    still uses the (path, nc_var) tuple from the earlier multi-variable
+    `.nc` schema, which `_walk_nwcsaf` keeps as a compatibility hook —
+    if that ever changes too, the second branch below can go away.
+    """
     try:
-        if source in ("radar", "mtg", "lightning"):
-            arr = np.load(item, allow_pickle=False)
-        else:
-            # nwcsaf / opera — item is (path, nc_var)
+        if isinstance(item, tuple):
+            # nwcsaf legacy path — (path, nc_var)
             if NC4Dataset is None:
                 raise RuntimeError("netCDF4 not installed")
             path, nc_var = item
@@ -526,12 +537,15 @@ def load_array(item, source: str) -> np.ndarray | None:
                 if nc_var not in ds.variables:
                     return None
                 arr = np.asarray(ds.variables[nc_var][:])
+        else:
+            # radar / mtg / lightning / opera — all `.npy`
+            arr = np.load(item, allow_pickle=False)
         # Strip time dim if present
         if arr.ndim == 3 and arr.shape[0] == 1:
             arr = arr[0]
         if arr.ndim != 2:
             return None
-        # Mask the netCDF _FillValue and resolve MaskedArray
+        # Resolve any MaskedArray from the netCDF path
         if isinstance(arr, np.ma.MaskedArray):
             arr = arr.filled(np.nan)
         return arr.astype(np.float64, copy=False)
