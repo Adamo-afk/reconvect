@@ -7,18 +7,27 @@ script makes the cadence explicit and validated up front so that arrange,
 download, reproject, patch-extract, sequence-extract, dataset-build and training
 scripts all consume the same configuration instead of duplicating constants.
 
-Native cadences are read from `product_cadences.json` (alongside this script):
+Native cadences are read from `product_cadences.config` (alongside this
+script). The file is an INI-style config with a single `[cadences]`
+section and one entry per active product:
 
-    {
-        "radar":     10,
-        "mtg":       10,
-        "nwcsaf":    10,
-        "lightning": null    # continuous — no minute filter
-    }
+    [cadences]
+    radar               = 10
+    mtg                 = 10
+    nwcsaf              = 10
+    lightning           = null
+    opera_reflectivity  = 15
+    opera_rainfall_rate = 15
 
-Override the cadences file with --cadences_file. The script does not inspect
-any data folders; product cadences are a property of the source, not of what
-happens to be on disk.
+Values are positive integers (native cadence in minutes) or `null`
+(continuous / event-based product, no minute filter). Lines starting
+with `#` or `;` are comments. The set of products you list here is the
+set that appears in the output `timestep_config.json` — comment out a
+product or remove the line to exclude it from the active set.
+
+Override the cadences file with --cadences_file. The script does not
+inspect any data folders; product cadences are a property of the source,
+not of what happens to be on disk.
 
 For each non-continuous product, the chosen step must be >= the product's
 native cadence — otherwise we'd need data we don't have. The step does not
@@ -54,6 +63,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import os
 import sys
@@ -62,42 +72,68 @@ from pathlib import Path
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CADENCES_PATH = SCRIPT_DIR / "product_cadences.json"
+DEFAULT_CADENCES_PATH = SCRIPT_DIR / "product_cadences.config"
 DEFAULT_OUTPUT_PATH = SCRIPT_DIR / "our_data" / "timestep_config.json"
+CADENCES_SECTION = "cadences"
 
 
 def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
     """
-    Load the product → native-cadence mapping from a JSON file.
+    Load the product → native-cadence mapping from an INI-style config.
 
-    Keys prefixed with '_' (e.g. '_comment') are ignored so the file can
-    document itself. Values must be a positive integer (minutes) or null
-    (continuous data, no minute filter needed).
+    The file must have a single `[cadences]` section. Each entry is a
+    product name and its native cadence in minutes (positive integer)
+    or `null` / empty for continuous / event-based products that have
+    no fixed acquisition cadence (lightning is the canonical example).
+    Lines starting with `#` or `;` are comments.
     """
     if not cadences_path.exists():
         raise FileNotFoundError(
             f"Product cadences file not found: {cadences_path}\n"
-            f"Expected JSON of the form:\n"
-            f'  {{"radar": 10, "mtg": 10, "nwcsaf": 10, "lightning": null}}'
+            f"Expected an INI-style config of the form:\n"
+            f"  [cadences]\n"
+            f"  radar     = 10\n"
+            f"  mtg       = 10\n"
+            f"  nwcsaf    = 10\n"
+            f"  lightning = null\n"
         )
 
-    raw = json.loads(cadences_path.read_text())
-    if not isinstance(raw, dict):
+    parser = configparser.ConfigParser(
+        allow_no_value=True,
+        inline_comment_prefixes=("#", ";"),
+    )
+    # Preserve the case of product names (configparser lowercases by default).
+    parser.optionxform = str
+    try:
+        parser.read(cadences_path, encoding="utf-8")
+    except configparser.Error as exc:
+        raise ValueError(f"{cadences_path}: parse error — {exc}") from exc
+
+    if CADENCES_SECTION not in parser:
         raise ValueError(
-            f"{cadences_path}: expected a JSON object, got {type(raw).__name__}"
+            f"{cadences_path}: missing required [{CADENCES_SECTION}] section"
         )
 
     cadences: dict[str, int | None] = {}
-    for key, value in raw.items():
-        if key.startswith("_"):
-            continue  # skip comment/metadata keys
-        if value is None:
+    for key, raw_value in parser.items(CADENCES_SECTION):
+        if raw_value is None:
             cadences[key] = None
             continue
-        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        value_str = raw_value.strip()
+        if value_str == "" or value_str.lower() == "null":
+            cadences[key] = None
+            continue
+        try:
+            value = int(value_str)
+        except ValueError:
             raise ValueError(
                 f"{cadences_path}: product '{key}' has invalid cadence "
-                f"{value!r} (expected positive integer or null)"
+                f"{raw_value!r} (expected positive integer, null, or empty)"
+            )
+        if value <= 0:
+            raise ValueError(
+                f"{cadences_path}: product '{key}' has non-positive "
+                f"cadence {value} (expected positive integer)"
             )
         cadences[key] = value
 

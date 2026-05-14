@@ -1,9 +1,0 @@
-{
-  "_comment": "Native cadences (minutes) of each data product. Used by validate_timestep.py to validate the requested training step and to compute per-product minute filters. null = continuous (no minute filter required). Update this file if you add a new data source or change an existing one. NOTE: the validator's floor is the max of all non-null cadences here; comment out (rename with leading underscore) the products you are not using if they would otherwise raise the floor beyond what you need.",
-  "radar": 10,
-  "mtg": 10,
-  "nwcsaf": 10,
-  "lightning": null,
-  "opera_reflectivity": 15,
-  "opera_rainfall_rate": 15
-}
