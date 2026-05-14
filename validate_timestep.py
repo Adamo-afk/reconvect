@@ -4,7 +4,7 @@ write a timestep configuration file consumed by all downstream pipeline scripts.
 
 The COALITION-4 pipeline previously assumed a fixed 15-minute cadence. This
 script makes the cadence explicit and validated up front so that arrange,
-download, regrid, patch-extract, sequence-extract, dataset-build and training
+download, reproject, patch-extract, sequence-extract, dataset-build and training
 scripts all consume the same configuration instead of duplicating constants.
 
 Native cadences are read from `product_cadences.json` (alongside this script):

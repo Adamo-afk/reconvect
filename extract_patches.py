@@ -1,8 +1,8 @@
 """
 COALITION-4 patch extraction pipeline.
 
-Reads the patch index (from identify_patches.py) and the cached regridded
-data (from regrid_data.py), extracts the active 256x256 patches for every
+Reads the patch index (from identify_patches.py) and the cached reprojected
+data (from reproject_data.py), extracts the active 256x256 patches for every
 product, applies resolution-dependent pooling, and saves stacked .npy files.
 
 Resolution categories:
@@ -108,7 +108,7 @@ PRODUCT_GROUPS = {
 }
 
 # Map canonical (prefixed) OPERA variable name → on-disk folder/short name.
-# Both rainfall variants resolve to the same regridded file.
+# Both rainfall variants resolve to the same reprojected file.
 OPERA_VAR_TO_DISK = {
     'opera_reflectivity':     'reflectivity',
     'opera_rainfall_rate':    'rainfall_rate',
@@ -358,11 +358,11 @@ def _resolve_hhmm(hhmm: str, group: str) -> str:
 # File discovery per product
 # =============================================================================
 
-def find_regridded_file_radar(data_root, variable, date_str, time_str):
+def find_reprojected_file_radar(data_root, variable, date_str, time_str):
     """
-    Find a regridded radar .npy file.
+    Find a reprojected radar .npy file.
 
-    Path: regridded_data/radar_data/{var}/nc4_{date}-Romania_{var}/
+    Path: reprojected_data/radar_data/{var}/nc4_{date}-Romania_{var}/
           nc4_{date}-Romania_{HHMM}_{var}.npy
 
     HHMM is snapped to the radar minute filter from timestep_config.json
@@ -372,18 +372,18 @@ def find_regridded_file_radar(data_root, variable, date_str, time_str):
     day_folder = f"nc4_{date_str}-Romania_{variable}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
     path = os.path.join(
-        data_root, 'regridded_data', 'radar_data',
+        data_root, 'reprojected_data', 'radar_data',
         variable, day_folder, filename
     )
     return path if os.path.isfile(path) else None
 
 
-def find_regridded_file_satellite(data_root, instrument, channel,
+def find_reprojected_file_satellite(data_root, instrument, channel,
                                    date_str, time_str):
     """
-    Find a regridded satellite .npy file.
+    Find a reprojected satellite .npy file.
 
-    Path: regridded_data/satellite_data/{MSG|MTG}/{channel}/
+    Path: reprojected_data/satellite_data/{MSG|MTG}/{channel}/
           nc4_{date}-Romania_{channel}/nc4_{date}-Romania_{HHMM}_{channel}.npy
 
     HHMM is snapped to the instrument's minute filter — MTG/MSG at 10-min
@@ -395,17 +395,17 @@ def find_regridded_file_satellite(data_root, instrument, channel,
     day_folder = f"nc4_{date_str}-Romania_{channel}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{channel}.npy"
     path = os.path.join(
-        data_root, 'regridded_data', 'satellite_data', instrument,
+        data_root, 'reprojected_data', 'satellite_data', instrument,
         channel, day_folder, filename
     )
     return path if os.path.isfile(path) else None
 
 
-def find_regridded_file_lightning(data_root, product, date_str, time_str):
+def find_reprojected_file_lightning(data_root, product, date_str, time_str):
     """
-    Find a regridded lightning .npy file.
+    Find a reprojected lightning .npy file.
 
-    Path: regridded_data/lightning_data/{product}/nc4_{date}-Romania_{product}/
+    Path: reprojected_data/lightning_data/{product}/nc4_{date}-Romania_{product}/
           lightning_{product}_{YYYYMMDD}_{HHMM}.npy
 
     Lightning has no minute filter in timestep_config.json (cadence_minutes
@@ -416,19 +416,19 @@ def find_regridded_file_lightning(data_root, product, date_str, time_str):
     day_folder = f"nc4_{date_str}-Romania_{product}"
     filename = f"lightning_{product}_{date_compact}_{hhmm}.npy"
     path = os.path.join(
-        data_root, 'regridded_data', 'lightning_data',
+        data_root, 'reprojected_data', 'lightning_data',
         product, day_folder, filename
     )
     return path if os.path.isfile(path) else None
 
 
-def find_regridded_file_nwcsaf(data_root, variable, date_str, time_str):
+def find_reprojected_file_nwcsaf(data_root, variable, date_str, time_str):
     """
-    Find a regridded NWCSAF `.npy` file. After the unification in regrid.py,
+    Find a reprojected NWCSAF `.npy` file. After the unification in reproject.py,
     each NWCSAF variable is stored as its own per-variable `.npy` mirroring
     the radar / MTG layout — no more multi-variable `.nc` files.
 
-    Path: regridded_data/nwcsaf_data/{variable}/nc4_{date}-Romania_{variable}/
+    Path: reprojected_data/nwcsaf_data/{variable}/nc4_{date}-Romania_{variable}/
           nc4_{date}-Romania_{HHMM}_{variable}.npy
 
     HHMM is snapped to the NWCSAF minute filter (same shape as MTG's).
@@ -437,19 +437,19 @@ def find_regridded_file_nwcsaf(data_root, variable, date_str, time_str):
     day_folder = f"nc4_{date_str}-Romania_{variable}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
     path = os.path.join(
-        data_root, 'regridded_data', 'nwcsaf_data', variable,
+        data_root, 'reprojected_data', 'nwcsaf_data', variable,
         day_folder, filename,
     )
     return path if os.path.isfile(path) else None
 
 
-def find_regridded_file_opera(data_root, variable, date_str, time_str):
+def find_reprojected_file_opera(data_root, variable, date_str, time_str):
     """
-    Find a regridded OPERA .npy file. The on-disk folder uses the short
+    Find a reprojected OPERA .npy file. The on-disk folder uses the short
     product name (reflectivity / rainfall_rate) while the variable name
     passed in by extract_patches uses the `opera_` prefix.
 
-    Path: regridded_data/opera_data/{short}/nc4_{date}-Romania_{short}/
+    Path: reprojected_data/opera_data/{short}/nc4_{date}-Romania_{short}/
           nc4_{date}-Romania_{HHMM}_{short}.npy
 
     The patch index is on OPERA's grid so the snap is a no-op here, but
@@ -460,39 +460,39 @@ def find_regridded_file_opera(data_root, variable, date_str, time_str):
     day_folder = f"nc4_{date_str}-Romania_{short}"
     filename = f"nc4_{date_str}-Romania_{hhmm}_{short}.npy"
     path = os.path.join(
-        data_root, 'regridded_data', 'opera_data',
+        data_root, 'reprojected_data', 'opera_data',
         short, day_folder, filename
     )
     return path if os.path.isfile(path) else None
 
 
-def find_regridded_file(data_root, variable, group, date_str, time_str):
+def find_reprojected_file(data_root, variable, group, date_str, time_str):
     """
     Dispatch to the correct file finder based on product group.
 
     Returns:
-        str or None: path to the regridded file, or None if not found
+        str or None: path to the reprojected file, or None if not found
     """
     if group == 'radar':
-        return find_regridded_file_radar(data_root, variable, date_str, time_str)
+        return find_reprojected_file_radar(data_root, variable, date_str, time_str)
     elif group == 'satellite_MSG':
-        return find_regridded_file_satellite(
+        return find_reprojected_file_satellite(
             data_root, 'MSG', variable, date_str, time_str
         )
     elif group == 'satellite_MTG':
-        return find_regridded_file_satellite(
+        return find_reprojected_file_satellite(
             data_root, 'MTG', variable, date_str, time_str
         )
     elif group == 'lightning':
-        return find_regridded_file_lightning(
+        return find_reprojected_file_lightning(
             data_root, variable, date_str, time_str
         )
     elif group == 'nwcsaf':
-        return find_regridded_file_nwcsaf(
+        return find_reprojected_file_nwcsaf(
             data_root, variable, date_str, time_str
         )
     elif group == 'opera':
-        return find_regridded_file_opera(
+        return find_reprojected_file_opera(
             data_root, variable, date_str, time_str
         )
     return None
@@ -502,10 +502,10 @@ def find_regridded_file(data_root, variable, group, date_str, time_str):
 # Data loading
 # =============================================================================
 
-def load_regridded(filepath, variable=None, group=None):
+def load_reprojected(filepath, variable=None, group=None):
     """
-    Load a regridded `.npy` file. All product families now write `.npy`;
-    multi-variable NWCSAF `.nc` files were removed when regrid.py was
+    Load a reprojected `.npy` file. All product families now write `.npy`;
+    multi-variable NWCSAF `.nc` files were removed when reproject.py was
     unified, so `variable` and `group` are no longer used here.
 
     Returns:
@@ -526,7 +526,7 @@ def extract_and_pool(data, active_patches, pool_factor):
     Extract active patches from a full grid and apply pooling.
 
     Args:
-        data: 2D array (768×1536) — the full regridded field
+        data: 2D array (768×1536) — the full reprojected field
         active_patches: sorted list of 1-indexed patch numbers
         pool_factor: 1 (no pooling), 2 (2×2), or 4 (4×4)
 
@@ -652,7 +652,7 @@ def run_extraction(data_root, output_root, date_filter=None,
                 continue
 
             # Find source file
-            filepath = find_regridded_file(
+            filepath = find_reprojected_file(
                 data_root, var_name, group, date_str, time_str
             )
 
@@ -662,7 +662,7 @@ def run_extraction(data_root, output_root, date_filter=None,
 
             try:
                 # Load the full 768×1536 grid
-                data = load_regridded(filepath, variable=var_name, group=group)
+                data = load_reprojected(filepath, variable=var_name, group=group)
 
                 # Extract patches and apply pooling
                 patches = extract_and_pool(data, active_patches, pool_factor)
@@ -708,7 +708,7 @@ def run_extraction(data_root, output_root, date_filter=None,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="COALITION-4 patch extraction pipeline. "
-                    "Extracts 256×256 patches from regridded data based on "
+                    "Extracts 256×256 patches from reprojected data based on "
                     "the patch index, with resolution-dependent pooling."
     )
     parser.add_argument(

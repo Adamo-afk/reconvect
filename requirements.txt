@@ -34,7 +34,7 @@ paramiko         # SFTP transfer from anm@192.168.11.223 — required by pipelin
 hdf5plugin       # CharLS plugin required to read FCI L1C compressed chunks
 
 # OPERA radar pipeline (our_data/opera_data/)
-h5py             # read OPERA ODC HDF5 files (regrid_opera.py)
+h5py             # read OPERA ODC HDF5 files (reproject_opera.py)
 
 # Visualization
 matplotlib

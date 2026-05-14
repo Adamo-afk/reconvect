@@ -4,7 +4,7 @@ pipeline_msg_mtg.py — MTG FCI L1C data pipeline (Romania)
 Downloads FCI chunk files from a remote machine via SFTP (paramiko),
 filters to Romania-covering chunks (35–36), reads them directly with
 netCDF4, and saves per-channel NetCDF files with geostationary
-projection metadata for downstream regridding.
+projection metadata for downstream reprojection.
 
 Usage:
     python pipeline_msg_mtg.py -s 2025/05/01-0000 -e 2025/05/01-2350 \\

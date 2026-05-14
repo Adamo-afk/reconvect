@@ -9,7 +9,7 @@ is no longer exercised by the active training flow. The active flow is:
         -> our_data/{satellite,nwcsaf,opera}_data/pipeline_*.py
         -> our_data/lightning_data/read_kml_version2.py
         -> identify_patches.py / identify_lightning_periods.py
-        -> regrid.py
+        -> reproject.py
         -> extract_patches.py
         -> extract_patch_seq_for_datasets.py        (Step 4.1)
         -> intersect_product_coverage.py            (Step 4.2)
@@ -27,8 +27,8 @@ process_nwcsaf.py
       - extract_latlon_coordinates(input_nc_file)
       - read_and_scale_nwcsaf_variable(nc_filename, variable_name)
     Both transform from the MSG GEOS projection to WGS84 via pyproj.
-    Equivalent (and broader) functionality lives inside regrid_nwcsaf() in
-    regrid.py, which also reprojects onto the EPSG:31700 Romania grid and
+    Equivalent (and broader) functionality lives inside reproject_nwcsaf() in
+    reproject.py, which also reprojects onto the EPSG:31700 Romania grid and
     writes per-variable .npy files. The only remaining consumer of this
     module is the legacy c4dl/datasets/msgccs4.py reader (see below), which
     is itself dormant in the active pipeline.
@@ -52,7 +52,7 @@ c4dl/features/test_nc.py
 c4dl/features/regions.py
     Patch-saving helpers (save_patches_radar, save_patches_lightning, ...)
     inherited from the original pipeline. The active extract_patches.py
-    reimplements its own patch slicing + pooling on the regridded grids,
+    reimplements its own patch slicing + pooling on the reprojected grids,
     so these helpers are unused at training time. A handful of legacy
     scripts (under scripts/) still pull from this module.
 
@@ -62,7 +62,7 @@ c4dl/datasets/swissdem.py, c4dl/datasets/solar.py,
 c4dl/datasets/goesabi.py, c4dl/datasets/goesglm.py, c4dl/datasets/nexrad.py,
 c4dl/datasets/ecmwfnwp.py, c4dl/datasets/asterdem.py
     Original per-source NetCDF readers from the MeteoSwiss / GOES forks.
-    All replaced by the our_data/* pipelines + regrid.py + extract_patches
+    All replaced by the our_data/* pipelines + reproject.py + extract_patches
     in the Romanian pipeline.
 
 scripts/
@@ -102,7 +102,7 @@ it directly)
 -------------------------------------------------------------------------
 
 c4dl/projection.py
-    GridProjection + romania_grid_area — used by regrid.py,
+    GridProjection + romania_grid_area — used by reproject.py,
     identify_patches.py and our_data/lightning_data/read_kml_version2.py
     to define the EPSG:31700 1536x768 target grid for Romania.
 

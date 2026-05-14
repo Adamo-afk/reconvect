@@ -296,8 +296,8 @@ def transform_cmic_phase(x):
     Hardcoded. Categorical variable with five classes — no continuous
     normalisation makes sense.
 
-    Input is expected to be int8 codes 0–4 from regrid.py (NaN replaced
-    with 0 = "no cloud / missing" at regrid time, so this function no
+    Input is expected to be int8 codes 0–4 from reproject.py (NaN replaced
+    with 0 = "no cloud / missing" at reproject time, so this function no
     longer needs to handle NaN). 4×4 LR pooling in extract_patches.py
     can still produce fractional values when a block mixes categories,
     so a final round-to-nearest still happens here before the one-hot.
@@ -369,7 +369,7 @@ def label_transform_opera_rainfall_multiclass(x):
     (<10, 10–20, 20–30, 30–40, ≥40 mm/h) so that COALITION-4 trained on
     OPERA labels stays comparable with the RZC-trained baseline. The
     label patch is loaded from `opera_rainfall_rate_hr` (HR alias of the
-    same regridded file) so the output shape matches the 256×256 HR head.
+    same reprojected file) so the output shape matches the 256×256 HR head.
     """
     x = np.where(np.isnan(x), 0.0, x)
     x = np.clip(x, 0.0, None)

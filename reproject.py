@@ -1,12 +1,12 @@
 # """
-# COALITION-4 data regridding pipeline (optimized with precomputed mappings).
+# COALITION-4 data reprojection pipeline (optimized with precomputed mappings).
 
 # Regrids all products to the Romania 1536x768 EPSG:31700 grid and caches
 # the results so the expensive reprojection runs only once per source file.
 
 # Optimization: the KD-tree is built ONCE per source geometry (not per file).
 # All files sharing the same source grid reuse the precomputed index mapping,
-# reducing regridding to a fast numpy array lookup.
+# reducing reprojection to a fast numpy array lookup.
 
 # Products handled:
 #     - Radar:     RZC, BZC, CZC, EZC-20, LZC, CPCH       → .npy
@@ -24,20 +24,20 @@
 #     our_data/nwcsaf_data/{date}-Romania/*.nc
 
 # Output paths:
-#     our_data/regridded_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
-#     our_data/regridded_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-#     our_data/regridded_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-#     our_data/regridded_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
-#     our_data/regridded_data/nwcsaf_data/{date}-Romania/*.nc
+#     our_data/reprojected_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
+#     our_data/reprojected_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
+#     our_data/reprojected_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
+#     our_data/reprojected_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
+#     our_data/reprojected_data/nwcsaf_data/{date}-Romania/*.nc
 
 # Usage (run from F:\\nowcasting\\coalition4-rcnn):
-#     python regrid_data.py --radar
-#     python regrid_data.py --satellite MSG
-#     python regrid_data.py --satellite MTG
-#     python regrid_data.py --lightning
-#     python regrid_data.py --nwcsaf
-#     python regrid_data.py --all
-#     python regrid_data.py --radar --date 2024-06-13
+#     python reproject_data.py --radar
+#     python reproject_data.py --satellite MSG
+#     python reproject_data.py --satellite MTG
+#     python reproject_data.py --lightning
+#     python reproject_data.py --nwcsaf
+#     python reproject_data.py --all
+#     python reproject_data.py --radar --date 2024-06-13
 # """
 
 # import numpy as np
@@ -119,10 +119,10 @@
 #               f"(source: {source_lats.shape}, target: {self.target_shape})")
 
 #     def apply(self, source_data, fill_value=None):
-#         """Apply the precomputed mapping to regrid source data (fast)."""
+#         """Apply the precomputed mapping to reproject source data (fast)."""
 #         fv = fill_value if fill_value is not None else self.fill_value
 
-#         regridded = kd_tree.get_sample_from_neighbour_info(
+#         reprojected = kd_tree.get_sample_from_neighbour_info(
 #             'nn',
 #             self.target_shape,
 #             source_data,
@@ -131,7 +131,7 @@
 #             self.index_array,
 #             fill_value=fv
 #         )
-#         return regridded
+#         return reprojected
 
 
 # # =============================================================================
@@ -230,12 +230,12 @@
 #     return datamap
 
 
-# def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
+# def reproject_radar(data_root, target_lats, target_lons, date_filter=None):
 #     """
-#     Regrid all radar products. KD-tree built once, reused for all files.
+#     Reproject all radar products. KD-tree built once, reused for all files.
 #     """
 #     radar_dir = os.path.join(data_root, 'radar_data')
-#     regridded_base = os.path.join(data_root, 'regridded_data', 'radar_data')
+#     reprojected_base = os.path.join(data_root, 'reprojected_data', 'radar_data')
 #     mapping = None
 
 #     for product in RADAR_PRODUCTS:
@@ -252,7 +252,7 @@
 #             if not os.path.isdir(day_path):
 #                 continue
 
-#             out_dir = os.path.join(regridded_base, product, day_folder)
+#             out_dir = os.path.join(reprojected_base, product, day_folder)
 #             nc_files = sorted(
 #                 f for f in os.listdir(day_path) if f.endswith('.nc')
 #             )
@@ -275,11 +275,11 @@
 #                         )
 
 #                     datamap = _read_radar_data(filepath)
-#                     regridded = mapping.apply(datamap)
-#                     regridded = np.flipud(regridded)
+#                     reprojected = mapping.apply(datamap)
+#                     reprojected = np.flipud(reprojected)
 
 #                     ensure_dir(out_dir)
-#                     np.save(out_path, regridded)
+#                     np.save(out_path, reprojected)
 #                     new += 1
 #                 except Exception as e:
 #                     print(f"    ERROR {nc_file}: {e}")
@@ -294,13 +294,13 @@
 # # MSG satellite
 # # =============================================================================
 
-# def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
+# def reproject_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
 #     """
-#     Regrid MSG channels. KD-tree built once per channel, reused for all files.
+#     Reproject MSG channels. KD-tree built once per channel, reused for all files.
 #     """
 #     msg_dir = os.path.join(data_root, 'satellite_data', 'MSG')
-#     regridded_base = os.path.join(
-#         data_root, 'regridded_data', 'satellite_data', 'MSG'
+#     reprojected_base = os.path.join(
+#         data_root, 'reprojected_data', 'satellite_data', 'MSG'
 #     )
 
 #     for channel in MSG_CHANNELS:
@@ -318,7 +318,7 @@
 #             if not os.path.isdir(day_path):
 #                 continue
 
-#             out_dir = os.path.join(regridded_base, channel, day_folder)
+#             out_dir = os.path.join(reprojected_base, channel, day_folder)
 #             nc_files = sorted(
 #                 f for f in os.listdir(day_path) if f.endswith('.nc')
 #             )
@@ -350,9 +350,9 @@
 #                             continue
 #                         sat_data = ds.variables[var_name][:]
 
-#                     regridded = mapping.apply(sat_data)
+#                     reprojected = mapping.apply(sat_data)
 #                     ensure_dir(out_dir)
-#                     np.save(out_path, regridded)
+#                     np.save(out_path, reprojected)
 #                     new += 1
 #                 except Exception as e:
 #                     print(f"    ERROR {nc_file}: {e}")
@@ -367,15 +367,15 @@
 # # MTG satellite
 # # =============================================================================
 
-# def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
+# def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
 #     """
-#     Regrid MTG channels. KD-tree built once per resolution (1km/2km),
+#     Reproject MTG channels. KD-tree built once per resolution (1km/2km),
 #     reused for all channels sharing that resolution.
 #     """
 #     mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')
 #     coord_dir = os.path.join(mtg_dir, 'coordinates')
-#     regridded_base = os.path.join(
-#         data_root, 'regridded_data', 'satellite_data', 'MTG'
+#     reprojected_base = os.path.join(
+#         data_root, 'reprojected_data', 'satellite_data', 'MTG'
 #     )
 
 #     # Precompute mappings per resolution
@@ -413,7 +413,7 @@
 #             if not os.path.isdir(day_path):
 #                 continue
 
-#             out_dir = os.path.join(regridded_base, channel, day_folder)
+#             out_dir = os.path.join(reprojected_base, channel, day_folder)
 #             nc_files = sorted(
 #                 f for f in os.listdir(day_path) if f.endswith('.nc')
 #             )
@@ -439,9 +439,9 @@
 #                             continue
 #                         sat_data = ds.variables[var_name][:]
 
-#                     regridded = mapping.apply(sat_data)
+#                     reprojected = mapping.apply(sat_data)
 #                     ensure_dir(out_dir)
-#                     np.save(out_path, regridded)
+#                     np.save(out_path, reprojected)
 #                     new += 1
 #                 except Exception as e:
 #                     print(f"    ERROR {nc_file}: {e}")
@@ -453,14 +453,14 @@
 
 
 # # =============================================================================
-# # Lightning (no regridding)
+# # Lightning (no reprojection)
 # # =============================================================================
 
-# def regrid_lightning(data_root, date_filter=None):
+# def reproject_lightning(data_root, date_filter=None):
 #     """Cache lightning NetCDF data as .npy (already on grid)."""
 #     lightning_dir = os.path.join(data_root, 'lightning_data')
-#     regridded_base = os.path.join(
-#         data_root, 'regridded_data', 'lightning_data'
+#     reprojected_base = os.path.join(
+#         data_root, 'reprojected_data', 'lightning_data'
 #     )
 
 #     for product in LIGHTNING_PRODUCTS:
@@ -477,7 +477,7 @@
 #             if not os.path.isdir(day_path):
 #                 continue
 
-#             out_dir = os.path.join(regridded_base, product, day_folder)
+#             out_dir = os.path.join(reprojected_base, product, day_folder)
 #             nc_files = sorted(
 #                 f for f in os.listdir(day_path) if f.endswith('.nc')
 #             )
@@ -516,12 +516,12 @@
 # # NWCSAF (saves as .nc)
 # # =============================================================================
 
-# def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
+# def reproject_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
 #     """
-#     Regrid NWCSAF files. KD-tree built once from first file, reused for all.
+#     Reproject NWCSAF files. KD-tree built once from first file, reused for all.
 #     """
 #     nwcsaf_dir = os.path.join(data_root, 'nwcsaf_data')
-#     regridded_base = os.path.join(data_root, 'regridded_data', 'nwcsaf_data')
+#     reprojected_base = os.path.join(data_root, 'reprojected_data', 'nwcsaf_data')
 
 #     if not os.path.isdir(nwcsaf_dir):
 #         print("  NWCSAF directory not found")
@@ -536,7 +536,7 @@
 #         if not os.path.isdir(day_path):
 #             continue
 
-#         out_dir = os.path.join(regridded_base, day_folder)
+#         out_dir = os.path.join(reprojected_base, day_folder)
 #         nc_files = sorted(
 #             f for f in os.listdir(day_path) if f.endswith('.nc')
 #         )
@@ -580,7 +580,7 @@
 #                     exclude |= {v for v in ds.variables if 'pal' in v}
 #                     var_names = [v for v in ds.variables if v not in exclude]
 
-#                     regridded_dict = {}
+#                     reprojected_dict = {}
 #                     for var_name in var_names:
 #                         data = ds.variables[var_name][:]
 
@@ -589,7 +589,7 @@
 #                         elif data.ndim == 1:
 #                             if isinstance(data, np.ma.MaskedArray):
 #                                 data = data.filled(0.0)
-#                             regridded_dict[var_name] = np.asarray(
+#                             reprojected_dict[var_name] = np.asarray(
 #                                 data, dtype=np.float32
 #                             )
 #                             continue
@@ -608,12 +608,12 @@
 #                             data, nan=0.0, posinf=1e6, neginf=-1e6
 #                         )
 
-#                         regridded = mapping.apply(data)
-#                         regridded_dict[var_name] = regridded
+#                         reprojected = mapping.apply(data)
+#                         reprojected_dict[var_name] = reprojected
 
-#                 if regridded_dict:
+#                 if reprojected_dict:
 #                     _save_nwcsaf_nc(
-#                         regridded_dict, target_lats, target_lons,
+#                         reprojected_dict, target_lats, target_lons,
 #                         out_dir, nc_file
 #                     )
 #                     new += 1
@@ -627,7 +627,7 @@
 
 
 # def _save_nwcsaf_nc(data_dict, lats, lons, out_dir, filename):
-#     """Save regridded NWCSAF data as a single NetCDF file."""
+#     """Save reprojected NWCSAF data as a single NetCDF file."""
 #     ensure_dir(out_dir)
 #     out_path = os.path.join(out_dir, filename)
 
@@ -654,7 +654,7 @@
 
 # def run(data_root, mode, instrument=None, date_filter=None):
 #     print("=" * 70)
-#     print("COALITION-4 Data Regridding Pipeline (precomputed mappings)")
+#     print("COALITION-4 Data Reprojection Pipeline (precomputed mappings)")
 #     print("=" * 70)
 #     print(f"Data root : {data_root}")
 #     print(f"Mode      : {mode}" + (f" ({instrument})" if instrument else ""))
@@ -673,13 +673,13 @@
 #         print(f"\n{'='*70}")
 #         print("Radar products")
 #         print(f"{'='*70}")
-#         regrid_radar(data_root, target_lats, target_lons, date_filter)
+#         reproject_radar(data_root, target_lats, target_lons, date_filter)
 
 #     if mode == 'satellite' and instrument == 'MSG' or mode == 'all':
 #         print(f"\n{'='*70}")
 #         print("MSG satellite channels")
 #         print(f"{'='*70}")
-#         regrid_satellite_msg(data_root, target_lats, target_lons, date_filter)
+#         reproject_satellite_msg(data_root, target_lats, target_lons, date_filter)
 
 #     if mode == 'satellite' and instrument == 'MTG' or mode == 'all':
 #         print(f"\n{'='*70}")
@@ -687,19 +687,19 @@
 #         print(f"{'='*70}")
 #         if target_lats is None:
 #             target_lats, target_lons = init_romania_grid()
-#         regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter)
+#         reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter)
 
 #     if mode in ('lightning', 'all'):
 #         print(f"\n{'='*70}")
 #         print("Lightning products")
 #         print(f"{'='*70}")
-#         regrid_lightning(data_root, date_filter)
+#         reproject_lightning(data_root, date_filter)
 
 #     if mode in ('nwcsaf', 'all'):
 #         print(f"\n{'='*70}")
 #         print("NWCSAF products")
 #         print(f"{'='*70}")
-#         regrid_nwcsaf(data_root, target_lats, target_lons, date_filter)
+#         reproject_nwcsaf(data_root, target_lats, target_lons, date_filter)
 
 #     elapsed = timer_module.time() - t_start
 #     print(f"\n{'='*70}")
@@ -713,7 +713,7 @@
 
 # if __name__ == "__main__":
 #     parser = argparse.ArgumentParser(
-#         description="COALITION-4 data regridding pipeline. "
+#         description="COALITION-4 data reprojection pipeline. "
 #                     "Uses precomputed KD-tree mappings for speed."
 #     )
 #     parser.add_argument(
@@ -727,15 +727,15 @@
 
 #     group = parser.add_mutually_exclusive_group(required=True)
 #     group.add_argument("--radar", action="store_true",
-#                        help="Regrid radar products")
+#                        help="Reproject radar products")
 #     group.add_argument("--satellite", type=str, choices=['MSG', 'MTG'],
-#                        metavar='INSTRUMENT', help="Regrid satellite channels")
+#                        metavar='INSTRUMENT', help="Reproject satellite channels")
 #     group.add_argument("--lightning", action="store_true",
 #                        help="Cache lightning data as .npy")
 #     group.add_argument("--nwcsaf", action="store_true",
-#                        help="Regrid NWCSAF products")
+#                        help="Reproject NWCSAF products")
 #     group.add_argument("--all", action="store_true",
-#                        help="Regrid all products")
+#                        help="Reproject all products")
 
 #     args = parser.parse_args()
 
@@ -758,19 +758,19 @@
 #     )
 
 """
-COALITION-4 data regridding pipeline (optimized with precomputed mappings).
+COALITION-4 data reprojection pipeline (optimized with precomputed mappings).
 
 Regrids all products to the Romania 1536x768 EPSG:31700 grid and caches
 the results so the expensive reprojection runs only once per source file.
 
 Optimization: the KD-tree is built ONCE per source geometry (not per file).
 All files sharing the same source grid reuse the precomputed index mapping,
-reducing regridding to a fast numpy array lookup.
+reducing reprojection to a fast numpy array lookup.
 
 Products handled — every family writes `.npy`. The Romania grid coordinates
 (`romania_grid_lats.npy`, `romania_grid_lons.npy`) and per-source projection
 constants (`{mtg,nwcsaf,opera}_constants.json`) are written **once** as
-sidecars so the regridded arrays remain self-recoverable for inspection.
+sidecars so the reprojected arrays remain self-recoverable for inspection.
 
     - Radar:     RZC, BZC, CZC, EZC-20, LZC, CPCH       → .npy
     - MSG:       VIS006, IR_039, IR_108, WV_062, WV_073 → .npy   (disabled)
@@ -789,24 +789,24 @@ Input paths:
     our_data/opera_data/{reflectivity|rainfall_rate}/{YYYY}/{MM}/{DD}/*.h5
 
 Output paths:
-    our_data/regridded_data/romania_grid_{lats,lons}.npy             (shared)
-    our_data/regridded_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
-    our_data/regridded_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-    our_data/regridded_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-    our_data/regridded_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
-    our_data/regridded_data/nwcsaf_data/{var}/nc4_{date}-Romania_{var}/*.npy
-    our_data/regridded_data/nwcsaf_data/nwcsaf_constants.json
-    our_data/regridded_data/opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
-    our_data/regridded_data/opera_data/opera_constants.json
+    our_data/reprojected_data/romania_grid_{lats,lons}.npy             (shared)
+    our_data/reprojected_data/radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
+    our_data/reprojected_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
+    our_data/reprojected_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
+    our_data/reprojected_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
+    our_data/reprojected_data/nwcsaf_data/{var}/nc4_{date}-Romania_{var}/*.npy
+    our_data/reprojected_data/nwcsaf_data/nwcsaf_constants.json
+    our_data/reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
+    our_data/reprojected_data/opera_data/opera_constants.json
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
-    python regrid_data.py --radar
-    python regrid_data.py --satellite MSG
-    python regrid_data.py --satellite MTG
-    python regrid_data.py --lightning
-    python regrid_data.py --nwcsaf
-    python regrid_data.py --all
-    python regrid_data.py --radar --date 2024-06-13
+    python reproject_data.py --radar
+    python reproject_data.py --satellite MSG
+    python reproject_data.py --satellite MTG
+    python reproject_data.py --lightning
+    python reproject_data.py --nwcsaf
+    python reproject_data.py --all
+    python reproject_data.py --radar --date 2024-06-13
 """
 
 import json
@@ -836,7 +836,7 @@ _h5_lock = threading.Lock()  # h5py builds aren't always thread-safe
 
 
 # =============================================================================
-# OPERA HDF5 helpers (used by regrid_opera and shared with inspect tools)
+# OPERA HDF5 helpers (used by reproject_opera and shared with inspect tools)
 # =============================================================================
 
 # Filename timestamp parsers — see pipeline_opera.py for the conventions:
@@ -884,7 +884,7 @@ def _read_opera_source_grid(h5_path):
     Returns (lats, lons, projection_metadata_dict).
     """
     if h5py is None:
-        raise RuntimeError("h5py is required for OPERA regridding; "
+        raise RuntimeError("h5py is required for OPERA reprojection; "
                            "install via `pip install h5py`.")
     with h5py.File(h5_path, 'r') as f:
         where = f['/where'].attrs
@@ -934,7 +934,7 @@ def _read_opera_data(h5_path):
     Returns a float32 2-D array (NaN where nodata, 0 where undetect).
     """
     if h5py is None:
-        raise RuntimeError("h5py is required for OPERA regridding; "
+        raise RuntimeError("h5py is required for OPERA reprojection; "
                            "install via `pip install h5py`.")
     with _h5_lock, h5py.File(h5_path, 'r') as f:
         ds = f['/dataset1/data1']
@@ -1021,10 +1021,10 @@ class PrecomputedMapping:
               f"(source: {source_lats.shape}, target: {self.target_shape})")
 
     def apply(self, source_data, fill_value=None):
-        """Apply the precomputed mapping to regrid source data (fast)."""
+        """Apply the precomputed mapping to reproject source data (fast)."""
         fv = fill_value if fill_value is not None else self.fill_value
 
-        regridded = kd_tree.get_sample_from_neighbour_info(
+        reprojected = kd_tree.get_sample_from_neighbour_info(
             'nn',
             self.target_shape,
             source_data,
@@ -1033,7 +1033,7 @@ class PrecomputedMapping:
             self.index_array,
             fill_value=fv
         )
-        return regridded
+        return reprojected
 
 
 # =============================================================================
@@ -1122,7 +1122,7 @@ def _read_radar_data(filepath):
 # Module-level workers for ProcessPoolExecutor
 # =============================================================================
 #
-# Each `regrid_*` function below runs its day folders through a fresh
+# Each `reproject_*` function below runs its day folders through a fresh
 # `ProcessPoolExecutor`. The workers MUST be defined at module level so
 # they can be pickled to child processes (nested functions can't be).
 #
@@ -1134,21 +1134,21 @@ def _read_radar_data(filepath):
 _WORKER_STATE: dict = {}
 
 
-def _write_regrid_log(regridded_root, category, all_errors):
-    """Write a single-line-per-error log named after the regrid category.
+def _write_reproject_log(reprojected_root, category, all_errors):
+    """Write a single-line-per-error log named after the reproject category.
 
     Format matches `errors.txt`:
         ERROR <filename>: <message>
 
-    The log is written under `regridded_root` (typically
-    `our_data/regridded_data/`) so it sits next to the regridded outputs.
+    The log is written under `reprojected_root` (typically
+    `our_data/reprojected_data/`) so it sits next to the reprojected outputs.
     Always overwrites — the log reflects the state of the most recent
     run, not a cumulative history. If no errors occurred, the log is
     still written but empty so downstream consumers can `open()` it
     unconditionally.
     """
-    ensure_dir(regridded_root)
-    log_path = os.path.join(regridded_root, f"regrid_{category}.log")
+    ensure_dir(reprojected_root)
+    log_path = os.path.join(reprojected_root, f"reproject_{category}.log")
     with open(log_path, 'w', encoding='utf-8') as f:
         for fname, msg in all_errors:
             f.write(f"ERROR {fname}: {msg}\n")
@@ -1182,10 +1182,10 @@ def _radar_day_worker(job):
         try:
             filepath = os.path.join(day_path, nc_file)
             datamap = _read_radar_data(filepath)
-            regridded = mapping.apply(datamap)
-            regridded = np.flipud(regridded)
+            reprojected = mapping.apply(datamap)
+            reprojected = np.flipud(reprojected)
             ensure_dir(out_dir)
-            np.save(out_path, regridded)
+            np.save(out_path, reprojected)
             new += 1
         except Exception as e:
             errors.append((nc_file, str(e)))
@@ -1211,9 +1211,9 @@ def _msg_day_worker(job):
                 if var_name is None:
                     continue
                 sat_data = ds.variables[var_name][:]
-            regridded = mapping.apply(sat_data)
+            reprojected = mapping.apply(sat_data)
             ensure_dir(out_dir)
-            np.save(out_path, regridded)
+            np.save(out_path, reprojected)
             new += 1
         except Exception as e:
             errors.append((nc_file, str(e)))
@@ -1238,9 +1238,9 @@ def _mtg_day_worker(job):
             sat_data = np.asarray(sat_data, dtype=np.float32)
             if sat_data.ndim == 3:
                 sat_data = np.squeeze(sat_data, axis=0)
-            regridded = mapping.apply(sat_data, fill_value=np.nan)
+            reprojected = mapping.apply(sat_data, fill_value=np.nan)
             ensure_dir(out_dir)
-            np.save(out_path, regridded)
+            np.save(out_path, reprojected)
             new += 1
         except Exception as e:
             errors.append((npy_file, str(e)))
@@ -1275,7 +1275,7 @@ def _lightning_day_worker(job):
 
 def _nwcsaf_day_worker(job):
     mapping = _WORKER_STATE['mapping']
-    regridded_base = _WORKER_STATE['regridded_base']
+    reprojected_base = _WORKER_STATE['reprojected_base']
     day_folder, day_path, nc_files = job
     new, skipped = 0, 0
     errors: list[tuple[str, str]] = []
@@ -1293,7 +1293,7 @@ def _nwcsaf_day_worker(job):
         all_outputs = []
         for var in vars_in_file:
             out_dir = os.path.join(
-                regridded_base, var, f"nc4_{date_str}-Romania_{var}"
+                reprojected_base, var, f"nc4_{date_str}-Romania_{var}"
             )
             out_name = f"nc4_{date_str}-Romania_{hhmm}_{var}.npy"
             all_outputs.append((var, out_dir, os.path.join(out_dir, out_name)))
@@ -1331,16 +1331,16 @@ def _nwcsaf_day_worker(job):
                 dtype = NWCSAF_VAR_SPEC[var]["dtype"]
                 if dtype == np.int8:
                     data = np.nan_to_num(data, nan=0.0)
-                    regridded = mapping.apply(data, fill_value=0)
-                    regridded = np.round(regridded).astype(np.int8)
+                    reprojected = mapping.apply(data, fill_value=0)
+                    reprojected = np.round(reprojected).astype(np.int8)
                 else:
                     data = np.nan_to_num(
                         data, nan=0.0, posinf=1e6, neginf=-1e6,
                     )
-                    regridded = mapping.apply(data, fill_value=np.nan)
-                    regridded = regridded.astype(np.float32)
+                    reprojected = mapping.apply(data, fill_value=np.nan)
+                    reprojected = reprojected.astype(np.float32)
                 ensure_dir(out_dir)
-                np.save(out_path, regridded)
+                np.save(out_path, reprojected)
             new += 1
         except Exception as e:
             errors.append((nc_file, str(e)))
@@ -1350,12 +1350,12 @@ def _nwcsaf_day_worker(job):
 def _opera_day_worker(job):
     mapping = _WORKER_STATE['mapping']
     product = _WORKER_STATE['product']
-    regridded_base = _WORKER_STATE['regridded_base']
+    reprojected_base = _WORKER_STATE['reprojected_base']
     date_str, day_path, h5_files = job
     new, skipped = 0, 0
     errors: list[tuple[str, str]] = []
     out_dir = os.path.join(
-        regridded_base, product, f"nc4_{date_str}-Romania_{product}"
+        reprojected_base, product, f"nc4_{date_str}-Romania_{product}"
     )
     for h5_file in h5_files:
         _, hhmm = _parse_opera_filename(h5_file)
@@ -1369,21 +1369,21 @@ def _opera_day_worker(job):
             continue
         try:
             physical = _read_opera_data(os.path.join(day_path, h5_file))
-            regridded = mapping.apply(physical, fill_value=np.nan)
+            reprojected = mapping.apply(physical, fill_value=np.nan)
             ensure_dir(out_dir)
-            np.save(out_path, regridded.astype(np.float32))
+            np.save(out_path, reprojected.astype(np.float32))
             new += 1
         except Exception as e:
             errors.append((h5_file, str(e)))
     return date_str, new, skipped, errors
 
 
-def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
+def reproject_radar(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid all radar products. KD-tree built once, day folders in parallel.
+    Reproject all radar products. KD-tree built once, day folders in parallel.
     """
     radar_dir = os.path.join(data_root, 'radar_data')
-    regridded_base = os.path.join(data_root, 'regridded_data', 'radar_data')
+    reprojected_base = os.path.join(data_root, 'reprojected_data', 'radar_data')
 
     if not os.path.isdir(radar_dir):
         print(f"  Radar directory not found: {radar_dir}")
@@ -1394,7 +1394,7 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
     mapping_cache = {}
 
     # Collect errors across all products so we can write one
-    # `regrid_radar.log` at the end.
+    # `reproject_radar.log` at the end.
     all_errors: list[tuple[str, str]] = []
 
     for product in RADAR_PRODUCTS:
@@ -1413,7 +1413,7 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
             day_path = os.path.join(product_dir, day_folder)
             if not os.path.isdir(day_path):
                 continue
-            out_dir = os.path.join(regridded_base, product, day_folder)
+            out_dir = os.path.join(reprojected_base, product, day_folder)
             nc_files = sorted(
                 f for f in os.listdir(day_path) if f.endswith('.nc')
             )
@@ -1462,8 +1462,8 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
                           f"{total} total, {len(errs)} errors")
                 all_errors.extend(errs)
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'radar', all_errors,
     )
 
@@ -1472,13 +1472,13 @@ def regrid_radar(data_root, target_lats, target_lons, date_filter=None):
 # MSG satellite
 # =============================================================================
 
-def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
+def reproject_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid MSG channels. KD-tree built once per channel, day folders in parallel.
+    Reproject MSG channels. KD-tree built once per channel, day folders in parallel.
     """
     msg_dir = os.path.join(data_root, 'satellite_data', 'MSG')
-    regridded_base = os.path.join(
-        data_root, 'regridded_data', 'satellite_data', 'MSG'
+    reprojected_base = os.path.join(
+        data_root, 'reprojected_data', 'satellite_data', 'MSG'
     )
 
     if not os.path.isdir(msg_dir):
@@ -1504,7 +1504,7 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
             day_path = os.path.join(channel_dir, day_folder)
             if not os.path.isdir(day_path):
                 continue
-            out_dir = os.path.join(regridded_base, channel, day_folder)
+            out_dir = os.path.join(reprojected_base, channel, day_folder)
             nc_files = sorted(
                 f for f in os.listdir(day_path) if f.endswith('.nc')
             )
@@ -1555,8 +1555,8 @@ def regrid_satellite_msg(data_root, target_lats, target_lons, date_filter=None):
                           f"{total} total, {len(errs)} errors")
                 all_errors.extend(errs)
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'satellite_MSG', all_errors,
     )
 
@@ -1619,9 +1619,9 @@ def _read_mtg_source_grid_from_constants(constants_path, resolution):
     return lat_2d.astype(np.float64), lon_2d.astype(np.float64)
 
 
-def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
+def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid MTG channels from pipeline-produced .npy files.
+    Reproject MTG channels from pipeline-produced .npy files.
 
     Source grid: reconstructed from mtg_constants.json (projection
     parameters + 1-D scanning angle arrays).
@@ -1629,16 +1629,16 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
     KD-tree built once per resolution (1km/2km), reused across all
     channels sharing that resolution.
 
-    Output: .npy files containing the regridded 2-D array on the
+    Output: .npy files containing the reprojected 2-D array on the
     768×1536 EPSG:31700 grid. The shared Romania-grid lat/lon arrays
-    are written once by run() at regridded_data/romania_grid_{lats,lons}.npy
+    are written once by run() at reprojected_data/romania_grid_{lats,lons}.npy
     (not per-product). Use inspect_mtg.py to reconstruct full .nc files
     for GIS viewing.
     """
     mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')
     constants_path = os.path.join(mtg_dir, 'mtg_constants.json')
-    regridded_base = os.path.join(
-        data_root, 'regridded_data', 'satellite_data', 'MTG'
+    reprojected_base = os.path.join(
+        data_root, 'reprojected_data', 'satellite_data', 'MTG'
     )
 
     if not os.path.isdir(mtg_dir):
@@ -1716,7 +1716,7 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
             day_path = os.path.join(channel_dir, day_folder)
             if not os.path.isdir(day_path):
                 continue
-            out_dir = os.path.join(regridded_base, channel, day_folder)
+            out_dir = os.path.join(reprojected_base, channel, day_folder)
             npy_files = sorted(
                 f for f in os.listdir(day_path) if f.endswith('.npy')
             )
@@ -1746,21 +1746,21 @@ def regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
                           f"{total} used, {len(errs)} errors")
                 all_errors.extend(errs)
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'satellite_MTG', all_errors,
     )
 
 
 # =============================================================================
-# Lightning (no regridding)
+# Lightning (no reprojection)
 # =============================================================================
 
-def regrid_lightning(data_root, date_filter=None):
+def reproject_lightning(data_root, date_filter=None):
     """Cache lightning NetCDF data as .npy, day folders in parallel."""
     lightning_dir = os.path.join(data_root, 'lightning_data')
-    regridded_base = os.path.join(
-        data_root, 'regridded_data', 'lightning_data'
+    reprojected_base = os.path.join(
+        data_root, 'reprojected_data', 'lightning_data'
     )
 
     if not os.path.isdir(lightning_dir):
@@ -1785,7 +1785,7 @@ def regrid_lightning(data_root, date_filter=None):
             day_path = os.path.join(product_dir, day_folder)
             if not os.path.isdir(day_path):
                 continue
-            out_dir = os.path.join(regridded_base, product, day_folder)
+            out_dir = os.path.join(reprojected_base, product, day_folder)
             nc_files = sorted(
                 f for f in os.listdir(day_path) if f.endswith('.nc')
             )
@@ -1796,7 +1796,7 @@ def regrid_lightning(data_root, date_filter=None):
             print(f"    No day folders found for {product}")
             continue
 
-        # Lightning has no regrid step (already on the Romania grid) —
+        # Lightning has no reproject step (already on the Romania grid) —
         # the worker just reads NetCDF and writes `.npy`. No mapping
         # to share, but we still hand `_init_worker` an empty state so
         # `_WORKER_STATE` is in a known shape inside the pool.
@@ -1817,8 +1817,8 @@ def regrid_lightning(data_root, date_filter=None):
                           f"{total} total, {len(errs)} errors")
                 all_errors.extend(errs)
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'lightning', all_errors,
     )
 
@@ -1851,9 +1851,9 @@ def _parse_nwcsaf_filename(name):
     return (f"{d[:4]}-{d[4:6]}-{d[6:8]}", m.group("hhmm"), m.group("product"))
 
 
-def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
+def reproject_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid NWCSAF CMIC + CTTH files to per-variable .npy on the Romania grid.
+    Reproject NWCSAF CMIC + CTTH files to per-variable .npy on the Romania grid.
 
     KD-tree built once from the first file; day folders processed in parallel.
     `cmic_phase` is saved as int8 (NaN replaced with 0 = "no cloud / missing")
@@ -1861,7 +1861,7 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
     saved as float32.
     """
     nwcsaf_dir = os.path.join(data_root, 'nwcsaf_data')
-    regridded_base = os.path.join(data_root, 'regridded_data', 'nwcsaf_data')
+    reprojected_base = os.path.join(data_root, 'reprojected_data', 'nwcsaf_data')
 
     if not os.path.isdir(nwcsaf_dir):
         print("  NWCSAF directory not found")
@@ -1925,15 +1925,15 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
 
     # Write the per-source projection constants once so consumers can
     # rebuild the source grid later without re-opening a CMIC/CTTH file.
-    ensure_dir(regridded_base)
-    constants_path = os.path.join(regridded_base, 'nwcsaf_constants.json')
+    ensure_dir(reprojected_base)
+    constants_path = os.path.join(reprojected_base, 'nwcsaf_constants.json')
     if not os.path.isfile(constants_path):
         with open(constants_path, 'w') as f:
             json.dump({
                 "gdal_projection": gdal_proj,
                 "source_grid_shape": list(ny_2d.shape),
                 "note": "lat/lon arrays for the Romania target grid live at "
-                        "regridded_data/romania_grid_{lats,lons}.npy",
+                        "reprojected_data/romania_grid_{lats,lons}.npy",
             }, f, indent=2)
         print(f"    Wrote {constants_path}")
 
@@ -1943,7 +1943,7 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
         max_workers=MAX_WORKERS,
         initializer=_init_worker,
         initargs=({'mapping': mapping,
-                   'regridded_base': regridded_base},),
+                   'reprojected_base': reprojected_base},),
     ) as pool:
         futures = {pool.submit(_nwcsaf_day_worker, j): j[0] for j in day_jobs}
         for future in as_completed(futures):
@@ -1954,8 +1954,8 @@ def regrid_nwcsaf(data_root, target_lats, target_lons, date_filter=None):
                       f"{len(errs)} errors")
             all_errors.extend(errs)
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'nwcsaf', all_errors,
     )
 
@@ -1978,12 +1978,12 @@ OPERA_PRODUCTS = {
 }
 
 
-def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
+def reproject_opera(data_root, target_lats, target_lons, date_filter=None):
     """
-    Regrid OPERA HDF5 files to per-product .npy on the Romania grid.
+    Reproject OPERA HDF5 files to per-product .npy on the Romania grid.
 
     Source layout: our_data/opera_data/{product}/{YYYY}/{MM}/{DD}/*.h5
-    Output layout: our_data/regridded_data/opera_data/{product}/
+    Output layout: our_data/reprojected_data/opera_data/{product}/
                        nc4_{date}-Romania_{product}/
                            nc4_{date}-Romania_{HHMM}_{product}.npy
 
@@ -1993,18 +1993,18 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
     Day folders for each product are processed in parallel.
     """
     if h5py is None:
-        print("  h5py not installed; skipping OPERA regridding "
+        print("  h5py not installed; skipping OPERA reprojection "
               "(pip install h5py).")
         return
 
     opera_dir = os.path.join(data_root, 'opera_data')
-    regridded_base = os.path.join(data_root, 'regridded_data', 'opera_data')
+    reprojected_base = os.path.join(data_root, 'reprojected_data', 'opera_data')
 
     if not os.path.isdir(opera_dir):
         print(f"  OPERA directory not found: {opera_dir}")
         return
 
-    ensure_dir(regridded_base)
+    ensure_dir(reprojected_base)
     constants = {}
     all_errors: list[tuple[str, str]] = []
 
@@ -2066,7 +2066,7 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
             initializer=_init_worker,
             initargs=({'mapping': mapping,
                        'product': product,
-                       'regridded_base': regridded_base},),
+                       'reprojected_base': reprojected_base},),
         ) as pool:
             futures = {pool.submit(_opera_day_worker, j): j[0] for j in day_jobs}
             for future in as_completed(futures):
@@ -2078,13 +2078,13 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
                 all_errors.extend(errs)
 
     if constants:
-        constants_path = os.path.join(regridded_base, 'opera_constants.json')
+        constants_path = os.path.join(reprojected_base, 'opera_constants.json')
         with open(constants_path, 'w') as f:
             json.dump(constants, f, indent=2)
         print(f"  Wrote {constants_path}")
 
-    _write_regrid_log(
-        os.path.join(data_root, 'regridded_data'),
+    _write_reproject_log(
+        os.path.join(data_root, 'reprojected_data'),
         'opera', all_errors,
     )
 
@@ -2095,7 +2095,7 @@ def regrid_opera(data_root, target_lats, target_lons, date_filter=None):
 
 def run(data_root, mode, instrument=None, date_filter=None):
     print("=" * 70)
-    print("COALITION-4 Data Regridding Pipeline (precomputed mappings)")
+    print("COALITION-4 Data Reprojection Pipeline (precomputed mappings)")
     print("=" * 70)
     print(f"Data root : {data_root}")
     print(f"Mode      : {mode}" + (f" ({instrument})" if instrument else ""))
@@ -2109,15 +2109,15 @@ def run(data_root, mode, instrument=None, date_filter=None):
     if needs_grid:
         target_lats, target_lons = init_romania_grid()
         # Write the shared Romania-grid coordinate arrays once at the root
-        # of regridded_data/ so every product can consume them as a sidecar.
-        regridded_root = os.path.join(data_root, 'regridded_data')
-        ensure_dir(regridded_root)
-        grid_lats_path = os.path.join(regridded_root, 'romania_grid_lats.npy')
-        grid_lons_path = os.path.join(regridded_root, 'romania_grid_lons.npy')
+        # of reprojected_data/ so every product can consume them as a sidecar.
+        reprojected_root = os.path.join(data_root, 'reprojected_data')
+        ensure_dir(reprojected_root)
+        grid_lats_path = os.path.join(reprojected_root, 'romania_grid_lats.npy')
+        grid_lons_path = os.path.join(reprojected_root, 'romania_grid_lons.npy')
         if not os.path.isfile(grid_lats_path):
             np.save(grid_lats_path, target_lats)
             np.save(grid_lons_path, target_lons)
-            print(f"  Wrote Romania grid coords -> {regridded_root}")
+            print(f"  Wrote Romania grid coords -> {reprojected_root}")
     else:
         target_lats = target_lons = None
 
@@ -2125,13 +2125,13 @@ def run(data_root, mode, instrument=None, date_filter=None):
         print(f"\n{'='*70}")
         print("Radar products")
         print(f"{'='*70}")
-        regrid_radar(data_root, target_lats, target_lons, date_filter)
+        reproject_radar(data_root, target_lats, target_lons, date_filter)
 
     if mode == 'satellite' and instrument == 'MSG' or mode == 'all':
         print(f"\n{'='*70}")
         print("MSG satellite channels")
         print(f"{'='*70}")
-        regrid_satellite_msg(data_root, target_lats, target_lons, date_filter)
+        reproject_satellite_msg(data_root, target_lats, target_lons, date_filter)
 
     if mode == 'satellite' and instrument == 'MTG' or mode == 'all':
         print(f"\n{'='*70}")
@@ -2139,25 +2139,25 @@ def run(data_root, mode, instrument=None, date_filter=None):
         print(f"{'='*70}")
         if target_lats is None:
             target_lats, target_lons = init_romania_grid()
-        regrid_satellite_mtg(data_root, target_lats, target_lons, date_filter)
+        reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter)
 
     if mode in ('lightning', 'all'):
         print(f"\n{'='*70}")
         print("Lightning products")
         print(f"{'='*70}")
-        regrid_lightning(data_root, date_filter)
+        reproject_lightning(data_root, date_filter)
 
     if mode in ('nwcsaf', 'all'):
         print(f"\n{'='*70}")
         print("NWCSAF products")
         print(f"{'='*70}")
-        regrid_nwcsaf(data_root, target_lats, target_lons, date_filter)
+        reproject_nwcsaf(data_root, target_lats, target_lons, date_filter)
 
     if mode in ('opera', 'all'):
         print(f"\n{'='*70}")
         print("OPERA radar products")
         print(f"{'='*70}")
-        regrid_opera(data_root, target_lats, target_lons, date_filter)
+        reproject_opera(data_root, target_lats, target_lons, date_filter)
 
     elapsed = timer_module.time() - t_start
     print(f"\n{'='*70}")
@@ -2171,7 +2171,7 @@ def run(data_root, mode, instrument=None, date_filter=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="COALITION-4 data regridding pipeline. "
+        description="COALITION-4 data reprojection pipeline. "
                     "Uses precomputed KD-tree mappings for speed."
     )
     parser.add_argument(
@@ -2189,17 +2189,17 @@ if __name__ == "__main__":
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--radar", action="store_true",
-                       help="Regrid radar products")
+                       help="Reproject radar products")
     group.add_argument("--satellite", type=str, choices=['MSG', 'MTG'],
-                       metavar='INSTRUMENT', help="Regrid satellite channels")
+                       metavar='INSTRUMENT', help="Reproject satellite channels")
     group.add_argument("--lightning", action="store_true",
                        help="Cache lightning data as .npy")
     group.add_argument("--nwcsaf", action="store_true",
-                       help="Regrid NWCSAF products")
+                       help="Reproject NWCSAF products")
     group.add_argument("--opera", action="store_true",
-                       help="Regrid OPERA radar products (HDF5 -> .npy)")
+                       help="Reproject OPERA radar products (HDF5 -> .npy)")
     group.add_argument("--all", action="store_true",
-                       help="Regrid all products")
+                       help="Reproject all products")
 
     args = parser.parse_args()
 
