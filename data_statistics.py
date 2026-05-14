@@ -374,8 +374,32 @@ def plot_samples_per_date(seq_data, out_dir, prefix='sequences'):
 def plot_patch_survival(patch_data, seq_data, out_dir, prefix='sequences'):
     """
     Grouped bar: how often each patch is active (patch_index) vs how often
-    it qualifies for sequences (passes continuity check).
-    Large gaps indicate transient, non-persistent convection.
+    it serves as the reference centre of a qualifying sequence.
+
+    Two distinct counts are plotted on the same axis:
+
+      - Blue (`Active`): number of (date, time) rows in `patch_index.csv`
+        where the patch has a DBSCAN cluster. Unit: timesteps.
+      - Green (`Qualifying`): number of sequence rows whose reference time
+        has this patch in its `patch_numbers` (i.e. the patch is active
+        continuously across the whole input+future window). Unit:
+        sequence rows (each sequence has a unique reference timestep).
+
+    The printed percentage is the centre-rate:
+        rate = seq_count[p] / active_count[p]
+
+    It measures "fraction of this patch's active timesteps that are valid
+    sequence reference centres". Note that with the standard
+    past=2 / future=3 / step=15-min window, a patch active for 8
+    consecutive timesteps yields at most ~3 valid centres (positions
+    3-5), so the rate is capped near 38% even for perfect continuity.
+    Every timestep that falls inside any qualifying window still
+    contributes to a training sample — it just is not the centre.
+
+    All 18 patches are always listed for layout consistency, including
+    those with no DBSCAN activity (e.g. P6 / P12 / P18 over the Black
+    Sea / outside the OPERA footprint) — they show as zero-height bars
+    with a 0% label rather than dropping off the chart entirely.
     """
     # Count from patch_index
     active_counts = Counter()
@@ -389,11 +413,10 @@ def plot_patch_survival(patch_data, seq_data, out_dir, prefix='sequences'):
         for p in row['patch_numbers']:
             seq_counts[p] += 1
 
-    patches_present = sorted(
-        set(active_counts.keys()) | set(seq_counts.keys())
-    )
+    # Always render the full 6x3 grid (18 patches).
+    patches_present = list(range(1, N_PATCHES + 1))
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(patches_present))
     width = 0.35
 
@@ -403,24 +426,27 @@ def plot_patch_survival(patch_data, seq_data, out_dir, prefix='sequences'):
     ax.bar(x - width / 2, active_vals, width, label='Active (patch_index)',
            color=COLORS['primary'], edgecolor='white', linewidth=0.5,
            alpha=0.85, zorder=3)
-    ax.bar(x + width / 2, seq_vals, width, label='Qualifying (sequences)',
+    ax.bar(x + width / 2, seq_vals, width, label='Qualifying centres (sequences)',
            color=COLORS['accent'], edgecolor='white', linewidth=0.5,
            alpha=0.85, zorder=3)
 
-    # Survival rate labels
+    # Centre-rate labels for every patch (including inactive ones — 0%).
+    max_h = max(active_vals + seq_vals + [1])
     for i, p in enumerate(patches_present):
         a = active_counts.get(p, 0)
         s = seq_counts.get(p, 0)
         rate = s / a * 100 if a > 0 else 0
-        ax.text(x[i], max(a, s) + max(active_vals) * 0.02,
+        ax.text(x[i], max(a, s) + max_h * 0.02,
                 f'{rate:.0f}%', ha='center', va='bottom',
                 fontsize=7, color=COLORS['text'])
 
     ax.set_xticks(x)
     ax.set_xticklabels([f'P{p}' for p in patches_present], fontsize=9)
-    ax.set_xlabel('Patch number', fontsize=11)
-    ax.set_ylabel('Number of timesteps', fontsize=11)
-    ax.set_title(f'Patch survival rate: active vs qualifying ({prefix})',
+    ax.set_xlabel('Patch number (1..18, row-major over the 6x3 grid)',
+                  fontsize=11)
+    ax.set_ylabel('Count (timesteps for blue, sequences for green)',
+                  fontsize=11)
+    ax.set_title(f'Patch centre-rate: active vs qualifying ({prefix})',
                  fontsize=13, fontweight='bold')
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
