@@ -408,7 +408,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--missing', '-m', type=str,
-        default='nwcsaf_missing_timesteps.json',
+        default=str(PROJECT_ROOT / 'nwcsaf_missing_timesteps.json'),
         help='Output JSON with missing timesteps '
              '(default: nwcsaf_missing_timesteps.json)',
     )

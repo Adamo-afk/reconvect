@@ -1,83 +1,56 @@
 """
-intersect_product_coverage.py — Keep train/val/test consistent across products.
+intersect_product_coverage.py — Compute the per-timestep intersection of
+available reprojected data across the chosen product set, and emit a
+manifest that extract_patches.py consumes to know exactly which
+timesteps to process.
 
 Pipeline placement (Step 4.2):
 
-    Step 4.1  extract_patch_seq_for_datasets.py    train/val/test CSVs from
-                                                   the patch activity index
-    Step 4.2  intersect_product_coverage.py        THIS SCRIPT — reads any
-                                                   subset of per-product
-                                                   summary CSVs and filters
-                                                   train/val/test to the
-                                                   dates where every chosen
-                                                   product has data
-    Step 4.3  compute_normalization_stats.py       per-variable mean/std on
-                                                   the filtered training set
-    Step 5    create_datasets.py                   build TF datasets
+    Step 4.1  extract_patch_seq_for_datasets.py    train/val/test CSVs
+    Step 4.2  intersect_product_coverage.py        THIS SCRIPT - emits
+                                                   timestep_manifest.csv +
+                                                   a per-date accounting
+                                                   plot
+    Step 4.3  compute_normalization_stats.py       per-variable mean/std
+    Step 5    extract_patches.py                   patch extraction reads
+                                                   the manifest
 
-Running this step before normalization is deliberate: the stats script
-then computes on a smaller, fully consistent set of timesteps instead of
-including samples that will later be discarded for missing inputs.
+Design contract
+---------------
+- The set of *active* products is determined by which `--summary` keys
+  the user passes. Lightning is included only when
+  `--summary lightning=...` is supplied. There is no implicit product
+  list - what you pass is what you get.
+- Per-timestep availability is read from each summarizer's companion
+  `<name>_missing_timesteps.json` (auto-discovered next to the summary
+  CSV; overridable per product with `--missing KEY=PATH`).
+- Per-product minute filters come from `timestep_config.json` (written
+  by validate_timestep.py). For each master-grid HHMM we snap to the
+  nearest minute in each product's filter, then check whether it is
+  in the available set for that product.
+- The `--products` flag belongs to extract_patches.py, not to this
+  script - intersect's product set is implicit in `--summary`.
+- Train / val / test CSVs are not touched. They keep whatever
+  extract_patch_seq_for_datasets.py wrote.
 
-Inputs
-------
-Each `--summary` argument names one product, the per-product summary CSV
-produced by a `summarize_*.py` script, and the column to read. The
-script works with **any** combination — pass only the products you'll
-actually feed to the model, skip the rest. With/without NWCSAF, with/
-without lightning, with/without OPERA — all valid.
+Outputs (only two, by design)
+-----------------------------
+- `timestep_manifest.csv` (default: our_data/timestep_manifest.csv)
+    One row per surviving (date, HHMM) timestep, with the per-product
+    snapped HHMM each product loaded so the manifest doubles as an
+    audit trail:
+        date,hhmm,mtg_hhmm,nwcsaf_hhmm,opera_hhmm,...
+- `intersect_summary.png` (default: our_data/intersect_summary.png)
+    Per-date stacked bar chart: kept timesteps + drops attributed to
+    each product / error log.
 
-    --summary KEY=PATH[:COLUMN]
-
-Default COLUMN is `coverage_pct` and works for every standard
-`summarize_*.py` output (MTG, NWCSAF, OPERA). Use `:kept` for the
-lightning summary's boolean flag, or one of OPERA's diagnostic
-per-product columns (`:opera_reflectivity_coverage_pct` /
-`:opera_rainfall_rate_coverage_pct`) only when you want to gate on a
-single OPERA product instead of the intersection.
-
-Per-product thresholds default to `--min_coverage` (default 100.0,
-"full coverage required"). Override per product with
-`--threshold KEY=VALUE` — e.g. `--threshold lightning=1` for the boolean
-`kept` flag, or `--threshold mtg=80` to relax MTG to 80%.
-
-Outputs (under --output_dir, default `our_data/`)
--------------------------------------------------
-    consistent_dates.csv
-        date, kept,
-        <key1>_value, <key1>_ok, <key2>_value, <key2>_ok, ...
-        — every date encountered in any CSV, with per-product values
-        and the final keep flag.
-
-    train_data_consistent.csv
-    validation_data_consistent.csv
-    test_data_consistent.csv
-        — copies of the original CSVs with rows whose `date` is not in
-        the kept set removed.
-
-    intersect_product_coverage.json
-        — manifest with all CLI args, per-product source paths,
-        thresholds, and per-split row counts (for reproducibility).
-
-Pass `--in_place` to overwrite the originals instead of writing
-`_consistent.csv` copies. Pass `--copy_to_canonical` to write the
-filtered files as `train_data.csv` / `validation_data.csv` /
-`test_data.csv` (still keeping the originals as `*_original.csv`).
-
-Examples
---------
-    # MTG + NWCSAF + OPERA (both products) + lightning — full coverage required
-    python intersect_product_coverage.py \\
-        --summary mtg=mtg_summary.csv \\
-        --summary nwcsaf=nwcsaf_summary.csv \\
-        --summary opera=opera_summary.csv \\
-        --summary lightning=lightning_summary.csv:kept \\
-        --threshold lightning=1
-
-    # No NWCSAF, no lightning, just radar + MTG, relaxed to 80%
-    python intersect_product_coverage.py \\
-        --summary mtg=mtg_summary.csv:coverage_pct \\
-        --min_coverage 80
+Example
+-------
+    python intersect_product_coverage.py \
+        --summary mtg=mtg_summary.csv \
+        --summary nwcsaf=nwcsaf_summary.csv \
+        --summary opera=opera_summary.csv \
+        --errors_log our_data/reprojected_data/reproject_satellite_MTG.log
 """
 
 from __future__ import annotations
@@ -85,11 +58,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
-import shutil
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")  # non-interactive
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 # =============================================================================
@@ -98,179 +75,201 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "our_data"
+DEFAULT_OUTPUT_CSV = DEFAULT_DATA_ROOT / "timestep_manifest.csv"
+DEFAULT_OUTPUT_PLOT = DEFAULT_DATA_ROOT / "intersect_summary.png"
+DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
 
-# Default column to read when the user doesn't supply one
-DEFAULT_COLUMN = "coverage_pct"
-
-# Regexes for the filename forms that show up in `reproject_<cat>.log`.
-# Each one captures (date, hhmm). Order matters — the most specific
-# pattern is tried first.
-_ERROR_FILENAME_PATTERNS = (
-    # OPERA ISO: 2026-03-27T174500Z-rainfall_rate-composite-opera.h5
-    re.compile(r'(?P<date>\d{4}-\d{2}-\d{2})T(?P<hhmm>\d{4})\d{2}Z'),
-    # NWCSAF compact ISO: S_NWC_CMIC_..._20260314T084000Z.nc
-    re.compile(r'_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})T(?P<hhmm>\d{4})\d{2}Z'),
-    # Radar / MTG / NWCSAF outputs: nc4_2026-04-14-Romania_1610_vis_06.npy
-    re.compile(r'(?P<date>\d{4}-\d{2}-\d{2})-Romania_(?P<hhmm>\d{4})_'),
-    # Lightning outputs: lightning_density_20260314_0840.npy
-    re.compile(r'_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})_(?P<hhmm>\d{4})'),
-)
-
-# Matches a Python-like identifier — used to tell a column name apart from
-# the tail of a Windows path when splitting `KEY=PATH:COLUMN`.
-_IDENTIFIER_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
+# Known product keys and their mapping to:
+#   - the `products.<name>` block in timestep_config.json (for the filter)
+#   - the conventional missing-JSON file name (alongside the summary CSV)
+PRODUCT_LAYOUT: dict[str, dict[str, str]] = {
+    "radar":     {"tsconfig_product": "radar",
+                  "missing_name":     "radar_missing_timesteps.json"},
+    "mtg":       {"tsconfig_product": "mtg",
+                  "missing_name":     "mtg_missing_timesteps.json"},
+    "nwcsaf":    {"tsconfig_product": "nwcsaf",
+                  "missing_name":     "nwcsaf_missing_timesteps.json"},
+    "opera":     {"tsconfig_product": "opera_rainfall_rate",
+                  "missing_name":     "opera_missing_timesteps.json"},
+    "lightning": {"tsconfig_product": "lightning",
+                  "missing_name":     "lightning_missing_timesteps.json"},
+}
 
 
 # =============================================================================
-# CLI arg parsing
+# Argument parsing
 # =============================================================================
 
-def parse_summary_arg(arg: str) -> tuple[str, Path, str]:
-    """
-    Parse `key=path[:column]`. Robust to Windows drive letters (`C:`)
-    because the right-most segment is only treated as a column when it
-    looks like an identifier (no slashes/backslashes).
-    """
-    if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"--summary must look like 'key=path[:column]', got {arg!r}"
+def parse_keyed_arg(raw: str, flag_name: str) -> tuple[str, Path]:
+    """Parse `KEY=PATH`. Tolerates a legacy trailing `:COLUMN`."""
+    if "=" not in raw:
+        sys.exit(f"ERROR: {flag_name} expects KEY=PATH, got {raw!r}")
+    key, _, rest = raw.partition("=")
+    key = key.strip().lower()
+    if ":" in rest and not re.match(r"^[A-Za-z]:[\\/]", rest):
+        rest = rest.split(":", 1)[0]   # drop legacy ":column"
+    if key not in PRODUCT_LAYOUT:
+        sys.exit(
+            f"ERROR: {flag_name} key {key!r} is not a known product. "
+            f"Choose from: {sorted(PRODUCT_LAYOUT)}"
         )
-    key, rest = arg.split("=", 1)
-    key = key.strip()
-    if not key:
-        raise argparse.ArgumentTypeError(
-            f"--summary entry has empty key in {arg!r}"
-        )
-    rest = rest.strip()
-
-    column = DEFAULT_COLUMN
-    if ":" in rest:
-        # Split on the rightmost ':'. Treat the tail as a column only if it
-        # has no path separators AND looks like a column identifier.
-        head, tail = rest.rsplit(":", 1)
-        tail = tail.strip()
-        if ("/" not in tail and "\\" not in tail
-                and _IDENTIFIER_RE.match(tail)):
-            rest = head.strip()
-            column = tail
-    return key, Path(rest), column
+    return key, Path(rest.strip())
 
 
-def parse_threshold_arg(arg: str) -> tuple[str, float]:
-    """Parse `key=value` into (key, float)."""
-    if "=" not in arg:
-        raise argparse.ArgumentTypeError(
-            f"--threshold must look like 'key=value', got {arg!r}"
-        )
-    key, value = arg.split("=", 1)
-    key = key.strip()
-    if not key:
-        raise argparse.ArgumentTypeError(
-            f"--threshold has empty key in {arg!r}"
-        )
-    try:
-        return key, float(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"--threshold value must be numeric, got {value!r}"
-        )
+def parse_summary_arg(raw: str) -> tuple[str, Path]:
+    return parse_keyed_arg(raw, "--summary")
+
+
+def parse_missing_arg(raw: str) -> tuple[str, Path]:
+    return parse_keyed_arg(raw, "--missing")
 
 
 # =============================================================================
-# Summary parsing
+# Summary CSV - we use it for the date list (which days the product was
+# scanned for) and as a presence marker for the active product set.
 # =============================================================================
 
-def load_summary_coverage(csv_path: Path, column: str) -> dict[str, float]:
-    """Return {date: numeric_value} read from `column` in `csv_path`."""
-    if not csv_path.exists():
+def read_summary_dates(csv_path: Path) -> set[str]:
+    if not csv_path.is_file():
         sys.exit(f"ERROR: summary CSV not found: {csv_path}")
-
-    out: dict[str, float] = {}
+    dates: set[str] = set()
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None or "date" not in reader.fieldnames:
-            sys.exit(f"ERROR: {csv_path}: no `date` column "
-                     f"(have: {reader.fieldnames})")
-        if column not in reader.fieldnames:
-            sys.exit(f"ERROR: {csv_path}: column {column!r} not in "
-                     f"{reader.fieldnames}")
+            sys.exit(f"ERROR: {csv_path}: missing `date` column")
         for row in reader:
-            date = row.get("date", "").strip()
-            if not date:
+            d = row.get("date", "").strip()
+            if d:
+                dates.add(d)
+    return dates
+
+
+# =============================================================================
+# Missing-JSON parsers (one schema per product family)
+# =============================================================================
+
+def _hhmm_4d(hhmm_or_hhcolon: str) -> str:
+    """Normalise 'HH:MM' or 'HHMM' to 4-digit 'HHMM'."""
+    return hhmm_or_hhcolon.replace(":", "").zfill(4)
+
+
+def load_missing(product: str, json_path: Path) -> set[tuple[str, str]]:
+    """Return the set of (date, 'HHMM') tuples missing for `product`.
+
+    The three summarizers emit slightly different JSON shapes; this
+    function normalises them into a single set.
+    """
+    if not json_path.exists():
+        print(f"  WARNING: missing-timesteps JSON not found for "
+              f"{product!r}: {json_path}. Treating product as fully "
+              f"present (probably wrong - re-run summarize_{product}.py "
+              f"with default --missing to populate it).")
+        return set()
+
+    try:
+        data = json.loads(json_path.read_text())
+    except (OSError, ValueError) as e:
+        sys.exit(f"ERROR: failed to parse {json_path}: {e}")
+
+    out: set[tuple[str, str]] = set()
+    dates_block = data.get("dates", {}) or {}
+
+    for date_str, block in dates_block.items():
+        if not isinstance(block, dict):
+            continue
+
+        if product == "opera":
+            # opera_missing_timesteps.json nests per sub-product. Use
+            # rainfall_rate (the DBSCAN driver + label source) as the
+            # canonical "is OPERA present" signal.
+            inner = block.get("opera_rainfall_rate", {})
+            times = inner.get("missing_times", []) or []
+        elif product == "mtg":
+            # mtg_missing_timesteps.json: per-date block with
+            # 'missing_times' at the top level (single product).
+            times = block.get("missing_times", []) or []
+            # MTG also tracks 'incomplete_times' (only 1 of 2 chunks);
+            # treat those as missing too because the reproject would
+            # have failed on them.
+            times = list(times) + list(block.get("incomplete_times", []) or [])
+        elif product == "nwcsaf":
+            # nwcsaf_missing_timesteps.json: per-date 'missing' or
+            # 'missing_times' depending on the build (handle both).
+            times = (block.get("missing_times")
+                     or block.get("missing")
+                     or [])
+        else:
+            # Generic fallback for radar / lightning / future products.
+            times = (block.get("missing_times")
+                     or block.get("missing")
+                     or [])
+
+        for t in times:
+            if not isinstance(t, str):
                 continue
-            raw = row.get(column, "").strip()
-            if raw == "":
-                continue
-            try:
-                out[date] = float(raw)
-            except ValueError:
-                continue
+            out.add((date_str, _hhmm_4d(t)))
+
     return out
 
 
 # =============================================================================
-# Intersection
+# Cadence snap (same rule as extract_patches.py)
 # =============================================================================
 
-def intersect(coverage_by_product: dict[str, dict[str, float]],
-              threshold_by_product: dict[str, float]
-              ) -> tuple[set[str], list[dict]]:
-    """
-    Build the per-date keep decision. A date is kept iff every product in
-    `coverage_by_product` has a value >= its threshold. Dates missing from
-    a product's CSV count as failing for that product.
-    """
-    all_dates: set[str] = set()
-    for d in coverage_by_product.values():
-        all_dates.update(d.keys())
+def load_timestep_config(path: Path) -> dict:
+    if not path.exists():
+        sys.exit(
+            f"ERROR: timestep_config.json not found at {path}.\n"
+            f"Run `python validate_timestep.py --step_minutes <N>` first."
+        )
+    return json.loads(path.read_text())
 
-    kept_dates: set[str] = set()
-    rows: list[dict] = []
-    for date in sorted(all_dates):
-        row: dict = {"date": date}
-        ok = True
-        for key, cov_map in coverage_by_product.items():
-            thr = threshold_by_product[key]
-            val = cov_map.get(date)
-            row[f"{key}_value"] = "" if val is None else f"{val:.4f}"
-            present = val is not None and val >= thr
-            row[f"{key}_ok"] = 1 if present else 0
-            if not present:
-                ok = False
-        row["kept"] = 1 if ok else 0
-        rows.append(row)
-        if ok:
-            kept_dates.add(date)
-    return kept_dates, rows
+
+def snap_hhmm(hhmm: str, filter_minutes: set[int]) -> str:
+    """Snap to nearest minute in `filter_minutes`; handle hour wrap; tie
+    breaks prefer the earlier minute."""
+    h, m = int(hhmm[:2]), int(hhmm[2:])
+    best = min(filter_minutes, key=lambda fm: (
+        min(abs(fm - m), 60 - abs(fm - m)),
+        fm,
+    ))
+    diff = best - m
+    if diff > 30:
+        diff -= 60
+    elif diff < -30:
+        diff += 60
+    total = (h * 60 + m + diff) % (24 * 60)
+    return f"{total // 60:02d}{total % 60:02d}"
 
 
 # =============================================================================
-# CSV filtering
+# Error-log parsing (reused from the previous design)
 # =============================================================================
+
+_ERROR_FILENAME_PATTERNS = (
+    re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})T(?P<hhmm>\d{4})\d{2}Z"),
+    re.compile(r"_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})T(?P<hhmm>\d{4})\d{2}Z"),
+    re.compile(r"(?P<date>\d{4}-\d{2}-\d{2})-Romania_(?P<hhmm>\d{4})_"),
+    re.compile(r"_(?P<y>\d{4})(?P<m>\d{2})(?P<d>\d{2})_(?P<hhmm>\d{4})"),
+)
+
 
 def parse_error_log(log_path: Path) -> set[tuple[str, str]]:
-    """Read a `reproject_<category>.log` file and return the (date, hhmm) pairs.
-
-    Lines that don't begin with `ERROR ` or whose filename can't be parsed
-    are silently ignored — defensive against partial / hand-edited logs.
-    """
     pairs: set[tuple[str, str]] = set()
     if not log_path.exists():
         print(f"  ERROR log not found, skipping: {log_path}")
         return pairs
-    with open(log_path, 'r', encoding='utf-8') as f:
+    with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line.startswith("ERROR "):
                 continue
-            # `ERROR <filename>: <message>` — pull the filename out
-            after = line[len("ERROR "):]
-            fname = after.split(":", 1)[0].strip()
+            fname = line[len("ERROR "):].split(":", 1)[0].strip()
             for pat in _ERROR_FILENAME_PATTERNS:
-                m = pat.search(fname)
-                if not m:
+                mm = pat.search(fname)
+                if not mm:
                     continue
-                groups = m.groupdict()
+                groups = mm.groupdict()
                 if "date" in groups:
                     date_str = groups["date"]
                 else:
@@ -280,70 +279,154 @@ def parse_error_log(log_path: Path) -> set[tuple[str, str]]:
     return pairs
 
 
-def _row_timesteps(row: dict, idx_cols: list[str]) -> set[tuple[str, str]]:
-    """Compute the set of (date, HHMM) timesteps a sequence row covers.
+# =============================================================================
+# Intersection
+# =============================================================================
 
-    `idx_cols` are the per-step columns like `idx_t-30`, `idx_t0`,
-    `idx_t+45` — the numeric suffix is the minute offset from
-    `reference_utc`. Day rollover is handled via a real datetime add.
-    """
-    date_str = row.get("date", "").strip()
-    ref = row.get("reference_utc", "").strip()
-    if not date_str or not ref:
-        return set()
-    try:
-        ref_dt = datetime.strptime(f"{date_str}T{ref}", "%Y-%m-%dT%H:%M")
-    except ValueError:
-        return set()
-    out: set[tuple[str, str]] = set()
-    for col in idx_cols:
-        m = re.match(r"^idx_t(?P<sign>[+-]?)(?P<n>\d+)$", col)
-        if not m:
-            continue
-        offset = int(m.group("n"))
-        if m.group("sign") == "-":
-            offset = -offset
-        step_dt = ref_dt + timedelta(minutes=offset)
-        out.add((step_dt.strftime("%Y-%m-%d"),
-                 step_dt.strftime("%H%M")))
+def build_master_grid(dates: list[str],
+                       step_minutes: int) -> list[tuple[str, str]]:
+    """Every step_minutes slot on every date."""
+    n_slots = 24 * 60 // step_minutes
+    out: list[tuple[str, str]] = []
+    for date_str in dates:
+        for k in range(n_slots):
+            total = k * step_minutes
+            out.append((date_str, f"{total // 60:02d}{total % 60:02d}"))
     return out
 
 
-def filter_csv(input_csv: Path, output_csv: Path,
-               kept_dates: set[str],
-               error_pairs: set[tuple[str, str]] | None = None,
-               ) -> tuple[int, int, int]:
-    """Copy `input_csv` to `output_csv`, dropping rows whose date isn't kept
-    OR whose timesteps overlap with `error_pairs` (reproject ERROR set).
+def intersect(master, product_keys, missing_by_product,
+              filter_by_product, error_pairs, dates_by_product):
+    """For each master slot:
+      1. snap HHMM to each product's filter,
+      2. check that the slot is not in the product's missing set (and
+         falls within a date the product was scanned for),
+      3. check that no error-log entry matches.
 
-    Returns (rows_in, rows_kept, rows_dropped_for_errors).
+    Returns:
+        kept: list of (date, master_hhmm, {product: snapped_hhmm})
+        dropped_by_reason: dict reason -> list of (date, master_hhmm)
     """
-    if not input_csv.exists():
-        print(f"  SKIP {input_csv} (not found)")
-        return 0, 0, 0
-    rows_in = rows_kept = rows_dropped_for_errors = 0
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    error_pairs = error_pairs or set()
-    with open(input_csv, "r", newline="") as f_in, \
-         open(output_csv, "w", newline="") as f_out:
-        reader = csv.DictReader(f_in)
-        if reader.fieldnames is None or "date" not in reader.fieldnames:
-            sys.exit(f"ERROR: {input_csv}: missing `date` column")
-        idx_cols = [c for c in reader.fieldnames if c.startswith("idx_t")]
-        writer = csv.DictWriter(f_out, fieldnames=reader.fieldnames)
-        writer.writeheader()
-        for row in reader:
-            rows_in += 1
-            if row.get("date", "").strip() not in kept_dates:
-                continue
-            if error_pairs:
-                steps = _row_timesteps(row, idx_cols)
-                if steps & error_pairs:
-                    rows_dropped_for_errors += 1
-                    continue
-            writer.writerow(row)
-            rows_kept += 1
-    return rows_in, rows_kept, rows_dropped_for_errors
+    kept: list[tuple[str, str, dict[str, str]]] = []
+    dropped: dict[str, list[tuple[str, str]]] = {p: [] for p in product_keys}
+    dropped["error_log"] = []
+    dropped["unscanned_date"] = []
+
+    for date_str, hhmm in master:
+        per_product_hhmm: dict[str, str] = {}
+        drop_reason: str | None = None
+
+        for product in product_keys:
+            if date_str not in dates_by_product[product]:
+                drop_reason = "unscanned_date"
+                break
+            flt = filter_by_product[product]
+            snapped = snap_hhmm(hhmm, flt) if flt else hhmm
+            if (date_str, snapped) in missing_by_product[product]:
+                drop_reason = product
+                break
+            per_product_hhmm[product] = snapped
+
+        if drop_reason is not None:
+            dropped[drop_reason].append((date_str, hhmm))
+            continue
+
+        # Error-log filter: any product's snapped HHMM appearing in
+        # the global error set kills the master slot.
+        in_error = any(
+            (date_str, snapped) in error_pairs
+            for snapped in per_product_hhmm.values()
+        )
+        if in_error:
+            dropped["error_log"].append((date_str, hhmm))
+            continue
+
+        kept.append((date_str, hhmm, per_product_hhmm))
+
+    return kept, dropped
+
+
+# =============================================================================
+# Output
+# =============================================================================
+
+def write_manifest(kept, product_keys, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["date", "hhmm"] + [f"{p}_hhmm" for p in product_keys]
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for date_str, hhmm, per_product in kept:
+            row = {"date": date_str, "hhmm": hhmm}
+            for p in product_keys:
+                row[f"{p}_hhmm"] = per_product.get(p, "")
+            w.writerow(row)
+    print(f"Manifest:     {out_path}  ({len(kept)} surviving timesteps)")
+
+
+def write_plot(kept, dropped, dates, step_minutes, product_keys,
+               out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_slots_per_day = 24 * 60 // step_minutes
+    date_idx = {d: i for i, d in enumerate(dates)}
+
+    kept_count = np.zeros(len(dates), dtype=int)
+    for date_str, _hhmm, _ in kept:
+        kept_count[date_idx[date_str]] += 1
+
+    drop_reasons = ["unscanned_date"] + product_keys + ["error_log"]
+    drop_count = {r: np.zeros(len(dates), dtype=int) for r in drop_reasons}
+    for r in drop_reasons:
+        for date_str, _hhmm in dropped.get(r, []):
+            di = date_idx.get(date_str)
+            if di is not None:
+                drop_count[r][di] += 1
+
+    fig, ax = plt.subplots(figsize=(max(10, len(dates) * 0.18), 5))
+    x = np.arange(len(dates))
+
+    colours = {
+        "kept":            "#4caf50",
+        "unscanned_date":  "#bdbdbd",
+        "radar":           "#7e57c2",
+        "mtg":             "#42a5f5",
+        "nwcsaf":          "#ff9800",
+        "opera":           "#ef5350",
+        "lightning":       "#ffd54f",
+        "error_log":       "#212121",
+    }
+
+    ax.bar(x, kept_count, label=f"Kept ({int(kept_count.sum())})",
+           color=colours["kept"], zorder=3)
+    bottom = kept_count.astype(float).copy()
+    for r in drop_reasons:
+        total = int(drop_count[r].sum())
+        if total == 0:
+            continue
+        ax.bar(x, drop_count[r], bottom=bottom,
+               label=f"Dropped: {r} ({total})",
+               color=colours.get(r, "#9e9e9e"), zorder=3, alpha=0.9)
+        bottom += drop_count[r]
+
+    ax.axhline(n_slots_per_day, color="#333", linestyle="--", linewidth=0.8,
+               alpha=0.6, label=f"Master grid: {n_slots_per_day}/day")
+
+    # Tick every 3 dates if there are many, otherwise every date
+    step = max(1, len(dates) // 40)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels([dates[i] for i in range(0, len(dates), step)],
+                       rotation=90, fontsize=7)
+    ax.set_xlabel("Date", fontsize=11)
+    ax.set_ylabel("Timesteps per day", fontsize=11)
+    ax.set_title("Per-date timestep accounting "
+                 "(kept after product intersection vs. drop reason)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.95)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot:         {out_path}")
 
 
 # =============================================================================
@@ -352,192 +435,138 @@ def filter_csv(input_csv: Path, output_csv: Path,
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Intersect per-product coverage CSVs and filter "
-                    "train/val/test to the dates where every requested "
-                    "product has data. Step 4.2 — runs after the "
-                    "per-product summarisers and before "
-                    "compute_normalization_stats.py."
+        description="Compute the per-timestep intersection of available "
+                    "reprojected data across the chosen product set. "
+                    "Emits a manifest CSV + a per-date accounting plot."
     )
     parser.add_argument(
-        "--summary", action="append", required=True,
-        metavar="KEY=PATH[:COLUMN]",
-        help="Per-product summary CSV. Repeat once per product. "
-             "Default COLUMN is 'coverage_pct'. Skipping a product is "
-             "fine — only the products you list are required to be "
-             "present.",
+        "--summary", action="append", default=[], type=parse_summary_arg,
+        metavar="KEY=PATH",
+        help="Required at least once. KEY is one of "
+             f"{sorted(PRODUCT_LAYOUT)}; PATH is the per-product summary "
+             "CSV produced by a `summarize_*.py` script. The KEYs you "
+             "pass define the active product set.",
     )
     parser.add_argument(
-        "--min_coverage", type=float, default=100.0,
-        help="Global threshold applied to every --summary that doesn't have "
-             "a matching --threshold override (default: 100.0). For "
-             "boolean-flag columns (e.g. lightning's `kept`), set this "
-             "via --threshold instead of relying on the default.",
-    )
-    parser.add_argument(
-        "--threshold", action="append", default=[], type=parse_threshold_arg,
-        metavar="KEY=VALUE",
-        help="Per-product threshold override. Repeat for each product "
-             "that needs a different threshold to --min_coverage.",
-    )
-    parser.add_argument(
-        "--train_csv", type=str,
-        default=str(DEFAULT_DATA_ROOT / "train_data.csv"),
-    )
-    parser.add_argument(
-        "--val_csv", type=str,
-        default=str(DEFAULT_DATA_ROOT / "validation_data.csv"),
-    )
-    parser.add_argument(
-        "--test_csv", type=str,
-        default=str(DEFAULT_DATA_ROOT / "test_data.csv"),
-    )
-    parser.add_argument(
-        "--output_dir", type=str, default=str(DEFAULT_DATA_ROOT),
-        help=f"Where to write consistent_dates.csv and the filtered "
-             f"train/val/test CSVs (default: {DEFAULT_DATA_ROOT}).",
-    )
-    parser.add_argument(
-        "--in_place", action="store_true",
-        help="Overwrite the original train_data.csv / validation_data.csv "
-             "/ test_data.csv files. Originals are renamed to "
-             "*_original.csv before being replaced.",
+        "--missing", action="append", default=[], type=parse_missing_arg,
+        metavar="KEY=PATH",
+        help="Override the auto-discovered missing-timesteps JSON for "
+             "a product. By default each `--summary KEY=PATH/summary.csv` "
+             "looks for `KEY_missing_timesteps.json` in the same "
+             "directory.",
     )
     parser.add_argument(
         "--errors_log", action="append", default=[], metavar="PATH",
-        help="Path to a `reproject_<category>.log` file (or `errors.txt`) "
-             "produced by reproject.py. Sequence rows whose timesteps "
-             "intersect any (date, HHMM) parsed from these logs are "
-             "dropped in addition to the per-date coverage filter. "
-             "Repeat for each log (radar, MTG, NWCSAF, OPERA, ...).",
+        help="Reproject error log (`reproject_<category>.log`). Repeat for "
+             "each category. (date, HHMM) pairs parsed from these logs are "
+             "removed from the kept set.",
+    )
+    parser.add_argument(
+        "--timestep_config", type=str, default=str(DEFAULT_TIMESTEP_CONFIG),
+        help=f"Path to timestep_config.json (default: "
+             f"{DEFAULT_TIMESTEP_CONFIG}).",
+    )
+    parser.add_argument(
+        "--output_csv", type=str, default=str(DEFAULT_OUTPUT_CSV),
+        help=f"Manifest CSV path (default: {DEFAULT_OUTPUT_CSV}).",
+    )
+    parser.add_argument(
+        "--output_plot", type=str, default=str(DEFAULT_OUTPUT_PLOT),
+        help=f"Plot path (default: {DEFAULT_OUTPUT_PLOT}).",
     )
 
     args = parser.parse_args()
 
-    # Collect all (date, HHMM) error pairs from the supplied logs.
-    error_pairs: set[tuple[str, str]] = set()
-    error_log_summaries: list[dict] = []
-    for raw in args.errors_log:
-        log_path = Path(raw)
-        pairs = parse_error_log(log_path)
-        error_pairs |= pairs
-        error_log_summaries.append({
-            "path":  str(log_path),
-            "pairs": len(pairs),
-        })
-        print(f"  errors_log {log_path}: {len(pairs)} (date, HHMM) pairs")
+    if not args.summary:
+        parser.error("at least one --summary KEY=PATH is required")
 
-    # Parse summary triples
-    coverage_by_product: dict[str, dict[str, float]] = {}
-    source_by_product: dict[str, dict] = {}
-    for raw in args.summary:
-        key, csv_path, column = parse_summary_arg(raw)
-        if key in coverage_by_product:
-            sys.exit(f"ERROR: duplicate --summary key {key!r}")
-        cov = load_summary_coverage(csv_path, column)
-        coverage_by_product[key] = cov
-        source_by_product[key] = {
-            "csv": str(csv_path),
-            "column": column,
-            "n_dates": len(cov),
-        }
+    product_keys: list[str] = []
+    summary_paths: dict[str, Path] = {}
+    for key, path in args.summary:
+        if key in summary_paths:
+            sys.exit(f"ERROR: --summary {key!r} appears more than once")
+        if not path.exists():
+            sys.exit(f"ERROR: --summary {key}: file not found: {path}")
+        product_keys.append(key)
+        summary_paths[key] = path
 
-    # Resolve per-product thresholds
-    threshold_by_product: dict[str, float] = {
-        k: args.min_coverage for k in coverage_by_product
-    }
-    for k, v in args.threshold:
-        if k not in threshold_by_product:
-            sys.exit(f"ERROR: --threshold {k}=... has no matching --summary")
-        threshold_by_product[k] = v
+    missing_overrides: dict[str, Path] = {}
+    for key, path in args.missing:
+        if key not in summary_paths:
+            sys.exit(f"ERROR: --missing {key!r} has no matching --summary")
+        missing_overrides[key] = path
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    config = load_timestep_config(Path(args.timestep_config))
+    step_minutes = int(config["step_minutes"])
+
+    filter_by_product: dict[str, set[int]] = {}
+    for key in product_keys:
+        ts_key = PRODUCT_LAYOUT[key]["tsconfig_product"]
+        block = config.get("products", {}).get(ts_key, {})
+        flt = block.get("filter")
+        filter_by_product[key] = set(int(m) for m in flt) if flt else set()
 
     print("=" * 70)
-    print("Cross-product coverage intersection (Step 4.2)")
+    print("Cross-product timestep intersection (Step 4.2)")
     print("=" * 70)
-    print(f"Min coverage (global) : {args.min_coverage}")
-    for key, meta in source_by_product.items():
-        thr = threshold_by_product[key]
-        print(f"  {key:14s} : {meta['csv']}")
-        print(f"      column={meta['column']}, threshold={thr}, "
-              f"{meta['n_dates']} dates")
+    print(f"step_minutes  : {step_minutes}")
+    for key in product_keys:
+        flt = sorted(filter_by_product[key])
+        print(f"  {key:10s} : filter={flt or '(continuous)'} "
+              f"<- {summary_paths[key]}")
     print()
 
-    kept_dates, rows = intersect(coverage_by_product, threshold_by_product)
+    # 1) Dates each product was scanned for (from the summary CSV).
+    dates_by_product: dict[str, set[str]] = {}
+    for key in product_keys:
+        dates_by_product[key] = read_summary_dates(summary_paths[key])
+        print(f"  {key:10s} : {len(dates_by_product[key])} dates in "
+              f"summary CSV")
 
-    # Decision table
-    decisions_path = output_dir / "consistent_dates.csv"
-    fieldnames = ["date"]
-    for key in coverage_by_product.keys():
-        fieldnames.extend([f"{key}_value", f"{key}_ok"])
-    fieldnames.append("kept")
-    with open(decisions_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote {decisions_path}  ({len(rows)} dates total, "
-          f"{len(kept_dates)} kept)")
-
-    # Filter train/val/test
-    splits = [
-        ("train",      Path(args.train_csv)),
-        ("validation", Path(args.val_csv)),
-        ("test",       Path(args.test_csv)),
-    ]
-    split_summaries: dict[str, dict] = {}
-    for split, input_csv in splits:
-        if args.in_place:
-            backup_csv = input_csv.with_name(input_csv.stem + "_original" + input_csv.suffix)
-            tmp_csv = output_dir / f"{split}_data_consistent.tmp"
-            rows_in, rows_kept, rows_dropped_err = filter_csv(
-                input_csv, tmp_csv, kept_dates, error_pairs,
-            )
-            if input_csv.exists():
-                if not backup_csv.exists():
-                    shutil.copy2(input_csv, backup_csv)
-                if tmp_csv.exists():
-                    shutil.move(str(tmp_csv), str(input_csv))
-            out_path = input_csv
+    # 2) Missing-timesteps JSON per product.
+    missing_by_product: dict[str, set[tuple[str, str]]] = {}
+    for key in product_keys:
+        if key in missing_overrides:
+            mpath = missing_overrides[key]
         else:
-            out_path = output_dir / f"{split}_data_consistent.csv"
-            rows_in, rows_kept, rows_dropped_err = filter_csv(
-                input_csv, out_path, kept_dates, error_pairs,
-            )
+            mpath = summary_paths[key].parent / PRODUCT_LAYOUT[key]["missing_name"]
+        missing_by_product[key] = load_missing(key, mpath)
+        print(f"  {key:10s} : {len(missing_by_product[key])} missing "
+              f"(date, HHMM) pairs <- {mpath.name}")
 
-        split_summaries[split] = {
-            "input":              str(input_csv),
-            "output":             str(out_path),
-            "rows_in":            rows_in,
-            "rows_kept":          rows_kept,
-            "rows_dropped_error": rows_dropped_err,
-        }
-        if rows_in:
-            pct = rows_kept / rows_in * 100
-        else:
-            pct = 0
-        extra = (f" ({rows_dropped_err} dropped for reproject errors)"
-                 if rows_dropped_err else "")
-        print(f"  {split:10s}: {rows_kept}/{rows_in} rows kept "
-              f"({pct:.1f}%){extra}  ->  {out_path}")
+    # 3) Error logs.
+    error_pairs: set[tuple[str, str]] = set()
+    for raw in args.errors_log:
+        p = Path(raw)
+        pairs = parse_error_log(p)
+        error_pairs |= pairs
+        print(f"  errors_log {p}: {len(pairs)} (date, HHMM) pairs")
 
-    # Manifest
-    manifest_path = output_dir / "intersect_product_coverage.json"
-    manifest = {
-        "computed_utc": datetime.now(timezone.utc)
-                                .isoformat(timespec="seconds"),
-        "min_coverage": args.min_coverage,
-        "in_place":     bool(args.in_place),
-        "sources":      source_by_product,
-        "thresholds":   threshold_by_product,
-        "error_logs":   error_log_summaries,
-        "n_error_pairs": len(error_pairs),
-        "n_dates_seen": len(rows),
-        "n_dates_kept": len(kept_dates),
-        "splits":       split_summaries,
-    }
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"\nManifest: {manifest_path}")
+    # 4) Master grid = union of dates seen across the active products.
+    all_dates = sorted({d for s in dates_by_product.values() for d in s})
+    if not all_dates:
+        sys.exit("ERROR: no dates listed in any --summary CSV. Re-run "
+                 "the summarize_*.py scripts first.")
+    master = build_master_grid(all_dates, step_minutes)
+    print(f"\nMaster grid   : {len(master)} slots "
+          f"({len(all_dates)} dates x {24 * 60 // step_minutes}/day)")
+
+    # 5) Intersect.
+    kept, dropped = intersect(
+        master, product_keys, missing_by_product,
+        filter_by_product, error_pairs, dates_by_product,
+    )
+    print(f"Kept          : {len(kept)} timesteps "
+          f"({len(kept) / max(1, len(master)) * 100:.1f}% of master grid)")
+    for r in ["unscanned_date"] + product_keys + ["error_log"]:
+        n = len(dropped[r])
+        if n:
+            print(f"  dropped by {r:14s}: {n}")
+
+    # 6) Outputs.
+    write_manifest(kept, product_keys, Path(args.output_csv))
+    write_plot(kept, dropped, all_dates, step_minutes, product_keys,
+               Path(args.output_plot))
 
     return 0
 

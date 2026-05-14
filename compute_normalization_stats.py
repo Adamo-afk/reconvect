@@ -8,9 +8,13 @@ which `create_datasets.py` then consumes — there is **no fallback to the
 Leinonen Swiss constants**, so this script must be run successfully before
 TF datasets can be built.
 
-When `train_data_consistent.csv` exists in the data root (i.e. Step 4.2
-has been run), pass it via `--train_csv our_data/train_data_consistent.csv`
-so the stats reflect the actual training set the model will see.
+When `timestep_manifest.csv` exists in the data root (i.e. Step 4.2 has
+been run), the stats accumulator can be restricted to the surviving
+(date, HHMM) timesteps instead of every reprojected file. The training
+CSV from Step 4.1 (`train_data.csv`) is still the authoritative source
+for *which sequences* the model will see at training time; the manifest
+just guarantees the underlying reprojected files exist for every
+referenced timestep.
 
 Policy decisions (also recorded inside the JSON for traceability)
 ---------------------------------------------------------------
