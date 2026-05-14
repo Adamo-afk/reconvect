@@ -87,7 +87,7 @@ coalition4-rcnn/
 │   │   │   └── wv_73/...
 │   │   ├── pipeline_msg_mtg.py        # MTG FCI L1C SFTP + Satpy processing pipeline
 │   │   ├── inspect_mtg.py             # Reconstruct .nc and plot raw / regridded MTG data
-│   │   ├── summarize_raw_chunks.py    # CSV report of downloaded FCI chunks per date
+│   │   ├── summarize_mtg.py    # CSV report of downloaded FCI chunks per date
 │   │   ├── check_chunk_names.py       # Diagnostic: inspect FCI chunk NetCDF structure
 │   │   ├── check_chunk_contents.py    # Diagnostic: read FCI chunk radiance data
 │   │   └── _raw_chunks/               # Cache of downloaded FCI chunk files (gitignored)
@@ -102,7 +102,7 @@ coalition4-rcnn/
 │   │   ├── {date}-Romania/S_NWC_{CMIC|CTTH}_*.nc   # arranged per-date dirs
 │   │   ├── _raw_data/                  # SFTP cache of downloaded SAFNWC files (gitignored)
 │   │   ├── pipeline_nwcsaf.py         # NWCSAF L2 SFTP + filter + per-date arrange
-│   │   ├── summarize_raw_data.py      # CSV + missing-timesteps report for _raw_data/
+│   │   ├── summarize_nwcsaf.py      # CSV + missing-timesteps report for _raw_data/
 │   │   └── process_nwcsaf.py          # Extract lat/lon from NWCSAF NetCDF files
 │   ├── opera_data/
 │   │   ├── reflectivity/{YYYY}/{MM}/{DD}/*.h5      # OPERA max-reflectivity HDF5 (2 km, 15 min)
@@ -428,7 +428,7 @@ Outputs in `our_data/lightning_periods/`:
 
 #### Cascade coverage report
 
-`summarize_lightning_periods.py` reads the cascade outputs and produces a report parallel to `summarize_raw_chunks.py` (MTG) and `summarize_raw_data.py` (NWCSAF). For each date it tells you exactly how many bins survived the cascade and which bins were dropped, **broken down by the stage that filtered them**:
+`summarize_lightning_periods.py` reads the cascade outputs and produces a report parallel to `summarize_mtg.py` (MTG) and `summarize_nwcsaf.py` (NWCSAF). For each date it tells you exactly how many bins survived the cascade and which bins were dropped, **broken down by the stage that filtered them**:
 
 | Bucket | Meaning |
 |---|---|
@@ -699,11 +699,11 @@ python our_data/satellite_data/pipeline_msg_mtg.py \
 
 #### MTG Helper Scripts
 
-**`summarize_raw_chunks.py`** — scan `_raw_chunks/` and emit a CSV showing how many repeat cycles and chunk files are present per date. Useful to confirm a download is complete before processing.
+**`summarize_mtg.py`** — scan `_raw_chunks/` and emit a CSV showing how many repeat cycles and chunk files are present per date. Useful to confirm a download is complete before processing.
 
 ```bash
-python our_data/satellite_data/summarize_raw_chunks.py
-python our_data/satellite_data/summarize_raw_chunks.py --raw_dir path/to/_raw_chunks --output summary.csv
+python our_data/satellite_data/summarize_mtg.py
+python our_data/satellite_data/summarize_mtg.py --raw_dir path/to/_raw_chunks --output summary.csv
 ```
 
 **`inspect_mtg.py`** — reconstruct a CF-compliant NetCDF from a pipeline `.npy` (using `mtg_constants.json` for the geos grid) or from a regridded `.npy` (using `romania_grid_lats/lons.npy`), and optionally plot it with matplotlib. Use this to open the data in Panoply / QGIS or to sanity-check a frame.
@@ -772,7 +772,7 @@ python our_data/nwcsaf_data/pipeline_nwcsaf.py \
 
 #### NWCSAF Helper Script
 
-**`summarize_raw_data.py`** — scan `_raw_data/`, group files by date, and report:
+**`summarize_nwcsaf.py`** — scan `_raw_data/`, group files by date, and report:
 
 - **Per-date CSV/table** with CMIC + CTTH file counts, `complete_pairs` (timesteps where both products are present), `incomplete_pairs`, `expected` (`len(minute_filter) × 24`), and `coverage_pct`.
 - **Missing-timesteps JSON** with three categorisations per date — `missing_completely_times`, `partial_times` (one product missing), and `per_product_missing` — plus an overall summary.
@@ -781,13 +781,13 @@ The "expected" count is derived from `timestep_config.json` (or `--timesteps NN 
 
 ```bash
 # Defaults: read cadence from timestep_config.json
-python our_data/nwcsaf_data/summarize_raw_data.py
+python our_data/nwcsaf_data/summarize_nwcsaf.py
 
 # Check completeness against every native :00 / .../ :50 timestep
-python our_data/nwcsaf_data/summarize_raw_data.py --timesteps all
+python our_data/nwcsaf_data/summarize_nwcsaf.py --timesteps all
 
 # Custom paths
-python our_data/nwcsaf_data/summarize_raw_data.py \
+python our_data/nwcsaf_data/summarize_nwcsaf.py \
     --raw_dir D:/backup/nwcsaf_raw --output backup_summary.csv \
     --missing backup_missing.json
 ```

@@ -85,7 +85,7 @@ scripts/
       - evaluate_coalition.py replaces plot_predictions /
         plot_test_swiss_data.
       - data_statistics.py + summarize_lightning_periods.py +
-        summarize_raw_chunks.py + summarize_raw_data.py +
+        summarize_mtg.py + summarize_nwcsaf.py +
         summarize_opera_data.py replace plots_lightning + related
         per-product diagnostics.
       - train_models.py replaces training_cscs.

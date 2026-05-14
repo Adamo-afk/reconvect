@@ -1,14 +1,14 @@
 """
-summarize_raw_chunks.py — Summarise downloaded FCI chunks by date.
+summarize_mtg.py — Summarise downloaded MTG FCI chunks by date.
 
 Scans the _raw_chunks directory, parses FCI filenames, and produces
 a CSV showing how many repeat cycles and chunk files are available
 per date.
 
 Usage:
-    python summarize_raw_chunks.py
-    python summarize_raw_chunks.py --raw_dir path/to/_raw_chunks
-    python summarize_raw_chunks.py --output summary.csv
+    python summarize_mtg.py
+    python summarize_mtg.py --raw_dir path/to/_raw_chunks
+    python summarize_mtg.py --output summary.csv
 """
 
 import os
@@ -311,9 +311,7 @@ if __name__ == "__main__":
             f'Output CSV path. Default lands at the project root '
             f'({PROJECT_ROOT / "mtg_summary.csv"}) so '
             f'intersect_product_coverage.py finds it regardless of '
-            f'where the script is invoked from. Renamed from '
-            f'raw_chunks_summary.csv to match the nwcsaf / opera '
-            f'naming convention.'
+            f'where the script is invoked from.'
         ),
     )
     parser.add_argument(

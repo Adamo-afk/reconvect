@@ -6,8 +6,8 @@ parses the timestamp from each `.h5` filename, and produces a per-date
 per-product table plus a JSON of the exact missing timestamps relative to
 the cadence configured in `our_data/timestep_config.json`.
 
-Mirrors the layout of `summarize_raw_chunks.py` (MTG) and
-`summarize_raw_data.py` (NWCSAF) so the three reports feel consistent.
+Mirrors the layout of `summarize_mtg.py` (MTG) and
+`summarize_nwcsaf.py` (NWCSAF) so the three reports feel consistent.
 
 Usage:
     python our_data/opera_data/summarize_opera_data.py
