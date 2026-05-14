@@ -305,8 +305,16 @@ if __name__ == "__main__":
         help=f'Path to _raw_chunks directory (default: {DEFAULT_RAW_DIR})',
     )
     parser.add_argument(
-        '--output', '-o', type=str, default='raw_chunks_summary.csv',
-        help='Output CSV filename (default: raw_chunks_summary.csv)',
+        '--output', '-o', type=str,
+        default=str(PROJECT_ROOT / 'mtg_summary.csv'),
+        help=(
+            f'Output CSV path. Default lands at the project root '
+            f'({PROJECT_ROOT / "mtg_summary.csv"}) so '
+            f'intersect_product_coverage.py finds it regardless of '
+            f'where the script is invoked from. Renamed from '
+            f'raw_chunks_summary.csv to match the nwcsaf / opera '
+            f'naming convention.'
+        ),
     )
     parser.add_argument(
         '--missing', '-m', type=str, default='missing_timesteps.json',

@@ -462,7 +462,7 @@ Designed to work with **any combination of products** — pass only the `--summa
 ```bash
 # Full configuration — every product required at 100% per date
 python intersect_product_coverage.py \
-    --summary mtg=raw_chunks_summary.csv \
+    --summary mtg=mtg_summary.csv \
     --summary nwcsaf=nwcsaf_summary.csv \
     --summary opera=opera_summary.csv \
     --summary lightning=lightning_summary.csv:kept \
@@ -470,7 +470,7 @@ python intersect_product_coverage.py \
 
 # Smaller experiment — only radar + MTG, 80% threshold acceptable
 python intersect_product_coverage.py \
-    --summary mtg=raw_chunks_summary.csv \
+    --summary mtg=mtg_summary.csv \
     --min_coverage 80
 ```
 

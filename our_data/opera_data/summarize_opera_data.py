@@ -406,7 +406,8 @@ def main() -> int:
              'timestep_config.json.',
     )
     parser.add_argument(
-        '--output', '-o', type=str, default='opera_summary.csv',
+        '--output', '-o', type=str,
+        default=str(PROJECT_ROOT / 'opera_summary.csv'),
         help='Output CSV filename (default: opera_summary.csv)',
     )
     parser.add_argument(

@@ -68,7 +68,7 @@ Examples
 --------
     # MTG + NWCSAF + OPERA (both products) + lightning — full coverage required
     python intersect_product_coverage.py \\
-        --summary mtg=raw_chunks_summary.csv \\
+        --summary mtg=mtg_summary.csv \\
         --summary nwcsaf=nwcsaf_summary.csv \\
         --summary opera=opera_summary.csv \\
         --summary lightning=lightning_summary.csv:kept \\
@@ -76,7 +76,7 @@ Examples
 
     # No NWCSAF, no lightning, just radar + MTG, relaxed to 80%
     python intersect_product_coverage.py \\
-        --summary mtg=raw_chunks_summary.csv:coverage_pct \\
+        --summary mtg=mtg_summary.csv:coverage_pct \\
         --min_coverage 80
 """
 
