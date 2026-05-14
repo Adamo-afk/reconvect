@@ -77,7 +77,7 @@ def load_minute_filter(product_key: str):
     if prod_cfg is None or prod_cfg.get("filter") is None:
         print(
             f"ERROR: product '{product_key}' has no minute filter in "
-            f"{TIMESTEP_CONFIG_PATH}. Add it to product_cadences.json and "
+            f"{TIMESTEP_CONFIG_PATH}. Add it to product_cadences.config and "
             f"re-run validate_timestep.py.",
             file=sys.stderr,
         )

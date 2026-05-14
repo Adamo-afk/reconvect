@@ -126,7 +126,7 @@ def load_timestep_filter(product_key: str):
         print(
             f"ERROR: product '{product_key}' has no minute filter in "
             f"{TIMESTEP_CONFIG_PATH}.\n"
-            f"Make sure '{product_key}' is listed in product_cadences.json, "
+            f"Make sure '{product_key}' is listed in product_cadences.config, "
             f"then re-run:\n    python validate_timestep.py "
             f"--step_minutes <N>",
             file=sys.stderr,

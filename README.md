@@ -153,7 +153,7 @@ coalition4-rcnn/
 ├── evaluation/                        # Evaluation outputs (not tracked in git)
 │   └── eval_{mode}/
 │
-├── product_cadences.json              # Native cadence per data product (input to Step 0)
+├── product_cadences.config              # Native cadence per data product (input to Step 0)
 ├── validate_timestep.py               # Step 0: Validate cadence → timestep_config.json
 ├── identify_patches.py                # Step 1: DBSCAN → patch_index.csv/json (radar)
 ├── identify_lightning_periods.py      # Step 1 (lightning variant): 3-stage cascade → lightning_periods/
@@ -231,7 +231,7 @@ conda activate tfenv
 
 The pipeline supports any training step that is at least as coarse as the
 highest native data cadence. Native cadences are declared in
-[`product_cadences.json`](product_cadences.json) at the project root and
+[`product_cadences.config`](product_cadences.config) at the project root and
 cover every product family the pipeline knows about (radar, MTG, NWCSAF,
 the two OPERA products, and lightning).
 
@@ -255,12 +255,15 @@ uses, and why the 10-min products are filtered to the alternating
 `{:00, :10, :30, :40}` pattern when paired with a 15-min training step.
 
 If you add a new data source or its native cadence changes, edit
-`product_cadences.json` rather than the validator script. The validator
-reads the file at startup; it does not inspect any data folders. Override
-with `--cadences_file path/to/other.json`. Comment out products you are
-not using (rename with a leading underscore) if they would otherwise
-raise the floor beyond what you need — e.g. drop OPERA's 15-min floor
-back to 10 min when running a radar-only experiment.
+`product_cadences.config` rather than the validator script. The file is
+INI-style with a single `[cadences]` section; comments start with `#`
+or `;`, and a value of `null` or an empty value marks a continuous /
+event-based product (lightning). The validator reads the file at
+startup; it does not inspect any data folders. Override the path with
+`--cadences_file path/to/other.config`. Comment out a product line
+with a leading `#` to drop it from the active set — e.g. comment out
+OPERA's two entries to bring the validator floor back to 10 min when
+running a radar-only experiment.
 
 Run the validator once before any other pipeline step:
 
@@ -792,7 +795,7 @@ OPERA is an alternative radar source with two products:
 | Maximum reflectivity (dBZ) | 2 km | 15 min | HDF5 (`.h5`) |
 | Instantaneous rainfall rate (mm/h) | 2 km | 15 min | HDF5 (`.h5`) |
 
-Both products are listed in `product_cadences.json` as `opera_reflectivity: 15` and `opera_rainfall_rate: 15`. They raise the validator floor to 15 min when OPERA is in use — comment them out (rename with a leading underscore) in the cadences file if you're not using OPERA and want a finer training step.
+Both products are listed in `product_cadences.config` as `opera_reflectivity = 15` and `opera_rainfall_rate = 15`. They raise the validator floor to 15 min when OPERA is in use — comment them out with a leading `#` in the cadences file if you're not using OPERA and want a finer training step.
 
 ##### Step 1 — Download (`pipeline_opera.py`)
 
