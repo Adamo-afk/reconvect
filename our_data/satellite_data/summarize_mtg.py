@@ -315,8 +315,14 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        '--missing', '-m', type=str, default='missing_timesteps.json',
-        help='Output JSON with missing timesteps (default: missing_timesteps.json)',
+        '--missing', '-m', type=str,
+        default=str(PROJECT_ROOT / 'mtg_missing_timesteps.json'),
+        help=(
+            f'Output JSON with missing timesteps '
+            f'(default: {PROJECT_ROOT / "mtg_missing_timesteps.json"} - '
+            f'anchored to the project root, matching the nwcsaf / opera '
+            f'naming convention).'
+        ),
     )
 
     args = parser.parse_args()

@@ -412,7 +412,7 @@ def main() -> int:
     )
     parser.add_argument(
         '--missing', '-m', type=str,
-        default='opera_missing_timesteps.json',
+        default=str(PROJECT_ROOT / 'opera_missing_timesteps.json'),
         help='Output JSON with missing timesteps '
              '(default: opera_missing_timesteps.json)',
     )

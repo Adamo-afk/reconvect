@@ -189,72 +189,35 @@ def read_patch_index(data_root):
     return results
 
 
-def _hhmm_from_reference_and_offset(reference_utc: str,
-                                     offset_minutes: int) -> tuple[str, str]:
-    """Apply a minute offset to a reference 'HH:MM' on a given date.
-
-    Returns (date_offset_days, 'HH:MM'). The caller must add the
-    day offset to the original sequence date to handle midnight wrap.
+def load_manifest_timesteps(manifest_path):
     """
-    h, m = int(reference_utc[:2]), int(reference_utc[3:5])
-    total = h * 60 + m + offset_minutes
-    day_offset, total = divmod(total, 24 * 60)
-    return day_offset, f"{total // 60:02d}:{total % 60:02d}"
+    Read the timestep manifest produced by `intersect_product_coverage.py`
+    and return the set of `(date, 'HH:MM')` tuples that survived the
+    per-timestep intersection.
 
-
-def _offset_minutes_from_col(col: str) -> int | None:
-    """Parse 'idx_t-30', 'idx_t0', 'idx_t+45' -> -30, 0, +45."""
-    m = re.match(r'^idx_t(?P<sign>[+-]?)(?P<n>\d+)$', col)
-    if not m:
-        return None
-    n = int(m.group('n'))
-    return -n if m.group('sign') == '-' else n
-
-
-def collect_used_timesteps(sequence_csvs):
+    The manifest columns are `date,hhmm,<key>_hhmm,...`. We only need the
+    first two — the per-product columns are an audit trail consumed by
+    other tooling. Returns an empty set if the file does not exist, in
+    which case the caller falls back to processing every entry in the
+    patch index.
     """
-    Read one or more sequence CSVs (the filtered output of
-    `intersect_product_coverage.py`) and return the union of
-    `(date, 'HH:MM')` timesteps that any surviving sequence row references.
-
-    Returns an empty set if none of the supplied paths exist — callers
-    interpret that as "no filter, process every entry in patch_index".
-
-    Midnight wrap is handled with a real `datetime` add so a sample
-    whose `T+45` lands on the next UTC day is attributed to that day.
-    """
-    from datetime import datetime, timedelta
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return set()
     used: set[tuple[str, str]] = set()
-    n_rows = 0
-    for path in sequence_csvs:
-        if not path or not os.path.isfile(path):
-            continue
-        with open(path, 'r') as f:
-            reader = csv.DictReader(f)
-            offset_cols = [
-                (c, _offset_minutes_from_col(c)) for c in reader.fieldnames
-                if c and c.startswith('idx_t')
-            ]
-            offset_cols = [(c, o) for c, o in offset_cols if o is not None]
-            for row in reader:
-                n_rows += 1
-                date_str = row['date']
-                ref = row['reference_utc']
-                try:
-                    ref_dt = datetime.strptime(
-                        f"{date_str}T{ref}", "%Y-%m-%dT%H:%M",
-                    )
-                except ValueError:
-                    continue
-                for _col, offset in offset_cols:
-                    step_dt = ref_dt + timedelta(minutes=offset)
-                    used.add((
-                        step_dt.strftime('%Y-%m-%d'),
-                        step_dt.strftime('%H:%M'),
-                    ))
-    if sequence_csvs and n_rows:
-        print(f"  Collected {len(used)} unique (date, time) timesteps "
-              f"from {n_rows} sequence rows across {len(sequence_csvs)} CSV(s)")
+    with open(manifest_path, 'r') as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or 'date' not in reader.fieldnames \
+                or 'hhmm' not in reader.fieldnames:
+            return set()
+        for row in reader:
+            date_str = row['date'].strip()
+            hhmm = row['hhmm'].strip()
+            if not date_str or len(hhmm) != 4 or not hhmm.isdigit():
+                continue
+            used.add((date_str, f"{hhmm[:2]}:{hhmm[2:]}"))
+    if used:
+        print(f"  Manifest:        {manifest_path}  "
+              f"({len(used)} timesteps to extract)")
     return used
 
 
@@ -552,7 +515,7 @@ def extract_and_pool(data, active_patches, pool_factor):
 # =============================================================================
 
 def run_extraction(data_root, output_root, date_filter=None,
-                   product_filter=None, sequence_csvs=None):
+                   product_filter=None, manifest=None):
     """
     Run the patch extraction pipeline.
 
@@ -561,14 +524,12 @@ def run_extraction(data_root, output_root, date_filter=None,
         output_root: path to output patches directory
         date_filter: optional YYYY-MM-DD
         product_filter: optional list of group names to process
-        sequence_csvs: optional list of paths to filtered sequence CSVs
-            (the output of `intersect_product_coverage.py`). When supplied
-            (or auto-discovered as the default train/val/test files), only
-            the (date, time) timesteps referenced by at least one surviving
-            sequence row are processed — the rest are skipped to avoid
-            wasted work on timesteps that won't end up in any sample.
-            Pass an empty list to disable and fall back to the full
-            patch_index (legacy behaviour).
+        manifest: optional path to `timestep_manifest.csv` (the output
+            of `intersect_product_coverage.py`). When supplied (or
+            auto-discovered at `<data_root>/timestep_manifest.csv`),
+            only timesteps listed in the manifest are processed.
+            Pass an empty string or `'none'` to disable and process
+            every active timestep in `patch_index.csv`.
     """
     print("=" * 70)
     print("COALITION-4 Patch Extraction Pipeline")
@@ -577,30 +538,24 @@ def run_extraction(data_root, output_root, date_filter=None,
     print(f"Output root : {output_root}")
 
     # Read patch index — this gives us the per-timestep set of active
-    # patches (needed regardless of whether sequence filtering is on).
+    # patches (needed regardless of whether the manifest filter is on).
     index = read_patch_index(data_root)
     if not index:
         return
 
-    # Constrain to (date, time) pairs referenced by at least one surviving
-    # sequence row. Skipping unused timesteps cuts both runtime and disk.
-    if sequence_csvs is None:
-        # Auto-discover the canonical post-intersect outputs
-        sequence_csvs = [
-            os.path.join(data_root, f)
-            for f in ('train_data.csv',
-                      'validation_data.csv',
-                      'test_data.csv')
-        ]
+    # Constrain to (date, time) pairs in the intersect manifest. Skipping
+    # un-listed timesteps avoids work on slots where one or more required
+    # products had no data.
+    if manifest is None:
+        manifest = os.path.join(data_root, 'timestep_manifest.csv')
     used_timesteps: set[tuple[str, str]] = set()
-    if sequence_csvs:
-        used_timesteps = collect_used_timesteps(sequence_csvs)
+    if manifest:
+        used_timesteps = load_manifest_timesteps(manifest)
     if used_timesteps:
         before = len(index)
         index = [(d, t, a) for d, t, a in index
                  if (d, t) in used_timesteps]
-        print(f"Sequence filter: kept {len(index)}/{before} timesteps "
-              f"that any train/val/test sample references")
+        print(f"Manifest filter: kept {len(index)}/{before} timesteps")
 
     if date_filter:
         index = [(d, t, a) for d, t, a in index if d == date_filter]
@@ -731,33 +686,29 @@ if __name__ == "__main__":
         help="Product groups to extract (default: all)"
     )
     parser.add_argument(
-        "--sequence_csvs", nargs='+', default=None,
-        help="Paths to filtered sequence CSVs (from "
-             "intersect_product_coverage.py). Default: the canonical "
-             "{train,validation,test}_data.csv under --data_root, if "
-             "they exist. Pass `--sequence_csvs none` to disable the "
-             "filter and process every active timestep in patch_index."
+        "--manifest", type=str, default=None,
+        help="Path to the timestep manifest produced by "
+             "intersect_product_coverage.py. Default: "
+             "<data_root>/timestep_manifest.csv if it exists. Pass "
+             "`--manifest none` to skip the filter and process every "
+             "active timestep in patch_index.csv."
     )
 
     args = parser.parse_args()
 
     output_root = args.output_dir or os.path.join(args.data_root, 'patches')
 
-    # `--sequence_csvs none` explicitly opts out; otherwise auto-discover.
-    if args.sequence_csvs is not None:
-        sequence_csvs = (
-            [] if (len(args.sequence_csvs) == 1
-                   and args.sequence_csvs[0].lower() == 'none')
-            else args.sequence_csvs
-        )
+    # `--manifest none` explicitly opts out; otherwise auto-discover.
+    if args.manifest is not None:
+        manifest = '' if args.manifest.lower() == 'none' else args.manifest
     else:
-        sequence_csvs = None  # let run_extraction auto-discover
+        manifest = None  # let run_extraction auto-discover
 
     run_extraction(
         data_root=args.data_root,
         output_root=output_root,
         date_filter=args.date,
         product_filter=args.products,
-        sequence_csvs=sequence_csvs,
+        manifest=manifest,
     )
     
