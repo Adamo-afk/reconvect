@@ -93,11 +93,6 @@ from pathlib import Path
 
 import numpy as np
 
-try:
-    from netCDF4 import Dataset as NC4Dataset
-except ImportError:
-    NC4Dataset = None  # only needed for NWCSAF / OPERA sources
-
 
 # =============================================================================
 # Configuration
@@ -160,20 +155,6 @@ NORMALIZATION_SPEC: dict[str, dict] = {
                             "fill": -32.0},
     "opera_rainfall_rate": {"source": "opera", "transform": "log_zscore",
                             "fill": 0.01, "clip_min": 0.01},
-}
-
-# Which NWCSAF L2 file holds each variable (CTTH or CMIC).
-NWCSAF_FILE_FOR_VAR = {
-    "ctth_alti":  "CTTH",
-    "ctth_tempe": "CTTH",
-    "cmic_cot":   "CMIC",
-}
-
-# Internal NWCSAF NetCDF variable name (typically lowercase)
-NWCSAF_NC_VAR_NAME = {
-    "ctth_alti":  "ctth_alti",
-    "ctth_tempe": "ctth_tempe",
-    "cmic_cot":   "cmic_cot",
 }
 
 # Default near-constant threshold — flagged in the JSON when triggered.
@@ -363,10 +344,6 @@ _LIGHTNING_NAME_PATTERN = re.compile(
     r'^lightning_(?P<var>density|current|occurrence)_'
     r'(?P<date>\d{8})_(?P<hhmm>\d{4})\.npy$'
 )
-_NWCSAF_NAME_PATTERN = re.compile(
-    r'^S_NWC_(?P<product>CMIC|CTTH)_[^_]+_[^_]+_'
-    r'(?P<date>\d{8})T(?P<hhmm>\d{4})\d{2}Z(.*?)?\.nc$'
-)
 
 
 def _walk_radar_or_mtg(root: Path, var: str,
@@ -424,29 +401,33 @@ def _walk_lightning(root: Path, var: str,
 
 def _walk_nwcsaf(root: Path, var: str,
                  training_keys: set[tuple[str, str]]
-                 ) -> list[tuple[Path, str]]:
+                 ) -> list[Path]:
     """
-    NWCSAF variables live inside CTTH or CMIC .nc files in
-    `reprojected_data/nwcsaf_data/{date}-Romania/`. Returns
-    [(file_path, internal_variable_name), ...] for every (date, HHMM) that
-    matches the training keys and whose file holds `var`.
+    After the reproject pipeline unification, NWCSAF is written as one
+    `.npy` per variable, same layout as radar / MTG / OPERA:
+
+      reprojected_data/nwcsaf_data/{variable}/
+          nc4_{date}-Romania_{variable}/nc4_{date}-Romania_{HHMM}_{variable}.npy
+
+    Walks that tree and returns the matching file paths (filtered by
+    `training_keys` when supplied).
     """
-    product = NWCSAF_FILE_FOR_VAR[var]
-    nc_var = NWCSAF_NC_VAR_NAME[var]
-    out: list[tuple[Path, str]] = []
-    for day_dir in sorted(root.iterdir()):
+    var_root = root / var
+    if not var_root.is_dir():
+        return []
+    out: list[Path] = []
+    for day_dir in sorted(var_root.iterdir()):
         if not day_dir.is_dir():
             continue
         for f in sorted(day_dir.iterdir()):
-            m = _NWCSAF_NAME_PATTERN.match(f.name)
-            if not m or m.group("product") != product:
+            m = _NPY_NAME_PATTERN.match(f.name)
+            if not m:
                 continue
-            d = m.group("date")
-            date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
-            hhmm = m.group("hhmm")
+            date_str = m.group(1)
+            hhmm = m.group(2)
             if training_keys and (date_str, hhmm) not in training_keys:
                 continue
-            out.append((f, nc_var))
+            out.append(f)
     return out
 
 
@@ -519,39 +500,23 @@ def discover_inputs(reproject_root: Path, var: str,
 
 
 def load_array(item, source: str) -> np.ndarray | None:
-    """Load a 2-D array for one file, with per-source quirks.
+    """Load a 2-D array from a reprojected `.npy` file.
 
-    After the reproject pipeline unification, every product writes
-    `.npy` (radar / mtg / lightning / nwcsaf / opera). Only `nwcsaf`
-    still uses the (path, nc_var) tuple from the earlier multi-variable
-    `.nc` schema, which `_walk_nwcsaf` keeps as a compatibility hook —
-    if that ever changes too, the second branch below can go away.
+    After the reproject pipeline unification, every product family
+    (radar, MTG, lightning, NWCSAF, OPERA) writes one `.npy` per
+    (variable, timestep), so the loader is the same everywhere.
     """
     try:
-        if isinstance(item, tuple):
-            # nwcsaf legacy path — (path, nc_var)
-            if NC4Dataset is None:
-                raise RuntimeError("netCDF4 not installed")
-            path, nc_var = item
-            with NC4Dataset(path, "r") as ds:
-                if nc_var not in ds.variables:
-                    return None
-                arr = np.asarray(ds.variables[nc_var][:])
-        else:
-            # radar / mtg / lightning / opera — all `.npy`
-            arr = np.load(item, allow_pickle=False)
-        # Strip time dim if present
+        arr = np.load(item, allow_pickle=False)
         if arr.ndim == 3 and arr.shape[0] == 1:
             arr = arr[0]
         if arr.ndim != 2:
             return None
-        # Resolve any MaskedArray from the netCDF path
         if isinstance(arr, np.ma.MaskedArray):
             arr = arr.filled(np.nan)
         return arr.astype(np.float64, copy=False)
     except Exception as e:
-        path = item if not isinstance(item, tuple) else item[0]
-        print(f"    WARN: could not load {path}: {e}", file=sys.stderr)
+        print(f"    WARN: could not load {item}: {e}", file=sys.stderr)
         return None
 
 
