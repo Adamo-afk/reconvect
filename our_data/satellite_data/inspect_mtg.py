@@ -5,7 +5,7 @@ Combines a .npy data file with the grid constants to produce a
 CF-compliant NetCDF (viewable in Panoply/QGIS) and/or a matplotlib
 plot.
 
-Works with both pipeline output (geostationary grid) and regridded
+Works with both pipeline output (geostationary grid) and reprojected
 output (EPSG:31700 Romania grid).
 
 Usage:
@@ -14,15 +14,15 @@ Usage:
         --npy MTG/vis_06/nc4_2026-02-13-Romania_vis_06/nc4_2026-02-13-Romania_0930_vis_06.npy \\
         --constants MTG/mtg_constants.json
 
-    # Plot regridded output (Romania EPSG:31700 grid)
-    python inspect_mtg.py --regridded \\
-        --npy regridded_data/satellite_data/MTG/vis_06/.../nc4_..._0930_vis_06.npy
+    # Plot reprojected output (Romania EPSG:31700 grid)
+    python inspect_mtg.py --reprojected \\
+        --npy reprojected_data/satellite_data/MTG/vis_06/.../nc4_..._0930_vis_06.npy
 
     # Save .nc without plotting
     python inspect_mtg.py --raw --npy <path> --constants <path> --save_nc --no_plot
 
     # Both
-    python inspect_mtg.py --regridded --npy <path> --save_nc
+    python inspect_mtg.py --reprojected --npy <path> --save_nc
 """
 
 import os
@@ -137,19 +137,19 @@ def build_raw_nc(npy_path, constants_path, channel=None):
 
 
 # =============================================================================
-# Regridded output (EPSG:31700 Romania grid)
+# Reprojected output (EPSG:31700 Romania grid)
 # =============================================================================
 
-def build_regridded_nc(npy_path, regridded_base=None, channel=None):
+def build_reprojected_nc(npy_path, reprojected_base=None, channel=None):
     """
-    Reconstruct a CF-compliant NetCDF from a regridded .npy file.
+    Reconstruct a CF-compliant NetCDF from a reprojected .npy file.
 
     Reads the Romania grid lat/lon arrays from romania_grid_lats.npy
     and romania_grid_lons.npy, and combines them with the data.
 
     Args:
-        npy_path (str): Path to the regridded .npy data file.
-        regridded_base (str): Directory containing romania_grid_*.npy.
+        npy_path (str): Path to the reprojected .npy data file.
+        reprojected_base (str): Directory containing romania_grid_*.npy.
             Auto-detected from npy_path if None.
         channel (str): Channel name. Auto-detected from filename if None.
 
@@ -167,24 +167,24 @@ def build_regridded_nc(npy_path, regridded_base=None, channel=None):
     data = np.load(npy_path)
 
     # Find the grid coordinate files
-    if regridded_base is None:
+    if reprojected_base is None:
         # Walk up from the .npy path to find romania_grid_lats.npy
         search_dir = os.path.dirname(npy_path)
         for _ in range(5):
             lats_path = os.path.join(search_dir, 'romania_grid_lats.npy')
             if os.path.isfile(lats_path):
-                regridded_base = search_dir
+                reprojected_base = search_dir
                 break
             search_dir = os.path.dirname(search_dir)
 
-    if regridded_base is None:
+    if reprojected_base is None:
         raise FileNotFoundError(
             "Cannot find romania_grid_lats.npy. "
             "Pass --grid_dir explicitly."
         )
 
-    lats = np.load(os.path.join(regridded_base, 'romania_grid_lats.npy'))
-    lons = np.load(os.path.join(regridded_base, 'romania_grid_lons.npy'))
+    lats = np.load(os.path.join(reprojected_base, 'romania_grid_lats.npy'))
+    lons = np.load(os.path.join(reprojected_base, 'romania_grid_lons.npy'))
 
     ds = xr.Dataset(
         {channel: (['y', 'x'], np.asarray(data, dtype=np.float32))},
@@ -213,7 +213,7 @@ def plot_data(ds, channel, title=None, output_image=None):
     """
     Plot the data array with matplotlib.
 
-    For regridded data (has latitude/longitude), plots on a map.
+    For reprojected data (has latitude/longitude), plots on a map.
     For raw data (integer indices), plots as a 2D image.
 
     Args:
@@ -234,7 +234,7 @@ def plot_data(ds, channel, title=None, output_image=None):
     has_latlon = 'latitude' in ds.coords
 
     if has_latlon:
-        # Regridded data — plot on lat/lon axes
+        # Reprojected data — plot on lat/lon axes
         lats = ds['latitude'].values
         lons = ds['longitude'].values
 
@@ -306,8 +306,8 @@ if __name__ == "__main__":
         help='Input is raw pipeline output (geostationary grid)',
     )
     mode.add_argument(
-        '--regridded', action='store_true',
-        help='Input is regridded output (EPSG:31700 Romania grid)',
+        '--reprojected', action='store_true',
+        help='Input is reprojected output (EPSG:31700 Romania grid)',
     )
 
     # Required
@@ -324,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--grid_dir', type=str, default=None,
         help='Directory containing romania_grid_lats/lons.npy '
-             '(auto-detected for --regridded)',
+             '(auto-detected for --reprojected)',
     )
     parser.add_argument(
         '--channel', type=str, default=None,
@@ -365,8 +365,8 @@ if __name__ == "__main__":
             args.npy, args.constants, channel=args.channel
         )
     else:
-        ds, channel = build_regridded_nc(
-            args.npy, regridded_base=args.grid_dir, channel=args.channel
+        ds, channel = build_reprojected_nc(
+            args.npy, reprojected_base=args.grid_dir, channel=args.channel
         )
 
     print(f"Channel  : {channel}")

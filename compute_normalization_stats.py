@@ -1,6 +1,6 @@
 """
 compute_normalization_stats.py — Derive per-variable normalization parameters
-from the regridded data in `our_data/regridded_data/`.
+from the reprojected data in `our_data/reprojected_data/`.
 
 This script is Step 4.3, between intersect_product_coverage.py (4.2) and
 create_datasets.py (Step 5). It produces `our_data/normalization_stats.json`,
@@ -21,19 +21,19 @@ Policy decisions (also recorded inside the JSON for traceability)
    `sequence_meta.json`) are expanded into the set of (date, HHMM)
    tuples actually consumed at training time; every other timestep
    (validation, test, or off-grid) is excluded. Pass `--no_split_filter`
-   to disable this and use every regridded file.
+   to disable this and use every reprojected file.
 
 2. **Single scalar mean/std per variable.** Across all valid pixels of
    all training timesteps, no per-pixel climatology. Per-pixel stats
    would let the model overfit to the training domain's geography
    (e.g. permanent radar beam blockage); a single scalar avoids that.
 
-3. **Source: regridded data, not patches.** Patches under
+3. **Source: reprojected data, not patches.** Patches under
    `our_data/patches/` are filtered by RZC-based DBSCAN activity (for
    radar mode) or by lightning activity (for lightning mode). Computing
    stats on them would bias every input variable's distribution toward
    convective scenes. Reading directly from
-   `our_data/regridded_data/.../1536x768.npy` uses the **full Romania
+   `our_data/reprojected_data/.../1536x768.npy` uses the **full Romania
    grid** at each timestep, removing that bias.
 
 4. **Missing-pixel handling.** Pixels that are NaN, or that match a
@@ -101,7 +101,7 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "our_data"
-DEFAULT_REGRID_ROOT = DEFAULT_DATA_ROOT / "regridded_data"
+DEFAULT_REGRID_ROOT = DEFAULT_DATA_ROOT / "reprojected_data"
 DEFAULT_OUTPUT = DEFAULT_DATA_ROOT / "normalization_stats.json"
 DEFAULT_TRAIN_CSV = DEFAULT_DATA_ROOT / "train_data.csv"
 DEFAULT_SEQUENCE_META = DEFAULT_DATA_ROOT / "sequence_meta.json"
@@ -109,7 +109,7 @@ DEFAULT_SEQUENCE_META = DEFAULT_DATA_ROOT / "sequence_meta.json"
 # Per-variable normalization spec.
 #
 # Each entry declares:
-#   source         : which regridded sub-tree to look in
+#   source         : which reprojected sub-tree to look in
 #                    (radar | mtg | lightning | nwcsaf | opera)
 #   transform      : 'log_zscore' or 'linear'
 #   fill           : value used to fill NaN at inference time (NOT used by
@@ -369,9 +369,9 @@ def _walk_radar_or_mtg(root: Path, var: str,
                        training_keys: set[tuple[str, str]]
                        ) -> list[Path]:
     """
-    `regridded_data/radar_data/{VAR}/nc4_{date}-Romania_{VAR}/nc4_{date}-Romania_{HHMM}_{VAR}.npy`
+    `reprojected_data/radar_data/{VAR}/nc4_{date}-Romania_{VAR}/nc4_{date}-Romania_{HHMM}_{VAR}.npy`
     or
-    `regridded_data/satellite_data/MTG/{ch}/nc4_{date}-Romania_{ch}/nc4_{date}-Romania_{HHMM}_{ch}.npy`
+    `reprojected_data/satellite_data/MTG/{ch}/nc4_{date}-Romania_{ch}/nc4_{date}-Romania_{HHMM}_{ch}.npy`
     """
     var_root = root / var
     if not var_root.is_dir():
@@ -396,7 +396,7 @@ def _walk_lightning(root: Path, var: str,
                     training_keys: set[tuple[str, str]]
                     ) -> list[Path]:
     """
-    `regridded_data/lightning_data/{var}/nc4_{date}-Romania_{var}/lightning_{var}_{YYYYMMDD}_{HHMM}.npy`
+    `reprojected_data/lightning_data/{var}/nc4_{date}-Romania_{var}/lightning_{var}_{YYYYMMDD}_{HHMM}.npy`
     """
     var_root = root / var
     if not var_root.is_dir():
@@ -423,7 +423,7 @@ def _walk_nwcsaf(root: Path, var: str,
                  ) -> list[tuple[Path, str]]:
     """
     NWCSAF variables live inside CTTH or CMIC .nc files in
-    `regridded_data/nwcsaf_data/{date}-Romania/`. Returns
+    `reprojected_data/nwcsaf_data/{date}-Romania/`. Returns
     [(file_path, internal_variable_name), ...] for every (date, HHMM) that
     matches the training keys and whose file holds `var`.
     """
@@ -450,8 +450,8 @@ def _walk_opera(root: Path, var: str,
                 training_keys: set[tuple[str, str]]
                 ) -> list[tuple[Path, str]]:
     """
-    `regridded_data/opera_data/{product}/nc4_{date}-Romania_{product}/nc4_{date}-Romania_{HHMM}_{product}.nc`
-    The internal NetCDF variable name follows the regrid_opera.py
+    `reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/nc4_{date}-Romania_{HHMM}_{product}.nc`
+    The internal NetCDF variable name follows the reproject_opera.py
     convention: 'max_reflectivity' or 'rainfall_rate'.
     """
     product_subdir = "reflectivity" if var == "opera_reflectivity" else "rainfall_rate"
@@ -478,7 +478,7 @@ def _walk_opera(root: Path, var: str,
     return out
 
 
-def discover_inputs(regrid_root: Path, var: str,
+def discover_inputs(reproject_root: Path, var: str,
                     training_keys: set[tuple[str, str]]
                     ) -> list:
     """
@@ -488,22 +488,22 @@ def discover_inputs(regrid_root: Path, var: str,
     spec = NORMALIZATION_SPEC[var]
     source = spec["source"]
     if source == "radar":
-        return _walk_radar_or_mtg(regrid_root / "radar_data", var, training_keys)
+        return _walk_radar_or_mtg(reproject_root / "radar_data", var, training_keys)
     if source == "mtg":
         return _walk_radar_or_mtg(
-            regrid_root / "satellite_data" / "MTG", var, training_keys,
+            reproject_root / "satellite_data" / "MTG", var, training_keys,
         )
     if source == "lightning":
         return _walk_lightning(
-            regrid_root / "lightning_data", var, training_keys,
+            reproject_root / "lightning_data", var, training_keys,
         )
     if source == "nwcsaf":
         return _walk_nwcsaf(
-            regrid_root / "nwcsaf_data", var, training_keys,
+            reproject_root / "nwcsaf_data", var, training_keys,
         )
     if source == "opera":
         return _walk_opera(
-            regrid_root / "opera_data", var, training_keys,
+            reproject_root / "opera_data", var, training_keys,
         )
     raise ValueError(f"Unknown source: {source!r}")
 
@@ -610,12 +610,12 @@ def compute_variable_stats(var: str,
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compute per-variable normalization stats (mean/std) "
-                    "from the regridded data in our_data/regridded_data/. "
+                    "from the reprojected data in our_data/reprojected_data/. "
                     "create_datasets.py requires the resulting JSON."
     )
-    parser.add_argument('--regrid_root', type=str,
+    parser.add_argument('--reproject_root', type=str,
                         default=str(DEFAULT_REGRID_ROOT),
-                        help=f'Regridded-data root '
+                        help=f'Reprojected-data root '
                              f'(default: {DEFAULT_REGRID_ROOT})')
     parser.add_argument('--train_csv', type=str,
                         default=str(DEFAULT_TRAIN_CSV),
@@ -628,7 +628,7 @@ def main() -> int:
                              f'(default: {DEFAULT_SEQUENCE_META})')
     parser.add_argument('--no_split_filter', action='store_true',
                         help='Disable the training-window filter and use '
-                             'every regridded file (validation / test data '
+                             'every reprojected file (validation / test data '
                              'WILL leak; only useful for diagnostics).')
     parser.add_argument('--variables', type=str, nargs='+', default=None,
                         help='Subset of variables to process '
@@ -653,7 +653,7 @@ def main() -> int:
     if not args.with_percentiles:
         args.reservoir_size = 0
 
-    regrid_root = Path(args.regrid_root)
+    reproject_root = Path(args.reproject_root)
     train_csv = Path(args.train_csv)
     seq_meta_path = Path(args.sequence_meta)
 
@@ -684,7 +684,7 @@ def main() -> int:
     print("=" * 70)
     print("Normalization Stats Computation")
     print("=" * 70)
-    print(f"Regrid root         : {regrid_root}")
+    print(f"Reproject root         : {reproject_root}")
     print(f"Training filter     : "
           f"{'DISABLED — using all files' if args.no_split_filter else f'enabled ({len(training_keys)} unique (date, HHMM) keys)'}")
     print(f"Variables           : {sorted(variables)}")
@@ -696,7 +696,7 @@ def main() -> int:
     variable_results: dict[str, dict] = {}
     for var in sorted(variables):
         spec = NORMALIZATION_SPEC[var]
-        items = discover_inputs(regrid_root, var, training_keys)
+        items = discover_inputs(reproject_root, var, training_keys)
         print(f"  {var:22s}: {len(items)} file(s) match")
         result = compute_variable_stats(
             var, items, spec, args.sample_fraction,
@@ -713,7 +713,7 @@ def main() -> int:
     payload = {
         "computed_utc":   datetime.now(timezone.utc)
                                  .isoformat(timespec="seconds"),
-        "regrid_root":    str(regrid_root),
+        "reproject_root":    str(reproject_root),
         "training_filter": {
             "train_csv":       (None if args.no_split_filter else str(train_csv)),
             "n_rows":          (None if args.no_split_filter else train_n_rows),

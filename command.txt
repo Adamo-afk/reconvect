@@ -11,7 +11,7 @@ python training_cscs.py kd_ft --sources hail-rls --target BZC --kd_ft_years 2020
 python training_cscs.py kd_ft --sources hail-rls --target BZC --kd_ft_years 2020 2025 -dev -ro_eval -gen_pred
 
 Plotting
-plotting regridded data -> python training_cscs.py kd_ft -plot_regrid --products HZC -visual_h 16 -visual_m 30
+plotting reprojected data -> python training_cscs.py kd_ft -plot_reproject --products HZC -visual_h 16 -visual_m 30
 
 Validation of fine-tuned model
 valid -> batch_idx = 2, sample_idx = 2

@@ -102,7 +102,7 @@ DEFAULT_DATA_ROOT = PROJECT_ROOT / "our_data"
 # Default column to read when the user doesn't supply one
 DEFAULT_COLUMN = "coverage_pct"
 
-# Regexes for the filename forms that show up in `regrid_<cat>.log`.
+# Regexes for the filename forms that show up in `reproject_<cat>.log`.
 # Each one captures (date, hhmm). Order matters — the most specific
 # pattern is tried first.
 _ERROR_FILENAME_PATTERNS = (
@@ -249,7 +249,7 @@ def intersect(coverage_by_product: dict[str, dict[str, float]],
 # =============================================================================
 
 def parse_error_log(log_path: Path) -> set[tuple[str, str]]:
-    """Read a `regrid_<category>.log` file and return the (date, hhmm) pairs.
+    """Read a `reproject_<category>.log` file and return the (date, hhmm) pairs.
 
     Lines that don't begin with `ERROR ` or whose filename can't be parsed
     are silently ignored — defensive against partial / hand-edited logs.
@@ -314,7 +314,7 @@ def filter_csv(input_csv: Path, output_csv: Path,
                error_pairs: set[tuple[str, str]] | None = None,
                ) -> tuple[int, int, int]:
     """Copy `input_csv` to `output_csv`, dropping rows whose date isn't kept
-    OR whose timesteps overlap with `error_pairs` (regrid ERROR set).
+    OR whose timesteps overlap with `error_pairs` (reproject ERROR set).
 
     Returns (rows_in, rows_kept, rows_dropped_for_errors).
     """
@@ -404,8 +404,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--errors_log", action="append", default=[], metavar="PATH",
-        help="Path to a `regrid_<category>.log` file (or `errors.txt`) "
-             "produced by regrid.py. Sequence rows whose timesteps "
+        help="Path to a `reproject_<category>.log` file (or `errors.txt`) "
+             "produced by reproject.py. Sequence rows whose timesteps "
              "intersect any (date, HHMM) parsed from these logs are "
              "dropped in addition to the per-date coverage filter. "
              "Repeat for each log (radar, MTG, NWCSAF, OPERA, ...).",
@@ -516,7 +516,7 @@ def main() -> int:
             pct = rows_kept / rows_in * 100
         else:
             pct = 0
-        extra = (f" ({rows_dropped_err} dropped for regrid errors)"
+        extra = (f" ({rows_dropped_err} dropped for reproject errors)"
                  if rows_dropped_err else "")
         print(f"  {split:10s}: {rows_kept}/{rows_in} rows kept "
               f"({pct:.1f}%){extra}  ->  {out_path}")
