@@ -12,8 +12,8 @@ Reads the outputs of `identify_lightning_periods.py`
        dropped, broken down by *why* (no_data / stage2 / stage3 / stage4),
        plus an overall summary block.
 
-Mirrors the structure of `summarize_raw_chunks.py` (MTG) and
-`summarize_raw_data.py` (NWCSAF) so the three reports feel consistent.
+Mirrors the structure of `summarize_mtg.py` (MTG) and
+`summarize_nwcsaf.py` (NWCSAF) so the three reports feel consistent.
 
 Usage:
     python summarize_lightning_periods.py

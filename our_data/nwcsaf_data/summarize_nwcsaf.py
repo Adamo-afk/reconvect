@@ -1,5 +1,5 @@
 """
-summarize_raw_data.py — Summarise downloaded NWCSAF files by date.
+summarize_nwcsaf.py — Summarise downloaded NWCSAF files by date.
 
 Scans the `_raw_data/` directory produced by `pipeline_nwcsaf.py`, parses
 SAFNWC filenames, and produces:
@@ -15,11 +15,11 @@ Expected per-day timestep count is derived from `our_data/timestep_config.json`
 cadence with `--timesteps 00 10 30 40 ...` if needed.
 
 Usage:
-    python our_data/nwcsaf_data/summarize_raw_data.py
-    python our_data/nwcsaf_data/summarize_raw_data.py --raw_dir path/to/_raw_data
-    python our_data/nwcsaf_data/summarize_raw_data.py --output summary.csv \\
+    python our_data/nwcsaf_data/summarize_nwcsaf.py
+    python our_data/nwcsaf_data/summarize_nwcsaf.py --raw_dir path/to/_raw_data
+    python our_data/nwcsaf_data/summarize_nwcsaf.py --output summary.csv \\
         --missing missing.json
-    python our_data/nwcsaf_data/summarize_raw_data.py --timesteps 00 30
+    python our_data/nwcsaf_data/summarize_nwcsaf.py --timesteps 00 30
 """
 
 from __future__ import annotations
