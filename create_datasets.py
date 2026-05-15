@@ -882,6 +882,140 @@ def build_dataset(csv_path, patches_dir, mode_config):
     return ds
 
 
+# ============================================================================
+# TFRecord I/O
+# ============================================================================
+#
+# `tf.data.Dataset.save / load` builds a single monolithic snapshot. Every
+# row of the eventual shuffle buffer is materialised in host RAM, so on
+# datasets larger than ~10 GB total it can OOM the writer (at save time)
+# and the reader (at training time, when filling the shuffle buffer).
+# TFRecord shards stream cleanly in both directions: the writer flushes
+# one sample at a time, the reader pulls records on demand and the
+# training-time shuffle buffer can be a fraction of the dataset.
+
+# How many samples we pack into a single .tfrecord shard.
+# - Too few -> too many small files, file-system overhead dominates.
+# - Too many -> a single shard barely fits in shuffle buffer.
+# 500 hits a sweet spot for our 5-MB samples: ~2.5 GB per shard.
+TFRECORD_SAMPLES_PER_SHARD = 500
+
+
+def _serialize_sample(stacked_inputs, stacked_label):
+    """Serialize one (inputs_dict, label) sample as a tf.train.Example."""
+    feature: dict[str, tf.train.Feature] = {}
+    for key, tensor in stacked_inputs.items():
+        # tf.io.serialize_tensor preserves dtype + shape inside the
+        # serialised bytes blob, so the parse side doesn't need to know
+        # them ahead of time.
+        feature[key] = tf.train.Feature(
+            bytes_list=tf.train.BytesList(
+                value=[tf.io.serialize_tensor(
+                    tf.convert_to_tensor(tensor)
+                ).numpy()],
+            )
+        )
+    feature["label"] = tf.train.Feature(
+        bytes_list=tf.train.BytesList(
+            value=[tf.io.serialize_tensor(
+                tf.convert_to_tensor(stacked_label)
+            ).numpy()],
+        )
+    )
+    example = tf.train.Example(features=tf.train.Features(feature=feature))
+    return example.SerializeToString()
+
+
+def write_tfrecord_shards(csv_path, patches_dir, mode_config,
+                          out_dir: Path,
+                          samples_per_shard: int = TFRECORD_SAMPLES_PER_SHARD,
+                          ) -> tuple[int, int]:
+    """Drive `generate_samples` and write samples into per-shard
+    `.tfrecord` files under `out_dir`. Returns (n_samples, n_shards).
+
+    Memory cost is one serialised sample at a time — the writer never
+    holds the full dataset in RAM, in contrast to tf.data.Dataset.save.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_samples = 0
+    shard_idx = 0
+    writer: tf.io.TFRecordWriter | None = None
+
+    def _shard_path(i: int) -> str:
+        return str(out_dir / f"shard_{i:05d}.tfrecord")
+
+    try:
+        for stacked_inputs, stacked_label in generate_samples(
+                csv_path, patches_dir, mode_config):
+            if writer is None or n_samples % samples_per_shard == 0:
+                if writer is not None:
+                    writer.close()
+                    shard_idx += 1
+                writer = tf.io.TFRecordWriter(_shard_path(shard_idx))
+                if n_samples == 0:
+                    print(f"    -> shard 0: {_shard_path(0)}")
+            writer.write(_serialize_sample(stacked_inputs, stacked_label))
+            n_samples += 1
+            if n_samples % 100 == 0:
+                print(f"    written {n_samples:,} samples "
+                      f"(shard {shard_idx})", flush=True)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    n_shards = shard_idx + 1 if n_samples > 0 else 0
+    return n_samples, n_shards
+
+
+def _make_parse_fn(input_specs, label_spec):
+    """Build the parse function that reverses `_serialize_sample`.
+
+    Returns a callable mapping (serialised_example) -> (inputs_dict, label),
+    with shapes set so downstream `model.fit` sees the same tensor shapes
+    as the old tf.data.Dataset.save path.
+    """
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string)
+        for key in input_specs
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, spec in input_specs.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=spec.dtype)
+            t.set_shape(spec.shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=label_spec.dtype)
+        label.set_shape(label_spec.shape)
+        return inputs, label
+
+    return parse
+
+
+def load_tfrecord_dataset(shard_dir: Path,
+                           mode_config: dict) -> tf.data.Dataset:
+    """Load a split's TFRecord shards into a tf.data.Dataset whose
+    output signature matches the one used during write."""
+    shard_paths = sorted(str(p) for p in shard_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No shard_*.tfrecord files in {shard_dir}. "
+            f"Re-run create_datasets.py for this mode."
+        )
+    input_specs, label_spec = get_output_signature(mode_config)
+    parse_fn = _make_parse_fn(input_specs, label_spec)
+    files_ds = tf.data.Dataset.from_tensor_slices(shard_paths)
+    ds = files_ds.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    return ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
+
+
 def create_and_save_datasets(data_root, mode, output_root=None):
     """Create and save train, validation, and test datasets.
 
@@ -939,21 +1073,29 @@ def create_and_save_datasets(data_root, mode, output_root=None):
 
         print(f"\n--- Processing {split_name} ({csv_name}) ---")
 
-        ds = build_dataset(str(csv_path), str(patches_dir), mode_config)
-
-        # Materialize to count samples and save
         split_dir = save_dir / split_name
         split_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save dataset
-        print(f"  Saving to {split_dir} ...")
-        tf.data.Dataset.save(ds, str(split_dir))
+        # Write TFRecord shards directly from the generator. One sample
+        # at a time, so peak RAM is one serialised sample (~5 MB) +
+        # whatever the generator's per-row state needs — not the full
+        # dataset like the old tf.data.Dataset.save path required.
+        print(f"  Writing TFRecord shards to {split_dir} ...")
+        n_samples, n_shards = write_tfrecord_shards(
+            str(csv_path), str(patches_dir), mode_config, split_dir,
+        )
+        print(f"  Wrote {n_samples:,} samples across {n_shards} shard(s)")
 
-        # Also save a metadata file with shapes and mode info
+        # Sidecar metadata. `format` lets the loader know which on-disk
+        # layout to expect; the eventual reader path is
+        # `load_tfrecord_dataset(split_dir, mode_config)`.
         meta = {
             "mode": mode,
             "split": split_name,
             "csv": csv_name,
+            "format": "tfrecord",
+            "n_samples": n_samples,
+            "n_shards": n_shards,
             "label_var": mode_config["label_var"],
             "label_type": mode_config["label_type"],
             "label_channels": LABEL_CHANNELS[mode_config["label_type"]],
