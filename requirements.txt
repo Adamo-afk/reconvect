@@ -44,7 +44,7 @@ h5py             # read OPERA ODC HDF5 files (reproject_opera.py)
 
 # Visualization
 matplotlib
+plotly           # feature_importance_analysis.py — interactive Xi heatmap / bar chart
 
 # Data processing
 pandas
-dask
