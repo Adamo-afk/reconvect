@@ -687,7 +687,7 @@ python our_data/satellite_data/pipeline_msg_mtg.py \
    - concatenates Romania chunks vertically,
    - writes one `.npy` per channel + a sidecar `MTG/mtg_constants.json` describing the geos projection (perspective height, semi-major/minor axes, sub-satellite longitude, sweep axis) and the 1-D scanning angles `x_geos`, `y_geos`.
 4. **No more coordinate `.npy` files**: the old `coordinates/lat_{1,2}km.npy` and `lon_{1,2}km.npy` are gone. `reproject.py` rebuilds the source lat/lon arrays on demand from `mtg_constants.json` via `pyproj.Proj(proj='geos', ...)`.
-5. **Old code preserved, inert**: the original `eumdac` + manual stitching path lives at the bottom of the file inside a `_DATASTORE_MANUAL_DISABLED` raw-string block; the previously-disabled MSG SEVIRI code is still in `_MSG_DISABLED`. Both parse but never execute — only the MTG-via-SFTP path is active.
+5. **Legacy code removed**: the original `eumdac` Data Store path and the inert MSG SEVIRI block that used to live at the bottom of `pipeline_msg_mtg.py` have been deleted. Only the MTG-via-SFTP path remains. If you need to re-enable MSG ingestion you can recover the historical code from `git log`.
 
 > **Network**: you must be on a network with route to `192.168.11.223` (ANM internal/VPN) and have read access to the FCI storage path. The script fails fast if SFTP can't connect or the password file is missing.
 
