@@ -1097,7 +1097,12 @@ def print_correlations(correlations):
 # ============================================================================
 
 def load_test_dataset(data_dir):
-    """Load a saved tf.data.Dataset and its metadata."""
+    """Load a saved dataset split + its metadata.
+
+    Supports both on-disk formats — TFRecord shards (current) and the
+    legacy `tf.data.Dataset.save` snapshot — distinguished by the
+    `format` field in `metadata.json`.
+    """
     meta_path = os.path.join(data_dir, "metadata.json")
     if os.path.isfile(meta_path):
         with open(meta_path) as f:
@@ -1107,7 +1112,49 @@ def load_test_dataset(data_dir):
     else:
         meta = {}
 
-    ds = tf.data.Dataset.load(data_dir)
+    fmt = meta.get("format", "tf_dataset_save")
+    if fmt != "tfrecord":
+        ds = tf.data.Dataset.load(data_dir)
+        return ds, meta
+
+    from pathlib import Path
+    split_dir = Path(data_dir)
+    shard_paths = sorted(str(p) for p in split_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No TFRecord shards in {data_dir} (expected "
+            f"`shard_*.tfrecord`). Re-run create_datasets.py."
+        )
+    input_shapes = meta["input_shapes"]
+    label_shape = meta["label_shape"]
+
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string) for key in input_shapes
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, shape in input_shapes.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=tf.float32)
+            t.set_shape(shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=tf.float32)
+        label.set_shape(label_shape)
+        return inputs, label
+
+    files_ds = tf.data.Dataset.from_tensor_slices(shard_paths)
+    ds = files_ds.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    ds = ds.map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+    n_samples = int(meta.get("n_samples", 0))
+    if n_samples > 0:
+        ds = ds.apply(tf.data.experimental.assert_cardinality(n_samples))
     return ds, meta
 
 

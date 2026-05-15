@@ -39,6 +39,66 @@ from tensorflow.keras.layers import (
 # Custom Layers — embedded for standalone model loading
 # ============================================================================
 
+def _load_split(split_dir: Path) -> tf.data.Dataset:
+    """Auto-detect the on-disk format of a saved dataset split and load it.
+
+    Supports two layouts, distinguished by `metadata.json["format"]`:
+      - "tfrecord" (current): `shard_*.tfrecord` files, parsed using
+        `input_shapes` + `label_shape` from metadata.
+      - "tf_dataset_save" (legacy): monolithic `tf.data.Dataset.save`
+        snapshot. Kept so older datasets keep working.
+    """
+    metadata_path = split_dir / "metadata.json"
+    if metadata_path.is_file():
+        with open(metadata_path) as f:
+            meta = json.load(f)
+        fmt = meta.get("format", "tf_dataset_save")
+    else:
+        meta = None
+        fmt = "tf_dataset_save"
+
+    if fmt != "tfrecord":
+        return tf.data.Dataset.load(str(split_dir))
+
+    shard_paths = sorted(str(p) for p in split_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No TFRecord shards in {split_dir} (expected "
+            f"`shard_*.tfrecord`). Re-run create_datasets.py."
+        )
+    input_shapes: dict = meta["input_shapes"]
+    label_shape: list = meta["label_shape"]
+
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string) for key in input_shapes
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, shape in input_shapes.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=tf.float32)
+            t.set_shape(shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=tf.float32)
+        label.set_shape(label_shape)
+        return inputs, label
+
+    files_ds = tf.data.Dataset.from_tensor_slices(shard_paths)
+    ds = files_ds.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    ds = ds.map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+    n_samples = int(meta.get("n_samples", 0))
+    if n_samples > 0:
+        ds = ds.apply(tf.data.experimental.assert_cardinality(n_samples))
+    return ds
+
+
 class ReflectionPadding2D(Layer):
     def __init__(self, padding=(1, 1), **kwargs):
         self.padding = tuple(padding)
@@ -1224,7 +1284,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         raise FileNotFoundError(f"{split.capitalize()} dataset not found: {eval_dir}")
 
     print(f"\n3. Loading {split} dataset from {eval_dir}")
-    eval_ds = tf.data.Dataset.load(str(eval_dir))
+    eval_ds = _load_split(eval_dir)
     eval_ds = eval_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     # Load validation dataset if threshold optimization needed
@@ -1233,7 +1293,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         val_dir = data_root / "datasets" / mode / "validation"
         if val_dir.exists():
             print(f"  Loading validation dataset for threshold optimization...")
-            val_ds = tf.data.Dataset.load(str(val_dir))
+            val_ds = _load_split(val_dir)
             val_ds = val_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
         else:
             print(f"  WARNING: Validation dataset not found at {val_dir}")
