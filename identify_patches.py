@@ -412,6 +412,145 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     return save_path
 
 
+def write_diagnostic_nc(reprojected, binary_mask, active_patches,
+                        date_str, time_str, output_dir, source,
+                        data_root):
+    """
+    Write a CF-compliant NetCDF mirroring `plot_patch_grid()`.
+
+    Mirrors the `inspect_mtg.py --reprojected` pattern: load the shared
+    Romania-grid lat/lon arrays from
+    `<data_root>/reprojected_data/romania_grid_{lats,lons}.npy` and
+    package the reprojected field + DBSCAN binary mask + per-patch
+    active flag into a single dataset that opens cleanly in QGIS / any
+    CF-aware GIS.
+
+    Output layout: `<output_dir>/nc/patches_<date>_<HHMM>.nc`, kept in a
+    sibling folder of the PNGs so the two artifacts pair up by filename.
+
+    Args:
+        reprojected: 2D array (768×1536) — the same array `plot_patch_grid`
+            renders on the left.
+        binary_mask: 2D array (768×1536) — the same DBSCAN mask the right
+            subplot draws.
+        active_patches: list of active patch numbers (1-indexed).
+        date_str: 'YYYY-MM-DD'.
+        time_str: 'HH:MM'.
+        output_dir: matches the PNG `output_dir`; the `.nc` lands under
+            `<output_dir>/nc/`.
+        source: 'radar' or 'opera'; controls the variable name and
+            long_name so the file is self-describing in GIS.
+        data_root: project `our_data/` root, used to locate
+            `reprojected_data/romania_grid_{lats,lons}.npy`.
+
+    Returns the path to the written `.nc` file, or None if xarray is not
+    installed or the grid coordinate files are missing.
+    """
+    try:
+        import xarray as xr
+    except ImportError:
+        print("    [nc] xarray not installed — skipping .nc output")
+        return None
+
+    grid_dir = os.path.join(data_root, "reprojected_data")
+    lats_path = os.path.join(grid_dir, "romania_grid_lats.npy")
+    lons_path = os.path.join(grid_dir, "romania_grid_lons.npy")
+    if not (os.path.isfile(lats_path) and os.path.isfile(lons_path)):
+        print(f"    [nc] romania_grid_{{lats,lons}}.npy not found under "
+              f"{grid_dir} — skipping .nc output")
+        return None
+
+    lats = np.load(lats_path)
+    lons = np.load(lons_path)
+
+    # Per-pixel patch ID (0..18 — 0 = outside any patch, never happens
+    # for this 1536x768 layout, but kept for safety). Useful in QGIS to
+    # symbolise patches by ID directly without re-deriving the grid.
+    patch_id_grid = np.zeros(reprojected.shape, dtype=np.int16)
+    for p in range(1, N_PATCHES + 1):
+        r0, r1, c0, c1 = get_patch_bounds(p)
+        patch_id_grid[r0:r1, c0:c1] = p
+
+    active_set = set(active_patches)
+    is_active_grid = np.isin(patch_id_grid, list(active_set)).astype(np.int8)
+
+    if source == "opera":
+        data_var_name = "opera_rainfall_rate"
+        long_name = "OPERA instantaneous rainfall rate (DBSCAN driver)"
+        units = "mm/h"
+    else:
+        data_var_name = "RZC"
+        long_name = "Reprojected RZC rain rate (DBSCAN driver)"
+        units = "mm/h"
+
+    ds = xr.Dataset(
+        {
+            data_var_name: (["y", "x"],
+                            np.asarray(reprojected, dtype=np.float32)),
+            "dbscan_mask": (["y", "x"],
+                            np.asarray(binary_mask, dtype=np.int8)),
+            "patch_id":    (["y", "x"], patch_id_grid),
+            "active_patch": (["y", "x"], is_active_grid),
+        },
+        coords={
+            "latitude":  (["y", "x"], lats),
+            "longitude": (["y", "x"], lons),
+        },
+    )
+    ds[data_var_name].attrs = {
+        "long_name":   long_name,
+        "units":       units,
+        "coordinates": "latitude longitude",
+        "grid_mapping": "crs",
+    }
+    ds["dbscan_mask"].attrs = {
+        "long_name":   "DBSCAN cluster membership (1 = in any cluster)",
+        "flag_values": np.array([0, 1], dtype=np.int8),
+        "flag_meanings": "background cluster",
+        "coordinates": "latitude longitude",
+        "grid_mapping": "crs",
+    }
+    ds["patch_id"].attrs = {
+        "long_name":   "1-indexed patch number on the 6x3 grid (1..18)",
+        "coordinates": "latitude longitude",
+        "grid_mapping": "crs",
+    }
+    ds["active_patch"].attrs = {
+        "long_name":   "1 if the pixel's patch is in `active_patches`",
+        "flag_values": np.array([0, 1], dtype=np.int8),
+        "flag_meanings": "inactive_patch active_patch",
+        "coordinates": "latitude longitude",
+        "grid_mapping": "crs",
+    }
+
+    # CF grid_mapping. EPSG:31700 (Stereo70). QGIS reads this and lays
+    # the raster out at the correct geographic location.
+    ds["crs"] = xr.DataArray(np.int32(0))
+    ds["crs"].attrs = {
+        "grid_mapping_name": "oblique_stereographic",
+        "EPSG":              31700,
+        "comment":           "Romania Stereo70 / Dealul Piscului 1970",
+    }
+
+    ds.attrs = {
+        "title":         f"COALITION-4 patch index diagnostic — "
+                         f"{date_str} {time_str} UTC",
+        "active_patches": ",".join(str(p) for p in active_patches)
+                          if active_patches else "",
+        "source":        f"identify_patches.py (--source {source})",
+        "Conventions":   "CF-1.8",
+    }
+
+    nc_dir = os.path.join(output_dir, "nc")
+    os.makedirs(nc_dir, exist_ok=True)
+    safe_time = time_str.replace(":", "")
+    nc_path = os.path.join(nc_dir,
+                           f"patches_{date_str}_{safe_time}.nc")
+    ds.to_netcdf(nc_path)
+    ds.close()
+    return nc_path
+
+
 # =============================================================================
 # File discovery
 # =============================================================================
@@ -693,10 +832,19 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                 patches_str = ','.join(str(p) for p in active)
                 print(f"  [{i+1}/{total}] {d} {t} → patches: [{patches_str}]")
 
-                # Save plot for active timestamps
+                # Save plot + companion .nc for active timestamps. The
+                # .nc carries the same arrays the plot renders plus the
+                # Romania-grid lat/lon coords + EPSG:31700 metadata, so
+                # the same outputs can be inspected in GIS software
+                # (open the .nc in QGIS to overlay on satellite basemap).
                 if save_plots:
                     plot_patch_grid(
                         reprojected, binary_mask, active, d, t, plot_dir
+                    )
+                    write_diagnostic_nc(
+                        reprojected, binary_mask, active,
+                        d, t, plot_dir, source=source,
+                        data_root=data_root,
                     )
             else:
                 print(f"  [{i+1}/{total}] {d} {t} → no active patches")
@@ -730,6 +878,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     print(f"  Output             : {output_dir}")
     if save_plots:
         print(f"  Plots saved        : {active_timesteps} PNGs in {plot_dir}")
+        print(f"  NetCDF saved       : {active_timesteps} .nc files in "
+              f"{os.path.join(plot_dir, 'nc')}")
 
 
 # =============================================================================
