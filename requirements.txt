@@ -36,11 +36,10 @@ hdf5plugin       # CharLS plugin required to read FCI L1C compressed chunks
 # OPERA radar pipeline (our_data/opera_data/)
 h5py             # read OPERA ODC HDF5 files (reproject_opera.py)
 
-# Optional GPU acceleration for compute_normalization_stats.py.
+# GPU acceleration for compute_normalization_stats.py.
 # Match the wheel to the CUDA major already on disk; CUDA 11.2 (the
-# version TensorFlow is pinned to here) needs the 11.x wheel. Without
-# CuPy the script transparently falls back to the numpy path.
-# cupy-cuda11x
+# version TensorFlow is pinned to here) needs the 11.x wheel.
+cupy-cuda11x
 
 # Visualization
 matplotlib

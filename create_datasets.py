@@ -474,8 +474,9 @@ def get_mode_config(mode):
     # Common: radar + lightning at HR
     hr_base = {**HR_RADAR_CONFIG, **HR_LIGHTNING_CONFIG}
 
-    # MSG modes are disabled in this build — see _MSG_DISABLED block in
-    # pipeline_msg_mtg.py for context. Re-enable both at once if needed.
+    # MSG modes are disabled in this build (MSG SEVIRI ingestion was
+    # removed from pipeline_msg_mtg.py). The recipes are kept commented
+    # so they can be re-enabled if the MSG branch is brought back.
     # if mode == "msg_lightning":
     #     return {
     #         "past_hr": (hr_base, 256, "HR"),
