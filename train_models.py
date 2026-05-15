@@ -1,25 +1,317 @@
 """
-train_coalition.py — COALITION-4 Romanian Adaptation: Training Script
-=====================================================================
+train_models.py — COALITION-4 Romanian Adaptation: Training Script
+==================================================================
 Builds the recurrent-convolutional architecture from scratch, loads the
 pre-built TF datasets, trains, and saves the model + history.
 
-Usage:
-    python train_coalition.py --mode msg_lightning --epochs 10
-    python train_coalition.py --mode mtg_radar --epochs 1 --batch_size 8
+Two ways to run
+---------------
+1. Loop over every mode listed in a config file (the common case):
+
+       python train_models.py --config training.config
+
+2. Train a single mode (still reads hyperparameters from the config):
+
+       python train_models.py --config training.config --mode mtg_opera_full
+
+Available training modes
+------------------------
+The mode determines which input groups feed the model and what the target
+is. The dataset for each mode must already exist under
+`our_data/datasets/<mode>/` (created by create_datasets.py — see its CLI
+choices for the full list).
+
+  - mtg_lightning
+        Inputs:  radar + LINET lightning + MTG vis_06 (HR) + MTG IR/WV (MR)
+                 + NWCSAF (LR).
+        Target:  binary lightning occurrence.
+
+  - mtg_radar
+        Inputs:  same channel set as mtg_lightning.
+        Target:  5-class precipitation (RZC bins).
+
+  - mtg_radar_continuous
+        Inputs:  same as mtg_radar.
+        Target:  continuous RZC regression in [0, 1] (normalised).
+
+  - mtg_opera_radar_only          *NWCSAF Shapley study — baseline*
+        Inputs:  MTG vis_06 (HR) + OPERA reflectivity + rainfall_rate (MR).
+                 No MTG IR/WV. No NWCSAF. No lightning.
+        Target:  opera_rainfall_rate 5-class (same bin edges as RZC).
+
+  - mtg_opera_mtgmr               *Shapley: + MTG IR/WV*
+        Inputs:  mtg_opera_radar_only + MTG IR/WV in MR.
+        Target:  same as mtg_opera_radar_only.
+
+  - mtg_opera_nwcsaf              *Shapley: + NWCSAF*
+        Inputs:  mtg_opera_radar_only + NWCSAF in LR.
+        Target:  same as mtg_opera_radar_only.
+
+  - mtg_opera_full                *Shapley: + MTG IR/WV + NWCSAF*
+        Inputs:  every input from the four bullets above.
+        Target:  same as mtg_opera_radar_only.
+
+The four `mtg_opera_*` modes form a 4-model coalition for the classical
+Shapley analysis of whether NWCSAF and MTG IR/WV add value on top of an
+OPERA-radar + MTG-vis baseline.
+
+Hyperparameters, the run list, the LR schedule, and the early-stopping
+configuration all live in `training.config`. See the docstring at the top
+of that file for the editable fields.
 
 Requires:
     - TensorFlow 2.x with GPU support
     - Pre-built TF datasets from create_datasets.py
-    - our_data/lightning_fraction.json (for lightning modes)
+    - our_data/lightning_fraction.json (for lightning modes only)
 """
 
 import argparse
+import configparser
 import json
+import math
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+
+# =============================================================================
+# Documented training modes
+# =============================================================================
+#
+# Used to validate `--mode` / `[modes].run` against a known set and to make
+# the registry of available modes discoverable. Kept in sync with
+# create_datasets.get_mode_config() — when you add a new mode there, add
+# a matching entry here so `--list-modes` and config validation keep working.
+
+TRAINING_MODES: dict[str, dict[str, str]] = {
+    "mtg_lightning": {
+        "target":  "lightning (binary occurrence)",
+        "summary": "Radar + lightning + MTG (vis_06 HR / IR/WV MR) + NWCSAF (LR).",
+    },
+    "mtg_radar": {
+        "target":  "RZC 5-class precipitation",
+        "summary": "Same channel set as mtg_lightning, different label head.",
+    },
+    "mtg_radar_continuous": {
+        "target":  "RZC continuous regression",
+        "summary": "Same channels as mtg_radar with a continuous target.",
+    },
+    "mtg_opera_radar_only": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Shapley baseline: MTG vis_06 + OPERA. No MTG IR/WV, "
+                   "no NWCSAF, no lightning.",
+    },
+    "mtg_opera_mtgmr": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Shapley: baseline + MTG IR/WV.",
+    },
+    "mtg_opera_nwcsaf": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Shapley: baseline + NWCSAF.",
+    },
+    "mtg_opera_full": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Shapley: baseline + MTG IR/WV + NWCSAF.",
+    },
+}
+
+
+# =============================================================================
+# Config loader (INI via configparser)
+# =============================================================================
+
+DEFAULT_TRAINING_CONFIG = Path(__file__).resolve().parent / "training.config"
+
+
+def _parse_norm(raw: str | None) -> str | None:
+    """Map a config `norm` value to what build_coalition_model expects.
+
+    Accepts 'none', 'None', empty string, or `null` -> Python None.
+    Anything else passes through after lower-casing.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if s in ("", "none", "null"):
+        return None
+    return s
+
+
+def _coerce(value: str, target_type):
+    """Convert a configparser string to the requested Python type."""
+    if target_type is bool:
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+    return target_type(value)
+
+
+def load_training_config(path: Path) -> dict:
+    """Load `training.config` and return a structured config dict.
+
+    Shape of the returned dict:
+
+        {
+            "modes":          [...],     # mode names, in run order
+            "defaults":       {...},     # epochs, batch_size, dropout, ...
+            "lr_schedule":    {...},
+            "early_stopping": {...},
+            "mode_overrides": {mode: {...}, ...},
+        }
+
+    Per-mode overrides under [mode.<name>] are applied on top of the
+    defaults at call time via `merge_for_mode()`.
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Training config not found: {path}\n"
+            f"Pass --config explicitly or create the default config at "
+            f"{DEFAULT_TRAINING_CONFIG}."
+        )
+
+    parser = configparser.ConfigParser(
+        inline_comment_prefixes=("#", ";"),
+    )
+    parser.optionxform = str   # preserve key case
+    parser.read(path, encoding="utf-8")
+
+    # [modes].run -> list of mode names
+    modes: list[str] = []
+    if parser.has_section("modes") and parser.has_option("modes", "run"):
+        raw = parser.get("modes", "run")
+        modes = [m.strip() for m in raw.split(",") if m.strip()]
+
+    unknown = [m for m in modes if m not in TRAINING_MODES]
+    if unknown:
+        raise ValueError(
+            f"[modes].run lists unknown mode(s): {unknown}. "
+            f"Known modes: {sorted(TRAINING_MODES)}"
+        )
+
+    # [defaults]
+    d = parser["defaults"] if parser.has_section("defaults") else {}
+    defaults = {
+        "epochs":           _coerce(d.get("epochs", "10"), int),
+        "batch_size":       _coerce(d.get("batch_size", "4"), int),
+        "dropout":          _coerce(d.get("dropout", "0.1"), float),
+        "norm":             _parse_norm(d.get("norm", "none")),
+        "seed":             _coerce(d.get("seed", "0"), int),
+        "shuffle_buffer":   _coerce(d.get("shuffle_buffer", "256"), int),
+        "mixed_precision":  _coerce(d.get("mixed_precision", "true"), bool),
+    }
+
+    # [lr_schedule]
+    s = parser["lr_schedule"] if parser.has_section("lr_schedule") else {}
+    lr_schedule = {
+        "type":          s.get("type", "cosine_warmup").strip().lower(),
+        "initial_lr":    _coerce(s.get("initial_lr", "1e-3"), float),
+        "warmup_epochs": _coerce(s.get("warmup_epochs", "2"), int),
+        "min_lr":        _coerce(s.get("min_lr", "1e-6"), float),
+    }
+    if lr_schedule["type"] != "cosine_warmup":
+        raise ValueError(
+            f"[lr_schedule].type = {lr_schedule['type']!r} is not "
+            f"supported. The only schedule wired up today is "
+            f"'cosine_warmup'."
+        )
+
+    # [early_stopping]
+    e = parser["early_stopping"] if parser.has_section("early_stopping") else {}
+    early_stopping = {
+        "enabled":              _coerce(e.get("enabled", "true"), bool),
+        "monitor":              e.get("monitor", "val_loss").strip(),
+        "mode":                 e.get("mode", "min").strip().lower(),
+        "patience":             _coerce(e.get("patience", "5"), int),
+        "min_delta":            _coerce(e.get("min_delta", "1e-4"), float),
+        "restore_best_weights": _coerce(e.get("restore_best_weights", "true"), bool),
+    }
+
+    # [checkpointing]
+    c = parser["checkpointing"] if parser.has_section("checkpointing") else {}
+    checkpointing = {
+        "enabled": _coerce(c.get("enabled", "true"), bool),
+        "resume":  _coerce(c.get("resume", "true"), bool),
+    }
+
+    # [mode.<name>] overrides
+    mode_overrides: dict[str, dict] = {}
+    for section in parser.sections():
+        if not section.startswith("mode."):
+            continue
+        mode_name = section[len("mode."):]
+        if mode_name not in TRAINING_MODES:
+            raise ValueError(
+                f"[{section}] references unknown mode {mode_name!r}. "
+                f"Known modes: {sorted(TRAINING_MODES)}"
+            )
+        block = parser[section]
+        overrides = {}
+        for key, raw in block.items():
+            if key == "norm":
+                overrides[key] = _parse_norm(raw)
+            elif key in ("epochs", "batch_size", "seed", "shuffle_buffer"):
+                overrides[key] = _coerce(raw, int)
+            elif key in ("dropout",):
+                overrides[key] = _coerce(raw, float)
+            else:
+                # Unknown per-mode key — pass through as string. The caller
+                # can decide whether to honour it.
+                overrides[key] = raw.strip()
+        mode_overrides[mode_name] = overrides
+
+    return {
+        "modes":          modes,
+        "defaults":       defaults,
+        "lr_schedule":    lr_schedule,
+        "early_stopping": early_stopping,
+        "checkpointing":  checkpointing,
+        "mode_overrides": mode_overrides,
+    }
+
+
+def merge_for_mode(cfg: dict, mode: str) -> dict:
+    """Return the effective hyperparameters for `mode` (defaults + override)."""
+    merged = dict(cfg["defaults"])
+    merged.update(cfg["mode_overrides"].get(mode, {}))
+    return merged
+
+
+# =============================================================================
+# Cosine-with-warmup learning-rate schedule
+# =============================================================================
+
+def cosine_warmup_schedule(initial_lr: float,
+                            warmup_epochs: int,
+                            total_epochs: int,
+                            min_lr: float):
+    """Return a `(epoch, current_lr) -> next_lr` callable for the
+    `tf.keras.callbacks.LearningRateScheduler`.
+
+      - Epochs [0 .. warmup_epochs - 1]: linear ramp `min_lr -> initial_lr`.
+      - Epochs [warmup_epochs .. total_epochs - 1]: half-cosine decay
+        `initial_lr -> min_lr`.
+
+    `current_lr` is required by Keras's signature but ignored — the schedule
+    is a pure function of `epoch`.
+    """
+    warmup_epochs = max(0, int(warmup_epochs))
+    total_epochs = max(1, int(total_epochs))
+
+    def schedule(epoch: int, _current_lr: float) -> float:
+        if epoch < warmup_epochs:
+            # +1 so the schedule reaches `initial_lr` at the START of the
+            # post-warmup phase, not partway through it.
+            frac = (epoch + 1) / max(1, warmup_epochs)
+            return float(min_lr + (initial_lr - min_lr) * frac)
+        denom = max(1, total_epochs - warmup_epochs)
+        progress = (epoch - warmup_epochs) / denom
+        progress = min(1.0, max(0.0, progress))
+        return float(
+            min_lr + 0.5 * (initial_lr - min_lr)
+            * (1.0 + math.cos(math.pi * progress))
+        )
+
+    return schedule
 
 import numpy as np
 import tensorflow as tf
@@ -35,13 +327,67 @@ from tensorflow.keras.models import Model
 # Mixed precision
 # ============================================================================
 
-def setup_mixed_precision():
-    """Enable mixed precision training for faster GPU execution."""
-    policy = tf.keras.mixed_precision.Policy('mixed_float16')
-    tf.keras.mixed_precision.set_global_policy(policy)
-    print(f"Mixed precision policy: {policy.name}")
-    print(f"  Compute dtype: {policy.compute_dtype}")
-    print(f"  Variable dtype: {policy.variable_dtype}")
+def configure_tf_runtime(use_mixed_precision: bool = True) -> None:
+    """Configure TensorFlow for stable GPU training on Windows.
+
+    Three independent settings, each addressing a different failure mode
+    that we've actually hit on this hardware (RTX A6000, CUDA 11.2, TF 2.x,
+    Windows). Call once before model construction.
+
+    1. **Memory growth** — by default TF allocates the entire GPU VRAM
+       block on first use. A mid-batch spike during the ConvGRU backward
+       pass that doesn't fit inside that block can then return a null
+       pointer that TF dereferences -> Windows "fatal exception: access
+       violation" (the OOM-as-segfault we kept seeing). With memory
+       growth enabled, TF allocates incrementally and the same condition
+       raises a clean `ResourceExhaustedError` we can react to.
+    2. **JIT/XLA off** — TF 2.x sometimes auto-compiles subgraphs with
+       XLA. XLA's fused kernels have a different memory profile from the
+       regular runtime and can OOM in patterns we wouldn't otherwise
+       hit. Explicitly disabling JIT keeps the memory footprint
+       predictable.
+    3. **Mixed precision** — `mixed_float16` is the recommended policy
+       for A6000-class GPUs (compute on tensor cores). Off-switch is
+       provided because fp16 underflow during loss spikes can also
+       crash CUDA kernels on some driver versions.
+    """
+    # 1. Memory growth — must be set before any GPU is initialised.
+    gpus = tf.config.list_physical_devices('GPU')
+    for g in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(g, True)
+        except RuntimeError:
+            # Already initialised — happens when train() is called twice
+            # in the same process (multi-mode loop). Memory growth was
+            # set on the first call and survives across iterations.
+            pass
+    if gpus:
+        print(f"  GPU memory growth: enabled on {len(gpus)} device(s)")
+    else:
+        print("  GPU memory growth: no GPUs detected, CPU-only run")
+
+    # 2. Disable XLA JIT compilation.
+    tf.config.optimizer.set_jit(False)
+    print("  JIT/XLA: disabled (predictable memory footprint)")
+
+    # 3. Mixed precision policy.
+    if use_mixed_precision:
+        policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        tf.keras.mixed_precision.set_global_policy(policy)
+        print(f"  Mixed precision: {policy.name} "
+              f"(compute={policy.compute_dtype}, "
+              f"variable={policy.variable_dtype})")
+    else:
+        # Reset to fp32 in case a previous run in the same process left
+        # the global policy at mixed_float16.
+        tf.keras.mixed_precision.set_global_policy('float32')
+        print("  Mixed precision: disabled (fp32 only)")
+
+
+# Backwards-compat alias so the rest of the file's existing call site
+# keeps working.
+def setup_mixed_precision() -> None:
+    configure_tf_runtime(use_mixed_precision=True)
 
 
 # ============================================================================
@@ -439,15 +785,90 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
 # Dataset loading
 # ============================================================================
 
-def load_dataset(dataset_dir, batch_size, shuffle=False, shuffle_buffer=2048):
-    """Load a saved tf.data.Dataset and prepare it for training."""
-    ds = tf.data.Dataset.load(str(dataset_dir))
+def load_dataset(dataset_dir, batch_size, shuffle=False, shuffle_buffer=256):
+    """Load a saved dataset split and prepare it for training.
+
+    Supports two on-disk formats — distinguished by the `format` field
+    in `metadata.json`:
+
+      - "tfrecord" (current): sharded `shard_*.tfrecord` files, parsed
+        with the signature reconstructed from metadata. Streams from
+        disk so the shuffle buffer doesn't have to hold the whole
+        dataset in RAM. The default `shuffle_buffer=256` is sized for
+        ~5-MB samples (well under 2 GB of host RAM).
+      - "tf_dataset_save" (legacy): the old monolithic
+        `tf.data.Dataset.save` snapshot. Kept for backward compatibility.
+    """
+    dataset_dir = Path(dataset_dir)
+
+    metadata_path = dataset_dir / "metadata.json"
+    if metadata_path.is_file():
+        with open(metadata_path) as f:
+            meta = json.load(f)
+        fmt = meta.get("format", "tf_dataset_save")
+    else:
+        # No metadata.json -> assume legacy format.
+        meta = None
+        fmt = "tf_dataset_save"
+
+    if fmt == "tfrecord":
+        ds = _load_tfrecord_split(dataset_dir, meta)
+    else:
+        ds = tf.data.Dataset.load(str(dataset_dir))
 
     if shuffle:
         ds = ds.shuffle(buffer_size=shuffle_buffer,
                         reshuffle_each_iteration=True)
 
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def _load_tfrecord_split(split_dir: Path, meta: dict) -> tf.data.Dataset:
+    """Reconstruct the parse signature from metadata.json and read the
+    `shard_*.tfrecord` files. Mirrors `create_datasets.load_tfrecord_dataset`
+    but reads the shapes from metadata so train_models doesn't have to
+    pull in the mode-config registry."""
+    shard_paths = sorted(str(p) for p in split_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No TFRecord shards in {split_dir} (expected "
+            f"`shard_*.tfrecord`). Re-run create_datasets.py."
+        )
+
+    input_shapes: dict[str, list[int]] = meta["input_shapes"]
+    label_shape: list[int] = meta["label_shape"]
+
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string) for key in input_shapes
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, shape in input_shapes.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=tf.float32)
+            t.set_shape(shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=tf.float32)
+        label.set_shape(label_shape)
+        return inputs, label
+
+    files_ds = tf.data.Dataset.from_tensor_slices(shard_paths)
+    ds = files_ds.interleave(
+        tf.data.TFRecordDataset,
+        cycle_length=tf.data.AUTOTUNE,
+        num_parallel_calls=tf.data.AUTOTUNE,
+        deterministic=False,
+    )
+    ds = ds.map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+    # TFRecordDataset advertises an unknown cardinality, which makes
+    # Keras print "X/Unknown" with no ETA during model.fit. Stamp the
+    # exact count from metadata so the progress bar shows X/Y and ETA.
+    n_samples = int(meta.get("n_samples", 0))
+    if n_samples > 0:
+        ds = ds.apply(tf.data.experimental.assert_cardinality(n_samples))
     return ds
 
 
@@ -524,28 +945,75 @@ class WallTimeCallback(tf.keras.callbacks.Callback):
             print(f"  Average per epoch: {np.mean(self.epoch_times):.1f}s")
 
 
+class _ResumableCheckpoint(tf.keras.callbacks.Callback):
+    """Per-epoch checkpoint that writes both the .keras model file and a
+    small JSON sidecar with the next-epoch index, so a subsequent run can
+    resume at the right position in the LR schedule.
+
+    Distinct from ModelCheckpoint(save_best_only=...) — this one always
+    saves the *latest* state, intentionally overwriting any previous
+    checkpoint. That's what 'resume from where you were' needs.
+    """
+
+    def __init__(self, filepath: str, epoch_meta_path: str, verbose: int = 1):
+        super().__init__()
+        self.filepath = filepath
+        self.epoch_meta_path = epoch_meta_path
+        self.verbose = verbose
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Save the full model (architecture + weights + optimizer state).
+        # Optimizer state matters: the LR schedule writes the current lr
+        # into the optimizer at each epoch begin, but Adam's m / v
+        # accumulators also persist here so resume picks up momentum.
+        try:
+            self.model.save(self.filepath)
+            with open(self.epoch_meta_path, "w") as f:
+                json.dump({"next_epoch": epoch + 1,
+                           "completed_epoch": epoch}, f, indent=2)
+            if self.verbose:
+                print(f"  [ckpt] saved epoch {epoch + 1} -> "
+                      f"{self.filepath}")
+        except Exception as e:
+            # Never let a checkpoint failure kill the training run.
+            print(f"  [ckpt] WARNING: failed to save checkpoint: {e}")
+
+
 # ============================================================================
 # Training
 # ============================================================================
 
 def train(mode, data_root, epochs, batch_size, output_dir,
-          dropout=0.1, norm=None, dataset_dir=None):
+          dropout=0.1, norm=None, dataset_dir=None,
+          shuffle_buffer=256,
+          mixed_precision=True,
+          lr_schedule_cfg=None,
+          early_stopping_cfg=None,
+          checkpoint_cfg=None,
+          resume=True):
     """Main training function.
 
     Args:
-        mode: msg_lightning, msg_radar, mtg_lightning, mtg_radar (used for
-              naming only when dataset_dir is provided explicitly)
+        mode: training-mode name (see TRAINING_MODES at the top of this
+            file). Used to name the saved model / history files and to
+            locate the default dataset directory.
         data_root: path to our_data/ containing datasets/{mode}/ and
-                   lightning_fraction.json
-        epochs: number of training epochs
-        batch_size: training batch size
-        output_dir: where to save model + history
-        dropout: dropout rate
-        norm: normalization type
-        dataset_dir: explicit path to the dataset directory. When provided,
-                     overrides the default data_root/datasets/{mode} path.
-                     This allows training on custom dataset variants (e.g.
-                     datasets built without NWCSAF).
+            lightning_fraction.json.
+        epochs: number of training epochs.
+        batch_size: training batch size.
+        output_dir: where to save model + history.
+        dropout: dropout rate.
+        norm: normalization type ('batch', 'layer', or None).
+        dataset_dir: explicit path to the dataset directory. When
+            provided, overrides the default data_root/datasets/{mode}.
+        shuffle_buffer: sample count for the training-time shuffle
+            buffer. With ~5 MB samples, 256 ≈ 1.3 GB host RAM.
+        lr_schedule_cfg: dict with keys `type`, `initial_lr`,
+            `warmup_epochs`, `min_lr`. None → use Adam's default LR
+            with no schedule (legacy behaviour).
+        early_stopping_cfg: dict with keys `enabled`, `monitor`, `mode`,
+            `patience`, `min_delta`, `restore_best_weights`. None →
+            disable early stopping.
     """
     data_root = Path(data_root)
     output_dir = Path(output_dir)
@@ -596,11 +1064,15 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     print(f"  Batch size:    {batch_size}")
     print(f"  Dropout:       {dropout}")
     print(f"  Norm:          {norm}")
-    print(f"  Mixed prec:    float16")
+    print(f"  Mixed prec:    {'float16' if mixed_precision else 'float32'}")
     print()
 
-    # Setup mixed precision
-    setup_mixed_precision()
+    # Configure the TF runtime (memory growth + XLA + mixed precision).
+    # This addresses the "Windows fatal exception: access violation" crash
+    # signature we kept seeing on the heavier modes — see the docstring of
+    # configure_tf_runtime for the per-flag rationale.
+    print("Configuring TF runtime...")
+    configure_tf_runtime(use_mixed_precision=mixed_precision)
 
     # Load ones_fraction for lightning modes from pre-computed JSON
     if label_type == "lightning":
@@ -610,8 +1082,10 @@ def train(mode, data_root, epochs, batch_size, output_dir,
 
     # Load datasets
     print("\nLoading datasets...")
-    train_ds = load_dataset(train_dir, batch_size, shuffle=True)
-    val_ds = load_dataset(val_dir, batch_size, shuffle=False)
+    train_ds = load_dataset(train_dir, batch_size,
+                             shuffle=True, shuffle_buffer=shuffle_buffer)
+    val_ds = load_dataset(val_dir, batch_size,
+                           shuffle=False)
     print("  Datasets loaded")
 
     # Build model dynamically from metadata
@@ -628,17 +1102,93 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     model.summary(print_fn=lambda x: print(f"  {x}"))
     print()
 
+    # ------------------------------------------------------------------
+    # Resumable training
+    # ------------------------------------------------------------------
+    # Per-epoch checkpoint at `models/checkpoints/<mode>_latest.keras`.
+    # On launch, if a checkpoint exists and `resume=True`, its weights
+    # are loaded so the run picks up where the previous one stopped —
+    # critical on Windows where the occasional driver-level CUDA crash
+    # would otherwise lose hours of progress.
+    ckpt_cfg = checkpoint_cfg or {}
+    ckpt_enabled = ckpt_cfg.get("enabled", True)
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_path = ckpt_dir / f"{mode}_latest.keras"
+    initial_epoch = 0
+    if ckpt_enabled and resume and ckpt_path.is_file():
+        try:
+            print(f"Resuming from checkpoint: {ckpt_path}")
+            model.load_weights(str(ckpt_path))
+            # Also restore the epoch counter so the LR schedule and
+            # callbacks see the right position. The companion JSON below
+            # is written alongside the .keras file by the checkpoint
+            # callback.
+            ckpt_meta_path = ckpt_dir / f"{mode}_latest.json"
+            if ckpt_meta_path.is_file():
+                with open(ckpt_meta_path) as f:
+                    initial_epoch = int(json.load(f).get("next_epoch", 0))
+                print(f"  Resumed at epoch {initial_epoch}")
+        except Exception as e:
+            print(f"  WARNING: could not load {ckpt_path}: {e}")
+            print(f"  Starting fresh.")
+            initial_epoch = 0
+
     # Callbacks
     wall_time = WallTimeCallback()
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-        patience=3, mode="min", factor=0.2, monitor="val_loss",
-        verbose=1, min_delta=0.0
-    )
-    early_stop = tf.keras.callbacks.EarlyStopping(
-        patience=6, mode="min", restore_best_weights=True,
-        monitor="val_loss"
-    )
-    callbacks = [wall_time, reduce_lr, early_stop]
+    callbacks: list = [wall_time]
+
+    # Learning-rate schedule. The cosine-with-warmup config drives a
+    # standard LearningRateScheduler — we don't combine it with
+    # ReduceLROnPlateau because the cosine decay is already an explicit
+    # decay schedule; stacking both would fight each other.
+    if lr_schedule_cfg is not None:
+        sched_fn = cosine_warmup_schedule(
+            initial_lr=lr_schedule_cfg["initial_lr"],
+            warmup_epochs=lr_schedule_cfg["warmup_epochs"],
+            total_epochs=epochs,
+            min_lr=lr_schedule_cfg["min_lr"],
+        )
+        callbacks.append(
+            tf.keras.callbacks.LearningRateScheduler(sched_fn, verbose=1)
+        )
+        print(f"  LR schedule:  cosine_warmup "
+              f"(initial={lr_schedule_cfg['initial_lr']:g}, "
+              f"warmup={lr_schedule_cfg['warmup_epochs']} ep, "
+              f"min={lr_schedule_cfg['min_lr']:g})")
+
+    # Early stopping. When `restore_best_weights=True` the model held in
+    # memory at the end of fit() is the best-epoch one, so the post-fit
+    # save below captures that automatically whether ES fired or the run
+    # went the full `epochs`.
+    if early_stopping_cfg is not None and early_stopping_cfg.get("enabled", True):
+        callbacks.append(
+            tf.keras.callbacks.EarlyStopping(
+                monitor=early_stopping_cfg["monitor"],
+                mode=early_stopping_cfg["mode"],
+                patience=early_stopping_cfg["patience"],
+                min_delta=early_stopping_cfg["min_delta"],
+                restore_best_weights=early_stopping_cfg["restore_best_weights"],
+                verbose=1,
+            )
+        )
+        print(f"  EarlyStop:    monitor={early_stopping_cfg['monitor']} "
+              f"({early_stopping_cfg['mode']}), "
+              f"patience={early_stopping_cfg['patience']}, "
+              f"restore_best={early_stopping_cfg['restore_best_weights']}")
+
+    # Per-epoch resumable checkpoint. Distinct from the final model save
+    # below: this is the *latest* state used for resume, not the *best*
+    # state used for inference. EarlyStopping(restore_best_weights=True)
+    # still controls what ends up in the final `coalition_<mode>.keras`.
+    if ckpt_enabled:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        callbacks.append(_ResumableCheckpoint(
+            filepath=str(ckpt_path),
+            epoch_meta_path=str(ckpt_dir / f"{mode}_latest.json"),
+            verbose=1,
+        ))
+        print(f"  Checkpoint:   per-epoch -> {ckpt_path}")
+    print()
 
     # Train
     print("\nStarting training...")
@@ -646,6 +1196,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         train_ds,
         validation_data=val_ds,
         epochs=epochs,
+        initial_epoch=initial_epoch,
         callbacks=callbacks,
     )
 
@@ -684,56 +1235,115 @@ def train(mode, data_root, epochs, batch_size, output_dir,
 # CLI
 # ============================================================================
 
+def _print_modes_and_exit() -> None:
+    print("Available training modes (defined in TRAINING_MODES):\n")
+    name_width = max(len(k) for k in TRAINING_MODES)
+    for name, info in TRAINING_MODES.items():
+        print(f"  {name:<{name_width}}  target: {info['target']}")
+        print(f"  {'':<{name_width}}  {info['summary']}")
+        print()
+    sys.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Train COALITION-4 model from pre-built TF datasets."
+        description="Train COALITION-4 model(s) from pre-built TF datasets. "
+                    "All hyperparameters live in training.config — see the "
+                    "docstring at the top of train_models.py for the list "
+                    "of available modes."
     )
     parser.add_argument(
-        "--mode", type=str, required=True,
-        help="Model variant name (e.g. mtg_lightning, mtg_lightning_no_nwcsaf). "
-             "Used for naming the saved model and history files."
+        "--config", type=str, default=str(DEFAULT_TRAINING_CONFIG),
+        help=f"Path to training.config (default: {DEFAULT_TRAINING_CONFIG}).",
+    )
+    parser.add_argument(
+        "--mode", type=str, default=None,
+        help="Train a single mode instead of the [modes].run list in the "
+             "config. Hyperparameters are still read from the config "
+             "(defaults + [mode.<name>] overrides). One of: "
+             f"{sorted(TRAINING_MODES)}.",
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
-        help="Root directory containing datasets/ and lightning_fraction.json"
+        help="Root directory containing datasets/ and lightning_fraction.json.",
     )
     parser.add_argument(
         "--dataset_dir", type=str, default=None,
-        help="Explicit path to the dataset directory (overrides data_root/datasets/{mode}). "
-             "Use this to train on custom dataset variants, e.g. datasets without NWCSAF."
+        help="Explicit path to the dataset directory "
+             "(overrides data_root/datasets/{mode}). Use with --mode only.",
     )
     parser.add_argument(
         "--output_dir", type=str, default="./models",
-        help="Directory to save trained model and history"
+        help="Directory to save trained model and history.",
     )
     parser.add_argument(
-        "--epochs", type=int, default=10,
-        help="Number of training epochs (default: 10)"
+        "--fresh", action="store_true",
+        help="Ignore any saved per-epoch checkpoint and start training "
+             "from scratch. By default the run resumes from "
+             "models/checkpoints/<mode>_latest.keras if it exists.",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32,
-        help="Training batch size (default: 32)"
+        "--list-modes", action="store_true",
+        help="Print the available training modes with their descriptions "
+             "and exit. No training is performed.",
     )
-    parser.add_argument(
-        "--dropout", type=float, default=0.1,
-        help="Dropout rate (default: 0.1)"
-    )
-    parser.add_argument(
-        "--norm", type=str, default=None, choices=[None, "batch", "layer"],
-        help="Normalization type (default: None)"
-    )
+
     args = parser.parse_args()
 
-    train(
-        mode=args.mode,
-        data_root=args.data_root,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        output_dir=args.output_dir,
-        dropout=args.dropout,
-        norm=args.norm,
-        dataset_dir=args.dataset_dir,
-    )
+    if args.list_modes:
+        _print_modes_and_exit()
+
+    cfg = load_training_config(Path(args.config))
+
+    # Decide what to run.
+    if args.mode is not None:
+        if args.mode not in TRAINING_MODES:
+            sys.exit(
+                f"ERROR: --mode {args.mode!r} is not a known training "
+                f"mode. Run `python train_models.py --list-modes` for the "
+                f"list."
+            )
+        modes_to_run = [args.mode]
+    else:
+        modes_to_run = cfg["modes"]
+        if not modes_to_run:
+            sys.exit(
+                f"ERROR: [modes].run is empty in {args.config}, and no "
+                f"--mode was given on the command line. Either populate "
+                f"the config or pass --mode."
+            )
+        if args.dataset_dir is not None:
+            sys.exit(
+                "ERROR: --dataset_dir is only meaningful when training a "
+                "single --mode. Drop --dataset_dir or pass --mode."
+            )
+
+    print(f"Training {len(modes_to_run)} mode(s): {modes_to_run}\n")
+
+    for i, mode in enumerate(modes_to_run, start=1):
+        print("#" * 70)
+        print(f"# [{i}/{len(modes_to_run)}] mode: {mode}")
+        print("#" * 70)
+        params = merge_for_mode(cfg, mode)
+        print(f"  Effective hyperparameters: {params}")
+        train(
+            mode=mode,
+            data_root=args.data_root,
+            epochs=params["epochs"],
+            batch_size=params["batch_size"],
+            output_dir=args.output_dir,
+            dropout=params["dropout"],
+            norm=params["norm"],
+            dataset_dir=args.dataset_dir,
+            shuffle_buffer=params["shuffle_buffer"],
+            mixed_precision=params["mixed_precision"],
+            lr_schedule_cfg=cfg["lr_schedule"],
+            early_stopping_cfg=cfg["early_stopping"],
+            checkpoint_cfg=cfg["checkpointing"],
+            resume=cfg["checkpointing"].get("resume", True) and not args.fresh,
+        )
+
+    print("\nAll requested training runs completed.")
 
 
 if __name__ == "__main__":
