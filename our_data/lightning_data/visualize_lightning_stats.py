@@ -15,7 +15,7 @@ CSV — Active steps:
 
 Input structure (COALITION-4):
     {data_root}/{product}/nc4_{date}-Romania_{product}/
-        lightning_{product}_YYYYMMDD_HHMM.nc
+        lightning_{product}_YYYYMMDD_HHMM.npy
 
 Output:
     {output_dir}/lightning_activity_per_day.png
@@ -31,7 +31,6 @@ import os
 import re
 import argparse
 import numpy as np
-import netCDF4 as nc
 from collections import defaultdict
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -53,8 +52,9 @@ PRODUCTS = {
 # Regex for date directories: nc4_YYYY-MM-DD-Romania_{product}
 DATE_DIR_PATTERN = re.compile(r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_')
 
-# Regex for filenames: lightning_{product}_YYYYMMDD_HHMM.nc
-FILE_PATTERN = re.compile(r'^lightning_\w+_(\d{8})_(\d{4})\.nc$')
+# Regex for filenames: lightning_{product}_YYYYMMDD_HHMM.npy
+# (read_kml_version2.py writes .npy directly — see its docstring).
+FILE_PATTERN = re.compile(r'^lightning_\w+_(\d{8})_(\d{4})\.npy$')
 
 
 # =============================================================================
@@ -63,18 +63,12 @@ FILE_PATTERN = re.compile(r'^lightning_\w+_(\d{8})_(\d{4})\.nc$')
 
 def check_file_has_activity(filepath):
     """
-    Check if a lightning NetCDF file has at least one non-zero pixel.
+    Check if a lightning `.npy` file has at least one non-zero pixel.
 
-    Returns True if any pixel in the datamap variable is != 0.
+    Returns True if any pixel in the array is != 0.
     """
     try:
-        ds = nc.Dataset(filepath, 'r')
-        data = ds.variables['datamap'][:]
-        ds.close()
-
-        if isinstance(data, np.ma.MaskedArray):
-            data = data.filled(0.0)
-
+        data = np.load(filepath)
         return bool(np.any(data != 0))
     except Exception as e:
         print(f"  WARNING: Could not read {filepath}: {e}")
@@ -111,15 +105,15 @@ def scan_product(data_root, product_name):
         if not os.path.isdir(day_dir):
             continue
 
-        nc_files = sorted(f for f in os.listdir(day_dir) if f.endswith('.nc'))
+        npy_files = sorted(f for f in os.listdir(day_dir) if f.endswith('.npy'))
 
-        for nc_file in nc_files:
-            fmatch = FILE_PATTERN.match(nc_file)
+        for npy_file in npy_files:
+            fmatch = FILE_PATTERN.match(npy_file)
             if not fmatch:
                 continue
 
             time_str = fmatch.group(2)  # HHMM
-            filepath = os.path.join(day_dir, nc_file)
+            filepath = os.path.join(day_dir, npy_file)
 
             active = check_file_has_activity(filepath)
             activity[date_str][time_str] = active

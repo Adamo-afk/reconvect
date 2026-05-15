@@ -56,7 +56,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
-from netCDF4 import Dataset
 
 
 # =============================================================================
@@ -90,10 +89,12 @@ DEFAULT_WINDOW_DAYS = 10
 DEFAULT_WINDOW_MIN_VALID_DAYS = 2
 
 
-# Lightning NetCDF filename: lightning_<product>_<YYYYMMDD>_<HHMM>.nc
+# Lightning filename: lightning_<product>_<YYYYMMDD>_<HHMM>.npy
+# (read_kml_version2.py writes .npy directly so the rest of the pipeline
+# never has to deal with NetCDF for lightning).
 FILENAME_PATTERN = re.compile(
     r'^lightning_(?P<product>density|current|occurrence)_'
-    r'(?P<date>\d{8})_(?P<hhmm>\d{4})\.nc$'
+    r'(?P<date>\d{8})_(?P<hhmm>\d{4})\.npy$'
 )
 
 
@@ -183,14 +184,10 @@ def load_date_maps(lightning_dir: str, product: str,
             continue
         hhmm = m.group('hhmm')
         try:
-            with Dataset(os.path.join(date_dir, filename), 'r') as ds:
-                data = ds.variables['datamap'][:]
-                if hasattr(data, 'filled'):
-                    data = data.filled(0)
-                data = np.asarray(data)
-                if data.ndim == 3:
-                    data = data[0]
-                maps.append((hhmm, data))
+            data = np.load(os.path.join(date_dir, filename))
+            if data.ndim == 3:
+                data = data[0]
+            maps.append((hhmm, data))
         except Exception as e:
             print(f"  WARN: could not read {filename}: {e}", file=sys.stderr)
 
