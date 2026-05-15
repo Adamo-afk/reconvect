@@ -13,9 +13,16 @@ Input structure (from arrange_lightning_data.py):
     {data_root}/kml_data/yyyy-mm-dd/yyyy-mm-dd.kml
 
 Output structure (COALITION-4 convention):
-    {output_root}/density/nc4_yyyy-mm-dd-Romania_density/lightning_density_yyyymmdd_HHMM.nc
-    {output_root}/current/nc4_yyyy-mm-dd-Romania_current/lightning_current_yyyymmdd_HHMM.nc
-    {output_root}/occurrence/nc4_yyyy-mm-dd-Romania_occurrence/lightning_occurrence_yyyymmdd_HHMM.nc
+    {output_root}/density/nc4_yyyy-mm-dd-Romania_density/lightning_density_yyyymmdd_HHMM.npy
+    {output_root}/current/nc4_yyyy-mm-dd-Romania_current/lightning_current_yyyymmdd_HHMM.npy
+    {output_root}/occurrence/nc4_yyyy-mm-dd-Romania_occurrence/lightning_occurrence_yyyymmdd_HHMM.npy
+
+Output is `.npy` (just the binned grid, no lat/lon metadata). Lightning
+is already on the Romania grid by virtue of being binned via
+`GridProjection`, so the rest of the pipeline (extract_patches,
+compute_normalization_stats, ...) reads these `.npy` files directly.
+To regenerate a viewable `.nc` for GIS inspection, use
+`our_data/lightning_data/inspect_lightning.py`.
 
 Usage:
     # Process all dates
@@ -37,7 +44,6 @@ import time
 import re
 import sys
 import json
-import netCDF4 as nc
 from pathlib import Path
 import argparse
 import os
@@ -309,39 +315,33 @@ def generate_lightning_occurrence_maps(lightning_df, grid_projection, timestamps
 # NetCDF output
 # =============================================================================
 
-def write_single_nc_file(output_path, data_slice, lat_data, lon_data,
-                         timestamp, var_name, var_units, var_long_name,
-                         time_interval):
-    """Write a single 15-minute lightning map to NetCDF."""
-    with nc.Dataset(output_path, 'w', format='NETCDF4') as dst:
-        dst.createDimension('lat', lat_data.shape[0])
-        dst.createDimension('lon', lat_data.shape[1])
-        dst.createDimension('time', 1)
+def write_single_npy_file(output_path, data_slice, lat_data, lon_data,
+                           timestamp, var_name, var_units, var_long_name,
+                           time_interval):
+    """Save a single 15-minute lightning map as a `.npy` array.
 
-        times = dst.createVariable('time', 'i4', ('time',))
-        lats = dst.createVariable('latitude', 'f4', ('lat', 'lon'))
-        lons = dst.createVariable('longitude', 'f4', ('lat', 'lon'))
-        variable = dst.createVariable(
-            var_name, 'f4' if var_name != 'datamap' else 'i1',
-            ('time', 'lat', 'lon')
-        )
-
-        times.units = 'seconds since 1970-01-01 00:00:00'
-        times.calendar = 'standard'
-        lats.units = 'degrees_north'
-        lons.units = 'degrees_east'
-        variable.units = var_units
-        variable.long_name = var_long_name
-
-        dst.description = f'{var_long_name} map'
-        dst.history = f'Created {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-        dst.source = f'Lightning data processed with {time_interval}-minute intervals'
-
-        times[:] = [int(timestamp.timestamp())]
-        lats[:] = lat_data
-        lons[:] = lon_data
-        variable[0, :, :] = data_slice
-
+    Output is the bare 2-D grid; the shared `romania_grid_{lats,lons}.npy`
+    in `reprojected_data/` carries the coordinates for all products, so
+    we don't duplicate them per file. The `lat_data` / `lon_data` /
+    `timestamp` / `var_units` / `var_long_name` / `time_interval`
+    arguments are kept in the signature for call-site compatibility with
+    the previous NetCDF writer but are not used here. To rebuild a
+    CF-compliant `.nc` for QGIS inspection, see
+    `our_data/lightning_data/inspect_lightning.py`.
+    """
+    # Mirror the dtype convention the old NetCDF path used: int8 for the
+    # binary occurrence map, float32 for density / current.
+    if var_name == 'datamap':
+        # `datamap` was the generic name; here we infer the actual dtype
+        # from the data range — occurrence is 0/1, others continuous.
+        unique = np.unique(np.asarray(data_slice))
+        if unique.size <= 2 and set(unique.tolist()) <= {0, 1}:
+            arr = np.asarray(data_slice, dtype=np.int8)
+        else:
+            arr = np.asarray(data_slice, dtype=np.float32)
+    else:
+        arr = np.asarray(data_slice, dtype=np.float32)
+    np.save(output_path, arr)
     return output_path
 
 
@@ -349,12 +349,12 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
                                 timestamps, grid_projection, output_root,
                                 date_str, batch_size=10):
     """
-    Save all lightning maps to individual NetCDF files using parallelization.
+    Save all lightning maps as `.npy` arrays using a process pool.
 
     Output structure (COALITION-4 convention):
-        {output_root}/density/nc4_{date}-Romania_density/lightning_density_YYYYMMDD_HHMM.nc
-        {output_root}/current/nc4_{date}-Romania_current/lightning_current_YYYYMMDD_HHMM.nc
-        {output_root}/occurrence/nc4_{date}-Romania_occurrence/lightning_occurrence_YYYYMMDD_HHMM.nc
+        {output_root}/density/nc4_{date}-Romania_density/lightning_density_YYYYMMDD_HHMM.npy
+        {output_root}/current/nc4_{date}-Romania_current/lightning_current_YYYYMMDD_HHMM.npy
+        {output_root}/occurrence/nc4_{date}-Romania_occurrence/lightning_occurrence_YYYYMMDD_HHMM.npy
     """
     output_root = Path(output_root)
 
@@ -398,7 +398,7 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
                 data = occurrence_maps[i]
 
             all_tasks.append((
-                str(folders[prod_key] / f"{file_prefix}_{time_str}.nc"),
+                str(folders[prod_key] / f"{file_prefix}_{time_str}.npy"),
                 data, lats, lons, timestamp,
                 'datamap', var_units, var_long_name, '15'
             ))
@@ -410,7 +410,7 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
     with multiprocessing.Pool(processes=num_cores) as pool:
         for i in range(0, total_tasks, batch_size):
             batch_tasks = all_tasks[i:i + batch_size]
-            pool.starmap(write_single_nc_file, batch_tasks)
+            pool.starmap(write_single_npy_file, batch_tasks)
 
             processed += len(batch_tasks)
             elapsed = time.time() - start_time

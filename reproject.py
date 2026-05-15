@@ -20,7 +20,7 @@
 #     our_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.nc
 #     our_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.nc
 #     our_data/satellite_data/MTG/coordinates/{lat,lon}_{1km,2km}.npy
-#     our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.nc
+#     our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
 #     our_data/nwcsaf_data/{date}-Romania/*.nc
 
 # Output paths:
@@ -784,7 +784,7 @@ Input paths:
     our_data/satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.nc
     our_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
     our_data/satellite_data/MTG/mtg_constants.json
-    our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.nc
+    our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
     our_data/nwcsaf_data/{date}-Romania/*.nc
     our_data/opera_data/{reflectivity|rainfall_rate}/{YYYY}/{MM}/{DD}/*.h5
 
@@ -1248,28 +1248,42 @@ def _mtg_day_worker(job):
 
 
 def _lightning_day_worker(job):
-    day_folder, day_path, out_dir, nc_files = job
+    """Lightning is already on the Romania grid (binned by `GridProjection`
+    inside `read_kml_version2.py`), so 'reprojection' is just a one-step
+    pass-through: load the source `.npy`, optionally normalise dtype /
+    squeeze a stray time axis, save under `reprojected_data/`. The
+    occurrence map keeps its int8 dtype; density / current become
+    float32. Source and destination both use the
+    `lightning_<product>_YYYYMMDD_HHMM.npy` naming convention so file
+    names stay stable across the move.
+    """
+    day_folder, day_path, out_dir, npy_files = job
     new, skipped = 0, 0
     errors: list[tuple[str, str]] = []
-    for nc_file in nc_files:
-        npy_file = nc_file.replace('.nc', '.npy')
+    for npy_file in npy_files:
         out_path = os.path.join(out_dir, npy_file)
         if output_exists(out_path):
             skipped += 1
             continue
         try:
-            filepath = os.path.join(day_path, nc_file)
-            with Dataset(filepath, 'r') as ds:
-                datamap = ds.variables['datamap'][:]
+            filepath = os.path.join(day_path, npy_file)
+            datamap = np.load(filepath)
             if isinstance(datamap, np.ma.MaskedArray):
                 datamap = datamap.filled(0.0)
             if datamap.ndim == 3:
                 datamap = np.squeeze(datamap, axis=0)
             ensure_dir(out_dir)
-            np.save(out_path, datamap.astype(np.float32))
+            # Preserve the on-disk dtype of the occurrence binary map
+            # (int8 from read_kml_version2.write_single_npy_file) so
+            # downstream consumers can treat it as a categorical flag.
+            np.save(
+                out_path,
+                datamap if datamap.dtype == np.int8
+                else datamap.astype(np.float32),
+            )
             new += 1
         except Exception as e:
-            errors.append((nc_file, str(e)))
+            errors.append((npy_file, str(e)))
     return day_folder, new, skipped, errors
 
 
@@ -1757,7 +1771,15 @@ def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=Non
 # =============================================================================
 
 def reproject_lightning(data_root, date_filter=None):
-    """Cache lightning NetCDF data as .npy, day folders in parallel."""
+    """Copy lightning `.npy` files from `lightning_data/` to
+    `reprojected_data/lightning_data/`, day folders in parallel.
+
+    Lightning is already on the Romania grid by virtue of being binned
+    with the `GridProjection` inside `read_kml_version2.py`, which now
+    writes `.npy` directly. This step exists to keep lightning's
+    on-disk layout consistent with the other products (raw source dir
+    -> reprojected_data mirror), not to do any actual reprojection.
+    """
     lightning_dir = os.path.join(data_root, 'lightning_data')
     reprojected_base = os.path.join(
         data_root, 'reprojected_data', 'lightning_data'
@@ -1786,11 +1808,11 @@ def reproject_lightning(data_root, date_filter=None):
             if not os.path.isdir(day_path):
                 continue
             out_dir = os.path.join(reprojected_base, product, day_folder)
-            nc_files = sorted(
-                f for f in os.listdir(day_path) if f.endswith('.nc')
+            npy_files = sorted(
+                f for f in os.listdir(day_path) if f.endswith('.npy')
             )
-            if nc_files:
-                day_jobs.append((day_folder, day_path, out_dir, nc_files))
+            if npy_files:
+                day_jobs.append((day_folder, day_path, out_dir, npy_files))
 
         if not day_jobs:
             print(f"    No day folders found for {product}")

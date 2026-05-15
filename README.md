@@ -93,9 +93,9 @@ coalition4-rcnn/
 │   │   └── _raw_chunks/               # Cache of downloaded FCI chunk files (gitignored)
 │   ├── lightning_data/
 │   │   ├── kml_data/{date}/{date}.kml
-│   │   ├── density/nc4_{date}-Romania_density/*.nc
-│   │   ├── current/nc4_{date}-Romania_current/*.nc
-│   │   ├── occurrence/nc4_{date}-Romania_occurrence/*.nc
+│   │   ├── density/nc4_{date}-Romania_density/*.npy
+│   │   ├── current/nc4_{date}-Romania_current/*.npy
+│   │   ├── occurrence/nc4_{date}-Romania_occurrence/*.npy
 │   │   ├── read_kml_version2.py       # KML → 15-min NetCDF lightning maps
 │   │   └── visualize_lightning_stats.py  # Lightning activity bar plots and CSV
 │   ├── nwcsaf_data/
@@ -721,7 +721,7 @@ python our_data/satellite_data/inspect_mtg.py --raw --npy <path> --constants <pa
 Two changes were needed to align `reproject.py` with the new pipeline output:
 
 1. **Source grid reconstruction**: previously `reproject_satellite_mtg()` loaded the precomputed `coordinates/lat_{1,2}km.npy` / `lon_{1,2}km.npy` files written by the old pipeline. Those files no longer exist. The new code reads `our_data/satellite_data/MTG/mtg_constants.json`, builds a `pyproj.Proj(proj='geos', h=..., a=..., b=..., lon_0=..., sweep=...)` from the embedded projection parameters, and reconstructs 2-D source lat/lon arrays from `x_geos` / `y_geos` once per resolution. The KD-tree (`PrecomputedMapping`) caching strategy is unchanged.
-2. **Input format**: MTG inputs are `.npy` arrays under `satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy` instead of `.nc`. Radar, MSG (disabled), lightning, and NWCSAF paths are untouched.
+2. **Input format**: MTG and lightning inputs are now `.npy` arrays (MTG written by `pipeline_msg_mtg.py`, lightning written by `read_kml_version2.py`). Radar, MSG (disabled), and NWCSAF paths still use `.nc`. To get a CF-compliant `.nc` for GIS inspection from any reprojected `.npy`, see `inspect_mtg.py --reprojected`, `inspect_lightning.py`, and `inspect_nwcsaf.py`.
 
 The reproject output for MTG remains `.npy` on the Romania 1536×768 grid. Use `inspect_mtg.py --reprojected` to get a CF NetCDF for any single reprojected sample.
 
