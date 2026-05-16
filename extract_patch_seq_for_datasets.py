@@ -462,15 +462,17 @@ def resolve_index_source(data_root, source):
 
     Returns: (csv_path, effective_step_minutes)
 
-    - source='radar': reads our_data/patch_index/patch_index.csv with the
-      cadence from timestep_config.json (STEP_MINUTES).
+    - source='dbscan': reads our_data/patch_index/patch_index.csv (DBSCAN-
+      driven, produced by identify_patches.py for either --source radar or
+      --source opera) with the cadence from timestep_config.json
+      (STEP_MINUTES).
     - source='lightning': reads our_data/lightning_periods/lightning_patches.csv
       with the cadence from lightning_periods_config.json (step_minutes).
       identify_lightning_periods.py no longer aggregates - each surviving
       occurrence map produces one row at the native step_minutes cadence -
       so the effective sequence step equals step_minutes.
     """
-    if source == 'radar':
+    if source == 'dbscan':
         return (
             os.path.join(data_root, 'patch_index', 'patch_index.csv'),
             STEP_MINUTES,
@@ -494,7 +496,7 @@ def resolve_index_source(data_root, source):
     raise ValueError(f"Unknown source: {source}")
 
 
-def load_patch_index(data_root, source='radar'):
+def load_patch_index(data_root, source='dbscan'):
     """
     Load the per-(date, time) patch-activity index for the chosen source.
 
@@ -504,7 +506,7 @@ def load_patch_index(data_root, source='radar'):
     csv_path, _ = resolve_index_source(data_root, source)
     if not os.path.isfile(csv_path):
         print(f"ERROR: {csv_path} not found")
-        if source == 'radar':
+        if source == 'dbscan':
             print("Run identify_patches.py first.")
         else:
             print("Run identify_lightning_periods.py first.")
@@ -920,13 +922,16 @@ def main():
              f"(default: {DEFAULT_BLOCK_HOURS})"
     )
     parser.add_argument(
-        "--source", type=str, default='radar',
-        choices=['radar', 'lightning'],
-        help="Activity source. 'radar' (default) reads patch_index.csv from "
-             "identify_patches.py and uses step_minutes from "
+        "--source", type=str, default='dbscan',
+        choices=['dbscan', 'lightning'],
+        help="Activity-index source. 'dbscan' (default) reads "
+             "patch_index.csv from identify_patches.py (DBSCAN clusters - "
+             "the underlying sensor is whatever was passed to "
+             "identify_patches's own --source flag, either radar / RZC or "
+             "opera_rainfall_rate). Uses step_minutes from "
              "timestep_config.json. 'lightning' reads lightning_patches.csv "
-             "from identify_lightning_periods.py and uses step_minutes "
-             "from lightning_periods_config.json as the step interval."
+             "from identify_lightning_periods.py and uses step_minutes from "
+             "lightning_periods_config.json as the step interval."
     )
     parser.add_argument(
         "--manifest", type=str, default=None,
@@ -1009,7 +1014,7 @@ def main():
     print(f"  Train: {len(train)}, Validation: {len(val)}, Test: {len(test)}")
 
     # Save three CSVs. Outputs are suffixed with `_<source>` so the
-    # radar-driven and lightning-driven tracks can coexist on disk
+    # DBSCAN-driven and lightning-driven tracks can coexist on disk
     # (domain-adaptation pipeline trains both and uses them as separate
     # feature extractors).
     print("\nSaving results...")
