@@ -1,13 +1,17 @@
 """
-Process LINET lightning KML data into 15-minute NetCDF maps for COALITION-4.
+Process LINET lightning KML data into per-cadence `.npy` maps for COALITION-4.
 
-Adapted from read_kml_version2.py with the following changes:
-    - 15-minute time steps (was 5-minute for density, 10-minute for occurrence)
-    - Fixed UTC time grid: 00:15, 00:30, ..., 23:30, 23:45 (96 steps)
-      Each step accumulates lightning in the preceding 15-minute window.
-    - Time steps from 23:56 onwards are excluded (last valid step is 23:45)
-    - Date extracted from the KML filename (dd_mm_yyyy.kml or dd.mm.yyyy.kml)
-    - Batch processing of all dates in the arranged directory structure
+The bin width is taken from `our_data/timestep_config.json`:
+    - Prefer `products.lightning.cadence_minutes` (the LINET native cadence,
+      typically 10 min) so the maps are generated at source resolution.
+    - Fall back to the global `step_minutes` only when lightning is declared
+      continuous / event-based (cadence is null).
+
+For a 10-minute cadence the day is binned into 144 fixed UTC slots
+(00:10, 00:20, ..., 23:50, 00:00 of the next day). Each slot accumulates
+the LINET strokes in its preceding `cadence` window. Date is extracted
+from the KML filename (dd_mm_yyyy.kml or dd.mm.yyyy.kml) and the whole
+arranged directory is walked unless `--date` is given.
 
 Input structure (from arrange_lightning_data.py):
     {data_root}/kml_data/yyyy-mm-dd/yyyy-mm-dd.kml
@@ -56,15 +60,27 @@ import os
 DEFAULT_DATA_ROOT = r"F:\nowcasting\coalition4-rcnn\our_data\lightning_data"
 DEFAULT_OUTPUT_ROOT = r"F:\nowcasting\coalition4-rcnn\our_data\lightning_data"
 
-# Time step is read from the project-level timestep_config.json so that
-# lightning aggregation matches the pipeline cadence chosen by
-# validate_timestep.py. Module-level constants are populated at import time;
-# callers may override via override_timestep() in tests.
+# Time step is read from the project-level timestep_config.json. We prefer
+# the lightning product's *native cadence* (products.lightning.cadence_minutes)
+# so the maps are generated at the source resolution; the per-product
+# minute filter inside the same JSON is what downstream tooling
+# (summarize_lightning_data.py, intersect_product_coverage.py) uses to
+# subsample. Falling back to the global step_minutes only when no native
+# cadence is declared keeps the script working for the legacy
+# "continuous / event-based" lightning configuration.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 
 
-def _load_step_minutes():
+def _load_lightning_cadence():
+    """Return (cadence_in_minutes, source_label) for the lightning maps.
+
+    Prefers `products.lightning.cadence_minutes` from timestep_config.json
+    (the native LINET cadence). Falls back to the global `step_minutes`
+    when the lightning product is configured as continuous (cadence is
+    null / missing). The label is included so the stdout banner makes
+    the source of the chosen value explicit.
+    """
     if not TIMESTEP_CONFIG_PATH.exists():
         print(
             f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
@@ -74,16 +90,47 @@ def _load_step_minutes():
         )
         sys.exit(2)
     cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
-    return int(cfg["step_minutes"])
+    lightning_cfg = cfg.get("products", {}).get("lightning", {})
+    cadence = lightning_cfg.get("cadence_minutes")
+    if cadence is not None:
+        return int(cadence), "products.lightning.cadence_minutes"
+    return int(cfg["step_minutes"]), "step_minutes (lightning cadence is null)"
 
 
-TIME_STEP_MINUTES = _load_step_minutes()
-STEPS_PER_DAY = 1440 // TIME_STEP_MINUTES
+def _load_lightning_filter():
+    """Return the sorted list of filter minutes for lightning, or None.
+
+    `products.lightning.filter` enumerates the minute-of-hour slots that
+    downstream tooling (summarize_lightning_data.py /
+    intersect_product_coverage.py) expects. When present, we only
+    generate maps at those slots and the accumulation window for each
+    map is the gap to the previous filter slot (variable width), so
+    every stroke in the day lands in exactly one bin.
+    """
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    flt = cfg.get("products", {}).get("lightning", {}).get("filter")
+    if flt is None:
+        return None
+    return sorted(int(m) for m in flt)
+
+
+TIME_STEP_MINUTES, _TIME_STEP_SOURCE = _load_lightning_cadence()
+LIGHTNING_FILTER = _load_lightning_filter()
 
 
 # =============================================================================
 # KML reading
 # =============================================================================
+
+def _empty_lightning_df():
+    """Return the empty schema used when a KML has no usable rows."""
+    return pd.DataFrame({
+        'lat':       pd.Series(dtype=float),
+        'lon':       pd.Series(dtype=float),
+        'current':   pd.Series(dtype=float),
+        'timestamp': pd.Series(dtype='datetime64[ns]'),
+    })
+
 
 def read_kml_extract_coordinates(kml_file):
     """
@@ -94,14 +141,34 @@ def read_kml_extract_coordinates(kml_file):
         - Current (kA)
         - Timestamp (UTC)
 
+    LINET emits a stylesheet-only KML (no `<Placemark>` elements) for
+    quiet days with no detected strokes. pyogrio doesn't treat that as
+    "zero rows" - it raises `IndexError` from `get_default_layer`
+    because there are no readable layers. We catch that (and any other
+    read failure) and return an empty DataFrame so the surrounding
+    pipeline's existing "empty df -> skip" path takes over instead of
+    aborting the whole batch.
+
     Args:
         kml_file (str): Path to the KML file
 
     Returns:
         pd.DataFrame: Columns [lat, lon, current, timestamp]
     """
-    gdf = gpd.read_file(kml_file)
+    try:
+        gdf = gpd.read_file(kml_file)
+    except (IndexError, ValueError, RuntimeError, OSError) as exc:
+        # pyogrio surfaces "no layers" as IndexError; gdal-style "failed
+        # to open" errors come through as RuntimeError/OSError. Any of
+        # them is reported once and treated as a no-stroke day.
+        print(f"  WARNING: cannot read {kml_file} ({type(exc).__name__}: "
+              f"{exc}) - treating as no-stroke day, skipping.")
+        return _empty_lightning_df()
     print(f"  Raw placemarks: {len(gdf)}")
+    if len(gdf) == 0 or 'Description' not in gdf.columns:
+        # Valid KML structure but zero placemarks (or no Description
+        # column to parse) - same treatment as the read failure.
+        return _empty_lightning_df()
 
     latitudes = []
     longitudes = []
@@ -157,70 +224,87 @@ def grid_accumulate(i, j, grid=None, weights=None, weighted_grid=None):
         np.add.at(weighted_grid, (i[valid_mask], j[valid_mask]), weights[valid_mask])
 
 
-def lightning_for_time(lightning_df, time, interval=None):
-    """Extract lightning data for the interval [time - interval, time).
-
-    If interval is None, defaults to the configured TIME_STEP_MINUTES.
-    """
-    if interval is None:
-        interval = timedelta(minutes=TIME_STEP_MINUTES)
-    start_time = time - interval
-    end_time = time
-    mask = (lightning_df['timestamp'] >= start_time) & (lightning_df['timestamp'] < end_time)
+def lightning_for_window(lightning_df, start_time, end_time):
+    """Extract lightning rows whose timestamp falls in [start_time, end_time)."""
+    mask = (
+        (lightning_df['timestamp'] >= start_time)
+        & (lightning_df['timestamp'] < end_time)
+    )
     return lightning_df[mask]
 
 
 # =============================================================================
-# Map generation — 15-minute time steps
+# Map generation - filter-aligned time steps with variable windows
 # =============================================================================
 
-def generate_fixed_timesteps(date_str):
-    """
-    Generate the fixed 15-minute UTC time grid for one day.
+def generate_timesteps_and_windows(date_str):
+    """Return (timestamps, start_times) lists for one calendar day.
 
-    Returns 96 timestamps: 00:00, 00:15, 00:30, ..., 23:30, 23:45.
-    Each timestamp represents the END of its 15-minute accumulation window.
-    For example, 00:00 accumulates [23:45 prev day, 00:00) — typically empty
-    for single-day files. The last step 23:45 accumulates [23:30, 23:45).
-    Anything from 23:46 onwards is discarded.
+    Two modes, selected by `products.lightning.filter` in
+    timestep_config.json:
 
-    Args:
-        date_str (str): Date in 'YYYY-MM-DD' format
+      * filter is set (typical) -> only filter minutes are emitted, one
+        bin per (hour, filter_minute) pair. Each bin's accumulation
+        window goes from the **previous** filter slot to this slot,
+        looping across midnight to the last filter minute of the
+        previous calendar day. Variable window widths ensure every
+        minute of the day belongs to exactly one bin (no strokes lost
+        in the gaps between filter steps).
 
-    Returns:
-        list[datetime]: 96 timestamps
+      * filter is None (lightning declared continuous) -> fall back to
+        a fixed-cadence grid of `TIME_STEP_MINUTES` width.
+
+    Each `timestamps[i]` is the END of bin i (the value used in the
+    .npy filename HH:MM). `start_times[i]` is the START of bin i.
     """
     base = datetime.strptime(date_str, "%Y-%m-%d")
+
+    if LIGHTNING_FILTER is not None:
+        flt = sorted(LIGHTNING_FILTER)
+        timestamps = [
+            base.replace(hour=h, minute=m)
+            for h in range(24) for m in flt
+        ]
+        # Previous step before the day's first filter minute is the LAST
+        # filter minute of the previous calendar day. The current KML is
+        # single-day, so any window crossing midnight just returns no
+        # rows - the resulting map is empty, which mirrors the legacy
+        # behaviour for the 00:00 slot.
+        prev = (base - timedelta(days=1)).replace(hour=23, minute=flt[-1])
+        start_times = []
+        for ts in timestamps:
+            start_times.append(prev)
+            prev = ts
+        return timestamps, start_times
+
+    # Fixed-cadence fallback.
+    steps_per_day = 1440 // TIME_STEP_MINUTES
     step = timedelta(minutes=TIME_STEP_MINUTES)
-
-    timestamps = []
-    current = base  # first step is 00:00
-    for _ in range(STEPS_PER_DAY):
-        timestamps.append(current)
-        current += step
-
-    return timestamps
+    timestamps = [base + i * step for i in range(steps_per_day)]
+    start_times = [ts - step for ts in timestamps]
+    return timestamps, start_times
 
 
-def create_density_maps(lightning_df, grid_projection, timestamps):
+def create_density_maps(lightning_df, grid_projection, timestamps, start_times):
     """
-    Generate lightning density and current-weighted density maps at
-    15-minute intervals on a fixed time grid.
+    Generate lightning density and current-weighted density maps on the
+    filter-aligned time grid (with variable window widths from
+    generate_timesteps_and_windows).
 
     Args:
         lightning_df (pd.DataFrame): Lightning data
         grid_projection: GridProjection object
-        timestamps (list[datetime]): Fixed 15-minute time grid
+        timestamps (list[datetime]): END of each bin (filter-aligned)
+        start_times (list[datetime]): START of each bin (parallel to timestamps)
 
     Returns:
         tuple: (normalized_density_maps, normalized_weighted_maps, timestamps)
     """
-    interval = timedelta(minutes=TIME_STEP_MINUTES)
     density_maps = []
     weighted_maps = []
 
-    for current_time in timestamps:
-        lightning = lightning_for_time(lightning_df, current_time, interval=interval)
+    for current_time, start_time in zip(timestamps, start_times):
+        lightning = lightning_for_window(lightning_df, start_time, current_time)
 
         density_map = np.zeros(
             (grid_projection.area.height, grid_projection.area.width), dtype=float
@@ -263,24 +347,25 @@ def create_density_maps(lightning_df, grid_projection, timestamps):
     return normalized_density, normalized_weighted, timestamps
 
 
-def generate_lightning_occurrence_maps(lightning_df, grid_projection, timestamps):
+def generate_lightning_occurrence_maps(lightning_df, grid_projection,
+                                        timestamps, start_times):
     """
     Generate binary lightning occurrence maps with 4-neighbor expansion
-    at 15-minute intervals.
+    on the filter-aligned time grid.
 
     Args:
         lightning_df (pd.DataFrame): Lightning data
         grid_projection: GridProjection object
-        timestamps (list[datetime]): Fixed 15-minute time grid
+        timestamps (list[datetime]): END of each bin (filter-aligned)
+        start_times (list[datetime]): START of each bin (parallel to timestamps)
 
     Returns:
         tuple: (occurrence_maps, timestamps)
     """
-    interval = timedelta(minutes=TIME_STEP_MINUTES)
     occurrence_maps = []
 
-    for current_time in timestamps:
-        lightning = lightning_for_time(lightning_df, current_time, interval=interval)
+    for current_time, start_time in zip(timestamps, start_times):
+        lightning = lightning_for_window(lightning_df, start_time, current_time)
 
         lightning_map = np.zeros(
             (grid_projection.area.height, grid_projection.area.width), dtype=int
@@ -318,7 +403,7 @@ def generate_lightning_occurrence_maps(lightning_df, grid_projection, timestamps
 def write_single_npy_file(output_path, data_slice, lat_data, lon_data,
                            timestamp, var_name, var_units, var_long_name,
                            time_interval):
-    """Save a single 15-minute lightning map as a `.npy` array.
+    """Save a single per-cadence lightning map as a `.npy` array.
 
     Output is the bare 2-D grid; the shared `romania_grid_{lats,lons}.npy`
     in `reprojected_data/` carries the coordinates for all products, so
@@ -370,7 +455,7 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
         'current':    ('current',    'lightning_current',    'normalized_current_weighted_density',
                        'Lightning Current-Weighted Density'),
         'occurrence': ('occurrence', 'lightning_occurrence', 'binary',
-                       'Lightning Occurrence within 15-minute window'),
+                       f'Lightning Occurrence within {TIME_STEP_MINUTES}-minute window'),
     }
 
     folders = {}
@@ -400,7 +485,7 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
             all_tasks.append((
                 str(folders[prod_key] / f"{file_prefix}_{time_str}.npy"),
                 data, lats, lons, timestamp,
-                'datamap', var_units, var_long_name, '15'
+                'datamap', var_units, var_long_name, str(TIME_STEP_MINUTES)
             ))
 
     total_tasks = len(all_tasks)
@@ -430,14 +515,60 @@ def save_lightning_maps_parallel(density_maps, weighted_maps, occurrence_maps,
 # Single-date processing
 # =============================================================================
 
-def process_single_date(kml_path, date_str, output_root):
+def expected_steps_per_day():
+    """Number of bins this run will produce per date.
+
+    Mirrors generate_timesteps_and_windows: with a filter, it's
+    `len(filter) * 24`; otherwise it falls back to the fixed-cadence
+    `1440 / TIME_STEP_MINUTES`. Used by the completeness check below.
     """
-    Process one KML file into 15-minute lightning NetCDF maps.
+    if LIGHTNING_FILTER is not None:
+        return len(LIGHTNING_FILTER) * 24
+    return 1440 // TIME_STEP_MINUTES
+
+
+def is_date_complete(output_root, date_str, expected_count):
+    """True iff every sub-product subdir for `date_str` already has
+    `expected_count` `.npy` files matching the lightning naming
+    pattern. Used for resume support: a date that's already fully
+    processed should be skipped so an interrupted run can be re-launched
+    cheaply.
+
+    The check is strict (all three sub-products at the expected count).
+    Partial output -> not complete -> reprocess. A run that uses a
+    different `--lightning_dir` for a different cadence would have
+    different `expected_count` and would correctly not consider the
+    old day "done".
+    """
+    output_root = Path(output_root)
+    for prod_name, file_prefix in (
+        ('density',    'lightning_density'),
+        ('current',    'lightning_current'),
+        ('occurrence', 'lightning_occurrence'),
+    ):
+        day_dir = output_root / prod_name / f"nc4_{date_str}-Romania_{prod_name}"
+        if not day_dir.is_dir():
+            return False
+        n_found = sum(
+            1 for f in os.listdir(day_dir)
+            if f.startswith(f"{file_prefix}_") and f.endswith(".npy")
+        )
+        if n_found != expected_count:
+            return False
+    return True
+
+
+def process_single_date(kml_path, date_str, output_root, force=False):
+    """
+    Process one KML file into per-cadence lightning `.npy` maps.
 
     Args:
         kml_path (str): Path to the KML file
         date_str (str): Date in 'YYYY-MM-DD' format
         output_root (str): Root output directory (product dirs are created inside)
+        force (bool): If False (default), skip the date when all three
+            sub-product subdirs already contain the expected number of
+            `.npy` files. If True, always reprocess and overwrite.
     """
     from c4dl.projection import GridProjection, romania_grid_area
 
@@ -445,6 +576,12 @@ def process_single_date(kml_path, date_str, output_root):
     print(f"Processing: {date_str}")
     print(f"{'=' * 70}")
     print(f"  KML file: {kml_path}")
+
+    expected = expected_steps_per_day()
+    if not force and is_date_complete(output_root, date_str, expected):
+        print(f"  Already complete ({expected} files per sub-product); "
+              f"skipping. Pass --force to reprocess.")
+        return
 
     # Read lightning data
     lightning_df = read_kml_extract_coordinates(kml_path)
@@ -471,8 +608,11 @@ def process_single_date(kml_path, date_str, output_root):
     # Create grid projection
     grid_projection = GridProjection(romania_grid_area)
 
-    # Generate fixed 15-minute time grid
-    timestamps = generate_fixed_timesteps(date_str)
+    # Generate filter-aligned time grid (or fixed-cadence fallback when
+    # products.lightning.filter is null). Each timestamp comes paired
+    # with its accumulation window start so variable window widths can
+    # cover the gaps between filter slots.
+    timestamps, start_times = generate_timesteps_and_windows(date_str)
     print(f"  Time steps: {len(timestamps)} "
           f"({timestamps[0].strftime('%H:%M')} to "
           f"{timestamps[-1].strftime('%H:%M')})")
@@ -480,13 +620,13 @@ def process_single_date(kml_path, date_str, output_root):
     # Generate density + current maps
     print(f"  Generating density and current-weighted maps...")
     density_maps, weighted_maps, _ = create_density_maps(
-        lightning_df, grid_projection, timestamps
+        lightning_df, grid_projection, timestamps, start_times
     )
 
     # Generate occurrence maps
     print(f"  Generating occurrence maps...")
     occurrence_maps, _ = generate_lightning_occurrence_maps(
-        lightning_df, grid_projection, timestamps
+        lightning_df, grid_projection, timestamps, start_times
     )
 
     # Save
@@ -540,7 +680,7 @@ def discover_dates(data_root):
     return results
 
 
-def run_all(data_root, output_root, date_filter=None):
+def run_all(data_root, output_root, date_filter=None, force=False):
     """
     Process all (or one) dates.
 
@@ -548,14 +688,25 @@ def run_all(data_root, output_root, date_filter=None):
         data_root (str): Root lightning data directory
         output_root (str): Root output directory
         date_filter (str or None): Process only this date (YYYY-MM-DD)
+        force (bool): If False (default), skip dates whose three
+            sub-product subdirs already contain the expected number of
+            `.npy` files. If True, reprocess everything.
     """
     print("=" * 70)
-    print("Lightning KML -> 15-minute NetCDF Maps (COALITION-4)")
+    print("Lightning KML -> per-cadence .npy Maps (COALITION-4)")
     print("=" * 70)
     print(f"Data root   : {data_root}")
     print(f"Output root : {output_root}")
-    print(f"Time step   : {TIME_STEP_MINUTES} minutes")
-    print(f"Steps/day   : {STEPS_PER_DAY}")
+    print(f"Time step   : {TIME_STEP_MINUTES} minutes "
+          f"({_TIME_STEP_SOURCE})")
+    if LIGHTNING_FILTER is not None:
+        print(f"Filter      : {LIGHTNING_FILTER}  "
+              f"(products.lightning.filter; "
+              f"{len(LIGHTNING_FILTER) * 24} maps/day, variable windows)")
+    else:
+        print(f"Filter      : (none) - {1440 // TIME_STEP_MINUTES} "
+              f"maps/day at fixed {TIME_STEP_MINUTES}-min cadence")
+    print(f"Resume      : {'OFF (--force)' if force else 'ON (skip complete dates)'}")
 
     if date_filter:
         kml_path = os.path.join(data_root, "kml_data", date_filter,
@@ -574,7 +725,7 @@ def run_all(data_root, output_root, date_filter=None):
         return
 
     for date_str, kml_path in dates:
-        process_single_date(kml_path, date_str, output_root)
+        process_single_date(kml_path, date_str, output_root, force=force)
 
     print(f"\n{'=' * 70}")
     print(f"Complete: processed {len(dates)} date(s)")
@@ -587,8 +738,10 @@ def run_all(data_root, output_root, date_filter=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Process LINET lightning KML data into 15-minute "
-                    "NetCDF maps for COALITION-4."
+        description="Process LINET lightning KML data into per-cadence "
+                    "`.npy` maps for COALITION-4. Cadence comes from "
+                    "products.lightning.cadence_minutes (falling back to "
+                    "step_minutes) in our_data/timestep_config.json."
     )
     parser.add_argument(
         "--data_root", "-d", type=str, default=DEFAULT_DATA_ROOT,
@@ -602,6 +755,13 @@ if __name__ == "__main__":
         "--date", type=str, default=None,
         help="Process a single date (YYYY-MM-DD)"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Reprocess and overwrite even when a date's three sub-product "
+             "subdirs already contain the expected number of .npy files. "
+             "Default behaviour is to skip already-complete dates so an "
+             "interrupted batch run can be resumed cheaply."
+    )
 
     args = parser.parse_args()
 
@@ -609,5 +769,6 @@ if __name__ == "__main__":
         data_root=args.data_root,
         output_root=args.output_root,
         date_filter=args.date,
+        force=args.force,
     )
     

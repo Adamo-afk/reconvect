@@ -386,7 +386,7 @@ import os
 import sys
 import json
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -465,7 +465,10 @@ def resolve_index_source(data_root, source):
     - source='radar': reads our_data/patch_index/patch_index.csv with the
       cadence from timestep_config.json (STEP_MINUTES).
     - source='lightning': reads our_data/lightning_periods/lightning_patches.csv
-      with the cadence from lightning_periods_config.json (aggregation_minutes).
+      with the cadence from lightning_periods_config.json (step_minutes).
+      identify_lightning_periods.py no longer aggregates - each surviving
+      occurrence map produces one row at the native step_minutes cadence -
+      so the effective sequence step equals step_minutes.
     """
     if source == 'radar':
         return (
@@ -486,7 +489,7 @@ def resolve_index_source(data_root, source):
         lp_cfg = json.loads(Path(cfg_path).read_text())
         return (
             os.path.join(lp_dir, 'lightning_patches.csv'),
-            int(lp_cfg['aggregation_minutes']),
+            int(lp_cfg['step_minutes']),
         )
     raise ValueError(f"Unknown source: {source}")
 
@@ -523,6 +526,99 @@ def load_patch_index(data_root, source='radar'):
                 index[(date_str, time_str)] = active
 
     return index
+
+
+# =============================================================================
+# Manifest gate (cross-product timestep filter from intersect_product_coverage)
+# =============================================================================
+
+def load_manifest_timesteps(manifest_path):
+    """Return the set of (date, 'HH:MM') tuples listed in the manifest.
+
+    `timestep_manifest.csv` (output of `intersect_product_coverage.py`)
+    has columns `date,hhmm,<key>_hhmm,...`. We only need the first two -
+    the per-product columns are an audit trail consumed by other tooling.
+    Returns None when no manifest path is supplied / discovered, so the
+    caller can distinguish "no manifest" from "manifest with zero rows".
+    """
+    if not manifest_path or not os.path.isfile(manifest_path):
+        return None
+    used: set[tuple[str, str]] = set()
+    with open(manifest_path, 'r') as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or 'date' not in reader.fieldnames \
+                or 'hhmm' not in reader.fieldnames:
+            return set()
+        for row in reader:
+            date_str = row['date'].strip()
+            hhmm = row['hhmm'].strip()
+            if not date_str or len(hhmm) != 4 or not hhmm.isdigit():
+                continue
+            used.add((date_str, f"{hhmm[:2]}:{hhmm[2:]}"))
+    return used
+
+
+def apply_manifest_gate(index, manifest_set, drops_csv_path):
+    """Filter `index` by `manifest_set` and report what was dropped.
+
+    `index` is the dict from `load_patch_index` (one key per active
+    (date, time)). `manifest_set` is the set returned by
+    `load_manifest_timesteps`, or None when no manifest was supplied.
+    `drops_csv_path` is where the per-source audit CSV listing every
+    dropped (date, time) is written when there's anything to write.
+
+    Returns the manifest-filtered index. When `manifest_set` is None,
+    returns the input unchanged and prints a notice so the no-gate
+    behaviour is visible rather than silent.
+    """
+    if manifest_set is None:
+        print()
+        print("Manifest gate")
+        print("-" * 70)
+        print("  No timestep_manifest.csv found - NO cross-product gate "
+              "applied.")
+        print("  Run `python intersect_product_coverage.py ...` to produce "
+              "one, or pass --manifest PATH explicitly.")
+        print()
+        return index
+
+    before = len(index)
+    kept_keys = [k for k in index.keys() if k in manifest_set]
+    dropped_keys = sorted(k for k in index.keys() if k not in manifest_set)
+    after = len(kept_keys)
+    n_dropped = before - after
+
+    print()
+    print("Manifest gate")
+    print("-" * 70)
+    print(f"  Patch index entries        : {before}")
+    print(f"  Manifest entries           : {len(manifest_set)}")
+    print(f"  Kept (in both)             : {after}")
+    print(f"  Dropped (index \\ manifest) : {n_dropped} "
+          f"({(n_dropped / before * 100) if before else 0:.1f}%)")
+
+    if n_dropped:
+        # Per-date breakdown: which days lost the most timesteps?
+        drop_count_by_date = Counter(d for d, _ in dropped_keys)
+        top_drops = drop_count_by_date.most_common(10)
+        print()
+        print(f"  Top {min(10, len(top_drops))} dates by drop count:")
+        for date_str, n in top_drops:
+            print(f"    {date_str} : {n} timesteps dropped")
+
+        # Audit CSV with every dropped (date, time) so the decision is
+        # reproducible from disk, not just from this script's stdout.
+        os.makedirs(os.path.dirname(drops_csv_path) or '.', exist_ok=True)
+        with open(drops_csv_path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['date', 'time_utc'])
+            for date_str, time_str in dropped_keys:
+                w.writerow([date_str, time_str])
+        print()
+        print(f"  Audit CSV: {drops_csv_path} ({n_dropped} rows)")
+    print()
+
+    return {k: index[k] for k in kept_keys}
 
 
 # =============================================================================
@@ -829,8 +925,16 @@ def main():
         help="Activity source. 'radar' (default) reads patch_index.csv from "
              "identify_patches.py and uses step_minutes from "
              "timestep_config.json. 'lightning' reads lightning_patches.csv "
-             "from identify_lightning_periods.py and uses aggregation_minutes "
+             "from identify_lightning_periods.py and uses step_minutes "
              "from lightning_periods_config.json as the step interval."
+    )
+    parser.add_argument(
+        "--manifest", type=str, default=None,
+        help="Path to timestep_manifest.csv from intersect_product_coverage.py "
+             "(default: auto-discover at <data_root>/timestep_manifest.csv). "
+             "Pass 'none' to disable the manifest gate explicitly; useful for "
+             "debugging where you want sequences before the cross-product "
+             "intersection is applied."
     )
 
     args = parser.parse_args()
@@ -864,8 +968,29 @@ def main():
     dates = sorted(set(d for d, _ in index.keys()))
     print(f"  {len(index)} active timestamps across {len(dates)} dates")
 
+    # Apply the cross-product manifest gate. This is the final filter -
+    # extract_patches.py reads the same manifest, so any (date, time) we
+    # surface in train/val/test_data.csv has guaranteed coverage from
+    # every product in the intersect set. Dropped entries are printed +
+    # written to an audit CSV so the decision is reproducible from disk.
+    if args.manifest is None:
+        manifest_path = os.path.join(args.data_root, 'timestep_manifest.csv')
+    elif args.manifest.lower() in ('none', ''):
+        manifest_path = ''
+    else:
+        manifest_path = args.manifest
+    manifest_set = (load_manifest_timesteps(manifest_path)
+                    if manifest_path else None)
+    drops_csv_path = os.path.join(
+        args.data_root, f'extract_patch_seq_drops_{args.source}.csv'
+    )
+    index = apply_manifest_gate(index, manifest_set, drops_csv_path)
+    if not index:
+        print("No timestamps survive the manifest gate. Nothing to do.")
+        return
+
     # Find all qualifying sequences (full 24h)
-    print("\nAnalyzing temporal continuity (all 24h)...")
+    print("Analyzing temporal continuity (all 24h)...")
     all_sequences = find_all_sequences(
         index, args.past, args.future,
         step_minutes=effective_step_minutes,
@@ -883,30 +1008,36 @@ def main():
     )
     print(f"  Train: {len(train)}, Validation: {len(val)}, Test: {len(test)}")
 
-    # Save three CSVs
+    # Save three CSVs. Outputs are suffixed with `_<source>` so the
+    # radar-driven and lightning-driven tracks can coexist on disk
+    # (domain-adaptation pipeline trains both and uses them as separate
+    # feature extractors).
     print("\nSaving results...")
+    src = args.source
     save_sequences(
         train,
-        os.path.join(args.data_root, 'train_data.csv'),
+        os.path.join(args.data_root, f'train_data_{src}.csv'),
         args.past, args.future
     )
     save_sequences(
         val,
-        os.path.join(args.data_root, 'validation_data.csv'),
+        os.path.join(args.data_root, f'validation_data_{src}.csv'),
         args.past, args.future
     )
     save_sequences(
         test,
-        os.path.join(args.data_root, 'test_data.csv'),
+        os.path.join(args.data_root, f'test_data_{src}.csv'),
         args.past, args.future
     )
 
     # Drop a sidecar metadata file so create_datasets.py can recover step
     # minutes and window length without re-parsing column names.
-    # `step_minutes` is the *effective* spacing between adjacent steps (i.e.
-    # aggregation_minutes when source=lightning), so downstream consumers can
-    # treat it uniformly. `source_step_minutes_native` is the configured
-    # cadence from timestep_config.json — preserved for traceability.
+    # `step_minutes` is the *effective* spacing between adjacent steps
+    # (i.e. aggregation_minutes when source=lightning), so downstream
+    # consumers can treat it uniformly. `source_step_minutes_native` is
+    # the configured cadence from timestep_config.json - preserved for
+    # traceability. Suffixed by source so the two tracks don't clobber
+    # each other's metadata.
     seq_meta = {
         "source": args.source,
         "step_minutes": effective_step_minutes,
@@ -916,7 +1047,9 @@ def main():
         "step_columns": [step_column_name(o)
                          for o in range(-args.past, args.future + 1)],
     }
-    seq_meta_path = os.path.join(args.data_root, 'sequence_meta.json')
+    seq_meta_path = os.path.join(
+        args.data_root, f'sequence_meta_{src}.json'
+    )
     with open(seq_meta_path, 'w') as f:
         json.dump(seq_meta, f, indent=2)
     print(f"  Saved sequence metadata -> {seq_meta_path}")

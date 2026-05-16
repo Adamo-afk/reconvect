@@ -21,9 +21,18 @@ Design contract
   the user passes. Lightning is included only when
   `--summary lightning=...` is supplied. There is no implicit product
   list - what you pass is what you get.
-- Per-timestep availability is read from each summarizer's companion
-  `<name>_missing_timesteps.json` (auto-discovered next to the summary
-  CSV; overridable per product with `--missing KEY=PATH`).
+- Per-timestep availability is read from one of two sources, per product:
+    * Default: `<name>_missing_timesteps.json` (auto-discovered next to
+      the summary CSV; overridable with `--missing KEY=PATH`). A slot
+      survives iff its snapped HHMM is NOT in the missing set.
+    * Opt-in via `--active KEY=PATH`: an active-steps CSV with
+      `date,time_utc,...` columns where each remaining column is a 1/0
+      activity flag. A slot survives iff its snapped HHMM IS in the
+      active set (any of the flag columns == 1). Used for lightning
+      (`lightning_active_steps.csv` from summarize_lightning_data.py)
+      where the activity signal — not just file presence — is what we
+      want the manifest to gate on. When `--active` is provided for a
+      product, the missing-JSON path is skipped for it entirely.
 - Per-product minute filters come from `timestep_config.json` (written
   by validate_timestep.py). For each master-grid HHMM we snap to the
   nearest minute in each product's filter, then check whether it is
@@ -50,6 +59,8 @@ Example
         --summary mtg=mtg_summary.csv \
         --summary nwcsaf=nwcsaf_summary.csv \
         --summary opera=opera_summary.csv \
+        --summary lightning=lightning_summary.csv \
+        --active lightning=lightning_active_steps.csv \
         --errors_log our_data/reprojected_data/reproject_satellite_MTG.log
 """
 
@@ -122,6 +133,10 @@ def parse_summary_arg(raw: str) -> tuple[str, Path]:
 
 def parse_missing_arg(raw: str) -> tuple[str, Path]:
     return parse_keyed_arg(raw, "--missing")
+
+
+def parse_active_arg(raw: str) -> tuple[str, Path]:
+    return parse_keyed_arg(raw, "--active")
 
 
 # =============================================================================
@@ -212,6 +227,57 @@ def load_missing(product: str, json_path: Path) -> set[tuple[str, str]]:
     return out
 
 
+def load_active(product: str, csv_path: Path) -> set[tuple[str, str]]:
+    """Return the set of (date, 'HHMM') tuples marked active for `product`.
+
+    The active CSV (e.g. `lightning_active_steps.csv` from
+    summarize_lightning_data.py) has columns
+        date,time_utc,<flag_1>,<flag_2>,...
+    where time_utc is `HH:MM` and the remaining columns are 1/0 flags
+    per sub-product. A row counts as "active" iff at least one flag
+    column is `1` — the any-of-three semantics requested for lightning.
+
+    When `--active` is supplied for a product, this set replaces the
+    missing-JSON gate entirely: a slot survives iff its snapped HHMM
+    is IN the returned set.
+    """
+    if not csv_path.is_file():
+        sys.exit(
+            f"ERROR: --active {product}: file not found: {csv_path}.\n"
+            f"Run summarize_lightning_data.py to regenerate it."
+        )
+
+    out: set[tuple[str, str]] = set()
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            sys.exit(f"ERROR: --active {product}: empty CSV {csv_path}")
+        missing_cols = [c for c in ("date", "time_utc")
+                        if c not in reader.fieldnames]
+        if missing_cols:
+            sys.exit(
+                f"ERROR: --active {product}: {csv_path} missing required "
+                f"columns: {missing_cols}"
+            )
+        flag_cols = [c for c in reader.fieldnames
+                     if c not in ("date", "time_utc")]
+        if not flag_cols:
+            sys.exit(
+                f"ERROR: --active {product}: {csv_path} has no flag columns "
+                f"(need at least one column beyond date,time_utc)"
+            )
+        for row in reader:
+            date_str = (row.get("date") or "").strip()
+            time_str = (row.get("time_utc") or "").strip()
+            if not date_str or not time_str:
+                continue
+            if not any((row.get(c) or "").strip() == "1" for c in flag_cols):
+                continue
+            out.add((date_str, _hhmm_4d(time_str)))
+
+    return out
+
+
 # =============================================================================
 # Cadence snap (same rule as extract_patches.py)
 # =============================================================================
@@ -295,12 +361,16 @@ def build_master_grid(dates: list[str],
     return out
 
 
-def intersect(master, product_keys, missing_by_product,
+def intersect(master, product_keys, missing_by_product, active_by_product,
               filter_by_product, error_pairs, dates_by_product):
     """For each master slot:
       1. snap HHMM to each product's filter,
-      2. check that the slot is not in the product's missing set (and
-         falls within a date the product was scanned for),
+      2. presence check, branching per product:
+         - if the product has an `active_by_product` entry (set), the slot
+           survives iff `(date, snapped) IN active_set` (active-CSV mode),
+         - otherwise the slot survives iff `(date, snapped) NOT IN missing`
+           (missing-JSON mode, the legacy default),
+         and the date must be in the product's scanned-dates set,
       3. check that no error-log entry matches.
 
     Returns:
@@ -322,9 +392,15 @@ def intersect(master, product_keys, missing_by_product,
                 break
             flt = filter_by_product[product]
             snapped = snap_hhmm(hhmm, flt) if flt else hhmm
-            if (date_str, snapped) in missing_by_product[product]:
-                drop_reason = product
-                break
+            active_set = active_by_product.get(product)
+            if active_set is not None:
+                if (date_str, snapped) not in active_set:
+                    drop_reason = product
+                    break
+            else:
+                if (date_str, snapped) in missing_by_product[product]:
+                    drop_reason = product
+                    break
             per_product_hhmm[product] = snapped
 
         if drop_reason is not None:
@@ -456,6 +532,15 @@ def main() -> int:
              "directory.",
     )
     parser.add_argument(
+        "--active", action="append", default=[], type=parse_active_arg,
+        metavar="KEY=PATH",
+        help="Replace the missing-JSON gate for a product with an "
+             "active-steps CSV (`date,time_utc,<flag1>,<flag2>,...`). A "
+             "slot survives iff its snapped HHMM is IN this set. "
+             "Mutually exclusive with --missing for the same product. "
+             "Typical use: `--active lightning=lightning_active_steps.csv`.",
+    )
+    parser.add_argument(
         "--errors_log", action="append", default=[], metavar="PATH",
         help="Reproject error log (`reproject_<category>.log`). Repeat for "
              "each category. (date, HHMM) pairs parsed from these logs are "
@@ -496,6 +581,17 @@ def main() -> int:
             sys.exit(f"ERROR: --missing {key!r} has no matching --summary")
         missing_overrides[key] = path
 
+    active_sources: dict[str, Path] = {}
+    for key, path in args.active:
+        if key not in summary_paths:
+            sys.exit(f"ERROR: --active {key!r} has no matching --summary")
+        if key in missing_overrides:
+            sys.exit(
+                f"ERROR: --active and --missing both supplied for "
+                f"{key!r}; choose one (active replaces missing for that product)."
+            )
+        active_sources[key] = path
+
     config = load_timestep_config(Path(args.timestep_config))
     step_minutes = int(config["step_minutes"])
 
@@ -523,16 +619,27 @@ def main() -> int:
         print(f"  {key:10s} : {len(dates_by_product[key])} dates in "
               f"summary CSV")
 
-    # 2) Missing-timesteps JSON per product.
+    # 2) Presence gate per product: either an active-CSV (--active) or a
+    #    missing-JSON (--missing override or auto-discovered).
     missing_by_product: dict[str, set[tuple[str, str]]] = {}
+    active_by_product: dict[str, set[tuple[str, str]] | None] = {}
     for key in product_keys:
-        if key in missing_overrides:
-            mpath = missing_overrides[key]
+        if key in active_sources:
+            apath = active_sources[key]
+            active_by_product[key] = load_active(key, apath)
+            missing_by_product[key] = set()
+            print(f"  {key:10s} : {len(active_by_product[key])} active "
+                  f"(date, HHMM) pairs <- {apath.name}")
         else:
-            mpath = summary_paths[key].parent / PRODUCT_LAYOUT[key]["missing_name"]
-        missing_by_product[key] = load_missing(key, mpath)
-        print(f"  {key:10s} : {len(missing_by_product[key])} missing "
-              f"(date, HHMM) pairs <- {mpath.name}")
+            active_by_product[key] = None
+            if key in missing_overrides:
+                mpath = missing_overrides[key]
+            else:
+                mpath = (summary_paths[key].parent
+                         / PRODUCT_LAYOUT[key]["missing_name"])
+            missing_by_product[key] = load_missing(key, mpath)
+            print(f"  {key:10s} : {len(missing_by_product[key])} missing "
+                  f"(date, HHMM) pairs <- {mpath.name}")
 
     # 3) Error logs.
     error_pairs: set[tuple[str, str]] = set()
@@ -553,7 +660,7 @@ def main() -> int:
 
     # 5) Intersect.
     kept, dropped = intersect(
-        master, product_keys, missing_by_product,
+        master, product_keys, missing_by_product, active_by_product,
         filter_by_product, error_pairs, dates_by_product,
     )
     print(f"Kept          : {len(kept)} timesteps "
