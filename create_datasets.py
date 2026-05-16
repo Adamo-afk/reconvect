@@ -605,7 +605,7 @@ def get_mode_config(mode):
 # past_steps, and future_steps. INPUT_COLS / LABEL_COLS / T_OFFSETS /
 # N_INPUT / N_LABEL are populated by init_sequence_config(data_root,
 # source) - called once from main() before any function below uses
-# them - so the radar-driven and lightning-driven tracks can coexist on
+# them - so the DBSCAN-driven and lightning-driven tracks can coexist on
 # disk without colliding on a single sequence_meta.json.
 
 PROJECT_ROOT_FOR_SEQ = Path(__file__).resolve().parent
@@ -627,7 +627,7 @@ N_INPUT: int | None = None
 N_LABEL: int | None = None
 
 
-def init_sequence_config(data_root, source: str = "radar") -> None:
+def init_sequence_config(data_root, source: str = "dbscan") -> None:
     """Load `sequence_meta_<source>.json` and populate module globals.
 
     Must be called exactly once before any function that depends on
@@ -1046,16 +1046,17 @@ def load_tfrecord_dataset(shard_dir: Path,
     return ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
 
-def create_and_save_datasets(data_root, mode, source="radar", output_root=None):
+def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None):
     """Create and save train, validation, and test datasets.
 
     Args:
         data_root: path to our_data/ directory containing CSVs and patches/
         mode: one of mtg_lightning, mtg_radar, mtg_radar_continuous,
-            mtg_opera_radar_only, mtg_opera_mtgmr, mtg_opera_nwcsaf,
-            mtg_opera_full
+            mtg_opera_radar_only, mtg_opera_mtgmr
         source: which extract_patch_seq source the sample CSVs came from
-            ('radar' or 'lightning'). The dataset directory is suffixed
+            ('dbscan' = patch_index.csv from identify_patches, or
+            'lightning' = lightning_patches.csv from
+            identify_lightning_periods). The dataset directory is suffixed
             by source so the two tracks coexist on disk.
         output_root: where to save datasets (default: data_root/datasets/)
     """
@@ -1172,18 +1173,20 @@ def main():
     parser.add_argument(
         "--mode", type=str, required=True,
         choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                 "mtg_opera_nwcsaf", "mtg_opera_full"],
+                 "mtg_opera_radar_only", "mtg_opera_mtgmr"],
         help="Dataset mode (MSG modes are disabled in this build)."
     )
     parser.add_argument(
-        "--source", type=str, default="radar",
-        choices=["radar", "lightning"],
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
         help="Which extract_patch_seq source the sample CSVs came from. "
              "Selects which sequence_meta_<source>.json and "
              "{train,validation,test}_data_<source>.csv are read, and "
              "lands the output dataset at datasets/<mode>_<source>/. "
-             "(default: radar)",
+             "'dbscan' (default) = patch_index.csv from identify_patches "
+             "(either --source radar/RZC or --source opera at that step). "
+             "'lightning' = lightning_patches.csv from "
+             "identify_lightning_periods.",
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",

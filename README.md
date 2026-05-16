@@ -20,10 +20,12 @@ Independently of which training mode you pick, sample selection now has two para
 
 | Track | What drives sample selection | Per-patch index produced by | `extract_patch_seq` / `create_datasets` / `train_models` flag |
 |---|---|---|---|
-| **OPERA / radar track** | DBSCAN clusters in OPERA `rainfall_rate` (or RZC) — broad convective coverage | `identify_patches.py --source opera` | `--source radar` |
+| **DBSCAN track** | DBSCAN clusters in OPERA `rainfall_rate` (or RZC) — broad convective coverage | `identify_patches.py --source {radar, opera}` | `--source dbscan` |
 | **Lightning track** | Per-map occurrence-fraction threshold (≥ 0.30 × mean over active maps) — lightning-active windows only | `identify_lightning_periods.py` | `--source lightning` |
 
-Both tracks share the same model architecture and downstream training script. Every artefact emitted by `extract_patch_seq` / `create_datasets` / `train_models` is suffixed with `_<source>` so the two tracks never overwrite each other. Run `python train_models.py --source radar --stage both` on one machine and `... --source lightning --stage both` on another to train them in parallel.
+> Note the two `--source` vocabularies: `identify_patches.py --source {radar, opera}` picks the **sensor** whose data is clustered (both writes go to the same `patch_index.csv`); downstream `extract_patch_seq / create_datasets / train_models --source {dbscan, lightning}` picks the **index file** to consume (`patch_index.csv` vs `lightning_patches.csv`).
+
+Both tracks share the same model architecture and downstream training script. Every artefact emitted by `extract_patch_seq` / `create_datasets` / `train_models` is suffixed with `_<source>` so the two tracks never overwrite each other. Run `python train_models.py --source dbscan --stage both` on one machine and `... --source lightning --stage both` on another to train them in parallel.
 
 For end-to-end commands per track, see the runbooks at the project root:
 
@@ -136,7 +138,7 @@ coalition4-rcnn/
 │   │   ├── lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
 │   │   ├── opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
 │   │   └── opera_data/opera_constants.json                    # source projection (/where attrs)
-│   ├── patch_index/                   # DBSCAN patch identification output (--source radar / opera)
+│   ├── patch_index/                   # DBSCAN patch identification output (identify_patches --source {radar, opera})
 │   │   ├── patch_index.csv
 │   │   ├── patch_index.json
 │   │   └── plots/                     # Optional diagnostic plots
@@ -171,7 +173,7 @@ coalition4-rcnn/
 ├── run_opera.config                    # Comments-only runbook for the OPERA-driven track
 │
 ├── validate_timestep.py               # Step 0: Validate cadence → timestep_config.json
-├── identify_patches.py                # Step 1 (--source radar / opera): DBSCAN → patch_index.csv
+├── identify_patches.py                # Step 1 (--source {radar, opera}): DBSCAN → patch_index.csv
 ├── identify_lightning_periods.py      # Step 1 (--source lightning): occurrence-fraction filter → lightning_periods/lightning_patches.csv
 ├── reproject.py                          # Step 2: Reproject all products to Romania grid; also aggregates per-category logs into errors.txt
 ├── extract_patches.py                 # Step 3: Slice 256×256 patches from reprojected data
@@ -179,7 +181,7 @@ coalition4-rcnn/
 ├── intersect_product_coverage.py      # Step 4.2: Per-timestep manifest + plot (--summary / --missing / --active per product)
 ├── compute_normalization_stats.py     # Step 4.3: Per-variable mean/std → normalization_stats.json
 ├── create_datasets.py                 # Step 5: Build TF datasets + metadata.json (--source aware)
-├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source radar / lightning)
+├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
 ├── evaluate_coalition.py              # Step 7: Evaluate and generate plots
 │
 ├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
@@ -388,11 +390,11 @@ Dataset splitting follows Czibula et al. (2024): each day is divided into equal 
 **Manifest gate (final cross-product filter).** Step 4.1 auto-discovers `our_data/timestep_manifest.csv` (from Step 4.2 below) and intersects the patch index with it before searching for sequences. This is the final filter that decides which `(date, time)` tuples can become training samples: a slot only survives if every product in the intersect set had data there. The intersection is reported on stdout with a top-N "dates by drop count" table, and every dropped `(date, time)` is written to `our_data/extract_patch_seq_drops_<source>.csv` for audit. Pass `--manifest none` to disable the gate (debug only).
 
 ```bash
-python extract_patch_seq_for_datasets.py --source radar             # OPERA / radar track (reads patch_index.csv)
+python extract_patch_seq_for_datasets.py --source dbscan            # DBSCAN track (reads patch_index.csv)
 python extract_patch_seq_for_datasets.py --source lightning         # Lightning track (reads lightning_patches.csv)
-python extract_patch_seq_for_datasets.py --source radar --block_hours 4            # 4h blocks (finer diurnal balance)
-python extract_patch_seq_for_datasets.py --source radar --test_frac 0.15 --val_frac 0.15  # 15/15/70 split
-python extract_patch_seq_for_datasets.py --source radar --manifest none            # Skip the manifest gate
+python extract_patch_seq_for_datasets.py --source dbscan --block_hours 4           # 4h blocks (finer diurnal balance)
+python extract_patch_seq_for_datasets.py --source dbscan --test_frac 0.15 --val_frac 0.15  # 15/15/70 split
+python extract_patch_seq_for_datasets.py --source dbscan --manifest none           # Skip the manifest gate
 ```
 
 Outputs (suffixed by source so the two tracks coexist on disk):
@@ -572,17 +574,19 @@ Transforms patches using the **data-driven** mean / std from
 
 Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, and the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr` modes. The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
 
-The new `--source {radar, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at `our_data/datasets/<mode>_<source>/`. Mode and source are independent: a single mode can be built once per source so the lightning- and OPERA-driven tracks have separate dataset directories.
+The new `--source {dbscan, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at `our_data/datasets/<mode>_<source>/`. Mode and source are independent: a single mode can be built once per source so the lightning- and DBSCAN-driven tracks have separate dataset directories.
 
 ```bash
-# OPERA / radar-driven sample selection
-python create_datasets.py --mode mtg_lightning        --source radar
-python create_datasets.py --mode mtg_radar            --source radar
-python create_datasets.py --mode mtg_radar_continuous --source radar
+# DBSCAN-driven sample selection (uses patch_index.csv produced by
+# identify_patches.py, whether that script was run with --source radar
+# or --source opera).
+python create_datasets.py --mode mtg_lightning        --source dbscan
+python create_datasets.py --mode mtg_radar            --source dbscan
+python create_datasets.py --mode mtg_radar_continuous --source dbscan
 
 # OPERA-driven precipitation modes
-python create_datasets.py --mode mtg_opera_radar_only --source radar
-python create_datasets.py --mode mtg_opera_mtgmr      --source radar
+python create_datasets.py --mode mtg_opera_radar_only --source dbscan
+python create_datasets.py --mode mtg_opera_mtgmr      --source dbscan
 
 # Lightning-driven sample selection (same modes can be rebuilt here)
 python create_datasets.py --mode mtg_lightning        --source lightning
@@ -642,24 +646,24 @@ The Swin head sits on the named `backbone_output` layer (the decoder's final fea
 # A. Simple — base only (the standard model, single run)
 python train_models.py \
     --config training.config \
-    --mode mtg_opera_full \
-    --source radar \
+    --mode mtg_opera_mtgmr \
+    --source dbscan \
     --stage base
 
 # B. Domain adaptation — base + Swin head fine-tune in one process
 python train_models.py \
     --config training.config \
-    --mode mtg_opera_full \
-    --source radar \
+    --mode mtg_opera_mtgmr \
+    --source dbscan \
     --stage both
 
 # C. Resume / fine-tune a previously-saved base
 python train_models.py \
     --config training.config \
-    --mode mtg_opera_full \
-    --source radar \
+    --mode mtg_opera_mtgmr \
+    --source dbscan \
     --stage finetune \
-    --base_checkpoint models/coalition_mtg_opera_full_radar.keras
+    --base_checkpoint models/coalition_mtg_opera_mtgmr_dbscan.keras
 
 # Train every mode listed in [modes].run, both stages, lightning source
 python train_models.py --config training.config --source lightning --stage both
@@ -667,8 +671,8 @@ python train_models.py --config training.config --source lightning --stage both
 # Override the default dataset path (debug only; --stage base only)
 python train_models.py \
     --config training.config \
-    --mode mtg_opera_full --source radar --stage base \
-    --dataset_dir our_data/datasets/mtg_opera_full_radar
+    --mode mtg_opera_mtgmr --source dbscan --stage base \
+    --dataset_dir our_data/datasets/mtg_opera_mtgmr_dbscan
 ```
 
 Outputs under `./models/` (`run_tag = <mode>_<source>`):
@@ -684,7 +688,7 @@ history_<run_tag>.json
 history_<run_tag>_finetuned.json
 ```
 
-The per-epoch checkpoint is the run's safety net for the occasional CUDA crash — at most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two tracks (`--source radar` vs `--source lightning`) have completely separate checkpoint paths so they can train in parallel on different machines without colliding.
+The per-epoch checkpoint is the run's safety net for the occasional CUDA crash — at most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two tracks (`--source dbscan` vs `--source lightning`) have completely separate checkpoint paths so they can train in parallel on different machines without colliding.
 
 #### Step 7 — Evaluate
 
@@ -708,7 +712,7 @@ python lightning_fraction.py
 
 # Generate dataset diagnostic plots (6 panels: diurnal cycle, spatial heatmap, etc.)
 python data_statistics.py
-python data_statistics.py --sequences our_data/train_data_radar.csv
+python data_statistics.py --sequences our_data/train_data_dbscan.csv
 
 # Lightning activity bar plots (reads lightning_active_steps.csv; plots-only).
 python our_data/lightning_data/visualize_lightning_stats.py \

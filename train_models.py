@@ -22,8 +22,7 @@ is. The dataset for each mode must already exist under
 choices for the full list).
 
   - mtg_lightning
-        Inputs:  radar + LINET lightning + MTG vis_06 (HR) + MTG IR/WV (MR)
-                 + NWCSAF (LR).
+        Inputs:  radar + LINET lightning + MTG vis_06 (HR) + MTG IR/WV (MR).
         Target:  binary lightning occurrence.
 
   - mtg_radar
@@ -34,26 +33,14 @@ choices for the full list).
         Inputs:  same as mtg_radar.
         Target:  continuous RZC regression in [0, 1] (normalised).
 
-  - mtg_opera_radar_only          *NWCSAF Shapley study — baseline*
+  - mtg_opera_radar_only
         Inputs:  MTG vis_06 (HR) + OPERA reflectivity + rainfall_rate (MR).
-                 No MTG IR/WV. No NWCSAF. No lightning.
+                 No MTG IR/WV. No lightning.
         Target:  opera_rainfall_rate 5-class (same bin edges as RZC).
 
-  - mtg_opera_mtgmr               *Shapley: + MTG IR/WV*
+  - mtg_opera_mtgmr
         Inputs:  mtg_opera_radar_only + MTG IR/WV in MR.
         Target:  same as mtg_opera_radar_only.
-
-  - mtg_opera_nwcsaf              *Shapley: + NWCSAF*
-        Inputs:  mtg_opera_radar_only + NWCSAF in LR.
-        Target:  same as mtg_opera_radar_only.
-
-  - mtg_opera_full                *Shapley: + MTG IR/WV + NWCSAF*
-        Inputs:  every input from the four bullets above.
-        Target:  same as mtg_opera_radar_only.
-
-The four `mtg_opera_*` modes form a 4-model coalition for the classical
-Shapley analysis of whether NWCSAF and MTG IR/WV add value on top of an
-OPERA-radar + MTG-vis baseline.
 
 Hyperparameters, the run list, the LR schedule, and the early-stopping
 configuration all live in `training.config`. See the docstring at the top
@@ -88,7 +75,7 @@ from pathlib import Path
 TRAINING_MODES: dict[str, dict[str, str]] = {
     "mtg_lightning": {
         "target":  "lightning (binary occurrence)",
-        "summary": "Radar + lightning + MTG (vis_06 HR / IR/WV MR) + NWCSAF (LR).",
+        "summary": "Radar + lightning + MTG (vis_06 HR / IR/WV MR).",
     },
     "mtg_radar": {
         "target":  "RZC 5-class precipitation",
@@ -100,20 +87,11 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
     },
     "mtg_opera_radar_only": {
         "target":  "opera_rainfall_rate 5-class",
-        "summary": "Shapley baseline: MTG vis_06 + OPERA. No MTG IR/WV, "
-                   "no NWCSAF, no lightning.",
+        "summary": "Baseline: MTG vis_06 + OPERA. No MTG IR/WV, no lightning.",
     },
     "mtg_opera_mtgmr": {
         "target":  "opera_rainfall_rate 5-class",
-        "summary": "Shapley: baseline + MTG IR/WV.",
-    },
-    "mtg_opera_nwcsaf": {
-        "target":  "opera_rainfall_rate 5-class",
-        "summary": "Shapley: baseline + NWCSAF.",
-    },
-    "mtg_opera_full": {
-        "target":  "opera_rainfall_rate 5-class",
-        "summary": "Shapley: baseline + MTG IR/WV + NWCSAF.",
+        "summary": "Baseline + MTG IR/WV in MR.",
     },
 }
 
@@ -1289,7 +1267,7 @@ class _ResumableCheckpoint(tf.keras.callbacks.Callback):
 
 def train(mode, data_root, epochs, batch_size, output_dir,
           dropout=0.1, norm=None, dataset_dir=None,
-          source="radar",
+          source="dbscan",
           shuffle_buffer=256,
           mixed_precision=True,
           lr_schedule_cfg=None,
@@ -1311,10 +1289,11 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         norm: normalization type ('batch', 'layer', or None).
         dataset_dir: explicit path to the dataset directory. When
             provided, overrides the default data_root/datasets/{mode}_{source}.
-        source: extract_patch_seq source ('radar' or 'lightning') the
-            dataset was built from. Selects which datasets/<mode>_<source>/
-            directory to read and is appended to the checkpoint / model /
-            history filenames so the two tracks don't clobber each other.
+        source: extract_patch_seq source ('dbscan' = patch_index.csv,
+            or 'lightning' = lightning_patches.csv) the dataset was built
+            from. Selects which datasets/<mode>_<source>/ directory to
+            read and is appended to the checkpoint / model / history
+            filenames so the two tracks don't clobber each other.
         shuffle_buffer: sample count for the training-time shuffle
             buffer. With ~5 MB samples, 256 ~= 1.3 GB host RAM.
         lr_schedule_cfg: dict with keys `type`, `initial_lr`,
@@ -1332,7 +1311,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     # Mode + source together are the unique experiment identifier - used
-    # everywhere we'd previously used just `mode` so the radar-driven
+    # everywhere we'd previously used just `mode` so the DBSCAN-driven
     # and lightning-driven runs can coexist on disk.
     run_tag = f"{mode}_{source}"
 
@@ -1551,7 +1530,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
 
 
 def train_finetune(mode, data_root, base_model_path, output_dir,
-                   source="radar", batch_size=4,
+                   source="dbscan", batch_size=4,
                    finetune_cfg=None,
                    shuffle_buffer=256,
                    mixed_precision=True,
@@ -1810,12 +1789,15 @@ def main():
         help="Root directory containing datasets/ and lightning_fraction.json.",
     )
     parser.add_argument(
-        "--source", type=str, default="radar",
-        choices=["radar", "lightning"],
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
         help="Which extract_patch_seq source the training dataset was "
-             "built from. Selects datasets/<mode>_<source>/ as the "
-             "input and suffixes every saved checkpoint / model / "
-             "history with `_<source>`. (default: radar)",
+             "built from. 'dbscan' (default) = patch_index.csv from "
+             "identify_patches (whichever sensor that script was run "
+             "with). 'lightning' = lightning_patches.csv from "
+             "identify_lightning_periods. Selects datasets/<mode>_<source>/ "
+             "as the input and suffixes every saved checkpoint / model / "
+             "history with `_<source>`.",
     )
     parser.add_argument(
         "--stage", type=str, default="base",
