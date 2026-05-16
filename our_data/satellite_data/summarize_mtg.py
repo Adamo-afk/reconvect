@@ -1,9 +1,12 @@
 """
-summarize_mtg.py — Summarise downloaded MTG FCI chunks by date.
+summarize_mtg.py - Summarise downloaded MTG FCI chunks by date.
 
-Scans the _raw_chunks directory, parses FCI filenames, and produces
-a CSV showing how many repeat cycles and chunk files are available
-per date.
+Scans the _raw_chunks directory, parses FCI filenames, and produces a
+per-date CSV + missing-timesteps JSON. Coverage is measured against the
+configured MTG minute filter (`products.mtg.filter` from
+timestep_config.json) - the same set pipeline_msg_mtg.py uses to filter
+downloads before transfer - so a fully-covered day reports 100%, not
+"66.7%" against the unfiltered 144-cycle native cadence.
 
 Usage:
     python summarize_mtg.py
@@ -15,6 +18,7 @@ import os
 import re
 import sys
 import csv
+import json
 import argparse
 import datetime
 from collections import defaultdict
@@ -27,7 +31,68 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = str(PROJECT_ROOT / 'our_data' / 'satellite_data'
                       / 'MTG' / '_raw_chunks')
+TIMESTEP_CONFIG_PATH = PROJECT_ROOT / 'our_data' / 'timestep_config.json'
 
+# MTG native cadence (repeat cycle = 10 min); the file has 144 cycles
+# per 24h day. The filter from timestep_config.json picks a subset of
+# the cycles that align with the master grid.
+NATIVE_CADENCE_MINUTES = 10
+NATIVE_CYCLES_PER_DAY = 1440 // NATIVE_CADENCE_MINUTES  # 144
+
+
+# =============================================================================
+# Cadence config
+# =============================================================================
+
+def load_minute_filter():
+    """Read the MTG minute filter + step from timestep_config.json.
+
+    Returns (filter set, step_minutes). The filter is the minute-of-hour
+    set the master grid snaps to for MTG - exactly the set
+    pipeline_msg_mtg.py pre-filters on before downloading.
+    """
+    if not TIMESTEP_CONFIG_PATH.exists():
+        print(
+            f"ERROR: timestep config not found at {TIMESTEP_CONFIG_PATH}.\n"
+            f"Run from the project root:\n"
+            f"    python validate_timestep.py --step_minutes <N>",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
+    flt = cfg.get('products', {}).get('mtg', {}).get('filter')
+    if flt is None:
+        print(
+            f"ERROR: product 'mtg' has no minute filter in "
+            f"{TIMESTEP_CONFIG_PATH}. Re-run validate_timestep.py with a "
+            f"non-continuous mtg cadence in product_cadences.config.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return set(int(m) for m in flt), int(cfg['step_minutes'])
+
+
+def rc_minute_of_hour(rc):
+    """Minute-of-hour for a 1-indexed MTG repeat cycle (10-min native)."""
+    return ((rc - 1) * NATIVE_CADENCE_MINUTES) % 60
+
+
+def expected_rc_set(filter_minutes):
+    """Set of MTG repeat-cycle numbers that fall on the configured filter.
+
+    For a 10-min cadence and a filter of e.g. {0, 10, 30, 40}, this picks
+    cycles whose minute-of-hour is in the filter - typically 4 of every
+    6 cycles per hour, so 96 per day at step=15.
+    """
+    return {
+        rc for rc in range(1, NATIVE_CYCLES_PER_DAY + 1)
+        if rc_minute_of_hour(rc) in filter_minutes
+    }
+
+
+# =============================================================================
+# Filename parsing
+# =============================================================================
 
 def parse_fci_filename(filename):
     """Extract metadata from an FCI L1C filename."""
@@ -56,7 +121,7 @@ def parse_fci_filename(filename):
     return info
 
 
-def nominal_time(date_ref, repeat_cycle_in_day, period_min=10):
+def nominal_time(date_ref, repeat_cycle_in_day, period_min=NATIVE_CADENCE_MINUTES):
     """Compute nominal start time from repeat cycle number."""
     base = date_ref.replace(hour=0, minute=0, second=0, microsecond=0)
     return base + datetime.timedelta(
@@ -64,38 +129,46 @@ def nominal_time(date_ref, repeat_cycle_in_day, period_min=10):
     )
 
 
-def summarize(raw_dir):
+def rc_to_hhmm(rc):
+    """1-indexed repeat cycle -> 'HH:MM' string."""
+    total_min = (rc - 1) * NATIVE_CADENCE_MINUTES
+    h, m = divmod(total_min, 60)
+    return f"{h:02d}:{m:02d}"
+
+
+# =============================================================================
+# Summarise
+# =============================================================================
+
+def summarize(raw_dir, filter_minutes):
     """
     Scan _raw_chunks and build a per-date summary.
 
-    Returns:
-        list of dicts, one per date, sorted chronologically.
+    Returns (rows, dates) where:
+        rows: list of per-date dicts ready for CSV / printing
+        dates: raw per-date data passed to build_missing_timesteps
     """
     if not os.path.isdir(raw_dir):
         print(f"ERROR: directory not found: {raw_dir}", file=sys.stderr)
         sys.exit(1)
 
+    expected_rcs = expected_rc_set(filter_minutes)
+    expected_per_day = len(expected_rcs)
+
     nc_files = [f for f in os.listdir(raw_dir) if f.endswith('.nc')]
     print(f"Found {len(nc_files)} .nc files in {raw_dir}")
 
-    # Group by date
-    # Key: date string (YYYY-MM-DD)
-    # Value: dict with sets of repeat cycles, chunk counts, etc.
     dates = defaultdict(lambda: {
-        'body_files': 0,
-        'trailer_files': 0,
-        'repeat_cycles': set(),       # set of rc numbers
-        'complete_cycles': 0,         # cycles with exactly 2 body chunks
-        'incomplete_cycles': 0,       # cycles with only 1 body chunk
-        'chunks_seen': defaultdict(set),  # rc_num -> set of chunk_numbers
+        'body_files':     0,
+        'trailer_files':  0,
+        'repeat_cycles':  set(),       # all rc numbers present
+        'chunks_seen':    defaultdict(set),  # rc_num -> set of chunk_numbers
     })
 
     for filename in nc_files:
         info = parse_fci_filename(filename)
-
         if info['sensing_start'] is None:
             continue
-
         date_str = info['sensing_start'].strftime('%Y-%m-%d')
 
         if info['is_trailer']:
@@ -112,7 +185,6 @@ def summarize(raw_dir):
                         info['chunk_number']
                     )
 
-    # Build summary rows
     rows = []
     for date_str in sorted(dates.keys()):
         d = dates[date_str]
@@ -124,103 +196,94 @@ def summarize(raw_dir):
             else:
                 incomplete += 1
 
-        total_cycles = len(d['repeat_cycles'])
+        present_rcs = d['repeat_cycles']
+        on_grid_present = present_rcs & expected_rcs
+        off_grid_present = present_rcs - expected_rcs
 
-        # Expected cycles for a full day (144 = 24h × 6 per hour)
-        coverage_pct = total_cycles / 144 * 100 if total_cycles > 0 else 0
+        coverage_pct = (
+            len(on_grid_present) / expected_per_day * 100
+            if expected_per_day else 0
+        )
 
         rows.append({
-            'date': date_str,
-            'body_files': d['body_files'],
-            'trailer_files': d['trailer_files'],
-            'repeat_cycles': total_cycles,
-            'complete_2chunk': complete,
+            'date':              date_str,
+            'body_files':        d['body_files'],
+            'trailer_files':     d['trailer_files'],
+            'repeat_cycles':     len(present_rcs),       # total (audit)
+            'on_grid':           len(on_grid_present),   # match the filter
+            'off_grid':          len(off_grid_present),  # outside the filter
+            'expected':          expected_per_day,
+            'complete_2chunk':   complete,
             'incomplete_1chunk': incomplete,
-            'coverage_pct': round(coverage_pct, 1),
+            'coverage_pct':      round(coverage_pct, 1),
         })
 
     return rows, dates
 
 
-def build_missing_timesteps(dates):
+def build_missing_timesteps(dates, filter_minutes):
     """
-    Compute the exact missing timesteps for each date.
+    Compute the exact missing on-grid timesteps for each date.
 
-    Compares the repeat cycles found in _raw_chunks against the full
-    set of 144 possible cycles per day (00:00, 00:10, ..., 23:50).
-
-    Args:
-        dates (dict): Raw date data from summarize().
-
-    Returns:
-        dict: {
-            "dates": {
-                "2026-02-13": {
-                    "present": 44,
-                    "missing": 100,
-                    "coverage_pct": 30.6,
-                    "missing_times": ["00:00", "00:10", ...],
-                    "incomplete_times": ["09:20"]  # only 1 of 2 chunks
-                },
-                ...
-            },
-            "summary": {
-                "total_dates": 30,
-                "total_present": 2774,
-                "total_missing": 1546,
-                "total_expected": 4320
-            }
-        }
+    Only on-grid cycles count - intersect_product_coverage.py snaps the
+    master HHMM to the MTG filter, so off-grid native cycles are
+    unreachable. They're tracked separately for diagnostics but not as
+    "missing".
     """
-    ALL_CYCLES = set(range(1, 145))  # 1-indexed, 144 cycles per day
+    expected_rcs = expected_rc_set(filter_minutes)
 
-    result = {'dates': {}, 'summary': {}}
+    result = {
+        'config': {'minute_filter': sorted(filter_minutes)},
+        'dates': {},
+        'summary': {},
+    }
     total_present = 0
     total_missing = 0
 
     for date_str in sorted(dates.keys()):
         d = dates[date_str]
         present_rcs = d['repeat_cycles']
-        missing_rcs = ALL_CYCLES - present_rcs
+        on_grid_present = present_rcs & expected_rcs
+        on_grid_missing = expected_rcs - present_rcs
+        off_grid_present = present_rcs - expected_rcs
 
-        # Convert rc numbers to HH:MM strings
-        missing_times = []
-        for rc in sorted(missing_rcs):
-            total_min = (rc - 1) * 10
-            h, m = divmod(total_min, 60)
-            missing_times.append(f"{h:02d}:{m:02d}")
+        missing_times = sorted(rc_to_hhmm(rc) for rc in on_grid_missing)
+        off_grid_times = sorted(rc_to_hhmm(rc) for rc in off_grid_present)
 
-        # Find incomplete cycles (only 1 chunk instead of 2)
         incomplete_times = []
-        for rc in sorted(present_rcs):
+        for rc in sorted(on_grid_present):
             chunks = d['chunks_seen'].get(rc, set())
             if len(chunks) < 2:
-                total_min = (rc - 1) * 10
-                h, m = divmod(total_min, 60)
-                incomplete_times.append(f"{h:02d}:{m:02d}")
+                incomplete_times.append(rc_to_hhmm(rc))
 
-        n_present = len(present_rcs)
-        n_missing = len(missing_rcs)
-        coverage = n_present / 144 * 100
+        n_present = len(on_grid_present)
+        n_missing = len(on_grid_missing)
+        coverage = (
+            n_present / len(expected_rcs) * 100 if expected_rcs else 0
+        )
 
         total_present += n_present
         total_missing += n_missing
 
         result['dates'][date_str] = {
-            'present': n_present,
-            'missing': n_missing,
-            'coverage_pct': round(coverage, 1),
-            'missing_times': missing_times,
+            'present':          n_present,
+            'missing':          n_missing,
+            'off_grid_present': len(off_grid_present),
+            'expected':         len(expected_rcs),
+            'coverage_pct':     round(coverage, 1),
+            'missing_times':    missing_times,
+            'off_grid_times':   off_grid_times,
             'incomplete_times': incomplete_times,
         }
 
-    total_expected = len(dates) * 144
+    total_expected = len(dates) * len(expected_rcs)
     result['summary'] = {
-        'total_dates': len(dates),
-        'total_present': total_present,
-        'total_missing': total_missing,
-        'total_expected': total_expected,
-        'overall_coverage_pct': round(
+        'total_dates':           len(dates),
+        'expected_per_day':      len(expected_rcs),
+        'total_present':         total_present,
+        'total_missing':         total_missing,
+        'total_expected':        total_expected,
+        'overall_coverage_pct':  round(
             total_present / total_expected * 100, 1
         ) if total_expected > 0 else 0,
     }
@@ -228,12 +291,9 @@ def build_missing_timesteps(dates):
     return result
 
 
-def save_missing_json(dates, output_path):
+def save_missing_json(dates, filter_minutes, output_path):
     """Build and save the missing timesteps JSON."""
-    import json
-
-    missing = build_missing_timesteps(dates)
-
+    missing = build_missing_timesteps(dates, filter_minutes)
     with open(output_path, 'w') as f:
         json.dump(missing, f, indent=2)
 
@@ -244,6 +304,10 @@ def save_missing_json(dates, output_path):
           f"{s['total_missing']} missing")
 
 
+# =============================================================================
+# Output
+# =============================================================================
+
 def print_table(rows):
     """Print a formatted table to stdout."""
     if not rows:
@@ -252,6 +316,7 @@ def print_table(rows):
 
     header = (
         f"{'Date':<12} {'Body':>6} {'Trail':>6} {'Cycles':>7} "
+        f"{'OnGrid':>7} {'OffGrid':>8} {'Exp':>5} "
         f"{'OK(2ch)':>8} {'Partial':>8} {'Coverage':>9}"
     )
     print(header)
@@ -259,22 +324,34 @@ def print_table(rows):
 
     total_body = 0
     total_cycles = 0
+    total_on_grid = 0
 
     for r in rows:
         total_body += r['body_files']
         total_cycles += r['repeat_cycles']
+        total_on_grid += r['on_grid']
         print(
             f"{r['date']:<12} {r['body_files']:>6} {r['trailer_files']:>6} "
-            f"{r['repeat_cycles']:>7} {r['complete_2chunk']:>8} "
-            f"{r['incomplete_1chunk']:>8} {r['coverage_pct']:>8.1f}%"
+            f"{r['repeat_cycles']:>7} {r['on_grid']:>7} {r['off_grid']:>8} "
+            f"{r['expected']:>5} "
+            f"{r['complete_2chunk']:>8} {r['incomplete_1chunk']:>8} "
+            f"{r['coverage_pct']:>8.1f}%"
         )
 
     print("-" * len(header))
+    overall_pct = (
+        total_on_grid / (rows[0]['expected'] * len(rows)) * 100
+        if rows and rows[0]['expected'] else 0
+    )
     print(
-        f"{'TOTAL':<12} {total_body:>6} {'':>6} {total_cycles:>7}"
+        f"{'TOTAL':<12} {total_body:>6} {'':>6} "
+        f"{total_cycles:>7} {total_on_grid:>7}"
+        + ' ' * (8 + 1 + 5 + 1 + 8 + 1 + 8 + 1)
+        + f"{overall_pct:>8.1f}%"
     )
     print(f"\n{len(rows)} dates, {total_body} body files, "
-          f"{total_cycles} repeat cycles")
+          f"{total_cycles} repeat cycles total "
+          f"({total_on_grid} on grid)")
 
 
 def save_csv(rows, output_path):
@@ -285,6 +362,7 @@ def save_csv(rows, output_path):
 
     fieldnames = [
         'date', 'body_files', 'trailer_files', 'repeat_cycles',
+        'on_grid', 'off_grid', 'expected',
         'complete_2chunk', 'incomplete_1chunk', 'coverage_pct',
     ]
 
@@ -295,6 +373,10 @@ def save_csv(rows, output_path):
 
     print(f"Saved CSV: {output_path}")
 
+
+# =============================================================================
+# CLI
+# =============================================================================
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -324,10 +406,31 @@ if __name__ == "__main__":
             f'naming convention).'
         ),
     )
+    parser.add_argument(
+        '--timesteps', type=str, nargs='+', default=None,
+        help="Override the cadence minute filter (e.g. 00 10 30 40). "
+             "Default: read from timestep_config.json.",
+    )
 
     args = parser.parse_args()
 
-    rows, dates = summarize(args.raw_dir)
+    if args.timesteps is not None:
+        filter_minutes = {int(m) for m in args.timesteps}
+        step_src = 'CLI override'
+    else:
+        filter_minutes, step = load_minute_filter()
+        step_src = f'timestep_config.json (step={step} min)'
+
+    print("=" * 70)
+    print("MTG Cache Summary")
+    print("=" * 70)
+    print(f"Raw dir        : {args.raw_dir}")
+    print(f"Minute filter  : {sorted(filter_minutes)} ({step_src})")
+    print(f"Expected/day   : {len(expected_rc_set(filter_minutes))} "
+          f"(of {NATIVE_CYCLES_PER_DAY} native cycles)")
+    print()
+
+    rows, dates = summarize(args.raw_dir, filter_minutes)
     print_table(rows)
     save_csv(rows, args.output)
-    save_missing_json(dates, args.missing)
+    save_missing_json(dates, filter_minutes, args.missing)

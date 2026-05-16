@@ -233,6 +233,31 @@ def load_training_config(path: Path) -> dict:
         "resume":  _coerce(c.get("resume", "true"), bool),
     }
 
+    # [finetune] - Swin transformer head + AdamW for domain-adaptation
+    # stage. Used when train_models.py is run with --stage finetune (or
+    # the finetune leg of --stage both). The base stage ignores this
+    # section entirely - it keeps the existing Adam optimizer + the
+    # main [lr_schedule].
+    f = parser["finetune"] if parser.has_section("finetune") else {}
+    finetune = {
+        "optimizer":      f.get("optimizer", "adamw").strip().lower(),
+        "weight_decay":   _coerce(f.get("weight_decay", "0.01"), float),
+        "initial_lr":     _coerce(f.get("initial_lr", "3e-4"), float),
+        "warmup_epochs":  _coerce(f.get("warmup_epochs", "1"), int),
+        "min_lr":         _coerce(f.get("min_lr", "1e-6"), float),
+        "epochs":         _coerce(f.get("epochs", "20"), int),
+        "window_size":    _coerce(f.get("window_size", "8"), int),
+        "n_swin_blocks":  _coerce(f.get("n_swin_blocks", "2"), int),
+        "num_heads":      _coerce(f.get("num_heads", "4"), int),
+        "c_shared":       _coerce(f.get("c_shared", "64"), int),
+        "head_dropout":   _coerce(f.get("head_dropout", "0.1"), float),
+    }
+    if finetune["optimizer"] not in ("adam", "adamw"):
+        raise ValueError(
+            f"[finetune].optimizer = {finetune['optimizer']!r} is not "
+            f"supported. Use 'adam' or 'adamw'."
+        )
+
     # [mode.<name>] overrides
     mode_overrides: dict[str, dict] = {}
     for section in parser.sections():
@@ -265,6 +290,7 @@ def load_training_config(path: Path) -> dict:
         "lr_schedule":    lr_schedule,
         "early_stopping": early_stopping,
         "checkpointing":  checkpointing,
+        "finetune":       finetune,
         "mode_overrides": mode_overrides,
     }
 
@@ -755,6 +781,12 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
         xt_dec = ResBlock(block_channels[max(i - 1, 0)], time_dist=True,
                           dropout=dropout, norm=norm)(xt_dec)
 
+    # Named graft point. `xt_dec` is the encoder-forecaster's final
+    # feature tensor of shape (B, F, H, W, C_deep). The fine-tune stage
+    # (train_finetune below) looks up this layer by name to attach a
+    # Swin transformer head on top of the frozen backbone.
+    xt_dec = Lambda(lambda x: x, name='backbone_output')(xt_dec)
+
     # ==================== OUTPUT HEAD ====================
     if label_type == "lightning":
         num_outputs = 1
@@ -779,6 +811,278 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
 
     return model
+
+
+# ============================================================================
+# Swin transformer head (domain-adaptation fine-tune)
+# ============================================================================
+#
+# Sits between the frozen backbone's `backbone_output` (shape
+# (B, F, H, W, C_deep) = (B, 3, 256, 256, 32) for the default model) and
+# a fresh per-lead-time output head. The backbone stays frozen; only
+# these layers train.
+#
+# Architecture (option (a) from the design discussion):
+#
+#   1. Collapse the future-time axis into shared spatial features:
+#         (B, F, H, W, C) -> (B, H, W, F*C) -> Conv 1x1 -> (B, H, W, c_shared)
+#   2. N Swin blocks (default 2): windowed self-attention with 8x8
+#      windows. Block 0 uses regular partition; block 1 uses cyclic
+#      shift by `window_size // 2` for cross-window communication.
+#      No relative-position bias and no attention mask on the shifted
+#      wrap-around (lite variant - the per-window MHA carries enough
+#      signal at this depth).
+#   3. F independent lightweight projection heads, each producing the
+#      prediction for one future step. Output stacked on axis=1 so the
+#      shape matches the base model exactly (B, F, H, W, num_outputs).
+#
+# At 256x256 with window_size=8 we get 1024 windows of 64 tokens, so
+# each MHA call sees 64 queries x 64 keys - cheap compared to a global
+# self-attention over 65k tokens.
+
+
+def _window_partition(x, window_size):
+    """(B, H, W, C) -> (B*nW, ws*ws, C) where nW = (H/ws)*(W/ws)."""
+    shape = tf.shape(x)
+    B, H, W = shape[0], shape[1], shape[2]
+    C = x.shape[-1]
+    ws = window_size
+    x = tf.reshape(x, [B, H // ws, ws, W // ws, ws, C])
+    x = tf.transpose(x, [0, 1, 3, 2, 4, 5])      # (B, H/ws, W/ws, ws, ws, C)
+    x = tf.reshape(x, [-1, ws * ws, C])
+    return x
+
+
+def _window_reverse(x_windows, H, W, window_size, B):
+    """(B*nW, ws*ws, C) -> (B, H, W, C)."""
+    ws = window_size
+    C = x_windows.shape[-1]
+    x = tf.reshape(x_windows, [B, H // ws, W // ws, ws, ws, C])
+    x = tf.transpose(x, [0, 1, 3, 2, 4, 5])      # (B, H/ws, ws, W/ws, ws, C)
+    x = tf.reshape(x, [B, H, W, C])
+    return x
+
+
+class SwinBlock(tf.keras.layers.Layer):
+    """Single Swin transformer block (W-MSA or SW-MSA + MLP).
+
+    Operates on `(B, H, W, C)` feature maps with H, W divisible by
+    `window_size`. When `shift_size > 0`, the input is cyclic-shifted
+    by `(shift, shift)` before window partitioning so different windows
+    see each other across blocks. The shifted-wrap attention mask is
+    omitted (lite variant); the impact is small at 256x256 with 8x8
+    windows because only one window-row and one window-column see a
+    wrap-around discontinuity.
+    """
+
+    def __init__(self, dim, num_heads, window_size, shift_size,
+                 mlp_ratio=2.0, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+
+    def build(self, input_shape):
+        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.attn = tf.keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=max(1, self.dim // self.num_heads),
+            dropout=self.dropout,
+        )
+        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        hidden = int(self.dim * self.mlp_ratio)
+        self.mlp_dense1 = tf.keras.layers.Dense(hidden, activation='gelu')
+        self.mlp_drop1 = tf.keras.layers.Dropout(self.dropout)
+        self.mlp_dense2 = tf.keras.layers.Dense(self.dim)
+        self.mlp_drop2 = tf.keras.layers.Dropout(self.dropout)
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        # x: (B, H, W, C)
+        B = tf.shape(x)[0]
+        H = tf.shape(x)[1]
+        W = tf.shape(x)[2]
+        shortcut = x
+        x = self.norm1(x)
+
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(-self.shift_size, -self.shift_size),
+                        axis=(1, 2))
+
+        x_windows = _window_partition(x, self.window_size)
+        attn_out = self.attn(x_windows, x_windows, training=training)
+        x = _window_reverse(attn_out, H, W, self.window_size, B)
+
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(self.shift_size, self.shift_size),
+                        axis=(1, 2))
+
+        x = shortcut + x
+
+        # MLP
+        h = self.norm2(x)
+        h = self.mlp_dense1(h)
+        h = self.mlp_drop1(h, training=training)
+        h = self.mlp_dense2(h)
+        h = self.mlp_drop2(h, training=training)
+        return x + h
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "dim":          self.dim,
+            "num_heads":    self.num_heads,
+            "window_size":  self.window_size,
+            "shift_size":   self.shift_size,
+            "mlp_ratio":    self.mlp_ratio,
+            "dropout":      self.dropout,
+        })
+        return cfg
+
+
+def build_swin_head(backbone_features, future_timesteps, num_outputs,
+                    label_type, window_size=8, n_blocks=2, num_heads=4,
+                    c_shared=64, dropout=0.0):
+    """Swin head + 3 per-lead-time projections.
+
+    backbone_features: (B, F, H, W, C_deep), output of the frozen backbone.
+    Returns a Keras tensor with shape (B, F, H, W, num_outputs) matching
+    the base model's output contract.
+    """
+    F = backbone_features.shape[1]
+    H = backbone_features.shape[2]
+    W = backbone_features.shape[3]
+    C = backbone_features.shape[-1]
+
+    # Step 1: collapse the F axis into channels and project to c_shared.
+    # Permute non-batch axes (F, H, W, C) -> (H, W, F, C); 1-indexed in
+    # Keras Permute means (2, 3, 1, 4).
+    x = tf.keras.layers.Permute((2, 3, 1, 4),
+                                 name='collapse_F_perm')(backbone_features)
+    x = tf.keras.layers.Reshape((H, W, F * C),
+                                 name='collapse_F_flat')(x)
+    x = tf.keras.layers.Conv2D(
+        c_shared, 1, activation='gelu',
+        name='backbone_to_shared',
+    )(x)
+
+    # Step 2: stack of Swin blocks. Odd blocks shift to enable
+    # cross-window flow. Even blocks use the regular partition.
+    half_window = window_size // 2
+    for i in range(n_blocks):
+        shift = half_window if (i % 2 == 1) else 0
+        x = SwinBlock(
+            dim=c_shared,
+            num_heads=num_heads,
+            window_size=window_size,
+            shift_size=shift,
+            dropout=dropout,
+            name=f'swin_block_{i}',
+        )(x)
+
+    # Step 3: F independent projection heads (option (a)). Each head is
+    # LayerNorm -> Conv 1x1 (gelu) -> Conv 1x1 (final activation, float32).
+    final_activation = 'sigmoid' if label_type == 'lightning' else 'softmax'
+    outs = []
+    for t in range(future_timesteps):
+        h = tf.keras.layers.LayerNormalization(
+            epsilon=1e-5, name=f'head_norm_t{t}',
+        )(x)
+        h = tf.keras.layers.Conv2D(
+            c_shared, 1, activation='gelu',
+            name=f'head_hidden_t{t}',
+        )(h)
+        h = tf.keras.layers.Conv2D(
+            num_outputs, 1, activation=final_activation,
+            dtype='float32',          # numerical stability under mixed prec
+            name=f'head_out_t{t}',
+        )(h)
+        outs.append(h)
+
+    # Stack the F per-step predictions back onto axis=1 -> (B, F, H, W, num_outputs)
+    seq_out = tf.keras.layers.Lambda(
+        lambda lst: tf.stack(lst, axis=1),
+        name='stack_lead_times',
+    )(outs)
+
+    return seq_out
+
+
+def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
+    """Load a base model, freeze it, and graft on a Swin head.
+
+    Args:
+        base_model_path: path to the saved base model (`.keras`).
+        finetune_cfg: dict from `load_training_config()["finetune"]`. We
+            pull `window_size`, `n_swin_blocks`, `num_heads`, `c_shared`,
+            `head_dropout` from it.
+        ones_fraction: occurrence rate (lightning modes only) for the
+            WeightedFocalLoss. Ignored when the base model targets the
+            5-class radar/OPERA head.
+
+    Returns: (model, loss, metrics) - the compiled finetune model, plus
+    the loss/metrics it should be compiled with (the caller wires those
+    into model.compile alongside the AdamW optimizer).
+    """
+    base = tf.keras.models.load_model(
+        str(base_model_path),
+        custom_objects={
+            "WeightedFocalLoss": WeightedFocalLoss,
+            "iou_metric": iou_metric,
+            "true_pos":   true_pos,
+            "false_pos":  false_pos,
+            "false_neg":  false_neg,
+        },
+        compile=False,
+    )
+    base.trainable = False  # freeze every weight in the backbone
+
+    # Build a sub-model that ends at backbone_output. Calling it with
+    # training=False forces dropout / batch-norm into inference mode at
+    # finetune training time - critical because layer.trainable=False
+    # only freezes weights, not stochastic behaviour.
+    backbone = tf.keras.Model(
+        inputs=base.inputs,
+        outputs=base.get_layer('backbone_output').output,
+        name='frozen_backbone',
+    )
+    backbone.trainable = False
+
+    features = backbone(base.inputs, training=False)
+
+    # Infer head shape from the base model's final output.
+    out_shape = base.output_shape   # (None, F, H, W, num_outputs)
+    future_timesteps = int(out_shape[1])
+    num_outputs = int(out_shape[-1])
+    label_type = 'lightning' if num_outputs == 1 else 'radar'
+
+    head_out = build_swin_head(
+        features,
+        future_timesteps=future_timesteps,
+        num_outputs=num_outputs,
+        label_type=label_type,
+        window_size=finetune_cfg["window_size"],
+        n_blocks=finetune_cfg["n_swin_blocks"],
+        num_heads=finetune_cfg["num_heads"],
+        c_shared=finetune_cfg["c_shared"],
+        dropout=finetune_cfg["head_dropout"],
+    )
+
+    finetuned = tf.keras.Model(
+        inputs=base.inputs, outputs=head_out, name='finetuned',
+    )
+
+    if label_type == 'lightning':
+        loss = WeightedFocalLoss(ones_fraction=ones_fraction, gamma=2.0)
+        metrics = [iou_metric, true_pos, false_pos, false_neg]
+    else:
+        loss = tf.keras.losses.CategoricalCrossentropy()
+        metrics = ['accuracy']
+
+    return finetuned, loss, metrics
 
 
 # ============================================================================
@@ -985,44 +1289,57 @@ class _ResumableCheckpoint(tf.keras.callbacks.Callback):
 
 def train(mode, data_root, epochs, batch_size, output_dir,
           dropout=0.1, norm=None, dataset_dir=None,
+          source="radar",
           shuffle_buffer=256,
           mixed_precision=True,
           lr_schedule_cfg=None,
           early_stopping_cfg=None,
           checkpoint_cfg=None,
           resume=True):
-    """Main training function.
+    """Main training function (base stage).
 
     Args:
         mode: training-mode name (see TRAINING_MODES at the top of this
             file). Used to name the saved model / history files and to
             locate the default dataset directory.
-        data_root: path to our_data/ containing datasets/{mode}/ and
-            lightning_fraction.json.
+        data_root: path to our_data/ containing datasets/{mode}_{source}/
+            and lightning_fraction.json.
         epochs: number of training epochs.
         batch_size: training batch size.
         output_dir: where to save model + history.
         dropout: dropout rate.
         norm: normalization type ('batch', 'layer', or None).
         dataset_dir: explicit path to the dataset directory. When
-            provided, overrides the default data_root/datasets/{mode}.
+            provided, overrides the default data_root/datasets/{mode}_{source}.
+        source: extract_patch_seq source ('radar' or 'lightning') the
+            dataset was built from. Selects which datasets/<mode>_<source>/
+            directory to read and is appended to the checkpoint / model /
+            history filenames so the two tracks don't clobber each other.
         shuffle_buffer: sample count for the training-time shuffle
-            buffer. With ~5 MB samples, 256 ≈ 1.3 GB host RAM.
+            buffer. With ~5 MB samples, 256 ~= 1.3 GB host RAM.
         lr_schedule_cfg: dict with keys `type`, `initial_lr`,
-            `warmup_epochs`, `min_lr`. None → use Adam's default LR
+            `warmup_epochs`, `min_lr`. None -> use Adam's default LR
             with no schedule (legacy behaviour).
         early_stopping_cfg: dict with keys `enabled`, `monitor`, `mode`,
-            `patience`, `min_delta`, `restore_best_weights`. None →
+            `patience`, `min_delta`, `restore_best_weights`. None ->
             disable early stopping.
+
+    Returns: (model_path, history_path) - tuple of pathlib.Path values
+    pointing at the saved base model and its history JSON. The
+    finetune stage reads `model_path` to graft the Swin head onto.
     """
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Mode + source together are the unique experiment identifier - used
+    # everywhere we'd previously used just `mode` so the radar-driven
+    # and lightning-driven runs can coexist on disk.
+    run_tag = f"{mode}_{source}"
 
     if dataset_dir is not None:
         dataset_dir = Path(dataset_dir)
     else:
-        dataset_dir = data_root / "datasets" / mode
+        dataset_dir = data_root / "datasets" / run_tag
 
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
@@ -1050,7 +1367,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     future_timesteps = label_shape[0]
 
     print("=" * 70)
-    print(f"COALITION-4 Training — Mode: {mode}")
+    print(f"COALITION-4 Training (base) - Mode: {mode}  Source: {source}")
     print("=" * 70)
     print(f"  Dataset:       {dataset_dir}")
     print(f"  Label type:    {label_type}")
@@ -1105,15 +1422,15 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     # ------------------------------------------------------------------
     # Resumable training
     # ------------------------------------------------------------------
-    # Per-epoch checkpoint at `models/checkpoints/<mode>_latest.keras`.
+    # Per-epoch checkpoint at `models/checkpoints/<mode>_<source>_latest.keras`.
     # On launch, if a checkpoint exists and `resume=True`, its weights
-    # are loaded so the run picks up where the previous one stopped —
+    # are loaded so the run picks up where the previous one stopped -
     # critical on Windows where the occasional driver-level CUDA crash
     # would otherwise lose hours of progress.
     ckpt_cfg = checkpoint_cfg or {}
     ckpt_enabled = ckpt_cfg.get("enabled", True)
     ckpt_dir = output_dir / "checkpoints"
-    ckpt_path = ckpt_dir / f"{mode}_latest.keras"
+    ckpt_path = ckpt_dir / f"{run_tag}_latest.keras"
     initial_epoch = 0
     if ckpt_enabled and resume and ckpt_path.is_file():
         try:
@@ -1123,7 +1440,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
             # callbacks see the right position. The companion JSON below
             # is written alongside the .keras file by the checkpoint
             # callback.
-            ckpt_meta_path = ckpt_dir / f"{mode}_latest.json"
+            ckpt_meta_path = ckpt_dir / f"{run_tag}_latest.json"
             if ckpt_meta_path.is_file():
                 with open(ckpt_meta_path) as f:
                     initial_epoch = int(json.load(f).get("next_epoch", 0))
@@ -1184,7 +1501,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         callbacks.append(_ResumableCheckpoint(
             filepath=str(ckpt_path),
-            epoch_meta_path=str(ckpt_dir / f"{mode}_latest.json"),
+            epoch_meta_path=str(ckpt_dir / f"{run_tag}_latest.json"),
             verbose=1,
         ))
         print(f"  Checkpoint:   per-epoch -> {ckpt_path}")
@@ -1201,13 +1518,15 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     )
 
     # Save model
-    model_path = output_dir / f"coalition_{mode}.keras"
+    model_path = output_dir / f"coalition_{run_tag}.keras"
     model.save(str(model_path))
     print(f"\nModel saved to: {model_path}")
 
     # Save history
     history_data = {
         "mode": mode,
+        "source": source,
+        "stage": "base",
         "label_type": label_type,
         "epochs_completed": len(history.history.get("loss", [])),
         "batch_size": batch_size,
@@ -1219,7 +1538,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         "history": {k: [float(v) for v in vals]
                     for k, vals in history.history.items()},
     }
-    history_path = output_dir / f"history_{mode}.json"
+    history_path = output_dir / f"history_{run_tag}.json"
     with open(history_path, 'w') as f:
         json.dump(history_data, f, indent=2)
     print(f"History saved to: {history_path}")
@@ -1228,7 +1547,230 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     print("Training complete.")
     print("=" * 70)
 
-    return model, history
+    return model_path, history_path
+
+
+def train_finetune(mode, data_root, base_model_path, output_dir,
+                   source="radar", batch_size=4,
+                   finetune_cfg=None,
+                   shuffle_buffer=256,
+                   mixed_precision=True,
+                   early_stopping_cfg=None,
+                   checkpoint_cfg=None,
+                   resume=True):
+    """Domain-adaptation fine-tune: freeze base, attach Swin head, train.
+
+    Args:
+        mode: training-mode name (drives label_type via the metadata).
+        data_root: path to our_data/.
+        base_model_path: path to the saved base model (`.keras`).
+        output_dir: where to save the fine-tuned model + history.
+        source: which extract_patch_seq source the dataset was built
+            from. Used to locate datasets/<mode>_<source>/ and to suffix
+            output filenames.
+        batch_size: training batch size.
+        finetune_cfg: dict from `load_training_config()["finetune"]`.
+            Drives the Swin head hyperparameters + AdamW config.
+        early_stopping_cfg / checkpoint_cfg / resume: same semantics as
+            in `train()`.
+    """
+    if finetune_cfg is None:
+        raise ValueError("finetune_cfg is required for train_finetune()")
+
+    data_root = Path(data_root)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_tag = f"{mode}_{source}"
+
+    dataset_dir = data_root / "datasets" / run_tag
+    train_dir = dataset_dir / "train"
+    val_dir = dataset_dir / "validation"
+    for d in [train_dir, val_dir]:
+        if not d.exists():
+            raise FileNotFoundError(f"Dataset not found: {d}")
+
+    meta_path = train_dir / "metadata.json"
+    with open(meta_path) as f:
+        meta = json.load(f)
+    label_type = meta.get(
+        "label_type", "lightning" if "lightning" in mode else "radar",
+    )
+
+    epochs = finetune_cfg["epochs"]
+
+    print("=" * 70)
+    print(f"COALITION-4 Training (finetune) - Mode: {mode}  Source: {source}")
+    print("=" * 70)
+    print(f"  Dataset:        {dataset_dir}")
+    print(f"  Base model:     {base_model_path}")
+    print(f"  Label type:     {label_type}")
+    print(f"  Epochs:         {epochs}")
+    print(f"  Batch size:     {batch_size}")
+    print(f"  Optimizer:      {finetune_cfg['optimizer']}")
+    print(f"  Weight decay:   {finetune_cfg['weight_decay']}")
+    print(f"  Initial LR:     {finetune_cfg['initial_lr']:g}")
+    print(f"  Swin window:    {finetune_cfg['window_size']}")
+    print(f"  Swin blocks:    {finetune_cfg['n_swin_blocks']}")
+    print(f"  Swin heads:     {finetune_cfg['num_heads']}")
+    print(f"  Swin c_shared:  {finetune_cfg['c_shared']}")
+    print(f"  Head dropout:   {finetune_cfg['head_dropout']}")
+    print(f"  Mixed prec:     {'float16' if mixed_precision else 'float32'}")
+    print()
+
+    configure_tf_runtime(use_mixed_precision=mixed_precision)
+
+    if label_type == "lightning":
+        ones_fraction = load_ones_fraction(data_root)
+    else:
+        ones_fraction = 0.0106  # unused for radar
+
+    print("\nLoading datasets...")
+    train_ds = load_dataset(train_dir, batch_size,
+                             shuffle=True, shuffle_buffer=shuffle_buffer)
+    val_ds = load_dataset(val_dir, batch_size, shuffle=False)
+    print("  Datasets loaded")
+
+    # Build the fine-tune model: frozen backbone + Swin head + per-step heads.
+    print("\nBuilding fine-tune model (frozen backbone + Swin head)...")
+    model, loss, metrics = build_finetune_model(
+        base_model_path=base_model_path,
+        finetune_cfg=finetune_cfg,
+        ones_fraction=ones_fraction,
+    )
+
+    # Pick optimizer. AdamW is the default for fine-tune; falling back
+    # to plain Adam is supported for parity experiments.
+    if finetune_cfg["optimizer"] == "adamw":
+        try:
+            optimizer = tf.keras.optimizers.AdamW(
+                learning_rate=finetune_cfg["initial_lr"],
+                weight_decay=finetune_cfg["weight_decay"],
+            )
+        except AttributeError:
+            # TF < 2.11 - fall back to the experimental package
+            optimizer = tf.keras.optimizers.experimental.AdamW(
+                learning_rate=finetune_cfg["initial_lr"],
+                weight_decay=finetune_cfg["weight_decay"],
+            )
+    else:
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=finetune_cfg["initial_lr"],
+        )
+
+    model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
+    model.summary(print_fn=lambda x: print(f"  {x}"))
+    print()
+
+    # Resume from a finetune-stage checkpoint if it exists. Distinct
+    # from the base checkpoint above so a partially-finished finetune
+    # doesn't overwrite the base latest.
+    ckpt_cfg = checkpoint_cfg or {}
+    ckpt_enabled = ckpt_cfg.get("enabled", True)
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_path = ckpt_dir / f"{run_tag}_finetune_latest.keras"
+    initial_epoch = 0
+    if ckpt_enabled and resume and ckpt_path.is_file():
+        try:
+            print(f"Resuming fine-tune from checkpoint: {ckpt_path}")
+            model.load_weights(str(ckpt_path))
+            ckpt_meta_path = ckpt_dir / f"{run_tag}_finetune_latest.json"
+            if ckpt_meta_path.is_file():
+                with open(ckpt_meta_path) as f:
+                    initial_epoch = int(json.load(f).get("next_epoch", 0))
+                print(f"  Resumed at epoch {initial_epoch}")
+        except Exception as e:
+            print(f"  WARNING: could not load {ckpt_path}: {e}")
+            print(f"  Starting fresh.")
+            initial_epoch = 0
+
+    wall_time = WallTimeCallback()
+    callbacks: list = [wall_time]
+
+    # Cosine warmup at the finetune LR.
+    sched_fn = cosine_warmup_schedule(
+        initial_lr=finetune_cfg["initial_lr"],
+        warmup_epochs=finetune_cfg["warmup_epochs"],
+        total_epochs=epochs,
+        min_lr=finetune_cfg["min_lr"],
+    )
+    callbacks.append(
+        tf.keras.callbacks.LearningRateScheduler(sched_fn, verbose=1)
+    )
+    print(f"  LR schedule:    cosine_warmup "
+          f"(initial={finetune_cfg['initial_lr']:g}, "
+          f"warmup={finetune_cfg['warmup_epochs']} ep, "
+          f"min={finetune_cfg['min_lr']:g})")
+
+    if (early_stopping_cfg is not None
+            and early_stopping_cfg.get("enabled", True)):
+        callbacks.append(
+            tf.keras.callbacks.EarlyStopping(
+                monitor=early_stopping_cfg["monitor"],
+                mode=early_stopping_cfg["mode"],
+                patience=early_stopping_cfg["patience"],
+                min_delta=early_stopping_cfg["min_delta"],
+                restore_best_weights=early_stopping_cfg["restore_best_weights"],
+                verbose=1,
+            )
+        )
+
+    if ckpt_enabled:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        callbacks.append(_ResumableCheckpoint(
+            filepath=str(ckpt_path),
+            epoch_meta_path=str(ckpt_dir / f"{run_tag}_finetune_latest.json"),
+            verbose=1,
+        ))
+        print(f"  Checkpoint:     per-epoch -> {ckpt_path}")
+    print()
+
+    print("\nStarting fine-tune training...")
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs,
+        initial_epoch=initial_epoch,
+        callbacks=callbacks,
+    )
+
+    model_path = output_dir / f"coalition_{run_tag}_finetuned.keras"
+    model.save(str(model_path))
+    print(f"\nFine-tuned model saved to: {model_path}")
+
+    history_data = {
+        "mode": mode,
+        "source": source,
+        "stage": "finetune",
+        "label_type": label_type,
+        "base_model": str(base_model_path),
+        "epochs_completed": len(history.history.get("loss", [])),
+        "batch_size": batch_size,
+        "optimizer": finetune_cfg["optimizer"],
+        "weight_decay": finetune_cfg["weight_decay"],
+        "initial_lr": finetune_cfg["initial_lr"],
+        "swin": {
+            "window_size":   finetune_cfg["window_size"],
+            "n_blocks":      finetune_cfg["n_swin_blocks"],
+            "num_heads":     finetune_cfg["num_heads"],
+            "c_shared":      finetune_cfg["c_shared"],
+            "head_dropout":  finetune_cfg["head_dropout"],
+        },
+        "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
+        "wall_times": wall_time.epoch_times,
+        "total_wall_time": sum(wall_time.epoch_times),
+        "history": {k: [float(v) for v in vals]
+                    for k, vals in history.history.items()},
+    }
+    history_path = output_dir / f"history_{run_tag}_finetuned.json"
+    with open(history_path, 'w') as f:
+        json.dump(history_data, f, indent=2)
+    print(f"History saved to: {history_path}")
+
+    print("\n" + "=" * 70)
+    print("Fine-tune training complete.")
+    print("=" * 70)
+
+    return model_path, history_path
 
 
 # ============================================================================
@@ -1268,9 +1810,34 @@ def main():
         help="Root directory containing datasets/ and lightning_fraction.json.",
     )
     parser.add_argument(
+        "--source", type=str, default="radar",
+        choices=["radar", "lightning"],
+        help="Which extract_patch_seq source the training dataset was "
+             "built from. Selects datasets/<mode>_<source>/ as the "
+             "input and suffixes every saved checkpoint / model / "
+             "history with `_<source>`. (default: radar)",
+    )
+    parser.add_argument(
+        "--stage", type=str, default="base",
+        choices=["base", "finetune", "both"],
+        help="Training stage. 'base' (default) trains the standard "
+             "encoder-forecaster from scratch. 'finetune' loads an "
+             "existing base model and trains a Swin head on top with "
+             "the backbone frozen (domain-adaptation flow). 'both' "
+             "runs the two back-to-back in the same process.",
+    )
+    parser.add_argument(
+        "--base_checkpoint", type=str, default=None,
+        help="Path to the saved base model used as the frozen backbone "
+             "for the finetune stage. Required when --stage=finetune; "
+             "ignored when --stage=base. When --stage=both, the base "
+             "model just produced is used and this flag is unused.",
+    )
+    parser.add_argument(
         "--dataset_dir", type=str, default=None,
         help="Explicit path to the dataset directory "
-             "(overrides data_root/datasets/{mode}). Use with --mode only.",
+             "(overrides data_root/datasets/{mode}_{source}). Use with "
+             "--mode only and only with --stage base.",
     )
     parser.add_argument(
         "--output_dir", type=str, default="./models",
@@ -1280,7 +1847,7 @@ def main():
         "--fresh", action="store_true",
         help="Ignore any saved per-epoch checkpoint and start training "
              "from scratch. By default the run resumes from "
-             "models/checkpoints/<mode>_latest.keras if it exists.",
+             "models/checkpoints/<mode>_<source>_latest.keras if it exists.",
     )
     parser.add_argument(
         "--list-modes", action="store_true",
@@ -1318,30 +1885,77 @@ def main():
                 "single --mode. Drop --dataset_dir or pass --mode."
             )
 
-    print(f"Training {len(modes_to_run)} mode(s): {modes_to_run}\n")
+    # Stage-specific argument validation.
+    if args.stage == "finetune" and not args.base_checkpoint:
+        sys.exit(
+            "ERROR: --stage finetune requires --base_checkpoint pointing "
+            "at the saved base `.keras` model to graft the Swin head onto."
+        )
+    if args.stage == "base" and args.base_checkpoint:
+        print(
+            "  NOTE: --base_checkpoint is ignored when --stage=base."
+        )
+    if args.stage == "both" and args.dataset_dir is not None:
+        sys.exit(
+            "ERROR: --dataset_dir is only meaningful with --stage base. "
+            "Drop it when running --stage both."
+        )
+
+    print(f"Training {len(modes_to_run)} mode(s): {modes_to_run} "
+          f"(source={args.source}, stage={args.stage})\n")
 
     for i, mode in enumerate(modes_to_run, start=1):
         print("#" * 70)
-        print(f"# [{i}/{len(modes_to_run)}] mode: {mode}")
+        print(f"# [{i}/{len(modes_to_run)}] mode: {mode}  "
+              f"source: {args.source}  stage: {args.stage}")
         print("#" * 70)
         params = merge_for_mode(cfg, mode)
         print(f"  Effective hyperparameters: {params}")
-        train(
-            mode=mode,
-            data_root=args.data_root,
-            epochs=params["epochs"],
-            batch_size=params["batch_size"],
-            output_dir=args.output_dir,
-            dropout=params["dropout"],
-            norm=params["norm"],
-            dataset_dir=args.dataset_dir,
-            shuffle_buffer=params["shuffle_buffer"],
-            mixed_precision=params["mixed_precision"],
-            lr_schedule_cfg=cfg["lr_schedule"],
-            early_stopping_cfg=cfg["early_stopping"],
-            checkpoint_cfg=cfg["checkpointing"],
-            resume=cfg["checkpointing"].get("resume", True) and not args.fresh,
-        )
+
+        base_model_path = None
+
+        # --- Base stage ---
+        if args.stage in ("base", "both"):
+            base_model_path, _ = train(
+                mode=mode,
+                data_root=args.data_root,
+                epochs=params["epochs"],
+                batch_size=params["batch_size"],
+                output_dir=args.output_dir,
+                dropout=params["dropout"],
+                norm=params["norm"],
+                dataset_dir=args.dataset_dir,
+                source=args.source,
+                shuffle_buffer=params["shuffle_buffer"],
+                mixed_precision=params["mixed_precision"],
+                lr_schedule_cfg=cfg["lr_schedule"],
+                early_stopping_cfg=cfg["early_stopping"],
+                checkpoint_cfg=cfg["checkpointing"],
+                resume=cfg["checkpointing"].get("resume", True)
+                       and not args.fresh,
+            )
+
+        # --- Finetune stage ---
+        if args.stage in ("finetune", "both"):
+            ft_base = (
+                base_model_path if args.stage == "both"
+                else Path(args.base_checkpoint)
+            )
+            train_finetune(
+                mode=mode,
+                data_root=args.data_root,
+                base_model_path=ft_base,
+                output_dir=args.output_dir,
+                source=args.source,
+                batch_size=params["batch_size"],
+                finetune_cfg=cfg["finetune"],
+                shuffle_buffer=params["shuffle_buffer"],
+                mixed_precision=params["mixed_precision"],
+                early_stopping_cfg=cfg["early_stopping"],
+                checkpoint_cfg=cfg["checkpointing"],
+                resume=cfg["checkpointing"].get("resume", True)
+                       and not args.fresh,
+            )
 
     print("\nAll requested training runs completed.")
 

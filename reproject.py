@@ -1134,18 +1134,65 @@ def _read_radar_data(filepath):
 _WORKER_STATE: dict = {}
 
 
+def _rebuild_aggregated_errors(reprojected_root):
+    """(Re)build `<reprojected_root>/errors.txt` from every per-category log.
+
+    Walks `reprojected_root` for `reproject_<category>.log` files,
+    concatenates their contents into a single `errors.txt`, prefixing
+    each non-empty block with a `# category: <name>` comment so a
+    reader can see which reproject pass each line came from. The
+    `#`-prefixed lines are ignored by intersect_product_coverage.py's
+    `parse_error_log` (which only consumes lines starting with `ERROR `),
+    so the aggregated file is a drop-in for any single `--errors_log`
+    flag downstream.
+
+    Always overwrites — `errors.txt` reflects the state of the *current*
+    set of per-category logs on disk, not a cumulative history. Empty
+    when no logs have any content.
+    """
+    agg_path = os.path.join(reprojected_root, 'errors.txt')
+    log_files = sorted(
+        f for f in os.listdir(reprojected_root)
+        if f.startswith('reproject_') and f.endswith('.log')
+    )
+    total_lines = 0
+    with open(agg_path, 'w', encoding='utf-8') as out:
+        for log_name in log_files:
+            log_path = os.path.join(reprojected_root, log_name)
+            category = log_name[len('reproject_'):-len('.log')]
+            try:
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    lines = [line.rstrip('\n') for line in f
+                             if line.strip().startswith('ERROR ')]
+            except OSError:
+                continue
+            if not lines:
+                continue
+            out.write(f"# category: {category}\n")
+            for line in lines:
+                out.write(line + '\n')
+                total_lines += 1
+    return agg_path, total_lines
+
+
 def _write_reproject_log(reprojected_root, category, all_errors):
     """Write a single-line-per-error log named after the reproject category.
 
-    Format matches `errors.txt`:
+    Format:
         ERROR <filename>: <message>
 
     The log is written under `reprojected_root` (typically
-    `our_data/reprojected_data/`) so it sits next to the reprojected outputs.
-    Always overwrites — the log reflects the state of the most recent
-    run, not a cumulative history. If no errors occurred, the log is
-    still written but empty so downstream consumers can `open()` it
+    `our_data/reprojected_data/`) so it sits next to the reprojected
+    outputs. Always overwrites — the log reflects the state of the most
+    recent run, not a cumulative history. If no errors occurred, the log
+    is still written but empty so downstream consumers can `open()` it
     unconditionally.
+
+    After writing the per-category log, `errors.txt` is re-aggregated
+    from every `reproject_*.log` currently on disk so the single-file
+    form stays in lockstep with the per-category logs. That lets
+    `intersect_product_coverage.py` consume either form interchangeably
+    via `--errors_log`.
     """
     ensure_dir(reprojected_root)
     log_path = os.path.join(reprojected_root, f"reproject_{category}.log")
@@ -1155,6 +1202,10 @@ def _write_reproject_log(reprojected_root, category, all_errors):
     n = len(all_errors)
     if n > 0:
         print(f"    Wrote {n} error line(s) to {log_path}")
+
+    agg_path, agg_lines = _rebuild_aggregated_errors(reprojected_root)
+    if agg_lines > 0:
+        print(f"    Aggregated {agg_lines} error line(s) into {agg_path}")
     return log_path
 
 

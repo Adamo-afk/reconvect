@@ -600,50 +600,79 @@ def get_mode_config(mode):
 # Timestep utilities
 # ============================================================================
 #
-# Dataset layout is driven by sequence_meta.json (written by
+# Dataset layout is driven by `sequence_meta_<source>.json` (written by
 # extract_patch_seq_for_datasets.py) which records the chosen step_minutes,
-# past_steps, and future_steps. INPUT_COLS / LABEL_COLS / T_OFFSETS / N_INPUT
-# / N_LABEL are populated at module load time from that file so all loaders
-# see the same schema regardless of cadence.
+# past_steps, and future_steps. INPUT_COLS / LABEL_COLS / T_OFFSETS /
+# N_INPUT / N_LABEL are populated by init_sequence_config(data_root,
+# source) - called once from main() before any function below uses
+# them - so the radar-driven and lightning-driven tracks can coexist on
+# disk without colliding on a single sequence_meta.json.
 
 PROJECT_ROOT_FOR_SEQ = Path(__file__).resolve().parent
-SEQUENCE_META_PATH = PROJECT_ROOT_FOR_SEQ / "our_data" / "sequence_meta.json"
+
+# Placeholders populated by init_sequence_config(). Keeping them at module
+# scope so the existing functions (generate_samples, get_output_signature,
+# create_and_save_datasets, ...) can keep referring to them by name once
+# the caller has initialised the schema.
+SEQUENCE_META_PATH: Path | None = None
+STEP_MINUTES: int | None = None
+PAST_STEPS: int | None = None
+FUTURE_STEPS: int | None = None
+SEQ_SOURCE: str | None = None
+SOURCE_STEP_MINUTES_NATIVE: int | None = None
+INPUT_COLS: list[str] | None = None
+LABEL_COLS: list[str] | None = None
+T_OFFSETS: list[int] | None = None
+N_INPUT: int | None = None
+N_LABEL: int | None = None
 
 
-def _load_sequence_meta():
+def init_sequence_config(data_root, source: str = "radar") -> None:
+    """Load `sequence_meta_<source>.json` and populate module globals.
+
+    Must be called exactly once before any function that depends on
+    `STEP_MINUTES`, `INPUT_COLS`, `LABEL_COLS`, `T_OFFSETS`, `N_INPUT`,
+    `N_LABEL`. The CLI's main() does this immediately after parsing
+    `--source`; callers that import functions from this module (e.g.
+    evaluate_coalition.py) only use `get_mode_config` /
+    `load_and_transform_group` / `load_label` and don't depend on these
+    globals, so they can skip init.
+    """
+    global SEQUENCE_META_PATH, STEP_MINUTES, PAST_STEPS, FUTURE_STEPS
+    global SEQ_SOURCE, SOURCE_STEP_MINUTES_NATIVE
+    global INPUT_COLS, LABEL_COLS, T_OFFSETS, N_INPUT, N_LABEL
+
+    data_root = Path(data_root)
+    SEQUENCE_META_PATH = data_root / f"sequence_meta_{source}.json"
     if not SEQUENCE_META_PATH.exists():
         print(
-            f"ERROR: sequence_meta.json not found at {SEQUENCE_META_PATH}.\n"
+            f"ERROR: {SEQUENCE_META_PATH} not found.\n"
             f"Run from the project root:\n"
             f"    python validate_timestep.py --step_minutes <N>\n"
-            f"    python extract_patch_seq_for_datasets.py",
+            f"    python extract_patch_seq_for_datasets.py --source {source}",
             file=sys.stderr,
         )
         sys.exit(2)
-    return json.loads(SEQUENCE_META_PATH.read_text())
+    seq = json.loads(SEQUENCE_META_PATH.read_text())
 
-
-_SEQ = _load_sequence_meta()
-STEP_MINUTES = int(_SEQ["step_minutes"])
-PAST_STEPS = int(_SEQ["past_steps"])
-FUTURE_STEPS = int(_SEQ["future_steps"])
-# Source of the activity index used by extract_patch_seq_for_datasets.py:
-# 'radar' (default, patch_index.csv) or 'lightning' (lightning_patches.csv).
-SEQ_SOURCE = _SEQ.get("source", "radar")
-# Native source cadence (step_minutes from timestep_config.json). For the
-# lightning source, STEP_MINUTES above is the aggregation window, while this
-# is the underlying lightning-map cadence.
-SOURCE_STEP_MINUTES_NATIVE = int(
-    _SEQ.get("source_step_minutes_native", STEP_MINUTES)
-)
-
-# Input columns are the past + current step indices; labels are the future ones.
-INPUT_COLS = [_SEQ["step_columns"][i] for i in range(PAST_STEPS + 1)]
-LABEL_COLS = [_SEQ["step_columns"][i] for i in range(PAST_STEPS + 1, len(_SEQ["step_columns"]))]
-# Minute offsets relative to reference_utc (T) — derived from step indices.
-T_OFFSETS = [k * STEP_MINUTES for k in range(-PAST_STEPS, FUTURE_STEPS + 1)]
-N_INPUT = len(INPUT_COLS)
-N_LABEL = len(LABEL_COLS)
+    STEP_MINUTES = int(seq["step_minutes"])
+    PAST_STEPS = int(seq["past_steps"])
+    FUTURE_STEPS = int(seq["future_steps"])
+    # Source of the activity index used by extract_patch_seq_for_datasets.py.
+    SEQ_SOURCE = seq.get("source", source)
+    # Native source cadence (step_minutes from timestep_config.json). For
+    # the lightning source, STEP_MINUTES above is the aggregation window,
+    # while this is the underlying lightning-map cadence.
+    SOURCE_STEP_MINUTES_NATIVE = int(
+        seq.get("source_step_minutes_native", STEP_MINUTES)
+    )
+    INPUT_COLS = [seq["step_columns"][i] for i in range(PAST_STEPS + 1)]
+    LABEL_COLS = [seq["step_columns"][i]
+                  for i in range(PAST_STEPS + 1, len(seq["step_columns"]))]
+    T_OFFSETS = [k * STEP_MINUTES
+                 for k in range(-PAST_STEPS, FUTURE_STEPS + 1)]
+    N_INPUT = len(INPUT_COLS)
+    N_LABEL = len(LABEL_COLS)
 
 
 def reference_to_hhmm(reference_utc_str, offset_minutes):
@@ -1017,12 +1046,17 @@ def load_tfrecord_dataset(shard_dir: Path,
     return ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
 
-def create_and_save_datasets(data_root, mode, output_root=None):
+def create_and_save_datasets(data_root, mode, source="radar", output_root=None):
     """Create and save train, validation, and test datasets.
 
     Args:
         data_root: path to our_data/ directory containing CSVs and patches/
-        mode: one of msg_lightning, msg_radar, mtg_lightning, mtg_radar
+        mode: one of mtg_lightning, mtg_radar, mtg_radar_continuous,
+            mtg_opera_radar_only, mtg_opera_mtgmr, mtg_opera_nwcsaf,
+            mtg_opera_full
+        source: which extract_patch_seq source the sample CSVs came from
+            ('radar' or 'lightning'). The dataset directory is suffixed
+            by source so the two tracks coexist on disk.
         output_root: where to save datasets (default: data_root/datasets/)
     """
     data_root = Path(data_root)
@@ -1039,11 +1073,14 @@ def create_and_save_datasets(data_root, mode, output_root=None):
     set_normalization_stats_path(data_root / "normalization_stats.json")
 
     mode_config = get_mode_config(mode)
-    save_dir = output_root / mode
+    # Suffix the dataset dir with the source so radar- and lightning-
+    # driven runs don't clobber each other (the domain-adaptation
+    # pipeline trains both and uses them as separate feature extractors).
+    save_dir = output_root / f"{mode}_{source}"
 
     # Print configuration summary
     print("=" * 70)
-    print(f"COALITION-4 Dataset Creation — Mode: {mode}")
+    print(f"COALITION-4 Dataset Creation - Mode: {mode}  Source: {source}")
     print("=" * 70)
     print(f"Data root:    {data_root}")
     print(f"Patches dir:  {patches_dir}")
@@ -1059,11 +1096,12 @@ def create_and_save_datasets(data_root, mode, output_root=None):
     print(f"  label: shape={sig[1].shape}, dtype={sig[1].dtype}")
     print()
 
-    # Process each split
+    # Process each split. CSVs are suffixed by source to match
+    # extract_patch_seq_for_datasets.py's output convention.
     splits = {
-        "train":      "train_data.csv",
-        "validation": "validation_data.csv",
-        "test":       "test_data.csv",
+        "train":      f"train_data_{source}.csv",
+        "validation": f"validation_data_{source}.csv",
+        "test":       f"test_data_{source}.csv",
     }
 
     for split_name, csv_name in splits.items():
@@ -1092,6 +1130,7 @@ def create_and_save_datasets(data_root, mode, output_root=None):
         # `load_tfrecord_dataset(split_dir, mode_config)`.
         meta = {
             "mode": mode,
+            "source": source,
             "split": split_name,
             "csv": csv_name,
             "format": "tfrecord",
@@ -1138,6 +1177,15 @@ def main():
         help="Dataset mode (MSG modes are disabled in this build)."
     )
     parser.add_argument(
+        "--source", type=str, default="radar",
+        choices=["radar", "lightning"],
+        help="Which extract_patch_seq source the sample CSVs came from. "
+             "Selects which sequence_meta_<source>.json and "
+             "{train,validation,test}_data_<source>.csv are read, and "
+             "lands the output dataset at datasets/<mode>_<source>/. "
+             "(default: radar)",
+    )
+    parser.add_argument(
         "--data_root", type=str, default="./our_data",
         help="Root directory containing CSVs and patches/ subfolder"
     )
@@ -1147,9 +1195,14 @@ def main():
     )
     args = parser.parse_args()
 
+    # Populate the module-level schema constants from the per-source
+    # sequence metadata before any sample-generating function is called.
+    init_sequence_config(args.data_root, args.source)
+
     create_and_save_datasets(
         data_root=args.data_root,
         mode=args.mode,
+        source=args.source,
         output_root=args.output_root
     )
 
