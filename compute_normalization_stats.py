@@ -2,30 +2,35 @@
 compute_normalization_stats.py — Derive per-variable normalization parameters
 from the reprojected data in `our_data/reprojected_data/`.
 
-This script is Step 4.3, between intersect_product_coverage.py (4.2) and
-create_datasets.py (Step 5). It produces `our_data/normalization_stats.json`,
-which `create_datasets.py` then consumes — there is **no fallback to the
-Leinonen Swiss constants**, so this script must be run successfully before
-TF datasets can be built.
+This script is Step 4.3, between extract_patch_seq_for_datasets.py (4.1)
+and create_datasets.py (Step 5). It produces
+`our_data/normalization_stats_<source>.json` for whichever `--source`
+the run targets (dbscan / lightning), which `create_datasets.py
+--source <source>` then consumes — there is **no fallback to the
+Leinonen Swiss constants**, so this script must be run successfully
+before TF datasets can be built. Each source has its own training
+distribution, so each gets its own stats file; the two never share.
 
-When `timestep_manifest.csv` exists in the data root (i.e. Step 4.2 has
-been run), the stats accumulator can be restricted to the surviving
-(date, HHMM) timesteps instead of every reprojected file. The training
-CSV from Step 4.1 (`train_data.csv`) is still the authoritative source
-for *which sequences* the model will see at training time; the manifest
-just guarantees the underlying reprojected files exist for every
-referenced timestep.
+The training CSV (`train_data_<source>.csv`) from Step 4.1 is the
+authoritative source for *which sequences* the model will see at
+training time. For each row, the past + current + future timesteps
+(read from `sequence_meta_<source>.json`) are expanded into the set of
+(date, HHMM) tuples consumed at training time, and only those
+contribute to the stats. The cross-product manifest gate has already
+been enforced upstream by extract_patch_seq, so no separate manifest
+read is needed here.
 
 Policy decisions (also recorded inside the JSON for traceability)
 ---------------------------------------------------------------
 
 1. **Training set only.** Statistics are computed exclusively from
-   timesteps that appear inside *training-eligible windows*. For each row
-   of `train_data.csv`, the past + current + future timesteps (read from
-   `sequence_meta.json`) are expanded into the set of (date, HHMM)
-   tuples actually consumed at training time; every other timestep
-   (validation, test, or off-grid) is excluded. Pass `--no_split_filter`
-   to disable this and use every reprojected file.
+   timesteps that appear inside *training-eligible windows*. For each
+   row of `train_data_<source>.csv`, the past + current + future
+   timesteps (read from `sequence_meta_<source>.json`) are expanded
+   into the set of (date, HHMM) tuples actually consumed at training
+   time; every other timestep (validation, test, or off-grid) is
+   excluded. Pass `--no_split_filter` to disable this and use every
+   reprojected file.
 
 2. **Single scalar mean/std per variable.** Across all valid pixels of
    all training timesteps, no per-pixel climatology. Per-pixel stats
@@ -101,10 +106,12 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "our_data"
 DEFAULT_REGRID_ROOT = DEFAULT_DATA_ROOT / "reprojected_data"
-DEFAULT_OUTPUT = DEFAULT_DATA_ROOT / "normalization_stats.json"
-DEFAULT_TRAIN_CSV = DEFAULT_DATA_ROOT / "train_data.csv"
-DEFAULT_SEQUENCE_META = DEFAULT_DATA_ROOT / "sequence_meta.json"
 DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
+# The training CSV / sequence meta / output are suffixed by the
+# `--source` flag at CLI time: train_data_<source>.csv,
+# sequence_meta_<source>.json, normalization_stats_<source>.json. The
+# constants below are only used when the user passes `--no_split_filter`
+# (no training-window scope; ignored otherwise).
 
 # Map a NORMALIZATION_SPEC source name to the matching product key in
 # timestep_config.json. OPERA has two entries in the config (reflectivity /
@@ -790,15 +797,24 @@ def main() -> int:
                         default=str(DEFAULT_REGRID_ROOT),
                         help=f'Reprojected-data root '
                              f'(default: {DEFAULT_REGRID_ROOT})')
-    parser.add_argument('--train_csv', type=str,
-                        default=str(DEFAULT_TRAIN_CSV),
-                        help=f'train_data.csv used to derive training '
-                             f'(date, HHMM) keys '
-                             f'(default: {DEFAULT_TRAIN_CSV})')
-    parser.add_argument('--sequence_meta', type=str,
-                        default=str(DEFAULT_SEQUENCE_META),
-                        help=f'sequence_meta.json used for window expansion '
-                             f'(default: {DEFAULT_SEQUENCE_META})')
+    parser.add_argument('--source', type=str, default='dbscan',
+                        choices=['dbscan', 'lightning'],
+                        help="Which extract_patch_seq source to compute "
+                             "stats for. Selects "
+                             "train_data_<source>.csv + "
+                             "sequence_meta_<source>.json as inputs and "
+                             "writes normalization_stats_<source>.json. "
+                             "The two tracks need separate stats because "
+                             "their training distributions differ. "
+                             "(default: dbscan)")
+    parser.add_argument('--train_csv', type=str, default=None,
+                        help='Explicit path to the training CSV. '
+                             'Defaults to '
+                             'our_data/train_data_<source>.csv.')
+    parser.add_argument('--sequence_meta', type=str, default=None,
+                        help='Explicit path to the sequence metadata '
+                             'JSON. Defaults to '
+                             'our_data/sequence_meta_<source>.json.')
     parser.add_argument('--no_split_filter', action='store_true',
                         help='Disable the training-window filter and use '
                              'every reprojected file (validation / test data '
@@ -833,9 +849,9 @@ def main() -> int:
                              "path falls back to CPU automatically "
                              "(reservoir sampling needs the full filtered "
                              "array on host).")
-    parser.add_argument('--output', '-o', type=str,
-                        default=str(DEFAULT_OUTPUT),
-                        help=f'Output JSON path (default: {DEFAULT_OUTPUT})')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help='Output JSON path. Defaults to '
+                             'our_data/normalization_stats_<source>.json.')
     parser.add_argument('--seed', type=int, default=0,
                         help='RNG seed (default: 0).')
 
@@ -855,9 +871,24 @@ def main() -> int:
     else:  # auto
         use_gpu = _cupy_available()
 
+    # Resolve per-source paths. The user can override any of them with
+    # an explicit flag - we only build the default when it's missing.
     reproject_root = Path(args.reproject_root)
-    train_csv = Path(args.train_csv)
-    seq_meta_path = Path(args.sequence_meta)
+    train_csv = Path(
+        args.train_csv
+        if args.train_csv
+        else DEFAULT_DATA_ROOT / f"train_data_{args.source}.csv"
+    )
+    seq_meta_path = Path(
+        args.sequence_meta
+        if args.sequence_meta
+        else DEFAULT_DATA_ROOT / f"sequence_meta_{args.source}.json"
+    )
+    output_path = Path(
+        args.output
+        if args.output
+        else DEFAULT_DATA_ROOT / f"normalization_stats_{args.source}.json"
+    )
 
     variables = None
     if args.variables:
@@ -901,7 +932,8 @@ def main() -> int:
           f"{'GPU (CuPy)' if use_gpu else 'CPU (numpy)'}"
           f"{' [forced cpu]' if args.device == 'cpu' else ''}"
           f"{' [auto-fallback: no GPU]' if args.device == 'auto' and not use_gpu else ''}")
-    print(f"Output              : {args.output}")
+    print(f"Source              : {args.source}")
+    print(f"Output              : {output_path}")
     print()
 
     variable_results: dict[str, dict] = {}
@@ -925,6 +957,7 @@ def main() -> int:
     payload = {
         "computed_utc":   datetime.now(timezone.utc)
                                  .isoformat(timespec="seconds"),
+        "source":         args.source,
         "reproject_root":    str(reproject_root),
         "training_filter": {
             "train_csv":       (None if args.no_split_filter else str(train_csv)),
@@ -944,11 +977,10 @@ def main() -> int:
         "sample_fraction": args.sample_fraction,
         "variables":       variable_results,
     }
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2))
     print()
-    print(f"Wrote normalization stats to {out_path}")
+    print(f"Wrote normalization stats to {output_path}")
     print(f"  {len(variable_results)} / {len(variables)} variables ready")
     if len(variable_results) < len(variables):
         missing = sorted(set(variables) - set(variable_results.keys()))

@@ -1071,7 +1071,11 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
     # Point the lazy stats loader at this run's data_root before any
     # transform fires; required because the transforms can be called
     # from worker threads later.
-    set_normalization_stats_path(data_root / "normalization_stats.json")
+    # Per-source normalization: stats are computed from the matching
+    # train_data_<source>.csv, so the file is suffixed too.
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
 
     mode_config = get_mode_config(mode)
     # Suffix the dataset dir with the source so radar- and lightning-
@@ -1085,7 +1089,7 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
     print("=" * 70)
     print(f"Data root:    {data_root}")
     print(f"Patches dir:  {patches_dir}")
-    print(f"Stats file:   {data_root / 'normalization_stats.json'}")
+    print(f"Stats file:   {data_root / f'normalization_stats_{source}.json'}")
     print(f"Output dir:   {save_dir}")
     print(f"Label:        {mode_config['label_var']}")
     print()

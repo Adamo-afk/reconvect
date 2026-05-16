@@ -1,33 +1,40 @@
 """
 COALITION-4 patch extraction pipeline.
 
-Reads the patch index (from identify_patches.py) and the cached reprojected
-data (from reproject_data.py), extracts the active 256x256 patches for every
-product, applies resolution-dependent pooling, and saves stacked .npy files.
+Driven by the train/val/test_data_<source>.csv files produced by
+extract_patch_seq_for_datasets.py - those splits already incorporate the
+cross-product manifest gate, so this script just walks the union of
+their per-row windows and slices the active patches at each (date, time)
+from the cached reprojected data.
 
 Resolution categories:
-    HR (1km)  → no pooling   → 256×256  (radar, lightning, MTG vis_06)
-    LR (2km)  → 2×2 avg pool → 128×128  (MTG IR/WV channels)
-    LR (3km)  → 4×4 avg pool →  64×64   (MSG, NWCSAF)
+    HR (1km)  -> no pooling   -> 256x256  (radar, lightning, MTG vis_06)
+    LR (2km)  -> 2x2 avg pool -> 128x128  (MTG IR/WV channels)
+    LR (3km)  -> 4x4 avg pool ->  64x64   (MSG, NWCSAF)
 
 Output:
     our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
     Each file has shape (num_active_patches, H, W).
-    Patch order matches the active patches from patch_index.csv for that
-    timestamp (sorted ascending).
+    Patch order matches the active patches from the source patch-index
+    (patch_index.csv for --source dbscan, lightning_patches.csv for
+    --source lightning), so the idx_t* columns in the split CSVs index
+    into these files correctly.
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
-    python extract_patches.py
-    python extract_patches.py --date 2025-05-15
-    python extract_patches.py --date 2025-05-15 --products radar lightning
+    python extract_patches.py --source dbscan
+    python extract_patches.py --source lightning
+    python extract_patches.py --source dbscan --date 2025-05-15
+    python extract_patches.py --source dbscan --products satellite_MTG opera
 """
 
 import numpy as np
 import os
 import re
+import sys
 import csv
 import json
 import argparse
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -155,70 +162,131 @@ def average_pool(data, factor):
 # Patch index reader
 # =============================================================================
 
-def read_patch_index(data_root):
-    """
-    Read patch_index.csv and return a list of (date, time, active_patches).
+def _resolve_index_csv(data_root, source):
+    """Path to the per-source patch-activity index CSV."""
+    if source == 'dbscan':
+        return os.path.join(data_root, 'patch_index', 'patch_index.csv')
+    if source == 'lightning':
+        return os.path.join(
+            data_root, 'lightning_periods', 'lightning_patches.csv'
+        )
+    raise ValueError(f"Unknown --source: {source!r}")
 
-    Args:
-        data_root: path to our_data directory
 
-    Returns:
-        list[tuple]: (date_str, time_str, list[int]) for each active row
+def read_patch_index(data_root, source='dbscan'):
     """
-    csv_path = os.path.join(data_root, 'patch_index', 'patch_index.csv')
+    Read the per-source patch-activity index and return a dict
+    `{(date, 'HH:MM'): [active_patch_numbers]}`.
+
+    For `source='dbscan'` this is `our_data/patch_index/patch_index.csv`
+    (produced by identify_patches.py, regardless of whether that script
+    was run with --source radar or --source opera). For
+    `source='lightning'` it's `our_data/lightning_periods/lightning_patches.csv`
+    (produced by identify_lightning_periods.py). Both files share the
+    same `date,time_utc,iso_timestamp,patch_1..patch_18` schema, so the
+    parser is identical.
+
+    Returns: dict keyed by (date, 'HH:MM') with the sorted list of
+    1-indexed active patch numbers as the value.
+    """
+    csv_path = _resolve_index_csv(data_root, source)
     if not os.path.isfile(csv_path):
-        print(f"ERROR: patch_index.csv not found at {csv_path}")
-        print("Run identify_patches.py first.")
-        return []
+        if source == 'dbscan':
+            print(f"ERROR: patch_index.csv not found at {csv_path}")
+            print("Run identify_patches.py first.")
+        else:
+            print(f"ERROR: lightning_patches.csv not found at {csv_path}")
+            print("Run identify_lightning_periods.py first.")
+        return {}
 
-    results = []
+    index: dict[tuple[str, str], list[int]] = {}
     with open(csv_path, 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             date_str = row['date']
             time_str = row['time_utc']
 
-            active = []
-            for p in range(1, N_PATCHES + 1):
-                if row.get(f'patch_{p}', '0') == '1':
-                    active.append(p)
-
+            active = [
+                p for p in range(1, N_PATCHES + 1)
+                if row.get(f'patch_{p}', '0') == '1'
+            ]
             if active:
-                results.append((date_str, time_str, active))
+                index[(date_str, time_str)] = active
 
-    return results
+    return index
 
 
-def load_manifest_timesteps(manifest_path):
+def _load_step_minutes_from_sequence_meta(data_root, source):
+    """Read step_minutes from sequence_meta_<source>.json.
+
+    The split CSVs (train/val/test_data_<source>.csv) were produced by
+    extract_patch_seq_for_datasets.py at this cadence; we need it to
+    enumerate the timesteps inside each row's `[start_utc, end_utc]`
+    window. Fails fast if the metadata is missing — the file must exist
+    in lockstep with the split CSVs.
     """
-    Read the timestep manifest produced by `intersect_product_coverage.py`
-    and return the set of `(date, 'HH:MM')` tuples that survived the
-    per-timestep intersection.
+    meta_path = os.path.join(data_root, f'sequence_meta_{source}.json')
+    if not os.path.isfile(meta_path):
+        print(
+            f"ERROR: {meta_path} not found.\n"
+            f"Run extract_patch_seq_for_datasets.py --source {source} first.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    with open(meta_path) as f:
+        seq = json.load(f)
+    return int(seq['step_minutes'])
 
-    The manifest columns are `date,hhmm,<key>_hhmm,...`. We only need the
-    first two — the per-product columns are an audit trail consumed by
-    other tooling. Returns an empty set if the file does not exist, in
-    which case the caller falls back to processing every entry in the
-    patch index.
+
+def load_sequence_timesteps(data_root, source):
+    """Return the set of (date, 'HH:MM') timesteps needed across all
+    train / validation / test sequences for the chosen source.
+
+    Each split row carries `date, start_utc, end_utc`. The window from
+    `start_utc` to `end_utc` (inclusive) at `step_minutes` spacing is
+    exactly the set of timesteps the training pipeline will load for
+    that sample (past + current + future). The union across all rows in
+    all three splits is what extract_patches needs on disk.
+
+    This replaces the older `patch_index ∩ timestep_manifest` flow: the
+    splits already incorporate the manifest gate (Step 6 enforces it),
+    so any (date, time) here is guaranteed to have survived every
+    upstream filter.
     """
-    if not manifest_path or not os.path.isfile(manifest_path):
-        return set()
-    used: set[tuple[str, str]] = set()
-    with open(manifest_path, 'r') as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames is None or 'date' not in reader.fieldnames \
-                or 'hhmm' not in reader.fieldnames:
-            return set()
-        for row in reader:
-            date_str = row['date'].strip()
-            hhmm = row['hhmm'].strip()
-            if not date_str or len(hhmm) != 4 or not hhmm.isdigit():
-                continue
-            used.add((date_str, f"{hhmm[:2]}:{hhmm[2:]}"))
-    if used:
-        print(f"  Manifest:        {manifest_path}  "
-              f"({len(used)} timesteps to extract)")
-    return used
+    step_minutes = _load_step_minutes_from_sequence_meta(data_root, source)
+    step = timedelta(minutes=step_minutes)
+
+    needed: set[tuple[str, str]] = set()
+    n_rows = 0
+    for split in ('train', 'validation', 'test'):
+        csv_path = os.path.join(data_root, f'{split}_data_{source}.csv')
+        if not os.path.isfile(csv_path):
+            print(f"  WARNING: {csv_path} not found - skipping {split} split.")
+            continue
+        with open(csv_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                date_str = row['date'].strip()
+                start_str = row['start_utc'].strip()
+                end_str = row['end_utc'].strip()
+                if not (date_str and start_str and end_str):
+                    continue
+                base = datetime.strptime(date_str, '%Y-%m-%d')
+                # start/end_utc are HH:MM relative to the same calendar
+                # day. We don't carry sequences across midnight today.
+                start_h, start_m = (int(x) for x in start_str.split(':'))
+                end_h, end_m = (int(x) for x in end_str.split(':'))
+                t = base.replace(hour=start_h, minute=start_m)
+                t_end = base.replace(hour=end_h, minute=end_m)
+                while t <= t_end:
+                    needed.add((date_str, t.strftime('%H:%M')))
+                    t += step
+                n_rows += 1
+
+    if needed:
+        print(f"  Split CSVs:      train+val+test for --source {source}  "
+              f"({n_rows} sequences -> {len(needed)} unique timesteps)")
+    return needed, step_minutes
 
 
 # =============================================================================
@@ -514,59 +582,75 @@ def extract_and_pool(data, active_patches, pool_factor):
 # Main pipeline
 # =============================================================================
 
-def run_extraction(data_root, output_root, date_filter=None,
-                   product_filter=None, manifest=None):
+def run_extraction(data_root, output_root, source='dbscan',
+                   date_filter=None, product_filter=None):
     """
     Run the patch extraction pipeline.
 
+    Step 6 (`extract_patch_seq_for_datasets.py`) already produced the
+    train / validation / test_data_<source>.csv files with the manifest
+    gate enforced - those CSVs are the authoritative list of (date, time)
+    pairs the training pipeline will load. We walk the union of the
+    three splits, look up the active patches at each timestep from the
+    per-source patch-activity index, and slice + save. No separate
+    manifest read is needed.
+
     Args:
-        data_root: path to our_data directory
-        output_root: path to output patches directory
-        date_filter: optional YYYY-MM-DD
+        data_root:      path to our_data directory
+        output_root:    path to output patches directory
+        source:         'dbscan' (patch_index.csv from identify_patches)
+                        or 'lightning' (lightning_patches.csv from
+                        identify_lightning_periods). Picks both the
+                        activity-index file and the split CSV suffix.
+        date_filter:    optional YYYY-MM-DD to restrict processing
         product_filter: optional list of group names to process
-        manifest: optional path to `timestep_manifest.csv` (the output
-            of `intersect_product_coverage.py`). When supplied (or
-            auto-discovered at `<data_root>/timestep_manifest.csv`),
-            only timesteps listed in the manifest are processed.
-            Pass an empty string or `'none'` to disable and process
-            every active timestep in `patch_index.csv`.
     """
     print("=" * 70)
     print("COALITION-4 Patch Extraction Pipeline")
     print("=" * 70)
     print(f"Data root   : {data_root}")
     print(f"Output root : {output_root}")
+    print(f"Source      : {source}")
 
-    # Read patch index — this gives us the per-timestep set of active
-    # patches (needed regardless of whether the manifest filter is on).
-    index = read_patch_index(data_root)
+    # Per-timestep active-patches lookup. The same index file the split
+    # CSVs were built from, so the saved-patch ORDER matches the idx_t*
+    # column values in those CSVs.
+    index = read_patch_index(data_root, source=source)
     if not index:
         return
 
-    # Constrain to (date, time) pairs in the intersect manifest. Skipping
-    # un-listed timesteps avoids work on slots where one or more required
-    # products had no data.
-    if manifest is None:
-        manifest = os.path.join(data_root, 'timestep_manifest.csv')
-    used_timesteps: set[tuple[str, str]] = set()
-    if manifest:
-        used_timesteps = load_manifest_timesteps(manifest)
-    if used_timesteps:
-        before = len(index)
-        index = [(d, t, a) for d, t, a in index
-                 if (d, t) in used_timesteps]
-        print(f"Manifest filter: kept {len(index)}/{before} timesteps")
+    # Union of (date, time) pairs across train / val / test_<source>.csv.
+    # Each split row's [start_utc, end_utc] window at step_minutes
+    # spacing contributes past+1+future timesteps.
+    needed_timesteps, _step_minutes = load_sequence_timesteps(
+        data_root, source
+    )
+    if not needed_timesteps:
+        print(f"No train/val/test_{source}.csv rows found at "
+              f"{data_root}. Run extract_patch_seq_for_datasets.py "
+              f"--source {source} first.")
+        return
 
+    # Filter the index to (date, time) the split CSVs actually need.
+    kept_keys = sorted(set(index.keys()) & needed_timesteps)
     if date_filter:
-        index = [(d, t, a) for d, t, a in index if d == date_filter]
+        kept_keys = [(d, t) for (d, t) in kept_keys if d == date_filter]
         print(f"Date filter : {date_filter}")
 
-    if not index:
-        print("No matching timestamps in patch index.")
+    if not kept_keys:
+        print("No matching timestamps. The split CSVs reference no "
+              "(date, time) pairs that exist in the patch index - "
+              "did you run Steps 4-6 for this source?")
         return
 
-    dates = sorted(set(d for d, _, _ in index))
-    print(f"Timestamps  : {len(index)} across {len(dates)} dates")
+    index_rows = [(d, t, index[(d, t)]) for d, t in kept_keys]
+    dates = sorted({d for d, _, _ in index_rows})
+    print(f"Timestamps  : {len(index_rows)} across {len(dates)} dates "
+          f"(union of train+val+test for --source {source})")
+
+    # Rebind for the rest of the loop: the older code below iterates
+    # `index` as a list of (date, time, active_patches) tuples.
+    index = index_rows
 
     # Determine which product groups to process
     if product_filter:
@@ -686,29 +770,26 @@ if __name__ == "__main__":
         help="Product groups to extract (default: all)"
     )
     parser.add_argument(
-        "--manifest", type=str, default=None,
-        help="Path to the timestep manifest produced by "
-             "intersect_product_coverage.py. Default: "
-             "<data_root>/timestep_manifest.csv if it exists. Pass "
-             "`--manifest none` to skip the filter and process every "
-             "active timestep in patch_index.csv."
+        "--source", type=str, default='dbscan',
+        choices=['dbscan', 'lightning'],
+        help="Which extract_patch_seq source to follow. 'dbscan' "
+             "(default) reads patch_index.csv from identify_patches "
+             "and walks train/val/test_data_dbscan.csv. 'lightning' "
+             "reads lightning_patches.csv from identify_lightning_periods "
+             "and walks train/val/test_data_lightning.csv. The split "
+             "CSVs already incorporate the timestep_manifest.csv gate, "
+             "so no separate manifest read is needed."
     )
 
     args = parser.parse_args()
 
     output_root = args.output_dir or os.path.join(args.data_root, 'patches')
 
-    # `--manifest none` explicitly opts out; otherwise auto-discover.
-    if args.manifest is not None:
-        manifest = '' if args.manifest.lower() == 'none' else args.manifest
-    else:
-        manifest = None  # let run_extraction auto-discover
-
     run_extraction(
         data_root=args.data_root,
         output_root=output_root,
+        source=args.source,
         date_filter=args.date,
         product_filter=args.products,
-        manifest=manifest,
     )
     
