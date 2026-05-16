@@ -665,9 +665,22 @@ def discover_inputs(reproject_root: Path, var: str,
             reproject_root / "satellite_data" / "MTG", var, keys,
         )
     if source == "lightning":
-        return _walk_lightning(
-            reproject_root / "lightning_data", var, keys,
-        )
+        # Lightning maps are written natively onto the Romania grid by
+        # read_kml_version2.py at `data_root/lightning_data/...`, NOT
+        # `reproject_root/lightning_data/...`. The legacy
+        # reproject.py --lightning flow used to mirror them under
+        # reproject_root, so try the legacy location first for
+        # backward compatibility, then fall back to the canonical
+        # native location (reproject_root's sibling).
+        for candidate in (
+            reproject_root / "lightning_data",
+            reproject_root.parent / "lightning_data",
+        ):
+            if (candidate / var).is_dir():
+                return _walk_lightning(candidate, var, keys)
+        # Neither exists - return [] so the caller's empty-list branch
+        # logs a clean "0 file(s) match" line.
+        return []
     if source == "nwcsaf":
         return _walk_nwcsaf(
             reproject_root / "nwcsaf_data", var, keys,
