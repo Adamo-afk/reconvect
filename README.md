@@ -155,7 +155,7 @@ coalition4-rcnn/
 │   ├── sequence_meta_{source}.json    # Per-sample window (generated in Step 4.1, per source)
 │   ├── timestep_manifest.csv          # Surviving (date, HHMM) timesteps (generated in Step 4.2)
 │   ├── intersect_summary.png          # Per-date stacked bar of kept vs dropped (Step 4.2)
-│   ├── normalization_stats.json       # Per-variable mean/std (generated in Step 4.3)
+│   ├── normalization_stats_{source}.json  # Per-variable mean/std per source (generated in Step 4.3)
 │   ├── train_data_{source}.csv        # Training sequences per source (80% per temporal block)
 │   ├── validation_data_{source}.csv   # Validation sequences per source (10% per temporal block)
 │   ├── test_data_{source}.csv         # Test sequences per source (10% per temporal block)
@@ -176,10 +176,10 @@ coalition4-rcnn/
 ├── identify_patches.py                # Step 1 (--source {radar, opera}): DBSCAN → patch_index.csv
 ├── identify_lightning_periods.py      # Step 1 (--source lightning): occurrence-fraction filter → lightning_periods/lightning_patches.csv
 ├── reproject.py                          # Step 2: Reproject all products to Romania grid; also aggregates per-category logs into errors.txt
-├── extract_patches.py                 # Step 3: Slice 256×256 patches from reprojected data
+├── extract_patches.py                 # Step 3: Slice 256×256 patches from reprojected data (driven by Step 4.1's per-source split CSVs; --source dbscan / lightning)
 ├── extract_patch_seq_for_datasets.py  # Step 4.1: Continuous sequences + Czibula split + manifest gate (per-source CSVs)
 ├── intersect_product_coverage.py      # Step 4.2: Per-timestep manifest + plot (--summary / --missing / --active per product)
-├── compute_normalization_stats.py     # Step 4.3: Per-variable mean/std → normalization_stats.json
+├── compute_normalization_stats.py     # Step 4.3: Per-variable mean/std → normalization_stats_<source>.json (--source dbscan / lightning)
 ├── create_datasets.py                 # Step 5: Build TF datasets + metadata.json (--source aware)
 ├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
 ├── evaluate_coalition.py              # Step 7: Evaluate and generate plots
@@ -365,21 +365,20 @@ python reproject.py --radar --date 2025-05-15      # single date
 
 #### Step 3 — Extract 256×256 patches
 
-Reads the patch index and reprojected data, extracts active patches, applies resolution-dependent pooling (none for HR, 2×2 for MTG LR, 4×4 for MSG LR).
+> **Order of operations:** this step now runs **after Step 4.1** (`extract_patch_seq_for_datasets.py`). The split CSVs that step produces (with the manifest gate baked in) are the exact list of (date, time) pairs extract_patches needs to walk — driving off them avoids the previous patch_index + manifest filtering loop and guarantees the saved patches stay in sync with what training will load.
 
-Two pieces of context are read automatically:
+Reads the per-source patch-activity index (`patch_index.csv` for `--source dbscan`, `lightning_patches.csv` for `--source lightning`) and the cached reprojected data, walks the **union of (date, time) tuples across `train/val/test_data_<source>.csv`**, slices the active patches at each step, applies resolution-dependent pooling (none for HR, 2×2 for MTG LR, 4×4 for MSG LR), and saves stacked `.npy` files.
 
-1. **`timestep_config.json`** — provides the per-product minute filter. The patch index uses OPERA's 15-min grid (`:00, :15, :30, :45`), but MTG files are written at `:00, :10, :30, :40`. The file finder maps the requested HHMM to the nearest minute in each product's filter — OPERA `:15` reads MTG `:10`, OPERA `:45` reads MTG `:40`, OPERA `:00 / :30` use exact match. The mapping is a direct function of the filter (not a ±tolerance search). If the config or a product entry is missing, the finder uses exact match.
-
-2. **`timestep_manifest.csv`** — the post-intersect manifest from Step 4.2. Only timesteps listed in the manifest are processed; the rest are skipped. Pass `--manifest none` to process every entry in `patch_index.csv` instead.
+`timestep_config.json` is still read for the per-product cadence snap (e.g. OPERA's 15-min grid vs MTG's `:00, :10, :30, :40`). No separate manifest read is needed because the split CSVs already incorporate that gate (Step 4.1 enforces it).
 
 ```bash
-python extract_patches.py
-python extract_patches.py --date 2025-05-15
-python extract_patches.py --products radar lightning
+python extract_patches.py --source dbscan
+python extract_patches.py --source lightning
+python extract_patches.py --source dbscan --date 2025-05-15
+python extract_patches.py --source dbscan --products satellite_MTG opera lightning
 ```
 
-Output: `our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy`
+Output: `our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy` (shape `(num_active_patches, H, W)`; the per-patch order at each timestep matches whichever index file `--source` selected, so the `idx_t*` columns in the split CSVs address the right slice).
 
 #### Step 4.1 — Extract temporally continuous sequences and split dataset
 
@@ -470,7 +469,7 @@ python lightning_fraction.py --scope_csv our_data/train_data_lightning.csv
 
 #### Step 4.2 — Intersect per-product timestep coverage
 
-`intersect_product_coverage.py` computes the per-timestep intersection of available data across the chosen product set and writes a manifest that Step 4.1 (`extract_patch_seq_for_datasets.py`, the final filter) and Step 5 (`extract_patches.py`) consume directly.
+`intersect_product_coverage.py` computes the per-timestep intersection of available data across the chosen product set and writes a manifest that Step 4.1 (`extract_patch_seq_for_datasets.py`, the final filter) consumes directly. `extract_patches.py` does **not** read the manifest itself any more — it walks the train/val/test CSVs produced by Step 4.1, which already incorporate the manifest gate.
 
 - **Active products** are determined by which `--summary KEY=PATH` flags you pass. Lightning is included only when `--summary lightning=...` is supplied.
 - **Per-timestep availability** is sourced from one of two gates per product:
@@ -509,28 +508,34 @@ python intersect_product_coverage.py \
 
 | File | Purpose |
 |---|---|
-| `our_data/timestep_manifest.csv` | One row per surviving `(date, HHMM)`; columns also include the per-product snapped HHMM each product loaded so the manifest doubles as an audit trail. Consumed by `extract_patches.py`. |
+| `our_data/timestep_manifest.csv` | One row per surviving `(date, HHMM)`; columns also include the per-product snapped HHMM each product loaded so the manifest doubles as an audit trail. Consumed by `extract_patch_seq_for_datasets.py` (Step 4.1) as the final cross-product gate before the split CSVs are written. |
 | `our_data/intersect_summary.png` | Per-date stacked bar: kept timesteps + drops attributed to each product / error log. Shows the quantitative impact of the intersection. |
 
 > **Why this comes before Step 4.3**: the normalization stats are computed on the surviving timesteps, so they never see slots that would later be discarded for missing inputs — fewer file reads and stats that match the eventual training distribution.
 
 #### Step 4.3 — Compute normalization statistics
 
-`compute_normalization_stats.py` derives per-variable mean / std from the reprojected data so the model trains on values centred for the **Romanian** distribution, not the Swiss one. This step is **mandatory** before Step 5: `create_datasets.py` no longer falls back to the Leinonen Table A1 constants — if `normalization_stats.json` is missing, the run fails with an explicit pointer back to this script.
+`compute_normalization_stats.py` derives per-variable mean / std from the reprojected data so the model trains on values centred for the **Romanian** distribution, not the Swiss one. This step is **mandatory** before Step 5: `create_datasets.py` no longer falls back to the Leinonen Table A1 constants — if `normalization_stats_<source>.json` is missing, the run fails with an explicit pointer back to this script.
+
+Stats are now **per-source**. The DBSCAN-driven and lightning-driven tracks have different training distributions (different sets of `(date, time)` survive each filter chain), so each writes its own `normalization_stats_<source>.json` and `create_datasets.py --source <source>` reads the matching one. The inputs (`train_data_<source>.csv`, `sequence_meta_<source>.json`) are also auto-resolved from `--source`.
 
 ```bash
-# Default — read reprojected_data/, filter to training-eligible timesteps,
-# scalar mean/std per variable
-python compute_normalization_stats.py
+# DBSCAN track (reads train_data_dbscan.csv + sequence_meta_dbscan.json,
+# writes normalization_stats_dbscan.json)
+python compute_normalization_stats.py --source dbscan
+
+# Lightning track (reads train_data_lightning.csv + sequence_meta_lightning.json,
+# writes normalization_stats_lightning.json)
+python compute_normalization_stats.py --source lightning
 
 # Subset of variables (faster iteration while tuning)
-python compute_normalization_stats.py --variables RZC ir_105 cmic_cot
+python compute_normalization_stats.py --source dbscan --variables RZC ir_105
 
 # Also surface p01 / p50 / p99 + MAD via reservoir sampling
-python compute_normalization_stats.py --with_percentiles
+python compute_normalization_stats.py --source dbscan --with_percentiles
 
 # Disable training-window filter (DIAGNOSTIC ONLY — leaks val/test data)
-python compute_normalization_stats.py --no_split_filter
+python compute_normalization_stats.py --source dbscan --no_split_filter
 ```
 
 **Policy decisions** (recorded inside the JSON for traceability):
@@ -570,7 +575,7 @@ When `--with_percentiles` is passed, each variable block additionally carries `p
 #### Step 5 — Build TF datasets
 
 Transforms patches using the **data-driven** mean / std from
-`our_data/normalization_stats.json` (Step 4.3) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
+`our_data/normalization_stats_<source>.json` (Step 4.3, matching the chosen `--source`) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
 
 Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, and the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr` modes. The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
 
