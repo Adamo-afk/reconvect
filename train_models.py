@@ -251,6 +251,15 @@ def load_training_config(path: Path) -> dict:
         "num_heads":      _coerce(f.get("num_heads", "4"), int),
         "c_shared":       _coerce(f.get("c_shared", "64"), int),
         "head_dropout":   _coerce(f.get("head_dropout", "0.1"), float),
+        # Per-stage mixed-precision override. Set to false to force fp32
+        # for the fine-tune stage even when [defaults].mixed_precision is
+        # true. Useful when the Swin head's MultiHeadAttention overflows
+        # fp16 (Q@K^T can exceed 65504) and produces NaN losses. None ->
+        # inherit from [defaults].mixed_precision.
+        "mixed_precision": (
+            None if "mixed_precision" not in f
+            else _coerce(f.get("mixed_precision"), bool)
+        ),
     }
     if finetune["optimizer"] not in ("adam", "adamw"):
         raise ValueError(
@@ -2012,6 +2021,12 @@ def main():
                 base_model_path if args.stage == "both"
                 else Path(args.base_checkpoint)
             )
+            # [finetune].mixed_precision overrides [defaults] if set; this
+            # lets the base stage stay in fp16 while the fine-tune runs in
+            # fp32 (the Swin head's MultiHeadAttention can overflow fp16).
+            ft_mp = cfg["finetune"]["mixed_precision"]
+            if ft_mp is None:
+                ft_mp = params["mixed_precision"]
             train_finetune(
                 mode=mode,
                 data_root=args.data_root,
@@ -2021,7 +2036,7 @@ def main():
                 batch_size=params["batch_size"],
                 finetune_cfg=cfg["finetune"],
                 shuffle_buffer=params["shuffle_buffer"],
-                mixed_precision=params["mixed_precision"],
+                mixed_precision=ft_mp,
                 early_stopping_cfg=cfg["early_stopping"],
                 checkpoint_cfg=cfg["checkpointing"],
                 resume=cfg["checkpointing"].get("resume", True)
