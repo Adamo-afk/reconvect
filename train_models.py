@@ -923,7 +923,17 @@ class SwinBlock(tf.keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, x, training=None):
-        # x: (B, H, W, C)
+        # x: (B, H, W, C). Under mixed_float16 global policy, some
+        # sublayers (notably MultiHeadAttention's internal Q/K/V/output
+        # dense projections, and the MLP Dense layers under autocast)
+        # can still emit fp16 even when their parent layer's dtype is
+        # 'float32' (Keras 2.10 doesn't always propagate the parent
+        # policy to internal sublayers). Without explicit casts at the
+        # residual joins, `shortcut + x` raises AddV2 dtype mismatch.
+        # All casts target self.dtype so the block runs in one dtype
+        # end-to-end regardless of the surrounding policy.
+        target_dtype = self.dtype
+        x = tf.cast(x, target_dtype)
         B = tf.shape(x)[0]
         H = tf.shape(x)[1]
         W = tf.shape(x)[2]
@@ -936,6 +946,7 @@ class SwinBlock(tf.keras.layers.Layer):
 
         x_windows = _window_partition(x, self.window_size)
         attn_out = self.attn(x_windows, x_windows, training=training)
+        attn_out = tf.cast(attn_out, target_dtype)
         x = _window_reverse(attn_out, H, W, self.window_size, B)
 
         if self.shift_size > 0:
@@ -950,6 +961,7 @@ class SwinBlock(tf.keras.layers.Layer):
         h = self.mlp_drop1(h, training=training)
         h = self.mlp_dense2(h)
         h = self.mlp_drop2(h, training=training)
+        h = tf.cast(h, target_dtype)
         return x + h
 
     def get_config(self):
