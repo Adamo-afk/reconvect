@@ -295,6 +295,113 @@ class ResGRU(Layer):
 
 
 # ============================================================================
+# Swin transformer head — embedded for standalone loading of fine-tuned models
+# ============================================================================
+#
+# Mirror of the Swin layer defined in train_models.py so saved
+# `*_finetuned.keras` files (Swin head grafted onto a frozen backbone)
+# can be reloaded here without importing the training module. Same
+# class name + same get_config so the serialised graph round-trips.
+
+
+def _window_partition(x, window_size):
+    """(B, H, W, C) -> (B*nW, ws*ws, C) where nW = (H/ws)*(W/ws)."""
+    shape = tf.shape(x)
+    B, H, W = shape[0], shape[1], shape[2]
+    C = x.shape[-1]
+    ws = window_size
+    x = tf.reshape(x, [B, H // ws, ws, W // ws, ws, C])
+    x = tf.transpose(x, [0, 1, 3, 2, 4, 5])
+    x = tf.reshape(x, [-1, ws * ws, C])
+    return x
+
+
+def _window_reverse(x_windows, H, W, window_size, B):
+    """(B*nW, ws*ws, C) -> (B, H, W, C)."""
+    ws = window_size
+    C = x_windows.shape[-1]
+    x = tf.reshape(x_windows, [B, H // ws, W // ws, ws, ws, C])
+    x = tf.transpose(x, [0, 1, 3, 2, 4, 5])
+    x = tf.reshape(x, [B, H, W, C])
+    return x
+
+
+class SwinBlock(tf.keras.layers.Layer):
+    """Single Swin transformer block (W-MSA or SW-MSA + MLP).
+
+    Re-implemented here for `tf.keras.models.load_model()` to find by
+    name when deserialising `*_finetuned.keras` files written by
+    train_models.train_finetune. Behaviour must stay in lockstep with
+    the definition in train_models.py.
+    """
+
+    def __init__(self, dim, num_heads, window_size, shift_size,
+                 mlp_ratio=2.0, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+
+    def build(self, input_shape):
+        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.attn = tf.keras.layers.MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=max(1, self.dim // self.num_heads),
+            dropout=self.dropout,
+        )
+        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        hidden = int(self.dim * self.mlp_ratio)
+        self.mlp_dense1 = tf.keras.layers.Dense(hidden, activation='gelu')
+        self.mlp_drop1 = tf.keras.layers.Dropout(self.dropout)
+        self.mlp_dense2 = tf.keras.layers.Dense(self.dim)
+        self.mlp_drop2 = tf.keras.layers.Dropout(self.dropout)
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        B = tf.shape(x)[0]
+        H = tf.shape(x)[1]
+        W = tf.shape(x)[2]
+        shortcut = x
+        x = self.norm1(x)
+
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(-self.shift_size, -self.shift_size),
+                        axis=(1, 2))
+
+        x_windows = _window_partition(x, self.window_size)
+        attn_out = self.attn(x_windows, x_windows, training=training)
+        x = _window_reverse(attn_out, H, W, self.window_size, B)
+
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(self.shift_size, self.shift_size),
+                        axis=(1, 2))
+
+        x = shortcut + x
+
+        h = self.norm2(x)
+        h = self.mlp_dense1(h)
+        h = self.mlp_drop1(h, training=training)
+        h = self.mlp_dense2(h)
+        h = self.mlp_drop2(h, training=training)
+        return x + h
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "dim":          self.dim,
+            "num_heads":    self.num_heads,
+            "window_size":  self.window_size,
+            "shift_size":   self.shift_size,
+            "mlp_ratio":    self.mlp_ratio,
+            "dropout":      self.dropout,
+        })
+        return cfg
+
+
+# ============================================================================
 # Loss and metrics — embedded for standalone model loading
 # ============================================================================
 
@@ -1260,13 +1367,18 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     print(f"\n2. Loading model from {model_path}")
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-    # Custom objects for deserialization (all defined above)
+    # Custom objects for deserialization (all defined above). SwinBlock
+    # is only present in `*_finetuned.keras` files (the Swin head grafted
+    # by train_models.train_finetune); it's harmless to include for the
+    # base `coalition_*.keras` too because Keras only looks up names it
+    # actually finds in the saved config.
     custom_objects = {
         'ReflectionPadding2D': ReflectionPadding2D,
         'ConvBlock': ConvBlock,
         'ResBlock': ResBlock,
         'GRUResBlock': GRUResBlock,
         'ResGRU': ResGRU,
+        'SwinBlock': SwinBlock,
         'WeightedFocalLoss': WeightedFocalLoss,
         'iou_metric': iou_metric,
         'true_pos': true_pos,
