@@ -37,6 +37,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from datetime import datetime, timedelta
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -45,14 +46,121 @@ DEFAULT_DATA_ROOT = str(PROJECT_ROOT / 'our_data')
 PRODUCTS = ['density', 'current', 'occurrence']
 
 
-def load_scope_set(csv_path):
+def _load_step_minutes(data_root, source):
+    """Read `step_minutes` from `sequence_meta_<source>.json`.
+
+    Needed when the scope CSV is per-sequence (train_data_<source>.csv
+    rows carry `start_utc / end_utc` instead of `time_utc`) and we
+    have to expand each row's window at the run's cadence.
+    """
+    meta_path = Path(data_root) / f"sequence_meta_{source}.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError(
+            f"{meta_path} not found - needed to expand sequence rows "
+            f"into per-timestep keys. Run "
+            f"`python extract_patch_seq_for_datasets.py --source {source}` "
+            f"first, or pass --scope_csv pointing at a per-timestep CSV "
+            f"such as lightning_active_steps.csv."
+        )
+    meta = json.loads(meta_path.read_text())
+    return int(meta["step_minutes"])
+
+
+def _load_lightning_filter(data_root):
+    """Return the set of lightning minute-of-hour slots from
+    `timestep_config.json`. Returns `None` if no filter is set
+    (continuous-cadence lightning), in which case no HHMM snapping is
+    applied.
+    """
+    cfg_path = Path(data_root) / "timestep_config.json"
+    if not cfg_path.is_file():
+        return None
+    cfg = json.loads(cfg_path.read_text())
+    flt = cfg.get("products", {}).get("lightning", {}).get("filter")
+    if not flt:
+        return None
+    return {int(m) for m in flt}
+
+
+def _snap_hhmm_to_filter(hhmm, filter_minutes):
+    """Snap an HHMM string to the nearest minute in `filter_minutes`.
+
+    Same rule as `extract_patches.py._snap_hhmm_to_filter` so the keys
+    here line up with the files that script writes / loads. Ties
+    prefer the earlier minute so master :15 deterministically snaps
+    to lightning :10 (not :20 if both existed).
+    """
+    h, m = int(hhmm[:2]), int(hhmm[2:])
+    best = min(
+        filter_minutes,
+        key=lambda fm: (min(abs(fm - m), 60 - abs(fm - m)), fm),
+    )
+    diff = best - m
+    if diff > 30:
+        diff -= 60
+    elif diff < -30:
+        diff += 60
+    total = (h * 60 + m + diff) % (24 * 60)
+    return f"{total // 60:02d}{total % 60:02d}"
+
+
+def _expand_sequence_rows(reader, step_minutes, filter_minutes):
+    """Iterate rows with `date / start_utc / end_utc` and yield every
+    `(date, HHMM)` tuple inside `[start_utc, end_utc]` at
+    `step_minutes` spacing, snapped to the lightning filter so the
+    HHMMs match the .npy filenames on disk (master grid :15 / :45
+    snap to lightning :10 / :40 etc.).
+    """
+    step = timedelta(minutes=step_minutes)
+    for row in reader:
+        date_str = (row.get('date') or '').strip()
+        start_str = (row.get('start_utc') or '').strip()
+        end_str = (row.get('end_utc') or '').strip()
+        if not (date_str and start_str and end_str):
+            continue
+        try:
+            base = datetime.strptime(date_str, '%Y-%m-%d')
+            sh, sm = (int(x) for x in start_str.split(':'))
+            eh, em = (int(x) for x in end_str.split(':'))
+        except ValueError:
+            continue
+        t = base.replace(hour=sh, minute=sm)
+        t_end = base.replace(hour=eh, minute=em)
+        # Windows don't cross midnight today; broken row -> skip.
+        if t_end < t:
+            continue
+        while t <= t_end:
+            hhmm = t.strftime('%H%M')
+            if filter_minutes is not None:
+                hhmm = _snap_hhmm_to_filter(hhmm, filter_minutes)
+            yield date_str, hhmm
+            t += step
+
+
+def load_scope_set(csv_path, data_root=None, source=None):
     """Return the set of (date_str, HHMM) tuples to scope the scan by.
 
-    Reads any CSV with at least `date` and `time_utc` columns
-    (`lightning_active_steps.csv`, `train_data.csv`, etc.). HH:MM in
-    the CSV is normalised to a 4-digit HHMM string so it matches the
-    `.npy` filenames on disk. Returns `None` to mean "no scope" - the
-    caller should treat that as the legacy "scan everything" mode.
+    Auto-detects the CSV shape:
+
+    - **Per-timestep CSVs** (`lightning_active_steps.csv`,
+      `patch_index.csv`) have `date,time_utc,...`. Each row is one
+      (date, time); read as-is. When the CSV also carries the
+      lightning sub-product flag columns
+      (density/current/occurrence), only rows where at least one flag
+      is 1 are kept.
+
+    - **Per-sequence CSVs** (`train_data_<source>.csv` and friends
+      from `extract_patch_seq_for_datasets.py`) have
+      `date,reference_utc,start_utc,end_utc,...`. Each row's
+      `[start_utc, end_utc]` window is expanded at `step_minutes`
+      (from `sequence_meta_<source>.json`) and every produced HHMM
+      is snapped to `products.lightning.filter` so it lines up with
+      the filenames `read_kml_version2.py` writes (master :15
+      snaps to lightning :10, etc.). `source` must be supplied for
+      this path.
+
+    Returns `None` when `csv_path` is empty or 'none' (legacy
+    "scan every .npy on disk" mode).
     """
     if not csv_path or str(csv_path).lower() in ('none', ''):
         return None
@@ -61,38 +169,66 @@ def load_scope_set(csv_path):
         raise FileNotFoundError(
             f"Scope CSV not found: {p}.\n"
             f"Pass --scope_csv none to scan every .npy on disk instead, or "
-            f"run summarize_lightning_data.py to produce the default "
-            f"lightning_active_steps.csv."
+            f"run extract_patch_seq_for_datasets.py --source <s> to "
+            f"produce the per-source train_data CSV."
         )
-    keys = set()
+
     with open(p, 'r', newline='') as f:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"{p}: empty CSV")
-        for col in ('date', 'time_utc'):
-            if col not in reader.fieldnames:
+        fieldnames = set(reader.fieldnames)
+        if 'date' not in fieldnames:
+            raise ValueError(
+                f"{p}: missing required column 'date' "
+                f"(have: {reader.fieldnames})"
+            )
+
+        # Resolve the lightning filter once. The per-sequence branch
+        # snaps every expanded HHMM; the per-timestep branch leaves
+        # already-listed HHMMs alone (they're typically already on
+        # the filter, e.g. lightning_active_steps.csv).
+        eff_data_root = (
+            data_root if data_root else str(p.parent)
+        )
+        filter_minutes = _load_lightning_filter(eff_data_root)
+
+        # Branch 1: per-timestep CSV.
+        if 'time_utc' in fieldnames:
+            keys = set()
+            flag_cols = [c for c in reader.fieldnames if c in PRODUCTS]
+            for row in reader:
+                if flag_cols and not any(
+                    (row.get(c) or '').strip() == '1' for c in flag_cols
+                ):
+                    continue
+                date_str = (row.get('date') or '').strip()
+                time_str = (row.get('time_utc') or '').strip()
+                if not date_str or not time_str:
+                    continue
+                keys.add((date_str, time_str.replace(':', '').zfill(4)))
+            return keys
+
+        # Branch 2: per-sequence CSV (start_utc + end_utc).
+        if 'start_utc' in fieldnames and 'end_utc' in fieldnames:
+            if source is None:
                 raise ValueError(
-                    f"{p}: missing required column {col!r} "
-                    f"(have: {reader.fieldnames})"
+                    f"{p}: per-sequence CSV requires --source so the "
+                    f"matching sequence_meta_<source>.json can be read "
+                    f"for step_minutes."
                 )
-        # If the CSV has activity flag columns (density/current/occurrence
-        # in lightning_active_steps.csv), only keep rows where at least
-        # one flag is 1. For other CSVs (train_data.csv etc.) every row
-        # counts. We distinguish the two by checking whether any of the
-        # known flag columns exist.
-        flag_cols = [c for c in reader.fieldnames if c in PRODUCTS]
-        for row in reader:
-            if flag_cols and not any(
-                (row.get(c) or '').strip() == '1' for c in flag_cols
-            ):
-                continue
-            date_str = (row.get('date') or '').strip()
-            time_str = (row.get('time_utc') or '').strip()
-            if not date_str or not time_str:
-                continue
-            hhmm = time_str.replace(':', '').zfill(4)
-            keys.add((date_str, hhmm))
-    return keys
+            step_minutes = _load_step_minutes(eff_data_root, source)
+            return set(_expand_sequence_rows(
+                reader, step_minutes, filter_minutes,
+            ))
+
+        # Neither schema matched.
+        raise ValueError(
+            f"{p}: cannot determine scope schema. Expected either "
+            f"`date,time_utc,...` (per-timestep) or "
+            f"`date,start_utc,end_utc,...` (per-sequence). "
+            f"Got columns: {reader.fieldnames}"
+        )
 
 
 def parse_filename(npy_file, product):
@@ -269,7 +405,9 @@ def main():
     print(f"  scope_csv  : {scope_csv}")
     print(f"  output     : {output_path}")
 
-    scope_keys = load_scope_set(scope_csv)
+    scope_keys = load_scope_set(
+        scope_csv, data_root=args.data_root, source=args.source,
+    )
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")
     else:
