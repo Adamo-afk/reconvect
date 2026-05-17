@@ -160,7 +160,7 @@ coalition4-rcnn/
 │   ├── validation_data_{source}.csv   # Validation sequences per source (10% per temporal block)
 │   ├── test_data_{source}.csv         # Test sequences per source (10% per temporal block)
 │   ├── extract_patch_seq_drops_{source}.csv  # Audit: (date, HHMM) dropped by the manifest gate
-│   └── lightning_fraction.json        # Active-scoped non-zero pixel fraction for focal loss
+│   └── lightning_fraction_{source}.json  # Per-source training-scope non-zero pixel fraction for focal loss
 │
 ├── models/                            # Saved trained models (not tracked in git)
 │   └── {mode}/
@@ -185,7 +185,7 @@ coalition4-rcnn/
 ├── evaluate_coalition.py              # Step 7: Evaluate and generate plots
 │
 ├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
-├── lightning_fraction.py              # Active-scoped non-zero pixel fraction prior for focal loss
+├── lightning_fraction.py              # Per-source training-scope non-zero pixel fraction prior for focal loss (--source dbscan / lightning)
 ├── data_statistics.py                 # Generate diagnostic plots from patch/sequence data
 │
 ├── requirements.txt
@@ -461,10 +461,14 @@ Outputs in `our_data/lightning_periods/`:
 python our_data/lightning_data/visualize_lightning_stats.py \
     --output_dir our_data/lightning_data
 
-# Active-scoped non-zero pixel fraction (replaces the old global lightning_fraction)
-python lightning_fraction.py
-# or scope to the eventual training split:
-python lightning_fraction.py --scope_csv our_data/train_data_lightning.csv
+# Per-source training-scope non-zero pixel fraction. Reads
+# train_data_<source>.csv and writes lightning_fraction_<source>.json,
+# which train_models.py loads for the focal-loss prior on any mode with
+# label_type='lightning' (mtg_lightning, mtg_lightning_opera_occurrence).
+python lightning_fraction.py --source dbscan
+python lightning_fraction.py --source lightning
+# Broader scope (skip the train-split filter):
+python lightning_fraction.py --source dbscan --scope_csv lightning_active_steps.csv
 ```
 
 #### Step 4.2 — Intersect per-product timestep coverage
@@ -713,11 +717,14 @@ Output: `evaluation/eval_{mode}/` (plots + `evaluation_results.json`)
 ### Utility Scripts
 
 ```bash
-# Active-scoped non-zero pixel fraction (focal-loss prior). Defaults scope
-# the scan to lightning_active_steps.csv so empty-window maps don't dilute
-# the denominator. Pass --scope_csv train_data_lightning.csv to scope
-# tighter to the training split, or --scope_csv none to scan everything.
-python lightning_fraction.py
+# Training-scope non-zero pixel fraction (focal-loss prior). Defaults
+# to train_data_<source>.csv and writes lightning_fraction_<source>.json
+# so the prior matches what the model sees. Run once per --source you
+# plan to train; train_models.py auto-resolves the matching JSON.
+python lightning_fraction.py --source dbscan
+python lightning_fraction.py --source lightning
+# Broader scope: --scope_csv lightning_active_steps.csv. Legacy
+# everything-on-disk: --scope_csv none.
 
 # Generate dataset diagnostic plots (6 panels: diurnal cycle, spatial heatmap, etc.)
 python data_statistics.py
