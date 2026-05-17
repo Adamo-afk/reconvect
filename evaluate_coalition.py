@@ -1434,8 +1434,71 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         'false_neg': false_neg,
     }
 
-    model = tf.keras.models.load_model(str(model_path),
-                                        custom_objects=custom_objects)
+    if finetuned:
+        # `tf.keras.models.load_model` of a fine-tuned `.keras` is fragile
+        # under TF 2.10: the saved model contains a sub-Model (the frozen
+        # backbone, wrapped by train_finetune) nested inside the outer
+        # Model. Keras's deserializer rebuilds the variable list in a
+        # different order than save_model wrote them, so weights line up
+        # against the wrong layers and assigns end up with shape
+        # mismatches like (1,1,64,32) -> (3,3,64,64).
+        #
+        # The robust workaround is to rebuild the architecture from
+        # scratch using the exact same `build_finetune_model` train_models
+        # uses, then call `model.load_weights(...)` which matches by name
+        # (not by index). Requires the base checkpoint path because the
+        # backbone is loaded fresh from there.
+        base_ckpt = model_dir / f"coalition_{run_tag}.keras"
+        if not base_ckpt.is_file():
+            raise FileNotFoundError(
+                f"Fine-tune evaluation needs the base checkpoint at "
+                f"{base_ckpt} (the .keras file produced by `--stage base`). "
+                f"Make sure both the base and the _finetuned files are in "
+                f"--model_dir."
+            )
+
+        # Read the Swin hyperparameters used at training time from the
+        # history JSON so we rebuild the SAME architecture.
+        if not history_path.is_file():
+            raise FileNotFoundError(
+                f"Fine-tune evaluation needs {history_path} to recover "
+                f"the Swin hyperparameters used at training time."
+            )
+        with open(history_path) as f:
+            hist_meta = json.load(f)
+        swin_cfg = hist_meta.get("swin", {})
+        ones_fraction = hist_meta.get("ones_fraction") or 0.0106
+
+        finetune_cfg = {
+            "optimizer":     hist_meta.get("optimizer", "adamw"),
+            "weight_decay":  hist_meta.get("weight_decay", 0.01),
+            "initial_lr":    hist_meta.get("initial_lr", 3e-4),
+            "warmup_epochs": 1,
+            "min_lr":        1e-6,
+            "epochs":        hist_meta.get("epochs_completed", 1),
+            "window_size":   swin_cfg.get("window_size", 8),
+            "n_swin_blocks": swin_cfg.get("n_blocks", 2),
+            "num_heads":     swin_cfg.get("num_heads", 4),
+            "c_shared":      swin_cfg.get("c_shared", 64),
+            "head_dropout":  swin_cfg.get("head_dropout", 0.1),
+        }
+
+        # Lazy import here so the base-model path doesn't pay the cost of
+        # importing train_models when it isn't needed.
+        from train_models import build_finetune_model
+        model, _loss, _metrics = build_finetune_model(
+            base_model_path=str(base_ckpt),
+            finetune_cfg=finetune_cfg,
+            ones_fraction=ones_fraction,
+        )
+        model.load_weights(str(model_path))
+        print(f"  Fine-tune model rebuilt + weights loaded from "
+              f"{model_path.name}")
+    else:
+        model = tf.keras.models.load_model(
+            str(model_path), custom_objects=custom_objects,
+        )
+
     print(f"  Model loaded: {model.count_params():,} parameters")
 
     # ---- 3. Load datasets ----
