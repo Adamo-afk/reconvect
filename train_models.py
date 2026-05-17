@@ -1027,14 +1027,25 @@ def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
     the loss/metrics it should be compiled with (the caller wires those
     into model.compile alongside the AdamW optimizer).
     """
+    # Custom layers + loss + metrics defined in this module need to be
+    # registered when reloading a saved base model. Without this Keras
+    # can't reconstruct ResBlock/ResGRU/ConvBlock instances and bails
+    # with `ValueError: Unknown layer: ResBlock`.
     base = tf.keras.models.load_model(
         str(base_model_path),
         custom_objects={
+            # Backbone layers from build_coalition_model:
+            "ConvBlock":         ConvBlock,
+            "ResBlock":          ResBlock,
+            "GRUResBlock":       GRUResBlock,
+            "ResGRU":            ResGRU,
+            # Loss + metrics (only present if the base was saved with
+            # compile=True, but cheap to include unconditionally):
             "WeightedFocalLoss": WeightedFocalLoss,
-            "iou_metric": iou_metric,
-            "true_pos":   true_pos,
-            "false_pos":  false_pos,
-            "false_neg":  false_neg,
+            "iou_metric":        iou_metric,
+            "true_pos":          true_pos,
+            "false_pos":         false_pos,
+            "false_neg":         false_neg,
         },
         compile=False,
     )
