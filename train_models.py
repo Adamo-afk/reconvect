@@ -1661,23 +1661,54 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     )
 
     # Pick optimizer. AdamW is the default for fine-tune; falling back
-    # to plain Adam is supported for parity experiments.
+    # to plain Adam is supported for parity experiments. The
+    # construction order is fiddly because of two interacting issues
+    # on the typical TF 2.10 install:
+    #   1. tf.keras.optimizers.AdamW (non-experimental) only exists on
+    #      TF >= 2.11; older versions raise AttributeError.
+    #   2. tf.keras.optimizers.experimental.AdamW + mixed_float16 +
+    #      its default XLA-compiled update step can't trace
+    #      AutoCastVariable tensors, blowing up at the first
+    #      train_step with `TypeError: Python object could not be
+    #      represented through the generic tracing type`. Passing
+    #      jit_compile=False to the experimental optimizer skips that
+    #      XLA path and the update runs in eager-graph mode instead.
+    # If both AdamW attempts fail we fall back to plain Adam (no
+    # weight_decay) with a warning - that loses regularization but the
+    # finetune head can still train.
+    lr = finetune_cfg["initial_lr"]
+    wd = finetune_cfg["weight_decay"]
+    optimizer = None
     if finetune_cfg["optimizer"] == "adamw":
-        try:
-            optimizer = tf.keras.optimizers.AdamW(
-                learning_rate=finetune_cfg["initial_lr"],
-                weight_decay=finetune_cfg["weight_decay"],
-            )
-        except AttributeError:
-            # TF < 2.11 - fall back to the experimental package
-            optimizer = tf.keras.optimizers.experimental.AdamW(
-                learning_rate=finetune_cfg["initial_lr"],
-                weight_decay=finetune_cfg["weight_decay"],
-            )
+        # 1. Non-experimental AdamW (TF >= 2.11).
+        if optimizer is None and hasattr(tf.keras.optimizers, "AdamW"):
+            try:
+                optimizer = tf.keras.optimizers.AdamW(
+                    learning_rate=lr, weight_decay=wd,
+                )
+            except (TypeError, ValueError):
+                optimizer = None
+        # 2. Experimental AdamW with XLA disabled (TF 2.10 / 2.11 path).
+        if (optimizer is None
+                and hasattr(tf.keras.optimizers, "experimental")
+                and hasattr(tf.keras.optimizers.experimental, "AdamW")):
+            try:
+                optimizer = tf.keras.optimizers.experimental.AdamW(
+                    learning_rate=lr,
+                    weight_decay=wd,
+                    jit_compile=False,
+                )
+            except (TypeError, ValueError):
+                optimizer = None
+        # 3. Last resort.
+        if optimizer is None:
+            print("  WARNING: AdamW unavailable on this TF; falling back "
+                  "to Adam without weight_decay. Install TF >= 2.11 or "
+                  "`tensorflow_addons` to recover the decoupled "
+                  "weight-decay term.")
+            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
     else:
-        optimizer = tf.keras.optimizers.Adam(
-            learning_rate=finetune_cfg["initial_lr"],
-        )
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
 
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
     model.summary(print_fn=lambda x: print(f"  {x}"))
