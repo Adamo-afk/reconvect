@@ -895,18 +895,31 @@ class SwinBlock(tf.keras.layers.Layer):
         self.dropout = dropout
 
     def build(self, input_shape):
-        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        # Propagate this block's policy (set via the constructor's `dtype`
+        # kwarg in build_swin_head) to every sublayer so the entire block
+        # runs in one dtype. The default is fp32 to keep the pre-softmax
+        # Q@K^T product in MultiHeadAttention from overflowing fp16
+        # (max ~65504) and NaN-ing the loss.
+        sub_dtype = self.dtype
+        self.norm1 = tf.keras.layers.LayerNormalization(
+            epsilon=1e-5, dtype=sub_dtype,
+        )
         self.attn = tf.keras.layers.MultiHeadAttention(
             num_heads=self.num_heads,
             key_dim=max(1, self.dim // self.num_heads),
             dropout=self.dropout,
+            dtype=sub_dtype,
         )
-        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-5)
+        self.norm2 = tf.keras.layers.LayerNormalization(
+            epsilon=1e-5, dtype=sub_dtype,
+        )
         hidden = int(self.dim * self.mlp_ratio)
-        self.mlp_dense1 = tf.keras.layers.Dense(hidden, activation='gelu')
-        self.mlp_drop1 = tf.keras.layers.Dropout(self.dropout)
-        self.mlp_dense2 = tf.keras.layers.Dense(self.dim)
-        self.mlp_drop2 = tf.keras.layers.Dropout(self.dropout)
+        self.mlp_dense1 = tf.keras.layers.Dense(
+            hidden, activation='gelu', dtype=sub_dtype,
+        )
+        self.mlp_drop1 = tf.keras.layers.Dropout(self.dropout, dtype=sub_dtype)
+        self.mlp_dense2 = tf.keras.layers.Dense(self.dim, dtype=sub_dtype)
+        self.mlp_drop2 = tf.keras.layers.Dropout(self.dropout, dtype=sub_dtype)
         super().build(input_shape)
 
     def call(self, x, training=None):
@@ -966,6 +979,16 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
     W = backbone_features.shape[3]
     C = backbone_features.shape[-1]
 
+    # The entire Swin head runs in fp32 even when the backbone uses
+    # mixed_float16. Rationale: MultiHeadAttention's pre-softmax Q@K^T
+    # matmul can produce values >65504 (fp16 max) inside an 8x8 window
+    # with 64 tokens, which collapses to inf -> softmax(inf)=NaN ->
+    # NaN loss on the forward pass. Forcing the head to fp32 keeps the
+    # backbone in fp16 (so the saved base model loads under its original
+    # policy) while eliminating the overflow source. The fp16 backbone
+    # output is auto-cast to fp32 at the first fp32 layer below.
+    head_dtype = 'float32'
+
     # Step 1: collapse the F axis into channels and project to c_shared.
     # Permute non-batch axes (F, H, W, C) -> (H, W, F, C); 1-indexed in
     # Keras Permute means (2, 3, 1, 4).
@@ -975,6 +998,7 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
                                  name='collapse_F_flat')(x)
     x = tf.keras.layers.Conv2D(
         c_shared, 1, activation='gelu',
+        dtype=head_dtype,
         name='backbone_to_shared',
     )(x)
 
@@ -989,6 +1013,7 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
             window_size=window_size,
             shift_size=shift,
             dropout=dropout,
+            dtype=head_dtype,
             name=f'swin_block_{i}',
         )(x)
 
@@ -998,15 +1023,16 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
     outs = []
     for t in range(future_timesteps):
         h = tf.keras.layers.LayerNormalization(
-            epsilon=1e-5, name=f'head_norm_t{t}',
+            epsilon=1e-5, dtype=head_dtype, name=f'head_norm_t{t}',
         )(x)
         h = tf.keras.layers.Conv2D(
             c_shared, 1, activation='gelu',
+            dtype=head_dtype,
             name=f'head_hidden_t{t}',
         )(h)
         h = tf.keras.layers.Conv2D(
             num_outputs, 1, activation=final_activation,
-            dtype='float32',          # numerical stability under mixed prec
+            dtype=head_dtype,
             name=f'head_out_t{t}',
         )(h)
         outs.append(h)
