@@ -341,11 +341,19 @@ def _load_product_filter(product_key: str) -> set[int] | None:
 # Map the PRODUCT_GROUPS keys to the timestep_config product names used to
 # look up minute filters. OPERA's filter is identical across its two
 # products (both at 15-min cadence), so we just point at one of them.
+#
+# Lightning now has a real filter in timestep_config.json
+# (`products.lightning.filter = [0, 10, 30, 40]` at the typical 15-min
+# step), so master :15 needs to snap to filter :10 and master :45 to
+# filter :40 - the only HHMMs `read_kml_version2.py` actually writes.
+# `_load_product_filter` falls back to no-snap when the filter is null,
+# so this remains correct if the user reverts lightning to a continuous
+# cadence in product_cadences.config.
 _FILTER_PRODUCT_KEY = {
     'radar':         'radar',
-    'satellite_MSG': None,        # legacy / not in current config — skip snap
+    'satellite_MSG': None,        # legacy / not in current config - skip snap
     'satellite_MTG': 'mtg',
-    'lightning':     None,        # cadence_minutes is null — skip snap
+    'lightning':     'lightning',
     'nwcsaf':        'nwcsaf',
     'opera':         'opera_rainfall_rate',
 }
