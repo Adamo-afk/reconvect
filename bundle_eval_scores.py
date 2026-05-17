@@ -56,16 +56,14 @@ import sys
 from pathlib import Path
 
 
-# Default 4-mode OPERA Shapley coalition: each (mode, letters) pair maps
-# the trained-model name to its source-letter combination. The first
-# entry's letter set defines the baseline that's always present (here:
-# 'o' = OPERA), so 'om' = baseline + MTG IR/WV, 'on' = baseline +
-# NWCSAF, 'omn' = both.
+# Default 2-mode OPERA coalition (NWCSAF was dropped from the active
+# build). Each (mode, letters) pair maps the trained-mode name to its
+# source-letter combination. 'o' = OPERA-only baseline, 'om' = baseline
+# + MTG IR/WV. Pass repeated `--mode MODE=LETTERS` to override the
+# pairing (e.g. when including the lightning-as-input modes).
 DEFAULT_COALITION = [
     ("mtg_opera_radar_only", "o"),
     ("mtg_opera_mtgmr",      "om"),
-    ("mtg_opera_nwcsaf",     "on"),
-    ("mtg_opera_full",       "omn"),
 ]
 
 # Lead-time keys exactly as written into evaluation_results.json by
@@ -128,6 +126,8 @@ def bundle_eval_scores(coalition: list[tuple[str, str]],
                        eval_root: Path,
                        output_dir: Path,
                        metric: str | None = None,
+                       source: str = "dbscan",
+                       finetuned: bool = False,
                        ) -> dict[str, dict]:
     """Read per-mode `evaluation_results.json` files and write the
     per-leadtime CSVs that classical Shapley reads.
@@ -139,11 +139,17 @@ def bundle_eval_scores(coalition: list[tuple[str, str]],
     summary: dict[str, dict] = {}
 
     for mode, letters in coalition:
-        results_path = eval_root / f"eval_{mode}" / "evaluation_results.json"
+        # Match the directory naming convention used by
+        # evaluate_coalition.py: eval_{mode}_{source}[_finetuned].
+        run_tag = f"{mode}_{source}"
+        if finetuned:
+            run_tag = f"{run_tag}_finetuned"
+        results_path = eval_root / f"eval_{run_tag}" / "evaluation_results.json"
         if not results_path.is_file():
             raise FileNotFoundError(
                 f"[{mode}] no evaluation_results.json at {results_path}. "
-                f"Run `evaluate_coalition.py --mode {mode}` first."
+                f"Run `evaluate_coalition.py --mode {mode} --source "
+                f"{source}{' --finetuned' if finetuned else ''}` first."
             )
         with open(results_path) as f:
             data = json.load(f)
@@ -233,13 +239,27 @@ def main() -> int:
     )
     parser.add_argument(
         "--eval_root", type=str, default="evaluation",
-        help="Directory containing per-mode `eval_<mode>/"
-             "evaluation_results.json` files (default: evaluation/).",
+        help="Directory containing per-mode `eval_<mode>_<source>"
+             "[_finetuned]/evaluation_results.json` files "
+             "(default: evaluation/).",
     )
     parser.add_argument(
         "--output_dir", type=str, default="results/eval_scores",
         help="Directory for the bundled per-leadtime CSVs "
              "(default: results/eval_scores/).",
+    )
+    parser.add_argument(
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
+        help="Sample-selection track. Must match the --source flag "
+             "the evaluation run used. Drives the eval_<mode>_<source> "
+             "directory lookup (default: dbscan).",
+    )
+    parser.add_argument(
+        "--finetuned", action="store_true",
+        help="Read from the Swin-head fine-tuned model's evaluation "
+             "directory (eval_<mode>_<source>_finetuned) instead of "
+             "the base model's.",
     )
     args = parser.parse_args()
 
@@ -264,6 +284,8 @@ def main() -> int:
             eval_root=eval_root,
             output_dir=output_dir,
             metric=args.metric,
+            source=args.source,
+            finetuned=args.finetuned,
         )
     except (FileNotFoundError, KeyError, ValueError) as e:
         print(f"ERROR: {e}", file=sys.stderr)

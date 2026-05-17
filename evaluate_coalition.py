@@ -5,10 +5,19 @@ Loads training history and trained model, runs evaluation on the test set,
 computes all metrics from the original COALITION paper, and saves plots.
 
 Usage:
-    python evaluate_coalition.py --mode msg_lightning --data_root ./our_data
-    python evaluate_coalition.py --mode msg_radar --model_dir ./models
+    # Base model, OPERA-driven sample selection
+    python evaluate_coalition.py --mode mtg_lightning_opera_occurrence \
+        --source dbscan --data_root ./our_data
 
-Outputs (saved to output_dir/eval_{mode}/):
+    # Swin-head fine-tuned model
+    python evaluate_coalition.py --mode mtg_lightning_opera_occurrence \
+        --source dbscan --finetuned
+
+    # Lightning-driven sample selection, base model
+    python evaluate_coalition.py --mode mtg_lightning \
+        --source lightning
+
+Outputs (saved to output_dir/eval_{mode}_{source}[_finetuned]/):
     - training_curves_{mode}.png       — loss and metrics vs epoch
     - metrics_per_leadtime_{mode}.png  — CSI, POD, FAR etc. vs lead time
     - calibration_{mode}.png           — reliability diagram
@@ -966,21 +975,25 @@ def evaluate_radar(model, test_ds, output_dir):
 
 def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
                                     plot_date, plot_hour, plot_threshold=0.5,
-                                    csv_name="test_data.csv"):
+                                    csv_name="test_data_dbscan.csv",
+                                    label_type=None):
     """Plot all patches for all timesteps matching a given date and hour.
 
     Uses the already-loaded model for the current mode only.
-    Lightning mode → lightning plots. Radar mode → radar plots.
+    Lightning label_type → lightning plots. Radar label_type → radar plots.
 
     Args:
         model: trained Keras model (already loaded)
-        mode: full mode string e.g. "msg_lightning", "msg_radar"
+        mode: full mode string e.g. "mtg_lightning_opera_occurrence"
         data_root: path to our_data/
         output_dir: path for saving plots
         plot_date: date string e.g. "2025-05-26"
         plot_hour: integer hour 0-23
         plot_threshold: probability threshold for lightning display
-        csv_name: CSV filename to read (default: "test_data.csv")
+        csv_name: per-source CSV filename (default: "test_data_dbscan.csv")
+        label_type: "lightning" or "radar"; if None, inferred from mode
+            (best-effort - the dataset's metadata.json is authoritative
+            and used by the caller).
     """
     import ast
     import pandas as pd
@@ -1000,7 +1013,14 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
     output_dir.mkdir(parents=True, exist_ok=True)
     patches_dir = data_root / "patches"
 
-    label_type = "lightning" if "lightning" in mode else "radar"
+    if label_type is None:
+        # Best-effort fallback. The caller normally passes label_type
+        # straight through from the dataset's metadata.json so we don't
+        # misclassify modes like `mtg_lightning_opera` (which has
+        # 'lightning' in its name but actually uses the 5-class OPERA
+        # rainfall target, i.e. label_type='radar').
+        mode_cfg = get_mode_config(mode)
+        label_type = mode_cfg["label_type"]
     mode_config = get_mode_config(mode)
 
     label_var = mode_config["label_var"]
@@ -1320,39 +1340,67 @@ def plot_training_history(history_path, output_dir):
 
 def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
              threshold=None, plot_threshold=0.5,
-             plot_date=None, plot_hour=None, split="test"):
+             plot_date=None, plot_hour=None, split="test",
+             source="dbscan", finetuned=False):
     """Run full evaluation pipeline.
 
     Args:
-        mode: msg_lightning, msg_radar, mtg_lightning, mtg_radar
-        data_root: path to our_data/ containing datasets/{mode}/
+        mode: one of the entries in TRAINING_MODES (e.g.
+            `mtg_lightning_opera_occurrence`, `mtg_opera_mtgmr`).
+        data_root: path to our_data/ containing datasets/{mode}_{source}/
         model_dir: path to directory containing trained model and history
         output_dir: where to save evaluation results and plots
         threshold: float or None.
             - If float (e.g. 0.5): use this fixed threshold for lightning
             - If None: optimize threshold on validation set (paper's approach)
+        source: which sample-selection track the artifacts were built
+            from (`dbscan` for OPERA-driven, `lightning` for
+            lightning-driven). Used to suffix every on-disk path.
+        finetuned: if True, evaluate the Swin-head fine-tuned model
+            (`coalition_<mode>_<source>_finetuned.keras` /
+            `history_<mode>_<source>_finetuned.json`) instead of the
+            base model. The dataset path is unchanged - the fine-tune
+            stage trains against the same TFRecord shards.
     """
     data_root = Path(data_root)
     model_dir = Path(model_dir)
-    output_dir = Path(output_dir) / f"eval_{mode}"
+    run_tag = f"{mode}_{source}"
+    artifact_tag = f"{run_tag}_finetuned" if finetuned else run_tag
+    output_dir = Path(output_dir) / f"eval_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    label_type = "lightning" if "lightning" in mode else "radar"
+    # Authoritative label_type comes from the dataset's metadata.json
+    # (written by create_datasets.py). Mode-name heuristics misclassify
+    # modes like `mtg_lightning_opera` which has 'lightning' in its name
+    # but targets OPERA 5-class rainfall.
+    meta_path = data_root / "datasets" / run_tag / split / "metadata.json"
+    if meta_path.is_file():
+        with open(meta_path) as f:
+            label_type = json.load(f).get(
+                "label_type",
+                "lightning" if "lightning" in mode else "radar",
+            )
+    else:
+        label_type = "lightning" if "lightning" in mode else "radar"
 
     print("=" * 70)
-    print(f"COALITION-4 Evaluation — Mode: {mode}")
+    print(f"COALITION-4 Evaluation - Mode: {mode}  Source: {source}  "
+          f"{'(finetuned)' if finetuned else '(base)'}")
     print("=" * 70)
     print(f"  Label type:    {label_type}")
     print(f"  Split:         {split}")
     print(f"  Threshold:     {threshold if threshold is not None else 'optimize on validation'}")
     print(f"  Plot thresh:   {plot_threshold}")
 
-    SPLIT_CSV = {"train": "train_data.csv", "validation": "validation_data.csv",
-                 "test": "test_data.csv"}
+    SPLIT_CSV = {
+        "train":      f"train_data_{source}.csv",
+        "validation": f"validation_data_{source}.csv",
+        "test":       f"test_data_{source}.csv",
+    }
     csv_name = SPLIT_CSV[split]
 
     # ---- 1. Plot training history ----
-    history_path = model_dir / f"history_{mode}.json"
+    history_path = model_dir / f"history_{artifact_tag}.json"
     if history_path.is_file():
         print(f"\n1. Plotting training history from {history_path}")
         plot_training_history(history_path, output_dir)
@@ -1360,7 +1408,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         print(f"\n1. WARNING: History file not found: {history_path}")
 
     # ---- 2. Load model (with mixed precision matching training) ----
-    model_path = model_dir / f"coalition_{mode}.keras"
+    model_path = model_dir / f"coalition_{artifact_tag}.keras"
     if not model_path.is_file():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
@@ -1391,7 +1439,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     print(f"  Model loaded: {model.count_params():,} parameters")
 
     # ---- 3. Load datasets ----
-    eval_dir = data_root / "datasets" / mode / split
+    eval_dir = data_root / "datasets" / run_tag / split
     if not eval_dir.exists():
         raise FileNotFoundError(f"{split.capitalize()} dataset not found: {eval_dir}")
 
@@ -1402,7 +1450,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     # Load validation dataset if threshold optimization needed
     val_ds = None
     if label_type == "lightning" and threshold is None:
-        val_dir = data_root / "datasets" / mode / "validation"
+        val_dir = data_root / "datasets" / run_tag / "validation"
         if val_dir.exists():
             print(f"  Loading validation dataset for threshold optimization...")
             val_ds = _load_split(val_dir)
@@ -1430,7 +1478,8 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             plot_predictions_for_date_hour(model, mode, data_root,
                                             output_dir, plot_date, plot_hour,
                                             plot_threshold=plot_threshold,
-                                            csv_name=csv_name)
+                                            csv_name=csv_name,
+                                            label_type=label_type)
         except Exception as e:
             print(f"  Skipping visualization: {e}")
     else:
@@ -1438,6 +1487,8 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
 
     # ---- 6. Save results ----
     results["mode"] = mode
+    results["source"] = source
+    results["finetuned"] = finetuned
     results["label_type"] = label_type
     results["split"] = split
     results["model_params"] = model.count_params()
@@ -1500,10 +1551,28 @@ def main():
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["msg_lightning", "msg_radar", "mtg_lightning", "mtg_radar",
+        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
                  "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                 "mtg_opera_nwcsaf", "mtg_opera_full"],
-        help="Model variant to evaluate"
+                 "mtg_lightning_opera", "mtg_lightning_opera_occurrence"],
+        help="Model variant to evaluate. Matches the modes registered "
+             "in train_models.TRAINING_MODES and create_datasets."
+    )
+    parser.add_argument(
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
+        help="Sample-selection track the artifacts were built from. "
+             "`dbscan` = OPERA-driven (patch_index.csv from "
+             "identify_patches --source opera); `lightning` = "
+             "lightning-driven (lightning_patches.csv from "
+             "identify_lightning_periods.py). Drives every on-disk "
+             "path (model, history, datasets/, CSVs)."
+    )
+    parser.add_argument(
+        "--finetuned", action="store_true",
+        help="Evaluate the Swin-head fine-tuned model "
+             "(coalition_<mode>_<source>_finetuned.keras) instead of "
+             "the base coalition_<mode>_<source>.keras. Dataset path "
+             "and label_type are unchanged."
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
@@ -1557,6 +1626,8 @@ def main():
         plot_date=args.date,
         plot_hour=args.hour,
         split=args.split,
+        source=args.source,
+        finetuned=args.finetuned,
     )
 
 
