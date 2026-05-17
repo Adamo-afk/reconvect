@@ -1090,7 +1090,11 @@ def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
         loss = WeightedFocalLoss(ones_fraction=ones_fraction, gamma=2.0)
         metrics = [iou_metric, true_pos, false_pos, false_neg]
     else:
-        loss = tf.keras.losses.CategoricalCrossentropy()
+        # label_smoothing=0.01 prevents log(0) on the forward pass if the
+        # Swin head's softmax saturates a class to exact 0 under mixed_float16
+        # (intermediate attention/MLP layers run in fp16 and can produce
+        # extreme pre-softmax logits that round-trip to inf).
+        loss = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.01)
         metrics = ['accuracy']
 
     return finetuned, loss, metrics
@@ -1678,6 +1682,11 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     # finetune head can still train.
     lr = finetune_cfg["initial_lr"]
     wd = finetune_cfg["weight_decay"]
+    # global_clipnorm=1.0 caps the L2 norm of the full gradient at 1.0. This
+    # is the standard transformer fine-tune recipe and the canonical defense
+    # against NaN losses when fp16 attention products overflow inside the
+    # Swin head (pre-softmax Q@K^T can exceed 65504) or when an extreme batch
+    # produces a huge gradient that throws weights out of their stable regime.
     optimizer = None
     if finetune_cfg["optimizer"] == "adamw":
         # 1. Non-experimental AdamW (TF >= 2.11).
@@ -1685,6 +1694,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
             try:
                 optimizer = tf.keras.optimizers.AdamW(
                     learning_rate=lr, weight_decay=wd,
+                    global_clipnorm=1.0,
                 )
             except (TypeError, ValueError):
                 optimizer = None
@@ -1697,6 +1707,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                     learning_rate=lr,
                     weight_decay=wd,
                     jit_compile=False,
+                    global_clipnorm=1.0,
                 )
             except (TypeError, ValueError):
                 optimizer = None
@@ -1706,9 +1717,13 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                   "to Adam without weight_decay. Install TF >= 2.11 or "
                   "`tensorflow_addons` to recover the decoupled "
                   "weight-decay term.")
-            optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+            optimizer = tf.keras.optimizers.Adam(
+                learning_rate=lr, global_clipnorm=1.0,
+            )
     else:
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        optimizer = tf.keras.optimizers.Adam(
+            learning_rate=lr, global_clipnorm=1.0,
+        )
 
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
     model.summary(print_fn=lambda x: print(f"  {x}"))
