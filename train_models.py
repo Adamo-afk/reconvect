@@ -1180,27 +1180,34 @@ def _load_tfrecord_split(split_dir: Path, meta: dict) -> tf.data.Dataset:
 # ones_fraction from pre-computed JSON
 # ============================================================================
 
-def load_ones_fraction(data_root):
-    """Load lightning occurrence fraction from pre-computed JSON.
+def load_ones_fraction(data_root, source):
+    """Load lightning occurrence fraction from the per-source prior JSON.
 
-    Reads our_data/lightning_fraction.json and returns the 'occurrence'
-    fraction, which is the correct value for the binary focal loss.
+    Reads `our_data/lightning_fraction_<source>.json` (produced by
+    `lightning_fraction.py --source <source>`) and returns the
+    'occurrence' fraction. Scoping by source means the focal-loss prior
+    matches the actual training distribution that `--source <source>`
+    selects - the DBSCAN-driven and lightning-driven tracks land on
+    different `(date, time)` sets and therefore have different
+    class balances.
 
     Args:
         data_root: path to our_data/ directory
+        source:    'dbscan' or 'lightning' (selects which JSON to read)
 
     Returns:
-        float: occurrence fraction
+        float: occurrence fraction scoped to train_data_<source>.csv
 
     Raises:
-        FileNotFoundError: if lightning_fraction.json does not exist
-        KeyError: if 'occurrence' key is missing from JSON
+        FileNotFoundError: if lightning_fraction_<source>.json does
+            not exist
+        KeyError: if 'occurrence' key is missing from the JSON
     """
-    json_path = Path(data_root) / "lightning_fraction.json"
+    json_path = Path(data_root) / f"lightning_fraction_{source}.json"
     if not json_path.is_file():
         raise FileNotFoundError(
             f"Lightning fraction file not found: {json_path}\n"
-            f"Run the lightning fraction computation script first to generate it."
+            f"Run `python lightning_fraction.py --source {source}` first."
         )
 
     with open(json_path) as f:
@@ -1392,9 +1399,12 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     print("Configuring TF runtime...")
     configure_tf_runtime(use_mixed_precision=mixed_precision)
 
-    # Load ones_fraction for lightning modes from pre-computed JSON
+    # Load ones_fraction for lightning modes from the per-source prior
+    # JSON. Each track's class balance is computed from its own
+    # train_data_<source>.csv, so the focal-loss prior matches what the
+    # model actually sees during training.
     if label_type == "lightning":
-        ones_fraction = load_ones_fraction(data_root)
+        ones_fraction = load_ones_fraction(data_root, source)
     else:
         ones_fraction = 0.0106  # unused for radar
 
@@ -1621,7 +1631,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     configure_tf_runtime(use_mixed_precision=mixed_precision)
 
     if label_type == "lightning":
-        ones_fraction = load_ones_fraction(data_root)
+        ones_fraction = load_ones_fraction(data_root, source)
     else:
         ones_fraction = 0.0106  # unused for radar
 

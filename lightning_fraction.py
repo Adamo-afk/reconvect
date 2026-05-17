@@ -1,29 +1,33 @@
 """
-Compute the fraction of non-zero (ones) pixels across the *active*
-lightning maps - i.e. the ones the training pipeline will actually
-consume - and emit a class-imbalance prior for train_models.py.
+Compute the fraction of non-zero (ones) pixels across the lightning
+maps used for training and emit the class-imbalance prior
+`train_models.py` reads at compile time (focal-loss `ones_fraction`).
 
 Formula: fraction = ones_pixels / total_pixels  (0.0 if total_pixels == 0)
 
-By default, only `.npy` maps whose `(date, HH:MM)` appears in
-`lightning_active_steps.csv` (produced by
-`our_data/lightning_data/summarize_lightning_data.py`) are scanned.
-This matches the gate downstream tooling applies, so the resulting
-fraction reflects what the model sees - empty-window maps don't
-dilute the denominator.
+The scope is per-source by default: `--source dbscan` scopes the scan
+to `train_data_dbscan.csv` and writes
+`lightning_fraction_dbscan.json`; `--source lightning` mirrors that
+for `train_data_lightning.csv` and
+`lightning_fraction_lightning.json`. The two tracks need separate
+priors because their training distributions differ - the
+OPERA-driven track samples many more "no lightning" timesteps than
+the lightning-driven track, so the prior is meaningfully different.
 
-Pass `--scope_csv path/to/file.csv` to use a different (date, HH:MM)-
-keyed CSV (`extract_patch_seq_for_datasets.py` outputs `train_data.csv`
-and friends, which would scope the fraction even tighter to the train
-split). Pass `--scope_csv none` to fall back to the legacy behaviour
-(scan every `.npy` on disk).
-
-Output: lightning_fraction.json (at `--data_root` by default).
+Pass `--scope_csv path/to/file.csv` to override the auto-resolved
+training CSV (e.g. `lightning_active_steps.csv` for the broader
+active-step scope, or any other (date, HH:MM)-keyed CSV). Pass
+`--scope_csv none` to scan every `.npy` on disk (legacy behaviour).
 
 Usage:
-    python lightning_fraction.py
-    python lightning_fraction.py --scope_csv train_data.csv
-    python lightning_fraction.py --scope_csv none
+    # Typical: per-source prior from the training split
+    python lightning_fraction.py --source dbscan
+    python lightning_fraction.py --source lightning
+
+    # Broader / legacy scopes
+    python lightning_fraction.py --source dbscan \\
+        --scope_csv lightning_active_steps.csv
+    python lightning_fraction.py --source dbscan --scope_csv none
 """
 
 import argparse
@@ -37,7 +41,6 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = str(PROJECT_ROOT / 'our_data')
-DEFAULT_SCOPE_CSV = str(PROJECT_ROOT / 'lightning_active_steps.csv')
 
 PRODUCTS = ['density', 'current', 'occurrence']
 
@@ -206,40 +209,67 @@ def compute_fraction(data_root, scope_keys):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute fraction of non-zero pixels in the active "
-                    "lightning maps. By default scopes the scan to "
-                    "lightning_active_steps.csv so empty-window maps "
-                    "don't dilute the denominator."
+        description="Compute fraction of non-zero pixels in the lightning "
+                    "maps used for training. By default scopes the scan "
+                    "to the train_data_<source>.csv produced by "
+                    "extract_patch_seq_for_datasets.py so the focal-loss "
+                    "prior matches the actual training distribution."
     )
     parser.add_argument(
         "--data_root", "-d", type=str, default=DEFAULT_DATA_ROOT,
         help="Path to our_data directory"
     )
     parser.add_argument(
-        "--output", "-o", type=str, default=None,
-        help="Output JSON path (default: our_data/lightning_fraction.json)"
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
+        help="Which extract_patch_seq source to scope by. 'dbscan' "
+             "(default) scopes to train_data_dbscan.csv and writes "
+             "lightning_fraction_dbscan.json. 'lightning' scopes to "
+             "train_data_lightning.csv and writes "
+             "lightning_fraction_lightning.json. The two tracks need "
+             "separate priors because they sample different timesteps.",
     )
     parser.add_argument(
-        "--scope_csv", "-s", type=str, default=DEFAULT_SCOPE_CSV,
-        help=f"Scope the scan by (date, HH:MM) pairs read from this CSV "
-             f"(default: {DEFAULT_SCOPE_CSV}). Pass 'none' to scan every "
-             f"`.npy` on disk (legacy behaviour). Any CSV with `date` + "
-             f"`time_utc` columns works - e.g. train_data.csv to scope "
-             f"the fraction to the training split."
+        "--output", "-o", type=str, default=None,
+        help="Output JSON path (default: "
+             "our_data/lightning_fraction_<source>.json)."
+    )
+    parser.add_argument(
+        "--scope_csv", "-s", type=str, default=None,
+        help="Scope the scan by (date, HH:MM) pairs read from this CSV. "
+             "Defaults to our_data/train_data_<source>.csv so the prior "
+             "matches the training distribution exactly. Pass 'none' to "
+             "scan every `.npy` on disk (legacy behaviour). "
+             "lightning_active_steps.csv at project root is also a "
+             "useful broader scope when no train CSV exists yet."
     )
 
     args = parser.parse_args()
-    output_path = args.output or os.path.join(
-        args.data_root, 'lightning_fraction.json'
+
+    # Per-source default paths. Explicit --scope_csv / --output flags
+    # override either.
+    scope_csv = (
+        args.scope_csv
+        if args.scope_csv is not None
+        else os.path.join(args.data_root, f"train_data_{args.source}.csv")
+    )
+    output_path = (
+        args.output
+        if args.output
+        else os.path.join(
+            args.data_root, f"lightning_fraction_{args.source}.json"
+        )
     )
 
     print("=" * 60)
-    print("Lightning pixel fraction (active-step scoped)")
+    print("Lightning pixel fraction (training-scope)")
     print("=" * 60)
     print(f"  data_root  : {args.data_root}")
-    print(f"  scope_csv  : {args.scope_csv}")
+    print(f"  source     : {args.source}")
+    print(f"  scope_csv  : {scope_csv}")
+    print(f"  output     : {output_path}")
 
-    scope_keys = load_scope_set(args.scope_csv)
+    scope_keys = load_scope_set(scope_csv)
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")
     else:
@@ -250,7 +280,8 @@ def main():
 
     # Add scope metadata so the resulting JSON is self-describing.
     stats['_scope'] = {
-        'scope_csv':  None if scope_keys is None else str(Path(args.scope_csv).resolve()),
+        'source':       args.source,
+        'scope_csv':    None if scope_keys is None else str(Path(scope_csv).resolve()),
         'n_scope_keys': None if scope_keys is None else len(scope_keys),
     }
 
