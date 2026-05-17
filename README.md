@@ -577,7 +577,7 @@ When `--with_percentiles` is passed, each variable block additionally carries `p
 Transforms patches using the **data-driven** mean / std from
 `our_data/normalization_stats_<source>.json` (Step 4.3, matching the chosen `--source`) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
 
-Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, and the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr` modes. The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
+Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr`, and the dual-target full-input pair `mtg_lightning_opera` (OPERA rainfall label) / `mtg_lightning_opera_occurrence` (lightning binary label). The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
 
 The new `--source {dbscan, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at `our_data/datasets/<mode>_<source>/`. Mode and source are independent: a single mode can be built once per source so the lightning- and DBSCAN-driven tracks have separate dataset directories.
 
@@ -598,12 +598,16 @@ python create_datasets.py --mode mtg_lightning        --source lightning
 python create_datasets.py --mode mtg_opera_mtgmr      --source lightning
 ```
 
-The OPERA modes replace radar (RZC and friends) with OPERA `opera_reflectivity` + `opera_rainfall_rate` in the MR branch (2 km, `pool=2`), drop the lightning HR channels, and use `opera_rainfall_rate_hr` (HR alias of the same reprojected file) as the 5-class multi-class label (same bin edges as RZC: `<10`, `10–20`, `20–30`, `30–40`, `≥40 mm/h`):
+The OPERA modes replace radar (RZC and friends) with OPERA `opera_reflectivity` + `opera_rainfall_rate` in the MR branch (2 km, `pool=2`) and use `opera_rainfall_rate_hr` (HR alias of the same reprojected file) as the 5-class multi-class label (same bin edges as RZC: `<10`, `10–20`, `20–30`, `30–40`, `≥40 mm/h`):
 
-| Mode | HR | MR | LR |
-|---|---|---|---|
-| `mtg_opera_radar_only` | MTG `vis_06` | OPERA | — |
-| `mtg_opera_mtgmr`      | MTG `vis_06` | OPERA + MTG IR/WV | — |
+| Mode | HR | MR | LR | Label |
+|---|---|---|---|---|
+| `mtg_opera_radar_only` | MTG `vis_06` | OPERA | — | OPERA rainfall 5-class |
+| `mtg_opera_mtgmr` | MTG `vis_06` | OPERA + MTG IR/WV | — | OPERA rainfall 5-class |
+| `mtg_lightning_opera` | lightning + MTG `vis_06` | OPERA + MTG IR/WV | — | OPERA rainfall 5-class |
+| `mtg_lightning_opera_occurrence` | lightning + MTG `vis_06` | OPERA + MTG IR/WV | — | lightning binary occurrence |
+
+`mtg_lightning_opera` and `mtg_lightning_opera_occurrence` share the **same input stack** but differ on the label head — same OPERA-driven sample selection (`--source dbscan`), same channels in HR and MR, but one predicts OPERA rainfall while the other predicts whether lightning will fire. They're the natural dual-target pair to train side-by-side and feed into the domain-adaptation Swin head.
 
 Custom modes can be defined by adding a new configuration in `create_datasets.py`. The training script requires no code changes — it reads whatever inputs are in the dataset.
 
