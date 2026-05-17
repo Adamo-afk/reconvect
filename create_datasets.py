@@ -567,6 +567,44 @@ def get_mode_config(mode):
             "label_suffix": "HR",
             "label_type": "radar",
         }
+    elif mode == "mtg_lightning_opera":
+        # Heaviest OPERA-track input stack: lightning channels in HR
+        # alongside MTG vis_06, plus OPERA + MTG IR/WV in MR. No ANM
+        # radar (it isn't reprojected on the OPERA track) and no
+        # NWCSAF (dropped from the active build). Label is OPERA
+        # rainfall_rate 5-class - the standard OPERA-track target.
+        # Pair this with `mtg_lightning_opera_occurrence` (same inputs,
+        # lightning-occurrence label) for the dual-target experiment.
+        hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
+        return {
+            "past_hr": (hr_lightning_vis, 256, "HR"),
+            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
+            "past_lr": None,
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+    elif mode == "mtg_lightning_opera_occurrence":
+        # Same input stack as `mtg_lightning_opera` (lightning + MTG
+        # vis_06 in HR, OPERA + MTG IR/WV in MR). Sample selection is
+        # still OPERA-driven (use --source dbscan with patch_index.csv
+        # from identify_patches --source opera). The only difference
+        # vs `mtg_lightning_opera` is the label head: predict binary
+        # lightning occurrence at T+future_steps instead of OPERA
+        # rainfall. Loss switches to the WeightedFocalLoss (label_type
+        # == 'lightning'), so the focal-loss prior reads
+        # `lightning_fraction.json` at training time.
+        hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
+        return {
+            "past_hr": (hr_lightning_vis, 256, "HR"),
+            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
+            "past_lr": None,
+            "label_var": "occurrence",
+            "label_transform": label_transform_occurrence,
+            "label_suffix": "HR",
+            "label_type": "lightning",
+        }
     elif mode == "mtg_opera_nwcsaf":
         return {
             "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
@@ -590,8 +628,9 @@ def get_mode_config(mode):
     else:
         raise ValueError(
             f"Unknown mode: {mode}. Use: mtg_lightning, mtg_radar, "
-            f"mtg_radar_continuous, mtg_opera_radar_only, mtg_opera_mtgmr, "
-            f"mtg_opera_nwcsaf, mtg_opera_full. "
+            f"mtg_radar_continuous, mtg_opera_radar_only, "
+            f"mtg_opera_mtgmr, mtg_lightning_opera, "
+            f"mtg_lightning_opera_occurrence. "
             f"(MSG modes are currently disabled.)"
         )
 
@@ -1177,7 +1216,8 @@ def main():
     parser.add_argument(
         "--mode", type=str, required=True,
         choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-                 "mtg_opera_radar_only", "mtg_opera_mtgmr"],
+                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
+                 "mtg_lightning_opera", "mtg_lightning_opera_occurrence"],
         help="Dataset mode (MSG modes are disabled in this build)."
     )
     parser.add_argument(

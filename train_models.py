@@ -42,6 +42,18 @@ choices for the full list).
         Inputs:  mtg_opera_radar_only + MTG IR/WV in MR.
         Target:  same as mtg_opera_radar_only.
 
+  - mtg_lightning_opera
+        Inputs:  lightning (density / current / occurrence) + MTG vis_06
+                 in HR; OPERA reflectivity + rainfall_rate + MTG IR/WV
+                 in MR. No ANM radar. No NWCSAF.
+        Target:  opera_rainfall_rate 5-class.
+
+  - mtg_lightning_opera_occurrence
+        Inputs:  same as mtg_lightning_opera.
+        Target:  lightning binary occurrence (focal loss). Pairs with
+                 mtg_lightning_opera as the dual-target experiment on
+                 OPERA-driven sample selection.
+
 Hyperparameters, the run list, the LR schedule, and the early-stopping
 configuration all live in `training.config`. See the docstring at the top
 of that file for the editable fields.
@@ -92,6 +104,16 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
     "mtg_opera_mtgmr": {
         "target":  "opera_rainfall_rate 5-class",
         "summary": "Baseline + MTG IR/WV in MR.",
+    },
+    "mtg_lightning_opera": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Lightning + MTG vis_06 in HR; OPERA + MTG IR/WV in MR; "
+                   "OPERA rainfall as label.",
+    },
+    "mtg_lightning_opera_occurrence": {
+        "target":  "lightning binary occurrence",
+        "summary": "Same inputs as mtg_lightning_opera; target is lightning "
+                   "occurrence instead of OPERA rainfall.",
     },
 }
 
