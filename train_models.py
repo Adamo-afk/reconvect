@@ -1001,6 +1001,24 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
     # output is auto-cast to fp32 at the first fp32 layer below.
     head_dtype = 'float32'
 
+    # Step 0: SANITIZE the backbone output. The frozen backbone runs in
+    # fp16 (training=False, no LossScaleOptimizer guarding it) and can
+    # produce inf/NaN activations on samples that trigger fp16 overflow
+    # in deep ResBlock/ConvGRU paths. During base training those were
+    # caught by dynamic loss scaling; during fine-tune they pass straight
+    # through. Replacing non-finite values with 0 here is the difference
+    # between "the entire run NaNs out on the first bad batch" and
+    # "the fine-tune trains stably". Cast to fp32 in the same op so the
+    # head's fp32 layers don't have to auto-cast on every forward.
+    backbone_features = tf.keras.layers.Lambda(
+        lambda t: tf.where(
+            tf.math.is_finite(t),
+            tf.cast(t, tf.float32),
+            tf.zeros_like(t, dtype=tf.float32),
+        ),
+        name='sanitize_backbone',
+    )(backbone_features)
+
     # Step 1: collapse the F axis into channels and project to c_shared.
     # Permute non-batch axes (F, H, W, C) -> (H, W, F, C); 1-indexed in
     # Keras Permute means (2, 3, 1, 4).
