@@ -1007,10 +1007,21 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
         print("\nNo results produced.")
         return
 
-    # Save outputs
+    # Save outputs. When --date is set the run only processed one day,
+    # so the master patch_index.csv would be overwritten with a single
+    # day's worth of rows - clobbering the upstream activity record the
+    # downstream pipeline (extract_patch_seq, data_statistics, ...)
+    # depends on. Skip the master write in that case; the per-date PNGs
+    # (and a date-suffixed CSV/JSON if save_plots is on) still land in
+    # the per-date plot directory below.
     os.makedirs(output_dir, exist_ok=True)
-    save_csv(results, output_dir)
-    save_json(results, output_dir)
+    if date_filter is None:
+        save_csv(results, output_dir)
+        save_json(results, output_dir)
+    else:
+        print(f"\nSingle-date run (--date {date_filter}) — NOT overwriting "
+              f"the master patch_index.csv / patch_index.json. Use a "
+              f"--start/--end range (or drop --date) to refresh those.")
 
     # Summary
     total_timesteps = len(results)
