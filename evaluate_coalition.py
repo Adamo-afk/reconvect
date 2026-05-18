@@ -440,6 +440,66 @@ class WeightedFocalLoss(tf.keras.losses.Loss):
         return config
 
 
+class WeightedFocalCategoricalCrossentropy(tf.keras.losses.Loss):
+    """Standalone copy of the radar multiclass loss for model loading.
+
+    Kept in lock-step with train_models.WeightedFocalCategoricalCrossentropy
+    so that .keras files saved by train_models.py deserialise here without
+    importing the training module.
+    """
+
+    def __init__(self, class_fractions, gamma=2.0, weighting='inverse',
+                 alpha_max=100.0, label_smoothing=0.0,
+                 name='weighted_focal_cce', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.class_fractions = [float(f) for f in class_fractions]
+        self.gamma = float(gamma)
+        self.weighting = str(weighting).lower()
+        self.alpha_max = float(alpha_max)
+        self.label_smoothing = float(label_smoothing)
+
+        f = np.asarray(self.class_fractions, dtype=np.float64)
+        f_safe = np.maximum(f, 1e-8)
+        if self.weighting == 'inverse':
+            alpha = 1.0 / (len(f) * f_safe)
+        elif self.weighting == 'median':
+            alpha = np.median(f_safe) / f_safe
+        elif self.weighting == 'none':
+            alpha = np.ones_like(f_safe)
+        else:
+            raise ValueError(
+                f"weighting must be 'inverse' | 'median' | 'none', "
+                f"got {self.weighting!r}"
+            )
+        if self.alpha_max > 0:
+            alpha = np.minimum(alpha, self.alpha_max)
+        self.alpha = tf.constant(alpha, dtype=tf.float32)
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        if self.label_smoothing > 0:
+            k = tf.cast(tf.shape(y_true)[-1], tf.float32)
+            y_true = y_true * (1.0 - self.label_smoothing) + self.label_smoothing / k
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        ce = -tf.reduce_sum(y_true * tf.math.log(y_pred), axis=-1)
+        w = tf.reduce_sum(y_true * self.alpha, axis=-1)
+        pt = tf.reduce_sum(y_true * y_pred, axis=-1)
+        focal = tf.pow(1.0 - pt, self.gamma)
+        return tf.reduce_mean(focal * w * ce)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'class_fractions':  self.class_fractions,
+            'gamma':            self.gamma,
+            'weighting':        self.weighting,
+            'alpha_max':        self.alpha_max,
+            'label_smoothing':  self.label_smoothing,
+        })
+        return config
+
+
 @tf.function
 def iou_metric(y_true, y_pred):
     y_true = tf.cast(y_true, tf.float32)
@@ -837,6 +897,37 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     return results
 
 
+def _per_class_from_cm(cm, class_names):
+    """Per-class precision / recall / F1 / CSI from a confusion matrix.
+
+    CSI = TP / (TP + FP + FN) is the standard nowcasting score, here
+    computed one-vs-rest per class so class 0 ("no/low rain") and the
+    rare heavy-rain classes get a directly comparable skill number.
+    """
+    n = len(class_names)
+    eps = 1e-10
+    per_class = {}
+    for c in range(n):
+        tp = int(cm[c, c])
+        fp = int(cm[:, c].sum() - tp)
+        fn = int(cm[c, :].sum() - tp)
+        precision = tp / (tp + fp + eps)
+        recall    = tp / (tp + fn + eps)
+        f1        = 2 * precision * recall / (precision + recall + eps)
+        csi       = tp / (tp + fp + fn + eps)
+        per_class[class_names[c]] = {
+            "precision": float(precision),
+            "recall":    float(recall),
+            "f1":        float(f1),
+            "csi":       float(csi),
+            "tp":        tp,
+            "fp":        fp,
+            "fn":        fn,
+            "support":   int(cm[c, :].sum()),
+        }
+    return per_class
+
+
 def evaluate_radar(model, test_ds, output_dir):
     """Run evaluation for radar (multi-class) mode.
 
@@ -873,32 +964,52 @@ def evaluate_radar(model, test_ds, output_dir):
         total = cm.sum()
         accuracy = cm.trace() / (total + 1e-10)
 
-        per_class = {}
-        for c in range(N_CLASSES):
-            tp = cm[c, c]
-            fp = cm[:, c].sum() - tp
-            fn = cm[c, :].sum() - tp
-            precision = tp / (tp + fp + 1e-10)
-            recall = tp / (tp + fn + 1e-10)
-            f1 = 2 * precision * recall / (precision + recall + 1e-10)
-            per_class[CLASS_NAMES[c]] = {
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1": float(f1),
-                "support": int(cm[c, :].sum()),
-            }
+        per_class = _per_class_from_cm(cm, CLASS_NAMES)
+        f1s = [per_class[CLASS_NAMES[c]]["f1"] for c in range(N_CLASSES)]
+        csis = [per_class[CLASS_NAMES[c]]["csi"] for c in range(N_CLASSES)]
+        recalls = [per_class[CLASS_NAMES[c]]["recall"] for c in range(N_CLASSES)]
+        macro_f1 = float(np.mean(f1s))
+        macro_csi = float(np.mean(csis))
+        balanced_accuracy = float(np.mean(recalls))
 
         results["per_leadtime"][LEAD_LABELS[t]] = {
             "accuracy": float(accuracy),
+            "balanced_accuracy": balanced_accuracy,
+            "macro_f1": macro_f1,
+            "macro_csi": macro_csi,
             "per_class": per_class,
             "confusion_matrix": cm.tolist(),
         }
-        print(f"    {LEAD_LABELS[t]}: accuracy={accuracy:.4f}")
+        print(f"    {LEAD_LABELS[t]}: acc={accuracy:.4f}  "
+              f"bal_acc={balanced_accuracy:.4f}  "
+              f"macro_F1={macro_f1:.4f}  macro_CSI={macro_csi:.4f}")
 
-    # Aggregate
+    # Aggregate: same per-class breakdown computed once on the summed
+    # confusion matrix. Pixel-weighted (so the rare classes don't dominate)
+    # plus a balanced view via macro-F1 and balanced accuracy.
     total = conf_agg.sum()
+    agg_per_class = _per_class_from_cm(conf_agg, CLASS_NAMES)
+    agg_f1s = [agg_per_class[CLASS_NAMES[c]]["f1"] for c in range(N_CLASSES)]
+    agg_csis = [agg_per_class[CLASS_NAMES[c]]["csi"] for c in range(N_CLASSES)]
+    agg_recalls = [agg_per_class[CLASS_NAMES[c]]["recall"] for c in range(N_CLASSES)]
     results["aggregate"]["accuracy"] = float(conf_agg.trace() / (total + 1e-10))
+    results["aggregate"]["balanced_accuracy"] = float(np.mean(agg_recalls))
+    results["aggregate"]["macro_f1"] = float(np.mean(agg_f1s))
+    results["aggregate"]["macro_csi"] = float(np.mean(agg_csis))
+    results["aggregate"]["per_class"] = agg_per_class
     results["aggregate"]["confusion_matrix"] = conf_agg.tolist()
+
+    print(f"\n  Aggregate: acc={results['aggregate']['accuracy']:.4f}  "
+          f"bal_acc={results['aggregate']['balanced_accuracy']:.4f}  "
+          f"macro_F1={results['aggregate']['macro_f1']:.4f}  "
+          f"macro_CSI={results['aggregate']['macro_csi']:.4f}")
+    print(f"  Per-class (aggregate):")
+    for c in range(N_CLASSES):
+        pc = agg_per_class[CLASS_NAMES[c]]
+        print(f"    {CLASS_NAMES[c]:>8}: "
+              f"P={pc['precision']:.3f}  R={pc['recall']:.3f}  "
+              f"F1={pc['f1']:.3f}  CSI={pc['csi']:.3f}  "
+              f"support={pc['support']:,}")
 
     # ==================== PLOTS ====================
 
@@ -968,6 +1079,45 @@ def evaluate_radar(model, test_ds, output_dir):
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_dir / "f1_per_class.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # 4. Per-class CSI per lead time
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c, name in enumerate(CLASS_NAMES):
+        csis = [results["per_leadtime"][lt]["per_class"][name]["csi"]
+                for lt in LEAD_LABELS]
+        ax.plot(LEAD_TIMES, csis, 'o-', linewidth=2, markersize=6, label=name)
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("CSI")
+    ax.set_title("Per-class CSI vs Lead Time")
+    ax.set_xticks(LEAD_TIMES)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "csi_per_class.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # 5. Macro summary per lead time (accuracy / balanced_accuracy /
+    # macro_F1 / macro_CSI). Accuracy vs balanced accuracy makes the
+    # class-0 dominance immediately visible.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for key, label, style in [
+        ("accuracy",          "Accuracy",          "o-"),
+        ("balanced_accuracy", "Balanced accuracy", "s-"),
+        ("macro_f1",          "Macro F1",          "^-"),
+        ("macro_csi",         "Macro CSI",         "d-"),
+    ]:
+        vals = [results["per_leadtime"][lt][key] for lt in LEAD_LABELS]
+        ax.plot(LEAD_TIMES, vals, style, linewidth=2, markersize=6, label=label)
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("Score")
+    ax.set_title("Macro summary vs Lead Time")
+    ax.set_xticks(LEAD_TIMES)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "macro_summary_per_leadtime.png", dpi=150,
+                bbox_inches='tight')
     plt.close()
 
     return results
@@ -1452,6 +1602,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         'ResGRU': ResGRU,
         'SwinBlock': SwinBlock,
         'WeightedFocalLoss': WeightedFocalLoss,
+        'WeightedFocalCategoricalCrossentropy': WeightedFocalCategoricalCrossentropy,
         'iou_metric': iou_metric,
         'true_pos': true_pos,
         'false_pos': false_pos,
