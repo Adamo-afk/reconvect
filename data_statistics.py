@@ -1,17 +1,18 @@
 """
 COALITION-4 dataset statistics and visualizations.
 
-Generates 6 diagnostic plots derived entirely from the per-source
-split CSV that --source / --split point at (train_data_<source>.csv,
-validation_data_<source>.csv, test_data_<source>.csv) so the
-diagnostics always reflect what the model actually trains on:
-    1. Diurnal cycle of convective activity
-    2. Spatial heatmap of patch activation frequency
-    3. Daily activity timeline (dates × hours)
-    4. Distribution of simultaneously active patches
-    5. Valid training samples per date
-    6. Per-patch qualifying frequency + overall survival rate
-       (uses `patch_numbers`, `n_qualifying`, `n_total_active`)
+Generates 6 diagnostic plots derived from the per-source split CSVs
+(train_data_<source>.csv, validation_data_<source>.csv,
+test_data_<source>.csv). All three splits are loaded so the
+overview plots (1-4) reflect the full dataset; the split-specific
+plots (5, 6) only describe the --split passed on the CLI.
+
+    1. Diurnal cycle of convective activity                 (all splits)
+    2. Spatial heatmap of patch activation frequency        (all splits)
+    3. Daily activity timeline (dates × hours)              (all splits)
+    4. Distribution of simultaneously active patches        (all splits)
+    5. Valid training samples per date                      (--split)
+    6. Per-patch active vs qualifying + overall survival    (all + --split)
 
 All plots are saved to our_data/data_statistics/
 
@@ -380,42 +381,49 @@ def plot_samples_per_date(seq_data, out_dir, prefix='sequences'):
 # Plot 6: Patch survival rate
 # =============================================================================
 
-def plot_patch_survival(seq_data, out_dir, prefix='sequences'):
+def plot_patch_survival(seq_all, seq_split, out_dir,
+                        prefix='sequences', split_label='train'):
     """
-    Per-patch survival diagnostic, derived entirely from the sequence
-    CSV (no upstream patch_index.csv dependency).
+    Per-patch active-vs-qualifying diagnostic.
 
-    Per row, the CSV gives us:
-      - `patch_numbers` = patches that qualified (passed every filter
-        and have data across the whole input+future window).
-      - `n_total_active` = scalar count of patches that were initially
-        active at the reference timestep, before window filtering.
+    Restored two-bar shape (active blue, qualifying green) without
+    going back to the upstream patch_index.csv. The two scopes are:
 
-    `n_total_active` is per-row, not per-patch, so we can't directly
-    plot a per-patch "active" bar. Instead this plot does two things
-    in one figure:
+      - Blue (`Active`): per-patch occurrence count summed over ALL
+        per-source split CSVs (train + validation + test combined).
+        Tracks how often each patch survived the cross-product filter
+        anywhere in the dataset - a sequence-CSV-side stand-in for the
+        old "DBSCAN-active timesteps" denominator.
+      - Green (`Qualifying`): per-patch occurrence count in JUST the
+        --split CSV (the one passed via --split / --sequences).
 
-      1. Per-patch QUALIFYING bars (green): how many sequence rows had
-         patch p in their `patch_numbers`. Identical to the old green
-         bars, just computed from the sequence CSV directly.
-      2. Aggregate survival annotation: sum(n_total_active) vs
-         sum(n_qualifying) reported as a percent in the title. That's
-         the overall fraction of initially-active patches that
-         survived the window filter — same idea as the old
-         centre-rate, just collapsed to a single number because the
-         CSV doesn't carry per-patch active counts.
+    The printed percentage is the split's share of total dataset
+    qualification for that patch:
+        rate = seq_split_count[p] / seq_all_count[p] * 100
+    e.g. ~80% on a patch the Czibula 80/10/10 split puts mostly in
+    train; ~10% on val/test patches.
+
+    Overall-survival annotation in the title still uses
+    sum(n_qualifying) / sum(n_total_active) computed on seq_split so
+    the "what fraction of initially-active patches passed the window
+    filter" number stays anchored to the chosen split.
 
     All 18 patches are always listed for layout consistency, including
     those that never qualified (e.g. patches over the Black Sea or
     outside the OPERA footprint) - they show as zero-height bars.
     """
-    seq_counts = Counter()
-    for row in seq_data:
+    all_counts = Counter()
+    for row in seq_all:
         for p in row['patch_numbers']:
-            seq_counts[p] += 1
+            all_counts[p] += 1
 
-    total_active = sum(r['n_total_active'] for r in seq_data)
-    total_qualifying = sum(r['n_qualifying'] for r in seq_data)
+    split_counts = Counter()
+    for row in seq_split:
+        for p in row['patch_numbers']:
+            split_counts[p] += 1
+
+    total_active = sum(r['n_total_active'] for r in seq_split)
+    total_qualifying = sum(r['n_qualifying'] for r in seq_split)
     overall_survival = (
         (total_qualifying / total_active * 100.0) if total_active > 0 else 0.0
     )
@@ -424,17 +432,27 @@ def plot_patch_survival(seq_data, out_dir, prefix='sequences'):
 
     fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(patches_present))
+    width = 0.35
 
-    seq_vals = [seq_counts.get(p, 0) for p in patches_present]
-    ax.bar(x, seq_vals, 0.6,
+    all_vals = [all_counts.get(p, 0) for p in patches_present]
+    split_vals = [split_counts.get(p, 0) for p in patches_present]
+
+    ax.bar(x - width / 2, all_vals, width,
+           label='Active (train + val + test)',
+           color=COLORS['primary'], edgecolor='white', linewidth=0.5,
+           alpha=0.85, zorder=3)
+    ax.bar(x + width / 2, split_vals, width,
+           label=f'Qualifying ({split_label} split)',
            color=COLORS['accent'], edgecolor='white', linewidth=0.5,
-           alpha=0.9, zorder=3,
-           label='Qualifying rows (this patch in patch_numbers)')
+           alpha=0.85, zorder=3)
 
-    max_h = max(seq_vals + [1])
+    max_h = max(all_vals + split_vals + [1])
     for i, p in enumerate(patches_present):
-        ax.text(x[i], seq_vals[i] + max_h * 0.02,
-                f'{seq_vals[i]:,}', ha='center', va='bottom',
+        a = all_counts.get(p, 0)
+        s = split_counts.get(p, 0)
+        rate = s / a * 100 if a > 0 else 0
+        ax.text(x[i], max(a, s) + max_h * 0.02,
+                f'{rate:.0f}%', ha='center', va='bottom',
                 fontsize=7, color=COLORS['text'])
 
     ax.set_xticks(x)
@@ -444,10 +462,11 @@ def plot_patch_survival(seq_data, out_dir, prefix='sequences'):
     ax.set_ylabel('Sequence rows where this patch qualified',
                   fontsize=11)
     ax.set_title(
-        f'Per-patch qualifying frequency ({prefix})  |  '
-        f'overall survival = {total_qualifying:,} / {total_active:,} '
-        f'patch-timesteps  ({overall_survival:.1f}%)',
-        fontsize=12, fontweight='bold',
+        f'Patch survival: {split_label} share of total qualification '
+        f'({prefix})  |  {split_label} window-filter survival = '
+        f'{total_qualifying:,} / {total_active:,} patch-timesteps  '
+        f'({overall_survival:.1f}%)',
+        fontsize=11, fontweight='bold',
     )
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
@@ -516,21 +535,44 @@ def main():
     print(f"Sequences : {seq_path}")
     print(f"Output    : {out_dir}")
 
-    # Load the per-source split CSV. Everything else - per-(date, time)
-    # patch activity for plots 1-4, the qualifying counts for plot 6 -
-    # is derived from it, so the diagnostics always match what the
-    # model trains on.
-    print(f"\nLoading sequence CSV ({os.path.basename(seq_path)})...")
-    seq_data = load_sequences(seq_path)
-    if not seq_data:
+    # Load the --split CSV first. This is the canonical source for
+    # plots 5 + 6 ("samples per date" and "patch survival") - they
+    # only describe the split the user picked. Plots 1-4 then union
+    # all three split CSVs (train + validation + test) so the
+    # diurnal / spatial / timeline / active-count diagnostics
+    # describe the full dataset rather than just one split.
+    print(f"\nLoading split CSV ({os.path.basename(seq_path)})...")
+    seq_split = load_sequences(seq_path)
+    if not seq_split:
         print(f"Cannot proceed without {seq_path}")
         return
-    seq_dates = sorted(set(r['date'] for r in seq_data))
-    print(f"  {len(seq_data)} valid sequences across {len(seq_dates)} dates")
+    split_dates = sorted(set(r['date'] for r in seq_split))
+    print(f"  {len(seq_split)} sequences across {len(split_dates)} dates")
 
-    patch_data = patch_activity_from_sequences(seq_data)
+    seq_all = list(seq_split)
+    if args.sequences is None:
+        # Auto-resolved seq_path: try to also load the other two splits
+        # so the overview plots reflect the full dataset. Missing files
+        # are skipped with a note - useful for partial setups (e.g. a
+        # dev machine that only has train).
+        for other in ("train", "validation", "test"):
+            if other == args.split:
+                continue
+            other_path = os.path.join(
+                args.data_root, f"{other}_data_{args.source}.csv",
+            )
+            if not os.path.isfile(other_path):
+                print(f"  ({other}_data_{args.source}.csv not found - "
+                      f"plots 1-4 will skip it)")
+                continue
+            extra = load_sequences(other_path)
+            if extra:
+                seq_all.extend(extra)
+                print(f"  + {len(extra)} sequences from {other}")
+
+    patch_data = patch_activity_from_sequences(seq_all)
     activity_dates = sorted(set(r['date'] for r in patch_data))
-    print(f"  Derived patch-activity: {len(patch_data)} active "
+    print(f"  Combined patch-activity: {len(patch_data)} active "
           f"timesteps across {len(activity_dates)} dates")
 
     # Cadence is read from sequence_meta.json / timestep_config.json so
@@ -548,8 +590,9 @@ def main():
     plot_active_distribution(patch_data, out_dir)
 
     seq_prefix = os.path.splitext(os.path.basename(seq_path))[0]
-    plot_samples_per_date(seq_data, out_dir, seq_prefix)
-    plot_patch_survival(seq_data, out_dir, seq_prefix)
+    plot_samples_per_date(seq_split, out_dir, seq_prefix)
+    plot_patch_survival(seq_all, seq_split, out_dir,
+                        prefix=seq_prefix, split_label=args.split)
 
     print(f"\nDone. All plots saved to {out_dir}")
 
