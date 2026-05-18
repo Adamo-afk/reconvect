@@ -250,13 +250,11 @@ def _load_country_borders_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray, s
     return [(col, row, "Romania")], "hardcoded_coarse"
 
 
-def overlay_borders(ax, *, color="black", linewidth=1.3,
-                    neighbour_linestyle=(0, (5, 3))):
+def overlay_borders(ax, *, color="black", linewidth=1.3):
     """Draw Romania + neighbour-country borders onto an axis that already
-    shows the 768x1536 data canvas in default (pixel) coords. Romania is
-    solid; neighbours use the same color/linewidth but a dashed pattern
-    (default = 5 px on, 3 px off) so they read as context borders rather
-    than the focal country. Caches geometry at module level."""
+    shows the 768x1536 data canvas in default (pixel) coords. All borders
+    use the same solid style; Romania is drawn last so it sits on top at
+    boundary meetings. Caches geometry at module level."""
     global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE
     if _BORDERS_PIXEL_CACHE is None:
         _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = \
@@ -266,8 +264,7 @@ def overlay_borders(ax, *, color="black", linewidth=1.3,
     for col, row, name in _BORDERS_PIXEL_CACHE:
         if name == "Romania":
             continue
-        ax.plot(col, row, color=color, linewidth=linewidth,
-                linestyle=neighbour_linestyle, zorder=5)
+        ax.plot(col, row, color=color, linewidth=linewidth, zorder=5)
     for col, row, name in _BORDERS_PIXEL_CACHE:
         if name != "Romania":
             continue
