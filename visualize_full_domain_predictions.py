@@ -889,7 +889,7 @@ def _custom_objects():
     # Import here so importing this module never forces TF graph construction.
     from evaluate_coalition import (
         ReflectionPadding2D, ConvBlock, ResBlock, GRUResBlock, ResGRU,
-        SwinBlock, WeightedFocalLoss,
+        SwinBlock, WeightedFocalLoss, WeightedFocalCategoricalCrossentropy,
         iou_metric, true_pos, false_pos, false_neg,
     )
     return {
@@ -900,6 +900,7 @@ def _custom_objects():
         "ResGRU":              ResGRU,
         "SwinBlock":           SwinBlock,
         "WeightedFocalLoss":   WeightedFocalLoss,
+        "WeightedFocalCategoricalCrossentropy": WeightedFocalCategoricalCrossentropy,
         "iou_metric":          iou_metric,
         "true_pos":            true_pos,
         "false_pos":           false_pos,
