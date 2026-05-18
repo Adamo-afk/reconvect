@@ -1034,9 +1034,26 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
         if cfg is not None:
             input_groups[key] = cfg
 
-    INPUT_COLS = ["idx_t-30", "idx_t-15", "idx_t0"]
-    LABEL_COLS_LOCAL = ["idx_t+15", "idx_t+30", "idx_t+45"]
-    T_OFFSETS = [-30, -15, 0, 15, 30, 45]
+    # Per-source split CSVs use step *indices* (idx_t-2, idx_t-1, idx_t0,
+    # idx_t+1, ...) not minute offsets - the schema is stable across the
+    # step_minutes choice. Read step_minutes from timestep_config.json
+    # to recover the actual minute values used to build HHMM filenames.
+    step_minutes_path = data_root / "timestep_config.json"
+    if step_minutes_path.is_file():
+        with open(step_minutes_path) as _f:
+            step_minutes = int(json.load(_f)["step_minutes"])
+    else:
+        print(f"  WARNING: {step_minutes_path} not found, assuming "
+              f"step_minutes=15.")
+        step_minutes = 15
+    INPUT_STEPS = [-2, -1, 0]
+    LABEL_STEPS = [1, 2, 3]
+    INPUT_COLS = [
+        f"idx_t{s}" if s < 0 else ("idx_t0" if s == 0 else f"idx_t+{s}")
+        for s in INPUT_STEPS
+    ]
+    LABEL_COLS_LOCAL = [f"idx_t+{s}" for s in LABEL_STEPS]
+    T_OFFSETS = [s * step_minutes for s in INPUT_STEPS + LABEL_STEPS]
     N_INPUT = 3
     N_LABEL_STEPS = 3
     RADAR_CLASS_NAMES = ["R<10", "10≤R<20", "20≤R<30", "30≤R<40", "R≥40"]
