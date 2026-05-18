@@ -94,16 +94,29 @@ COLORS = {
 # Data loaders
 # =============================================================================
 
-def load_patch_index(data_root):
+def _resolve_patch_activity_csv(data_root, source):
+    """Per-source path to the upstream patch-activity CSV. Both files
+    share the same schema (date, time_utc, iso_timestamp, patch_1..
+    patch_18 binary flags) so the parser below is identical."""
+    if source == "lightning":
+        return os.path.join(
+            data_root, 'lightning_periods', 'lightning_patches.csv',
+        )
+    return os.path.join(data_root, 'patch_index', 'patch_index.csv')
+
+
+def load_patch_index(data_root, source="dbscan"):
     """
-    Load patch_index.csv.
+    Load the per-source patch-activity CSV:
+      - source='dbscan'   -> our_data/patch_index/patch_index.csv
+      - source='lightning'-> our_data/lightning_periods/lightning_patches.csv
 
     Returns:
         list[dict]: Each dict has 'date', 'time', 'hour', 'active_patches'
     """
-    csv_path = os.path.join(data_root, 'patch_index', 'patch_index.csv')
+    csv_path = _resolve_patch_activity_csv(data_root, source)
     if not os.path.isfile(csv_path):
-        print(f"  patch_index.csv not found at {csv_path}")
+        print(f"  Patch-activity CSV not found at {csv_path}")
         return []
 
     rows = []
@@ -526,10 +539,11 @@ def main():
     print(f"Output    : {out_dir}")
 
     # Load data
-    print("\nLoading patch_index.csv...")
-    patch_data = load_patch_index(args.data_root)
+    patch_csv = _resolve_patch_activity_csv(args.data_root, args.source)
+    print(f"\nLoading patch-activity CSV ({os.path.basename(patch_csv)})...")
+    patch_data = load_patch_index(args.data_root, args.source)
     if not patch_data:
-        print("Cannot proceed without patch_index.csv")
+        print(f"Cannot proceed without {patch_csv}")
         return
 
     dates = sorted(set(r['date'] for r in patch_data))
