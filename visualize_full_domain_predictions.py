@@ -683,6 +683,206 @@ def plot_full_domain(
 
 
 # ============================================================================
+# Zoom plot for the highest-activity patch
+# ============================================================================
+def find_highest_activity_patch(
+    gt_canvases: list[np.ndarray],
+    valid_patches: list[int],
+    label_type: str,
+) -> tuple[int, int]:
+    """Pick the qualifying patch with the most GT activity summed across
+    all lead times.
+
+    Activity =
+      - lightning: count of pixels where the GT occurrence flag is 1
+        (anything above 0 - the label transform clips to {0, 1}).
+      - radar: count of pixels classified to ANY non-zero rain class
+        (0 = R<10 means dry, -1 = no qualifying patch).
+
+    Returns (patch_number, activity_score). If no patch has any
+    activity, returns the first valid patch with score 0.
+    """
+    best_patch = valid_patches[0]
+    best_score = -1
+    for p in valid_patches:
+        r0, r1, c0, c1 = get_patch_bounds(p)
+        score = 0
+        for canvas in gt_canvases:
+            tile = canvas[r0:r1, c0:c1]
+            if label_type == "lightning":
+                score += int(np.sum(tile > 0))
+            else:
+                score += int(np.sum((tile > 0) & (tile != -1)))
+        if score > best_score:
+            best_score = score
+            best_patch = p
+    return best_patch, max(best_score, 0)
+
+
+def _format_pixel_to_latlon(col_px: float, row_px: float) -> str:
+    """Reverse the pixel->lat/lon mapping for a corner annotation."""
+    try:
+        import pyproj
+        xmin, xmax, ymin, ymax = ROMANIA_EXTENT_UTM
+        x = xmin + (col_px / W_FULL) * (xmax - xmin)
+        y = ymax - (row_px / H_FULL) * (ymax - ymin)
+        transformer = pyproj.Transformer.from_crs(
+            "EPSG:31700", "EPSG:4326", always_xy=True,
+        )
+        lon, lat = transformer.transform(x, y)
+        return f"{lat:.2f}°N, {lon:.2f}°E"
+    except Exception:
+        return ""
+
+
+def plot_zoom_patch(
+    gt_canvases: list[np.ndarray],
+    pred_canvases: list[np.ndarray],
+    patch_num: int,
+    activity_score: int,
+    label_type: str,
+    *,
+    date_str: str,
+    ref_utc: str,
+    threshold: float | None,
+    output_path: Path,
+    step_minutes: int,
+):
+    """Save a zoomed 2x3 figure for one specific 256x256 patch.
+
+    Same GT-over-Pred 3-leadtime layout as plot_full_domain but cropped
+    to the chosen patch. Country borders that intersect the patch are
+    drawn inside the cropped frame so the location stays identifiable;
+    the patch's lat/lon centre is reported in the figure suptitle so the
+    operator can match it to a real-world region.
+    """
+    r0, r1, c0, c1 = get_patch_bounds(patch_num)
+    lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
+    label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9.5),
+                             constrained_layout=True)
+
+    # GT styling identical to plot_full_domain so the zoom reads as a
+    # consistent panel of the same figure.
+    if label_type == "lightning":
+        gt_cmap = mcolors.LinearSegmentedColormap.from_list(
+            "gt_red", ["#fff5f0", "#67000d"]
+        )
+        gt_kwargs = dict(cmap=gt_cmap, vmin=0.0, vmax=1.0,
+                         aspect="equal", interpolation="nearest",
+                         extent=(c0, c1, r1, r0))
+    else:
+        gt_kwargs = dict(cmap=plt.get_cmap("viridis", 5),
+                         vmin=0, vmax=4,
+                         aspect="equal", interpolation="nearest",
+                         extent=(c0, c1, r1, r0))
+
+    for t in range(3):
+        ax = axes[0, t]
+        canvas = gt_canvases[t]
+        tile = canvas[r0:r1, c0:c1]
+        if label_type == "radar":
+            display = np.where(tile < 0, np.nan, tile.astype(float))
+            im_gt = ax.imshow(display, **gt_kwargs)
+        else:
+            im_gt = ax.imshow(tile, **gt_kwargs)
+        # Country borders inside the patch frame (matplotlib auto-clips).
+        try:
+            overlay_borders(ax)
+        except Exception:
+            pass
+        active_px = int(np.sum(tile > 0)) if label_type == "lightning" \
+            else int(np.sum((tile > 0) & (tile != -1)))
+        ax.text(
+            c0 + 4, r1 - 6, f"pixels={active_px}",
+            color="white", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25",
+                      facecolor="black", alpha=0.55, edgecolor="none"),
+            va="bottom", ha="left", zorder=7,
+        )
+        ax.set_title(f"GT — {lead_titles[t]} "
+                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
+                     fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c0, c1); ax.set_ylim(r1, r0)
+
+    # Predictions row
+    if label_type == "lightning":
+        thr = threshold if threshold is not None else 0.5
+        pred_norm = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=thr, vmax=1.0)
+        pred_kwargs = dict(cmap="RdYlBu_r", norm=pred_norm,
+                           aspect="equal", interpolation="nearest",
+                           extent=(c0, c1, r1, r0))
+    else:
+        pred_kwargs = dict(cmap=plt.get_cmap("viridis", 5),
+                           vmin=0, vmax=4,
+                           aspect="equal", interpolation="nearest",
+                           extent=(c0, c1, r1, r0))
+
+    for t in range(3):
+        ax = axes[1, t]
+        canvas = pred_canvases[t]
+        tile = canvas[r0:r1, c0:c1]
+        if label_type == "radar":
+            display = np.where(tile < 0, np.nan, tile.astype(float))
+            im_pred = ax.imshow(display, **pred_kwargs)
+        else:
+            im_pred = ax.imshow(tile, **pred_kwargs)
+        try:
+            overlay_borders(ax)
+        except Exception:
+            pass
+        if label_type == "lightning":
+            thr_for_count = threshold if threshold is not None else 0.5
+            above = int(np.sum(tile >= thr_for_count))
+            ax.text(
+                c0 + 4, r1 - 6,
+                f"pixels≥{thr_for_count:.2f}={above}  "
+                f"max={tile.max():.3f}",
+                color="white", fontsize=10,
+                bbox=dict(boxstyle="round,pad=0.25",
+                          facecolor="black", alpha=0.55, edgecolor="none"),
+                va="bottom", ha="left", zorder=7,
+            )
+            title_suffix = f"(≥{thr_for_count:.2f})"
+        else:
+            title_suffix = ""
+        ax.set_title(f"Pred {title_suffix} — {lead_titles[t]} "
+                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
+                     fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c0, c1); ax.set_ylim(r1, r0)
+
+    # Colorbars (one per row, same as plot_full_domain).
+    if label_type == "lightning":
+        cax_gt = fig.colorbar(im_gt, ax=axes[0, :].ravel().tolist(),
+                              shrink=0.85, pad=0.01, location="right")
+        cax_gt.set_label("Occurrence")
+        cax_pred = fig.colorbar(im_pred, ax=axes[1, :].ravel().tolist(),
+                                shrink=0.85, pad=0.01, location="right")
+        cax_pred.set_label("Probability")
+    else:
+        cax = fig.colorbar(im_gt, ax=axes.ravel().tolist(),
+                           ticks=[0, 1, 2, 3, 4],
+                           shrink=0.85, pad=0.01, location="right")
+        cax.set_ticklabels(RADAR_CLASS_NAMES)
+        cax.set_label("Rain-rate class")
+
+    centre_latlon = _format_pixel_to_latlon((c0 + c1) / 2, (r0 + r1) / 2)
+    fig.suptitle(
+        f"ZOOM patch #{patch_num}  ({'Lightning' if label_type == 'lightning' else 'OPERA 5-class'})  "
+        f"— Date: {date_str}  |  Ref: {ref_utc} UTC  |  "
+        f"GT activity: {activity_score} px"
+        + (f"  |  Centre: {centre_latlon}" if centre_latlon else ""),
+        fontsize=13, fontweight="bold",
+    )
+
+    fig.savefig(output_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================================
 # Model loading
 # ============================================================================
 def _custom_objects():
@@ -850,6 +1050,11 @@ def main() -> int:
                              "prediction map (overrides optimal_threshold).")
     parser.add_argument("--batch_size", type=int, default=18,
                         help="Per-row batch size (default 18 = max patches).")
+    parser.add_argument("--no_zoom", action="store_true",
+                        help="Skip the per-timestep zoom-in plot of the "
+                             "patch with the highest GT activity. Default "
+                             "is to save BOTH the full-domain figure and "
+                             "the zoom figure side by side.")
     args = parser.parse_args()
 
     csv_path = Path(args.csv)
@@ -952,6 +1157,24 @@ def main() -> int:
             step_minutes=step_minutes,
         )
         print(f"  Saved -> {out_png}")
+
+        # Zoom plot: the qualifying patch with the most GT activity.
+        if not args.no_zoom:
+            best_patch, best_score = find_highest_activity_patch(
+                gt_canvases, valid_patches, label_type,
+            )
+            zoom_png = (
+                output_dir
+                / f"ts{rank:02d}_{date_str}_{safe_ref}_zoom_p{best_patch:02d}.png"
+            )
+            plot_zoom_patch(
+                gt_canvases, pred_canvases, best_patch, best_score,
+                label_type, date_str=date_str, ref_utc=ref_utc,
+                threshold=threshold, output_path=zoom_png,
+                step_minutes=step_minutes,
+            )
+            print(f"  Zoom  -> {zoom_png}  "
+                  f"(patch #{best_patch}, GT activity={best_score} px)")
 
     print(f"\nDone. {len(df_top)} figure(s) written under {output_dir}")
     return 0
