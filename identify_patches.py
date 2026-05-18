@@ -118,6 +118,144 @@ DBSCAN_MIN_SAMPLES = 20  # minimum cluster size
 
 
 # =============================================================================
+# Country-border overlay (cartopy Natural Earth preferred, pyproj fallback)
+# =============================================================================
+# Mirrors the helpers in visualize_full_domain_predictions.py so the
+# patch-selection diagnostic plot reads as a consistent panel of the same
+# Romania visualisation - just with the GT/Pred rows swapped for the
+# RZC field + DBSCAN mask. Coords go lat/lon -> EPSG:31700 -> pixel via
+# the canvas's known UTM extent (no GeoAxes needed).
+
+# UTM zone 35N (EPSG:31700) extent of the Romania grid, from c4dl/projection.py.
+# Order: (lower_left_x, upper_right_x, lower_left_y, upper_right_y).
+ROMANIA_EXTENT_UTM = (-177324.0, 1331353.0, 77148.0, 723370.0)
+
+# Pixels of breathing room beyond the farthest data-canvas edge from
+# Romania's centroid. Same value the prediction plotter uses (~250 km in
+# UTM 35N at the 1 km/pixel grid resolution).
+VIEW_EXTRA_PAD = 80
+
+# Natural Earth admin_0_countries that we want to draw alongside Romania.
+# Aliases included because the attribute name varies across NE versions.
+NEIGHBOUR_NAMES = {
+    "Hungary", "Serbia", "Bulgaria", "Moldova", "Republic of Moldova",
+    "Ukraine", "Slovakia", "Austria", "Czech Republic", "Czechia",
+    "Poland", "Belarus", "Russia", "Croatia", "Bosnia and Herz.",
+    "Bosnia and Herzegovina", "Greece", "North Macedonia", "Macedonia",
+    "Albania", "Italy", "Slovenia", "Turkey", "Montenegro", "Kosovo",
+    "Republic of Serbia",
+}
+
+# Coarse fallback used only when cartopy is unavailable.
+_ROMANIA_OUTLINE_LONLAT_FALLBACK = [
+    (22.69, 47.99), (23.14, 48.10), (24.30, 47.91), (25.41, 47.93),
+    (26.40, 48.22), (27.05, 47.99), (27.55, 47.40), (28.10, 46.81),
+    (28.21, 45.97), (28.83, 45.30), (29.65, 45.18), (29.69, 44.81),
+    (28.84, 44.05), (28.05, 43.81), (27.00, 44.13), (25.65, 43.69),
+    (24.50, 43.68), (23.27, 43.83), (22.65, 44.22), (22.42, 44.71),
+    (21.56, 44.77), (21.36, 45.04), (20.79, 45.46), (20.25, 46.10),
+    (20.79, 46.30), (21.06, 46.83), (22.13, 47.59), (22.69, 47.99),
+]
+
+_BORDERS_PIXEL_CACHE = None    # populated lazily on first plot
+_BORDERS_SOURCE = None         # "natural_earth_10m" or "hardcoded_coarse"
+_VIEW_EXTENT = None            # (col_lo, col_hi, row_lo, row_hi)
+
+
+def _latlon_to_pixel(lon, lat):
+    """Convert lon/lat arrays to (col, row) on the 768x1536 grid via
+    pyproj (lat/lon -> EPSG:31700 -> pixel through the UTM extent)."""
+    import pyproj
+    transformer = pyproj.Transformer.from_crs(
+        "EPSG:4326", "EPSG:31700", always_xy=True,
+    )
+    x, y = transformer.transform(lon, lat)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    xmin, xmax, ymin, ymax = ROMANIA_EXTENT_UTM
+    col = (x - xmin) / (xmax - xmin) * GRID_WIDTH
+    row = (ymax - y) / (ymax - ymin) * GRID_HEIGHT
+    return col, row
+
+
+def _load_country_borders():
+    """Resolve Romania + neighbour-country borders to (col, row, name)
+    tuples. Cartopy Natural Earth 10m if available, hardcoded fallback
+    otherwise. Returns (rings, source_label)."""
+    try:
+        import cartopy.io.shapereader as shpreader
+        shp = shpreader.natural_earth(
+            resolution="10m", category="cultural",
+            name="admin_0_countries",
+        )
+        wanted = NEIGHBOUR_NAMES | {"Romania"}
+        rings = []
+        for country in shpreader.Reader(shp).records():
+            name = country.attributes.get("NAME") \
+                or country.attributes.get("ADMIN") \
+                or country.attributes.get("name")
+            if name not in wanted:
+                continue
+            geom = country.geometry
+            geoms = list(geom.geoms) if geom.geom_type == "MultiPolygon" \
+                else [geom]
+            for poly in geoms:
+                lon = np.asarray(poly.exterior.coords.xy[0], dtype=np.float64)
+                lat = np.asarray(poly.exterior.coords.xy[1], dtype=np.float64)
+                col, row = _latlon_to_pixel(lon, lat)
+                rings.append((col, row, name))
+                for interior in poly.interiors:
+                    lon_i = np.asarray(interior.coords.xy[0], dtype=np.float64)
+                    lat_i = np.asarray(interior.coords.xy[1], dtype=np.float64)
+                    c_i, r_i = _latlon_to_pixel(lon_i, lat_i)
+                    rings.append((c_i, r_i, name))
+        if rings:
+            return rings, "natural_earth_10m"
+    except Exception:
+        pass
+
+    lonlat = np.asarray(_ROMANIA_OUTLINE_LONLAT_FALLBACK, dtype=np.float64)
+    col, row = _latlon_to_pixel(lonlat[:, 0], lonlat[:, 1])
+    return [(col, row, "Romania")], "hardcoded_coarse"
+
+
+def _ensure_borders_cached():
+    global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE, _VIEW_EXTENT
+    if _BORDERS_PIXEL_CACHE is None:
+        _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = _load_country_borders()
+    if _VIEW_EXTENT is None:
+        ro_cols, ro_rows = [], []
+        for col, row, name in _BORDERS_PIXEL_CACHE:
+            if name == "Romania":
+                ro_cols.append(col)
+                ro_rows.append(row)
+        if ro_cols:
+            all_col = np.concatenate(ro_cols)
+            all_row = np.concatenate(ro_rows)
+            c_x = float((all_col.min() + all_col.max()) / 2)
+            c_y = float((all_row.min() + all_row.max()) / 2)
+        else:
+            c_x, c_y = GRID_WIDTH / 2.0, GRID_HEIGHT / 2.0
+        half_w = max(c_x - 0.0, GRID_WIDTH - c_x) + VIEW_EXTRA_PAD
+        half_h = max(c_y - 0.0, GRID_HEIGHT - c_y) + VIEW_EXTRA_PAD
+        _VIEW_EXTENT = (c_x - half_w, c_x + half_w,
+                        c_y - half_h, c_y + half_h)
+
+
+def _overlay_borders(ax, *, color="black", linewidth=1.3):
+    """Solid country borders, Romania drawn last so it stays prominent."""
+    _ensure_borders_cached()
+    for col, row, name in _BORDERS_PIXEL_CACHE:
+        if name == "Romania":
+            continue
+        ax.plot(col, row, color=color, linewidth=linewidth, zorder=5)
+    for col, row, name in _BORDERS_PIXEL_CACHE:
+        if name != "Romania":
+            continue
+        ax.plot(col, row, color=color, linewidth=linewidth, zorder=6)
+
+
+# =============================================================================
 # Radar I/O
 # =============================================================================
 
@@ -327,8 +465,10 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     """
     Plot the reprojected RZC data with the 6×3 patch grid overlay.
 
-    Active patches (containing DBSCAN cluster pixels) are highlighted.
-    Each patch is numbered at its upper-left corner (1–18).
+    Styled to match `visualize_full_domain_predictions.py`: Romania
+    sits centred in the figure, neighbour-country borders frame the
+    canvas, every patch slot is outlined with a dashed grid in black,
+    and active patches get a red highlight on top.
 
     Args:
         reprojected: 2D array (768×1536) of reprojected RZC values
@@ -338,7 +478,10 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
         time_str: 'HH:MM'
         output_dir: directory to save the PNG
     """
-    fig, axes = plt.subplots(1, 2, figsize=(20, 5.5),
+    _ensure_borders_cached()
+    c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8),
                              constrained_layout=True)
 
     active_set = set(active_patches)
@@ -346,54 +489,62 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     for ax_idx, (ax, data, title_suffix) in enumerate(zip(
         axes,
         [reprojected, binary_mask],
-        ['RZC (reprojected)', 'DBSCAN binary mask']
+        ['RZC (regridded)', 'DBSCAN binary mask']
     )):
         if ax_idx == 0:
-            # RZC with a continuous colormap
             im = ax.imshow(data, cmap='viridis', aspect='equal',
                            interpolation='nearest')
             fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label='RZC')
         else:
-            # Binary mask: 0=gray, 1=red
             cmap = ListedColormap(['#e0e0e0', '#d32f2f'])
             im = ax.imshow(data, cmap=cmap, vmin=0, vmax=1, aspect='equal',
                            interpolation='nearest')
 
-        # Draw grid lines and patch labels
+        # 1. Dashed grid in black over every patch slot (matches the
+        #    prediction plotter's _plot_patch_grid).
         for p in range(1, N_PATCHES + 1):
-            r0, r1, c0, c1 = get_patch_bounds(p)
+            r0, _, c0, _ = get_patch_bounds(p)
+            ax.add_patch(Rectangle(
+                (c0, r0), PATCH_SIZE, PATCH_SIZE,
+                linewidth=0.7, edgecolor='black',
+                linestyle=(0, (1, 3)), facecolor='none',
+                zorder=3,
+            ))
 
+        # 2. Active-patch highlight: red outline + light red fill on top.
+        for p in active_patches:
+            r0, _, c0, _ = get_patch_bounds(p)
+            ax.add_patch(Rectangle(
+                (c0, r0), PATCH_SIZE, PATCH_SIZE,
+                linewidth=2.0, edgecolor='#f44336',
+                facecolor='#f4433620', linestyle='-', zorder=4,
+            ))
+
+        # 3. Patch number labels (red+bold for active, white otherwise).
+        for p in range(1, N_PATCHES + 1):
+            r0, _, c0, _ = get_patch_bounds(p)
             is_active = p in active_set
-
-            # Highlight active patches
-            if is_active:
-                rect = Rectangle(
-                    (c0, r0), PATCH_SIZE, PATCH_SIZE,
-                    linewidth=2.0, edgecolor='#f44336', facecolor='#f4433620',
-                    linestyle='-', zorder=3
-                )
-            else:
-                rect = Rectangle(
-                    (c0, r0), PATCH_SIZE, PATCH_SIZE,
-                    linewidth=0.8, edgecolor='white', facecolor='none',
-                    linestyle='--', zorder=2
-                )
-            ax.add_patch(rect)
-
-            # Patch number at upper-left corner
-            label_color = '#f44336' if is_active else 'white'
-            fontweight = 'bold' if is_active else 'normal'
             ax.text(
                 c0 + 8, r0 + 22, str(p),
-                color=label_color, fontsize=9, fontweight=fontweight,
-                ha='left', va='top', zorder=4,
+                color='#f44336' if is_active else 'white',
+                fontsize=9, fontweight='bold' if is_active else 'normal',
+                ha='left', va='top', zorder=7,
                 bbox=dict(boxstyle='round,pad=0.15', facecolor='black',
                           alpha=0.55, edgecolor='none')
             )
 
+        # 4. Country borders on top.
+        try:
+            _overlay_borders(ax)
+        except Exception:
+            pass
+
         ax.set_title(f'{title_suffix}', fontsize=11)
-        ax.set_xlabel('Column (px)')
-        ax.set_ylabel('Row (px)')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)  # image y is flipped
+        ax.set_aspect('equal')
 
     patches_str = ', '.join(str(p) for p in active_patches) if active_patches else 'none'
     fig.suptitle(
@@ -401,7 +552,6 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
         fontsize=13, fontweight='bold'
     )
 
-    # Save
     os.makedirs(output_dir, exist_ok=True)
     safe_time = time_str.replace(':', '')
     filename = f"patches_{date_str}_{safe_time}.png"
