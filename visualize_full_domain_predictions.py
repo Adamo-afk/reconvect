@@ -653,8 +653,10 @@ def plot_full_domain(
                      f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_xlim(-VIEW_PAD, W_FULL + VIEW_PAD)
-        ax.set_ylim(H_FULL + VIEW_PAD, -VIEW_PAD)
+        _ensure_view_cached()
+        c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)
         ax.set_aspect("equal")
 
     # Colorbars (one per row).
