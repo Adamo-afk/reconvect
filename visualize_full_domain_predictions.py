@@ -89,11 +89,25 @@ W_FULL = N_COLS * PATCH_SIZE              # 1536
 # upper_right_y) in metres.
 ROMANIA_EXTENT_UTM = (-177324.0, 1331353.0, 77148.0, 723370.0)
 
-INPUT_TIME_COLS = ["idx_t-30", "idx_t-15", "idx_t0"]
-LABEL_TIME_COLS = ["idx_t+15", "idx_t+30", "idx_t+45"]
-INPUT_OFFSETS_MIN = [-30, -15, 0]
-LABEL_OFFSETS_MIN = [15, 30, 45]
-LEAD_TITLES = ["t+15", "t+30", "t+45"]
+# Column names in the per-source split CSVs use STEP indices, not minute
+# offsets - the schema is stable across step_minutes values. The actual
+# minute offsets are derived at runtime by multiplying by step_minutes
+# from our_data/timestep_config.json.
+INPUT_STEP_OFFSETS = [-2, -1, 0]
+LABEL_STEP_OFFSETS = [1, 2, 3]
+
+
+def _step_column_name(offset: int) -> str:
+    """Mirror of extract_patch_seq_for_datasets.step_column_name."""
+    if offset < 0:
+        return f"idx_t{offset}"
+    if offset == 0:
+        return "idx_t0"
+    return f"idx_t+{offset}"
+
+
+INPUT_TIME_COLS = [_step_column_name(o) for o in INPUT_STEP_OFFSETS]
+LABEL_TIME_COLS = [_step_column_name(o) for o in LABEL_STEP_OFFSETS]
 RADAR_CLASS_NAMES = ["R<10", "10≤R<20", "20≤R<30",
                      "30≤R<40", "R≥40"]
 
@@ -188,7 +202,22 @@ def _ref_to_hhmm(ref_utc: str, offset_min: int) -> str:
     return (ref_dt + timedelta(minutes=offset_min)).strftime("%H%M")
 
 
-def build_batch_inputs(row, patches_dir: str, mode_config: dict) -> tuple[dict, list[int]]:
+def _load_step_minutes(data_root: Path) -> int:
+    """Read step_minutes from our_data/timestep_config.json. This is what
+    multiplies the step indices in the CSV columns to recover minute
+    offsets used to build HHMM filenames."""
+    config_path = data_root / "timestep_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"{config_path} not found - run validate_timestep.py first "
+            f"or pass --step_minutes manually."
+        )
+    with open(config_path) as f:
+        return int(json.load(f)["step_minutes"])
+
+
+def build_batch_inputs(row, patches_dir: str, mode_config: dict,
+                       step_minutes: int) -> tuple[dict, list[int]]:
     """Build a single batched inputs dict for every qualifying patch in `row`.
 
     Returns:
@@ -204,7 +233,8 @@ def build_batch_inputs(row, patches_dir: str, mode_config: dict) -> tuple[dict, 
     patches = ast.literal_eval(row["patch_numbers"])
     idx_lists = {col: ast.literal_eval(row[col]) for col in INPUT_TIME_COLS}
 
-    input_hhmms = [_ref_to_hhmm(ref_utc, off) for off in INPUT_OFFSETS_MIN]
+    input_hhmms = [_ref_to_hhmm(ref_utc, off * step_minutes)
+                   for off in INPUT_STEP_OFFSETS]
 
     input_groups: dict[str, tuple] = {}
     for key in ("past_hr", "past_mr", "past_lr"):
@@ -245,7 +275,7 @@ def build_batch_inputs(row, patches_dir: str, mode_config: dict) -> tuple[dict, 
 
 
 def build_full_gt(row, patches_dir: str, mode_config: dict,
-                  label_type: str) -> list[np.ndarray]:
+                  label_type: str, step_minutes: int) -> list[np.ndarray]:
     """Return a list of 3 full-domain GT canvases (one per lead time).
 
     Lightning: float32 in [0, 1], shape (H_FULL, W_FULL).
@@ -262,7 +292,7 @@ def build_full_gt(row, patches_dir: str, mode_config: dict,
 
     canvases: list[np.ndarray] = []
     for t, col in enumerate(LABEL_TIME_COLS):
-        label_hhmm = _ref_to_hhmm(ref_utc, LABEL_OFFSETS_MIN[t])
+        label_hhmm = _ref_to_hhmm(ref_utc, LABEL_STEP_OFFSETS[t] * step_minutes)
         label_idxs = ast.literal_eval(row[col])
 
         if label_type == "lightning":
@@ -342,7 +372,10 @@ def plot_full_domain(
     ref_utc: str,
     threshold: float | None,
     output_path: Path,
+    step_minutes: int,
 ):
+    lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
+    label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
     """Draw the GT-over-Pred 2x3 figure for one reference timestep."""
     fig, axes = plt.subplots(2, 3, figsize=(20, 10), constrained_layout=True)
 
@@ -380,8 +413,8 @@ def plot_full_domain(
                       facecolor="black", alpha=0.55, edgecolor="none"),
             va="bottom", ha="left", zorder=6,
         )
-        ax.set_title(f"GT — {LEAD_TITLES[t]} "
-                     f"({_ref_to_hhmm(ref_utc, LABEL_OFFSETS_MIN[t])} UTC)",
+        ax.set_title(f"GT — {lead_titles[t]} "
+                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlim(0, W_FULL); ax.set_ylim(H_FULL, 0)
@@ -426,8 +459,8 @@ def plot_full_domain(
             title_suffix = f"(≥{thr_for_count:.2f})"
         else:
             title_suffix = ""
-        ax.set_title(f"Pred {title_suffix} — {LEAD_TITLES[t]} "
-                     f"({_ref_to_hhmm(ref_utc, LABEL_OFFSETS_MIN[t])} UTC)",
+        ax.set_title(f"Pred {title_suffix} — {lead_titles[t]} "
+                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlim(0, W_FULL); ax.set_ylim(H_FULL, 0)
@@ -641,6 +674,7 @@ def main() -> int:
 
     mode_config = get_mode_config(args.mode)
     label_type = mode_config["label_type"]
+    step_minutes = _load_step_minutes(data_root)
 
     run_tag = f"{args.mode}_{args.source}"
     artifact_tag = f"{run_tag}_finetuned" if args.finetuned else run_tag
@@ -655,6 +689,7 @@ def main() -> int:
     print(f"  Source:      {args.source}  "
           f"{'(finetuned)' if args.finetuned else '(base)'}")
     print(f"  Top N:       {args.top_n}")
+    print(f"  Step (min):  {step_minutes}")
     print(f"  Output dir:  {output_dir}")
 
     threshold = resolve_threshold(
@@ -680,7 +715,7 @@ def main() -> int:
               f"({row['n_patches']} qualifying patches)")
 
         inputs, valid_patches = build_batch_inputs(
-            row, str(patches_dir), mode_config,
+            row, str(patches_dir), mode_config, step_minutes,
         )
         if not valid_patches:
             print(f"  No usable patches (all input timesteps were missing). "
@@ -694,7 +729,7 @@ def main() -> int:
         print(f"  Model output shape: {preds.shape}")
 
         gt_canvases = build_full_gt(
-            row, str(patches_dir), mode_config, label_type,
+            row, str(patches_dir), mode_config, label_type, step_minutes,
         )
         pred_canvases = build_full_pred(preds, valid_patches, label_type)
 
@@ -704,6 +739,7 @@ def main() -> int:
             gt_canvases, pred_canvases, valid_patches, label_type,
             date_str=date_str, ref_utc=ref_utc,
             threshold=threshold, output_path=out_png,
+            step_minutes=step_minutes,
         )
         print(f"  Saved -> {out_png}")
 
