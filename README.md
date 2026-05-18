@@ -210,6 +210,39 @@ coalition4-rcnn/
 | LR (2 km) | 1536×768 | 128×128 | 2×2 avg | MTG IR/WV (ir_38, ir_105, wv_63, wv_73), OPERA (reflectivity, rainfall_rate) |
 | LR (3 km) | 1536×768 | 64×64 | 4×4 avg | MSG (VIS006, IR_039, IR_108, WV_062, WV_073) |
 
+### Handling multi-resolution inputs
+
+The pipeline mixes radar (~1 km), lightning (~1 km), MTG vis (1 km), MTG IR/WV (2 km), OPERA (2 km), and MSG (3 km). Two design choices reconcile them without lying about each product's information content:
+
+**1. Reproject every product to the same 1 km Romania grid first.** `reproject.py` runs a precomputed pyresample KD-tree mapping from each product's native CRS into the shared 1536×768 EPSG:31700 (Stereo70) canvas. After this step every `.npy` is on the *same grid* and the same patch-number maps to the same geographic tile across all products. This makes spatial alignment trivial downstream — the cost of cross-scale comparison is paid once per cadence step, not at training time.
+
+**2. Pool *down* to native resolution before the model sees the data, not up.** `extract_patches.py` slices each reprojected product into 256×256 1 km HR tiles, then average-pools to:
+- **128×128 (MR)** for products natively at ~2 km (MTG IR/WV, OPERA)
+- **64×64 (LR)** for products natively at ~3 km (MSG)
+
+The HR (1 km) products keep their 256×256 tiles unchanged.
+
+Why downsample instead of bilinearly upsampling the 2 km / 3 km inputs to 1 km? Upsampling fabricates pixels — the model would see "1 km MSG IR" with no genuine 1 km information and would inevitably overfit interpolation artifacts. Downsampling does the opposite: it preserves the *real* spatial resolution each instrument actually measured, so the encoder is forced to cross-scale honestly rather than hallucinating detail.
+
+**3. Multi-branch encoder, merges at matching scales.** [`train_models.build_coalition_model`](train_models.py) wires one input per resolution bucket (`past_hr` 256×256, `past_mr` 128×128, optionally `past_lr` 64×64) and walks each through ResBlock + ConvGRU stages of [32, 64, 128] channels. After the HR branch's first stride-2 ResBlock it lands at 128×128 and gets concatenated with the MR branch; after the second it lands at 64×64 and merges with the LR branch (if present). The decoder then upsamples a single fused state back to 256×256 over three lead times.
+
+```
+INPUT  past_hr (256×256, 1 km) ─┐
+                                ├─ ResBlock + ConvGRU ─stride 2─┐
+                                │                                ▼
+       past_mr (128×128, 2 km) ─┴────── concat ─────────────────[merge @128]
+                                                                 │
+                                                                 ▼
+                                          ResBlock + ConvGRU ─stride 2─┐
+                                                                       ▼
+       past_lr (64×64, 3 km) ────────── concat ─────────────────[merge @64]
+                                                                       │
+                                                                       ▼
+                                                                  DECODER → T+15/30/45
+```
+
+**4. The model rebuilds itself from `metadata.json`.** Each dataset's `metadata.json` records the input group names + their shapes (`[T, H, W, C]`). `build_coalition_model` reads the metadata, computes each branch's downsample factor as `max_res / branch_res` (so 1 for HR, 2 for MR, 4 for LR), and wires the merges automatically. Adding a new resolution bucket needs no code change in the model — only `create_datasets.get_mode_config()` learns about it.
+
 ### Data Sources
 
 | Source | Products | Native cadence | Native resolution | Role | Pipeline entry point |
