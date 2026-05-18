@@ -70,8 +70,10 @@ import tensorflow as tf
 # input tensors we feed the model match the training/eval pipeline byte-for-byte.
 from create_datasets import (
     get_mode_config,
+    init_sequence_config,
     load_and_transform_group,
     load_label,
+    set_normalization_stats_path,
     LABEL_CHANNELS,
 )
 
@@ -671,6 +673,16 @@ def main() -> int:
         print(f"ERROR: patches dir {patches_dir} not found "
               f"(run extract_patches.py first).")
         return 1
+
+    # Point create_datasets at the per-source artifacts before any input
+    # transform runs. init_sequence_config populates the step/cols globals
+    # from sequence_meta_<source>.json; set_normalization_stats_path
+    # points the lazy stats loader at normalization_stats_<source>.json
+    # (required - the transforms in create_datasets read those stats).
+    init_sequence_config(str(data_root), args.source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{args.source}.json"
+    )
 
     mode_config = get_mode_config(args.mode)
     label_type = mode_config["label_type"]
