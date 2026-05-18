@@ -15,19 +15,23 @@ OPERA Shapley study (4-model coalition, "is NWCSAF useful?"):
     python create_datasets.py --mode mtg_opera_full       --data_root ./our_data
 
 The training cadence is read from our_data/timestep_config.json (set via
-validate_timestep.py) and the per-sample window from our_data/sequence_meta.json
-(written by extract_patch_seq_for_datasets.py). MSG modes are disabled in this
-build — see comments in get_mode_config().
+validate_timestep.py) and the per-sample window from
+our_data/sequence_meta_<source>.json (written by
+extract_patch_seq_for_datasets.py). MSG modes are disabled in this build —
+see comments in get_mode_config().
 
-Inputs:
-    - train_data.csv, validation_data.csv, test_data.csv in data_root/
-    - sequence_meta.json in data_root/ (step_minutes, past_steps, future_steps)
+Inputs (per --source = dbscan | lightning):
+    - train_data_<source>.csv, validation_data_<source>.csv,
+      test_data_<source>.csv in data_root/
+    - sequence_meta_<source>.json in data_root/
+      (step_minutes, past_steps, future_steps)
+    - normalization_stats_<source>.json in data_root/
     - .npy patch files in data_root/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
 
-Outputs:
-    - Saved tf.data.Dataset in data_root/datasets/{mode}/train/
-    - Saved tf.data.Dataset in data_root/datasets/{mode}/validation/
-    - Saved tf.data.Dataset in data_root/datasets/{mode}/test/
+Outputs (per --mode and --source):
+    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/train/
+    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/validation/
+    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/test/
     - metadata.json per split (input_shapes, label_type, step_minutes, ...)
 """
 
@@ -645,7 +649,7 @@ def get_mode_config(mode):
 # N_INPUT / N_LABEL are populated by init_sequence_config(data_root,
 # source) - called once from main() before any function below uses
 # them - so the DBSCAN-driven and lightning-driven tracks can coexist on
-# disk without colliding on a single sequence_meta.json.
+# disk under separate sequence_meta_<source>.json files.
 
 PROJECT_ROOT_FOR_SEQ = Path(__file__).resolve().parent
 

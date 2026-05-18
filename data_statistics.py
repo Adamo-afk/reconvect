@@ -59,17 +59,26 @@ N_COLS = 6
 N_ROWS = 3
 
 
-def _load_step_minutes(data_root):
-    """Read `step_minutes` from `our_data/timestep_config.json`.
+def _load_step_minutes(data_root, source="dbscan"):
+    """Read the cadence (`step_minutes`) used to build the per-source
+    split CSVs.
 
-    Falls back to 15 minutes if the file is missing or unreadable, which
-    is the historical hardcoded default. We prefer `sequence_meta.json`
-    when present because it records the cadence actually used to build
-    `patch_index.csv` (for lightning-source runs the aggregation can
-    differ from the timestep_config value).
+    Looks in this order:
+      1. `our_data/sequence_meta_<source>.json` (canonical, recorded
+         alongside the train/val/test CSVs). For the lightning track
+         it carries both the aggregation `step_minutes` and the native
+         `source_step_minutes_native`; we prefer the native value
+         because the daily-timeline plot is laid out on the
+         per-timestep grid before any aggregation.
+      2. `our_data/timestep_config.json` (master cadence from
+         `validate_timestep.py`).
+      3. 15 minutes (historical hardcoded default).
     """
-    for fname in ('sequence_meta.json', 'timestep_config.json'):
-        path = os.path.join(data_root, fname)
+    candidates = [
+        os.path.join(data_root, f"sequence_meta_{source}.json"),
+        os.path.join(data_root, "timestep_config.json"),
+    ]
+    for path in candidates:
         if not os.path.isfile(path):
             continue
         try:
@@ -77,8 +86,6 @@ def _load_step_minutes(data_root):
                 cfg = json.load(f)
         except (OSError, ValueError):
             continue
-        # `sequence_meta.json` uses `source_step_minutes_native` for the
-        # native cadence of patch_index.csv; fall back to `step_minutes`.
         val = (cfg.get('source_step_minutes_native')
                or cfg.get('step_minutes'))
         if val:
@@ -577,10 +584,11 @@ def main():
     print(f"  Combined patch-activity: {len(patch_data)} active "
           f"timesteps across {len(activity_dates)} dates")
 
-    # Cadence is read from sequence_meta.json / timestep_config.json so
-    # the daily-timeline grid sizes itself correctly for any --step_minutes
-    # validate_timestep.py was run with.
-    step_minutes = _load_step_minutes(args.data_root)
+    # Cadence is read from sequence_meta_<source>.json (preferred) or
+    # timestep_config.json (fallback) so the daily-timeline grid sizes
+    # itself correctly for any --step_minutes validate_timestep.py was
+    # run with.
+    step_minutes = _load_step_minutes(args.data_root, args.source)
     print(f"  step_minutes: {step_minutes} (from config)")
 
     # Generate plots
