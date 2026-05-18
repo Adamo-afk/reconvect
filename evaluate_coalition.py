@@ -976,7 +976,7 @@ def evaluate_radar(model, test_ds, output_dir):
 def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
                                     plot_date, plot_hour, plot_threshold=0.5,
                                     csv_name="test_data_dbscan.csv",
-                                    label_type=None):
+                                    label_type=None, source="dbscan"):
     """Plot all patches for all timesteps matching a given date and hour.
 
     Uses the already-loaded model for the current mode only.
@@ -1002,13 +1002,20 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
     try:
         from create_datasets import (
             get_mode_config, load_and_transform_group, load_label,
-            LABEL_CHANNELS,
+            set_normalization_stats_path, LABEL_CHANNELS,
         )
     except ImportError:
         print("  WARNING: Could not import from create_datasets.py. Skipping.")
         return
 
     data_root = Path(data_root)
+    # The lazy normalization-stats loader in create_datasets defaults to
+    # `normalization_stats.json` at the project root; the per-source
+    # pipeline writes `normalization_stats_<source>.json`. Point the
+    # loader at the right file before any input transform fires.
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     patches_dir = data_root / "patches"
@@ -1559,7 +1566,8 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
                                             output_dir, plot_date, plot_hour,
                                             plot_threshold=plot_threshold,
                                             csv_name=csv_name,
-                                            label_type=label_type)
+                                            label_type=label_type,
+                                            source=source)
         except Exception as e:
             print(f"  Skipping visualization: {e}")
     else:
