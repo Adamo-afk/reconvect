@@ -36,6 +36,10 @@ For end-to-end commands per track, see the runbooks at the project root:
 
 `train_models.py --stage both` adds an optional second training stage after the base model finishes: load the saved base, **freeze the encoder-forecaster**, graft a 2-block Swin transformer head with 8×8 windowed attention on top, and fine-tune that head with AdamW. The Swin head shares features once across the 3 lead-time predictions and projects each lead-time output through an independent lightweight Conv 1×1 head. All hyperparameters live in the `[finetune]` section of [`training.config`](training.config). For a simpler first run, use `--stage base` instead — that's the standard COALITION-4 model with no transformer head.
 
+### Optional class-weighted focal loss for the radar / OPERA multiclass head
+
+The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% of pixels, class 4 (`R≥40`) is sparser by orders of magnitude. The `[radar_loss]` section of [`training.config`](training.config) lets you swap the historical `CategoricalCrossentropy(label_smoothing=0.01)` for `WeightedFocalCategoricalCrossentropy` — focal modulation `(1 − p_t)^gamma` plus per-class weights derived from the training-distribution pixel fractions (read from `our_data/opera_rainfall_fraction_<source>.json`, produced by `opera_rainfall_fraction.py --source <source>`). `weighting` accepts `inverse`, `median`, or `none`; setting `weighting = none` and `gamma = 0` reproduces the plain-CCE baseline exactly. Per-source like the lightning prior, so the dbscan / lightning tracks each compute their own.
+
 ## Environment Setup
 
 ### Prerequisites
@@ -168,7 +172,7 @@ coalition4-rcnn/
 │   └── eval_{mode}/
 │
 ├── product_cadences.config              # Native cadence per data product (input to Step 0)
-├── training.config                     # train_models.py hyperparameters + [finetune] Swin head config
+├── training.config                     # train_models.py hyperparameters + [finetune] Swin head + [radar_loss] focal/class-weighted CCE config
 ├── run_lightning.config                # Comments-only runbook for the lightning-driven track
 ├── run_opera.config                    # Comments-only runbook for the OPERA-driven track
 │
@@ -182,10 +186,13 @@ coalition4-rcnn/
 ├── compute_normalization_stats.py     # Step 4.3: Per-variable mean/std → normalization_stats_<source>.json (--source dbscan / lightning)
 ├── create_datasets.py                 # Step 5: Build TF datasets + metadata.json (--source aware)
 ├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
-├── evaluate_coalition.py              # Step 7: Evaluate and generate plots
+├── evaluate_coalition.py              # Step 7: Evaluate, generate metrics + plots (--source / --finetuned)
+├── bundle_eval_scores.py              # Bundle per-mode eval results into Shapley-ready per-leadtime CSVs (--source / --finetuned)
+├── visualize_full_domain_predictions.py  # Top-N reference timesteps -> full-domain GT vs Pred (Romania-centred, country borders, zoom-in)
 │
 ├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
-├── lightning_fraction.py              # Per-source training-scope non-zero pixel fraction prior for focal loss (--source dbscan / lightning)
+├── lightning_fraction.py              # Per-source lightning-occurrence prior for the binary focal loss (--source dbscan / lightning)
+├── opera_rainfall_fraction.py         # Per-source OPERA 5-class pixel fractions; prior for WeightedFocalCategoricalCrossentropy
 ├── data_statistics.py                 # Generate diagnostic plots from patch/sequence data
 │
 ├── requirements.txt
@@ -641,7 +648,7 @@ For `create_datasets.py` and `evaluate_coalition.py`, the mode name **must** exi
 
 Builds the COALITION recurrent-convolutional architecture (ResBlock + ConvGRU encoder-decoder) dynamically from the dataset's `metadata.json`. The model architecture adapts automatically to whatever inputs are present — number of input groups, channel counts, and resolutions are all read from metadata rather than hardcoded. This means training with different input configurations (MSG vs MTG, different precipitation targets) requires no code changes; only the dataset needs to change.
 
-Hyperparameters live in [`training.config`](training.config) (epochs, batch size, dropout, cosine-warmup LR schedule, early stopping, checkpointing, and the new `[finetune]` section for the Swin head). Per-mode overrides go under `[mode.<name>]`.
+Hyperparameters live in [`training.config`](training.config) (epochs, batch size, dropout, cosine-warmup LR schedule, early stopping, checkpointing, the `[finetune]` section for the Swin head, and the `[radar_loss]` section for the OPERA multiclass focal/class-weighted loss). Per-mode overrides go under `[mode.<name>]`.
 
 ##### `--stage` — base training vs. domain-adaptation fine-tune
 
@@ -705,26 +712,81 @@ The per-epoch checkpoint is the run's safety net for the occasional CUDA crash �
 
 #### Step 7 — Evaluate
 
-Loads the trained model, runs evaluation on the test set, and generates diagnostic plots.
+Loads the trained model, runs evaluation on the test set, and generates diagnostic plots. Both `--source` (sample-selection track) and `--finetuned` (Swin-head model) are wired through every on-disk path so the four artefact combinations (`{base, finetuned} × {dbscan, lightning}`) never collide.
 
 ```bash
-python evaluate_coalition.py --mode msg_lightning --data_root ./our_data --model_dir ./models
-python evaluate_coalition.py --mode msg_radar --data_root ./our_data --model_dir ./models
+# Base model, OPERA-driven sample selection
+python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --source dbscan
+
+# Swin-head fine-tuned variant of the same run
+python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --source dbscan --finetuned
+
+# Lightning-driven sample selection, base model
+python evaluate_coalition.py --mode mtg_lightning --source lightning
 ```
 
-Output: `evaluation/eval_{mode}/` (plots + `evaluation_results.json`)
+For OPERA multiclass modes (`mtg_opera_radar_only`, `mtg_opera_mtgmr`, `mtg_lightning_opera`), the radar branch now emits aggregate per-class precision / recall / F1 / CSI plus macro-F1, macro-CSI, balanced accuracy on top of the existing accuracy and confusion-matrix outputs. Two extra plots ride along: `csi_per_class.png` and `macro_summary_per_leadtime.png` so the dominance of class 0 (`R<10`) is visually obvious next to the balanced numbers.
+
+Output: `evaluation/eval_<mode>_<source>[_finetuned]/` (plots + `evaluation_results.json`).
+
+##### Fine-tune evaluation path
+
+`--finetuned` does not call `tf.keras.models.load_model` on the saved `.keras`. Saved fine-tuned models contain the backbone as a sub-Model, and Keras 2.10's deserializer rebuilds the variable list in a different order than `save_model` wrote it, so the assigns fail with shape mismatches. Instead the script rebuilds the architecture from scratch with `train_models.build_finetune_model` and calls `model.load_weights(...)` which matches by name. Swin hyperparameters get recovered from `history_<run_tag>_finetuned.json`, so the rebuild matches what training produced. The base `coalition_<run_tag>.keras` must sit alongside the fine-tuned file in `--model_dir`; `--stage both` keeps them together automatically.
+
+##### Per-leadtime CSV bundle for Shapley
+
+`bundle_eval_scores.py` reads each mode's `evaluation_results.json` and writes the per-leadtime CSVs `feature_importance_analysis.py --methods classical_shapley` expects. Same `--source` / `--finetuned` flags as `evaluate_coalition.py`, plus a `--mode MODE=LETTERS` flag to override the default coalition pairing.
+
+```bash
+# Default OPERA coalition (mtg_opera_radar_only = o, mtg_opera_mtgmr = om)
+python bundle_eval_scores.py --source dbscan
+
+# Custom coalition for the lightning study
+python bundle_eval_scores.py --source dbscan --prefix lightning \
+    --mode "mtg_lightning_opera_occurrence=l" \
+    --mode "mtg_lightning_opera=or"
+```
+
+##### Full-domain GT vs Pred visualisation
+
+`visualize_full_domain_predictions.py` is a richer companion to `evaluate_coalition.py`'s per-patch plots. For every top-N reference timestep (by qualifying-patch count in the chosen CSV), it builds full 768×1536 Romania-canvas GT and prediction maps for all three lead times, in a single batched `model.predict(...)` call, with everything in memory (no disk writes). The plot is centred on Romania with neighbour-country borders, all 18 patch slots are outlined with a dashed grid, and a second figure zooms into the patch with the most GT activity per timestep.
+
+```bash
+# OPERA multiclass base model
+python visualize_full_domain_predictions.py \
+    --csv our_data/test_data_dbscan.csv \
+    --mode mtg_lightning_opera \
+    --source dbscan --top_n 3
+
+# Lightning occurrence fine-tuned model; threshold from evaluation_results.json
+python visualize_full_domain_predictions.py \
+    --csv our_data/test_data_dbscan.csv \
+    --mode mtg_lightning_opera_occurrence \
+    --source dbscan --top_n 3 --finetuned
+```
+
+Output: `full_domain_plots/full_domain_<run_tag>[_finetuned]/ts<NN>_<date>_<HHMM>.png` plus a `..._zoom_p<NN>.png` per timestep. With cartopy installed, neighbour-country borders draw from Natural Earth's 10m `admin_0_countries` shapefile; without it the script falls back to a coarse hardcoded Romania polygon and prints `Border src: hardcoded_coarse` in the startup banner.
 
 ### Utility Scripts
 
 ```bash
-# Training-scope non-zero pixel fraction (focal-loss prior). Defaults
-# to train_data_<source>.csv and writes lightning_fraction_<source>.json
-# so the prior matches what the model sees. Run once per --source you
-# plan to train; train_models.py auto-resolves the matching JSON.
+# Training-scope non-zero pixel fraction for the LIGHTNING binary head.
+# Defaults to train_data_<source>.csv and writes
+# lightning_fraction_<source>.json so the prior matches what the model
+# sees. Run once per --source you plan to train; train_models.py
+# auto-resolves the matching JSON.
 python lightning_fraction.py --source dbscan
 python lightning_fraction.py --source lightning
 # Broader scope: --scope_csv lightning_active_steps.csv. Legacy
 # everything-on-disk: --scope_csv none.
+
+# Training-scope per-class pixel fractions for the RADAR / OPERA
+# multiclass head. Writes opera_rainfall_fraction_<source>.json which
+# WeightedFocalCategoricalCrossentropy reads to build its alpha_k
+# class weights. Required when [radar_loss].weighting != none in
+# training.config; ignored when the configured radar loss is plain CCE.
+python opera_rainfall_fraction.py --source dbscan
+python opera_rainfall_fraction.py --source lightning
 
 # Generate dataset diagnostic plots (6 panels: diurnal cycle, spatial heatmap, etc.)
 python data_statistics.py
@@ -733,6 +795,12 @@ python data_statistics.py --sequences our_data/train_data_dbscan.csv
 # Lightning activity bar plots (reads lightning_active_steps.csv; plots-only).
 python our_data/lightning_data/visualize_lightning_stats.py \
     --output_dir our_data/lightning_data
+
+# Re-run the DBSCAN patch-selection diagnostic plot for one date.
+# Now styled to match the prediction plotter (Romania-centred view,
+# neighbour-country borders, dashed grid + red active highlight).
+python identify_patches.py --date 2025-05-16 --plot
+python identify_patches.py --date 2025-05-16 --plot --source opera
 ```
 
 ### Data Acquisition and Arrangement

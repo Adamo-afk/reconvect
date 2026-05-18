@@ -45,5 +45,13 @@ cupy-cuda11x
 matplotlib
 plotly           # feature_importance_analysis.py — interactive Xi heatmap / bar chart
 
+# Optional: high-quality country borders on the full-domain prediction
+# plots and on identify_patches' diagnostic figures. Without cartopy
+# those scripts fall back to a coarse hardcoded Romania polygon (no
+# neighbour borders). Conda is strongly preferred on Windows because
+# the pip wheels for cartopy's GEOS/PROJ dependencies are flaky:
+#     conda install -c conda-forge cartopy
+cartopy          # optional — see comment above
+
 # Data processing
 pandas
