@@ -27,8 +27,8 @@ Usage:
     python data_statistics.py --source dbscan --split validation
     python data_statistics.py --source lightning --split test
 
-    # Explicit override (any CSV with the per-source schema)
-    python data_statistics.py --sequences our_data/train_data_dbscan.csv
+    # Explicit override (any CSV with the per-source split schema)
+    python data_statistics.py --csv our_data/train_data_dbscan.csv
 """
 
 import numpy as np
@@ -496,28 +496,30 @@ def main():
         choices=["dbscan", "lightning"],
         help="Sample-selection track. Selects which per-source split "
              "CSV to read by default (train_data_<source>.csv). "
-             "Ignored when --sequences is given explicitly. "
+             "Ignored when --csv is given explicitly. "
              "Default: dbscan."
     )
     parser.add_argument(
         "--split", type=str, default="train",
         choices=["train", "validation", "test"],
-        help="Which split to plot when --sequences is auto-resolved "
-             "from --source. Ignored when --sequences is given "
+        help="Which split to plot when --csv is auto-resolved "
+             "from --source. Ignored when --csv is given "
              "explicitly. Default: train."
     )
     parser.add_argument(
-        "--sequences", "-s", type=str, default=None,
-        help="Explicit path to a sequence CSV. Overrides --source / "
-             "--split. Default: <data_root>/<split>_data_<source>.csv."
+        "--csv", "-c", type=str, default=None,
+        help="Explicit path to a per-source split CSV "
+             "(train_data_<source>.csv / validation_data_<source>.csv / "
+             "test_data_<source>.csv). Overrides --source / --split. "
+             "Default: <data_root>/<split>_data_<source>.csv."
     )
 
     args = parser.parse_args()
-    if args.sequences is not None:
-        seq_path = args.sequences
+    if args.csv is not None:
+        seq_path = args.csv
         # If provided path doesn't exist, try resolving relative to data_root
         if not os.path.isfile(seq_path):
-            alt_path = os.path.join(args.data_root, args.sequences)
+            alt_path = os.path.join(args.data_root, args.csv)
             if os.path.isfile(alt_path):
                 seq_path = alt_path
     else:
@@ -550,7 +552,7 @@ def main():
     print(f"  {len(seq_split)} sequences across {len(split_dates)} dates")
 
     seq_all = list(seq_split)
-    if args.sequences is None:
+    if args.csv is None:
         # Auto-resolved seq_path: try to also load the other two splits
         # so the overview plots reflect the full dataset. Missing files
         # are skipped with a note - useful for partial setups (e.g. a

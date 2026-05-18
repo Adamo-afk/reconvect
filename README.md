@@ -795,7 +795,7 @@ python opera_rainfall_fraction.py --source lightning
 python data_statistics.py                                    # train_data_dbscan.csv
 python data_statistics.py --source lightning                 # train_data_lightning.csv
 python data_statistics.py --source dbscan --split validation # validation_data_dbscan.csv
-python data_statistics.py --sequences /any/path.csv          # explicit override
+python data_statistics.py --csv /any/path.csv                # explicit override
 
 # Lightning activity bar plots (reads lightning_active_steps.csv; plots-only).
 python our_data/lightning_data/visualize_lightning_stats.py \
