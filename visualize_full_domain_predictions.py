@@ -143,11 +143,22 @@ _ROMANIA_OUTLINE_LONLAT_FALLBACK = [
     (20.79, 46.30), (21.06, 46.83), (22.13, 47.59), (22.69, 47.99),
 ]
 
-# Module-level cache for the resolved Romania boundary in pixel coords.
-# Populated lazily on first overlay call so we don't pay the
-# shapefile-read cost for every figure (or at all if cartopy is missing).
-_ROMANIA_BORDER_PIXEL_CACHE: list[tuple[np.ndarray, np.ndarray]] | None = None
-_ROMANIA_BORDER_SOURCE: str | None = None
+# Module-level cache for all country boundaries in pixel coords. Populated
+# lazily on first overlay call. With cartopy installed: Romania + the six
+# neighbours (Hungary, Serbia, Bulgaria, Moldova, Ukraine, Black Sea is
+# water - no neighbour to the east). Without cartopy: only Romania's
+# hardcoded polygon.
+# Each entry is (col_px, row_px, name).
+_BORDERS_PIXEL_CACHE: list[tuple[np.ndarray, np.ndarray, str]] | None = None
+_BORDERS_SOURCE: str | None = None
+
+# How many pixels of padding to add around the 768x1536 data canvas so
+# Romania sits centred with visible neighbour context. The pad is sized
+# to roughly the width of a single patch (256 px) which corresponds to
+# ~250 km in UTM 35N at this grid resolution.
+VIEW_PAD = 220
+NEIGHBOUR_NAMES = {"Hungary", "Serbia", "Bulgaria", "Moldova", "Ukraine",
+                   "Republic of Moldova"}
 
 
 def latlon_to_pixel(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -170,19 +181,22 @@ def latlon_to_pixel(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.nd
     return col, row
 
 
-def _load_romania_border_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray]], str]:
-    """Resolve Romania's national boundary to a list of (col, row) pixel
-    pairs. Each tuple is one ring (a polygon's exterior or one piece of a
-    multipolygon - Romania doesn't have islands so it's typically one).
+def _load_country_borders_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray, str]], str]:
+    """Resolve Romania and its neighbours to (col, row, name) tuples in
+    canvas pixel coords. Each polygon ring becomes one entry; multi-
+    polygons (e.g. islands - Romania has none but its neighbours do)
+    become multiple entries.
 
     Strategy:
-      1. If cartopy is installed: read Natural Earth 10m
-         `admin_0_countries`, filter for Romania, return every ring of
-         every geometry. Smooth, politically accurate, cached by cartopy
-         under ~/.cache/cartopy after first download.
-      2. Otherwise: convert the coarse hardcoded polygon. Visually
-         identifies the country but obviously not for any use beyond
-         "where are we?".
+      1. If cartopy is importable: read Natural Earth 10m
+         `admin_0_countries`, keep Romania + listed neighbours,
+         convert every exterior + interior ring through pyproj to the
+         shared (col_px, row_px) coordinate system. Pixels may go
+         negative or exceed W_FULL/H_FULL - the caller is expected to
+         set xlim/ylim wide enough to include them so the neighbour
+         borders show up around the data canvas.
+      2. Otherwise: only Romania's hardcoded polygon. Tagged
+         "Romania" so the caller can still style it specifically.
     """
     try:
         import cartopy.io.shapereader as shpreader
@@ -190,12 +204,13 @@ def _load_romania_border_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray]], 
             resolution="10m", category="cultural",
             name="admin_0_countries",
         )
-        rings: list[tuple[np.ndarray, np.ndarray]] = []
+        wanted = NEIGHBOUR_NAMES | {"Romania"}
+        result: list[tuple[np.ndarray, np.ndarray, str]] = []
         for country in shpreader.Reader(shp).records():
             name = country.attributes.get("NAME") \
                 or country.attributes.get("ADMIN") \
                 or country.attributes.get("name")
-            if name != "Romania":
+            if name not in wanted:
                 continue
             geom = country.geometry
             geoms = list(geom.geoms) if geom.geom_type == "MultiPolygon" \
@@ -204,37 +219,46 @@ def _load_romania_border_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray]], 
                 lon = np.asarray(poly.exterior.coords.xy[0], dtype=np.float64)
                 lat = np.asarray(poly.exterior.coords.xy[1], dtype=np.float64)
                 col, row = latlon_to_pixel(lon, lat)
-                rings.append((col, row))
+                result.append((col, row, name))
                 for interior in poly.interiors:
                     lon_i = np.asarray(interior.coords.xy[0],
                                        dtype=np.float64)
                     lat_i = np.asarray(interior.coords.xy[1],
                                        dtype=np.float64)
                     c_i, r_i = latlon_to_pixel(lon_i, lat_i)
-                    rings.append((c_i, r_i))
-            break
-        if rings:
-            return rings, "natural_earth_10m"
+                    result.append((c_i, r_i, name))
+        if result:
+            return result, "natural_earth_10m"
     except Exception:
-        # Cartopy missing, network failed, or attribute layout differs.
-        # Drop through to the fallback.
         pass
 
     lonlat = np.asarray(_ROMANIA_OUTLINE_LONLAT_FALLBACK, dtype=np.float64)
     col, row = latlon_to_pixel(lonlat[:, 0], lonlat[:, 1])
-    return [(col, row)], "hardcoded_coarse"
+    return [(col, row, "Romania")], "hardcoded_coarse"
 
 
-def overlay_romania(ax, *, color="black", linewidth=1.0):
-    """Draw the Romania border onto an axis that already shows the
-    768x1536 canvas via imshow in default (pixel) coords. Caches the
-    border data at module level after the first call."""
-    global _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE
-    if _ROMANIA_BORDER_PIXEL_CACHE is None:
-        _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE = \
-            _load_romania_border_pixels()
-    for col, row in _ROMANIA_BORDER_PIXEL_CACHE:
-        ax.plot(col, row, color=color, linewidth=linewidth, zorder=5)
+def overlay_borders(ax, *, romania_color="black", romania_lw=1.3,
+                    neighbour_color="dimgray", neighbour_lw=0.7,
+                    neighbour_alpha=0.75):
+    """Draw Romania + neighbour-country borders onto an axis that already
+    shows the 768x1536 data canvas in default (pixel) coords. Romania is
+    drawn last (on top) and slightly heavier so it stays prominent.
+    Caches the geometry at module level after the first call."""
+    global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE
+    if _BORDERS_PIXEL_CACHE is None:
+        _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = \
+            _load_country_borders_pixels()
+    # Neighbours first (under), Romania last (on top).
+    for col, row, name in _BORDERS_PIXEL_CACHE:
+        if name == "Romania":
+            continue
+        ax.plot(col, row, color=neighbour_color, linewidth=neighbour_lw,
+                alpha=neighbour_alpha, zorder=5)
+    for col, row, name in _BORDERS_PIXEL_CACHE:
+        if name != "Romania":
+            continue
+        ax.plot(col, row, color=romania_color, linewidth=romania_lw,
+                zorder=6)
 
 
 # ============================================================================
@@ -490,7 +514,7 @@ def plot_full_domain(
             im_gt = ax.imshow(canvas, **gt_kwargs)
         _plot_patch_grid(ax)
         try:
-            overlay_romania(ax)
+            overlay_borders(ax)
         except Exception:
             pass
         active_px = int(np.sum(canvas > 0)) if label_type == "lightning" \
@@ -506,7 +530,12 @@ def plot_full_domain(
                      f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_xlim(0, W_FULL); ax.set_ylim(H_FULL, 0)
+        # Padded view: keep imshow at its native (0..W_FULL, 0..H_FULL)
+        # pixel range but expand the axis limits so Romania sits
+        # centred with neighbour-country context visible around it.
+        ax.set_xlim(-VIEW_PAD, W_FULL + VIEW_PAD)
+        ax.set_ylim(H_FULL + VIEW_PAD, -VIEW_PAD)
+        ax.set_aspect("equal")
 
     # --- Bottom row: predictions -----------------------------------------
     if label_type == "lightning":
@@ -539,7 +568,7 @@ def plot_full_domain(
             im_pred = ax.imshow(canvas, **pred_kwargs)
         _plot_patch_grid(ax)
         try:
-            overlay_romania(ax)
+            overlay_borders(ax)
         except Exception:
             pass
         if label_type == "lightning":
@@ -560,7 +589,9 @@ def plot_full_domain(
                      f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_xlim(0, W_FULL); ax.set_ylim(H_FULL, 0)
+        ax.set_xlim(-VIEW_PAD, W_FULL + VIEW_PAD)
+        ax.set_ylim(H_FULL + VIEW_PAD, -VIEW_PAD)
+        ax.set_aspect("equal")
 
     # Colorbars (one per row).
     if label_type == "lightning":
@@ -811,13 +842,14 @@ def main() -> int:
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
-    # Resolve the Romania border once now (populates the module cache)
-    # so we can report which source got picked (cartopy vs hardcoded)
-    # rather than learning it from a difference in plot quality.
-    global _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE
-    _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE = \
-        _load_romania_border_pixels()
-    print(f"  Border src:  {_ROMANIA_BORDER_SOURCE}")
+    # Resolve the country borders once now (populates the module cache)
+    # so we can report which source got picked (cartopy Natural Earth vs
+    # hardcoded fallback) rather than learning it from a difference in
+    # plot quality.
+    global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE
+    _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = _load_country_borders_pixels()
+    countries = sorted({n for _, _, n in _BORDERS_PIXEL_CACHE})
+    print(f"  Border src:  {_BORDERS_SOURCE}  ({', '.join(countries)})")
 
     print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
     df_top = load_top_n_rows(csv_path, args.top_n)
