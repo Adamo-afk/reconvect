@@ -233,6 +233,23 @@ def load_training_config(path: Path) -> dict:
         "resume":  _coerce(c.get("resume", "true"), bool),
     }
 
+    # [radar_loss] - controls the multiclass loss used by radar/OPERA
+    # modes. Defaults reproduce the historical plain CCE behaviour
+    # (weighting=none, gamma=0) so an unchanged training.config keeps
+    # producing the same numbers until the user opts in.
+    rl = parser["radar_loss"] if parser.has_section("radar_loss") else {}
+    radar_loss = {
+        "weighting":       rl.get("weighting", "none").strip().lower(),
+        "gamma":           _coerce(rl.get("gamma", "0.0"), float),
+        "alpha_max":       _coerce(rl.get("alpha_max", "100.0"), float),
+        "label_smoothing": _coerce(rl.get("label_smoothing", "0.01"), float),
+    }
+    if radar_loss["weighting"] not in ("inverse", "median", "none"):
+        raise ValueError(
+            f"[radar_loss].weighting = {radar_loss['weighting']!r} is not "
+            f"supported. Use 'inverse', 'median', or 'none'."
+        )
+
     # [finetune] - Swin transformer head + AdamW for domain-adaptation
     # stage. Used when train_models.py is run with --stage finetune (or
     # the finetune leg of --stage both). The base stage ignores this
@@ -290,6 +307,7 @@ def load_training_config(path: Path) -> dict:
         "lr_schedule":    lr_schedule,
         "early_stopping": early_stopping,
         "checkpointing":  checkpointing,
+        "radar_loss":     radar_loss,
         "finetune":       finetune,
         "mode_overrides": mode_overrides,
     }
@@ -647,6 +665,77 @@ class WeightedFocalLoss(tf.keras.losses.Loss):
         return config
 
 
+class WeightedFocalCategoricalCrossentropy(tf.keras.losses.Loss):
+    """Per-class focal categorical cross-entropy for the radar multiclass head.
+
+    Multiclass generalisation of WeightedFocalLoss. Each class k gets a
+    weight alpha_k derived from its training-distribution pixel fraction
+    f_k (read from opera_rainfall_fraction_<source>.json). The focal
+    (1 - p_t)^gamma factor down-weights easy pixels - critical for class 0
+    ("<10 mm/h") which is ~98% of the data and saturates quickly.
+
+    weighting:
+      'inverse': alpha_k = 1 / (K * max(f_k, eps))                normalised by K
+      'median':  alpha_k = median(f) / max(f_k, eps)              median-frequency balancing
+      'none':    alpha_k = 1                                      pure focal, no class weights
+
+    alpha_max clips per-class weights to keep gradients stable when the
+    rarest class (class 4, >=40 mm/h) is so sparse that its inverse-frequency
+    weight would otherwise blow up to ~1e4.
+    """
+
+    def __init__(self, class_fractions, gamma=2.0, weighting='inverse',
+                 alpha_max=100.0, label_smoothing=0.0,
+                 name='weighted_focal_cce', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.class_fractions = [float(f) for f in class_fractions]
+        self.gamma = float(gamma)
+        self.weighting = str(weighting).lower()
+        self.alpha_max = float(alpha_max)
+        self.label_smoothing = float(label_smoothing)
+
+        f = np.asarray(self.class_fractions, dtype=np.float64)
+        f_safe = np.maximum(f, 1e-8)
+        if self.weighting == 'inverse':
+            alpha = 1.0 / (len(f) * f_safe)
+        elif self.weighting == 'median':
+            alpha = np.median(f_safe) / f_safe
+        elif self.weighting == 'none':
+            alpha = np.ones_like(f_safe)
+        else:
+            raise ValueError(
+                f"weighting must be 'inverse' | 'median' | 'none', "
+                f"got {self.weighting!r}"
+            )
+        if self.alpha_max > 0:
+            alpha = np.minimum(alpha, self.alpha_max)
+        self.alpha = tf.constant(alpha, dtype=tf.float32)
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        if self.label_smoothing > 0:
+            k = tf.cast(tf.shape(y_true)[-1], tf.float32)
+            y_true = y_true * (1.0 - self.label_smoothing) + self.label_smoothing / k
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        ce = -tf.reduce_sum(y_true * tf.math.log(y_pred), axis=-1)
+        w = tf.reduce_sum(y_true * self.alpha, axis=-1)
+        pt = tf.reduce_sum(y_true * y_pred, axis=-1)
+        focal = tf.pow(1.0 - pt, self.gamma)
+        return tf.reduce_mean(focal * w * ce)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'class_fractions':  self.class_fractions,
+            'gamma':            self.gamma,
+            'weighting':        self.weighting,
+            'alpha_max':        self.alpha_max,
+            'label_smoothing':  self.label_smoothing,
+        })
+        return config
+
+
 @tf.function
 def iou_metric(y_true, y_pred):
     """IoU / CSI metric."""
@@ -682,9 +771,43 @@ def false_neg(y_true, y_pred):
 # Model construction
 # ============================================================================
 
+def _build_radar_loss(class_fractions, radar_loss_cfg):
+    """Pick the radar multiclass loss based on the [radar_loss] config.
+
+    `radar_loss_cfg=None` or `weighting='none'` + `gamma=0` reproduces the
+    historical plain CategoricalCrossentropy(label_smoothing=0.01) so
+    runs that don't opt in stay numerically identical to before.
+    `class_fractions` is required whenever weighting != 'none'.
+    """
+    cfg = radar_loss_cfg or {}
+    weighting = cfg.get("weighting", "none")
+    gamma = float(cfg.get("gamma", 0.0))
+    smoothing = float(cfg.get("label_smoothing", 0.01))
+    alpha_max = float(cfg.get("alpha_max", 100.0))
+
+    if weighting == "none" and gamma == 0.0:
+        return tf.keras.losses.CategoricalCrossentropy(label_smoothing=smoothing)
+
+    if weighting != "none" and class_fractions is None:
+        raise ValueError(
+            "[radar_loss].weighting != 'none' requires class_fractions. "
+            "Run `python opera_rainfall_fraction.py --source <s>` and "
+            "make sure the radar mode loads the prior."
+        )
+    fractions = class_fractions if class_fractions is not None else [0.2] * 5
+    return WeightedFocalCategoricalCrossentropy(
+        class_fractions=fractions,
+        gamma=gamma,
+        weighting=weighting,
+        alpha_max=alpha_max,
+        label_smoothing=smoothing,
+    )
+
+
 def build_coalition_model(input_shapes, label_type, past_timesteps=3,
                           future_timesteps=3, dropout=0, norm=None,
-                          ones_fraction=0.0106):
+                          ones_fraction=0.0106,
+                          class_fractions=None, radar_loss_cfg=None):
     """Build the COALITION encoder-forecaster model dynamically.
 
     The model architecture adapts to whatever inputs the dataset provides.
@@ -799,7 +922,7 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
         num_outputs = 5
         final_conv = Conv2D(num_outputs, kernel_size=(1, 1),
                             activation='softmax', dtype='float32')
-        loss = tf.keras.losses.CategoricalCrossentropy()
+        loss = _build_radar_loss(class_fractions, radar_loss_cfg)
         metrics = ['accuracy']
 
     seq_out = TimeDistributed(final_conv)(xt_dec)
@@ -1011,7 +1134,8 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
     return seq_out
 
 
-def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
+def build_finetune_model(base_model_path, finetune_cfg, ones_fraction,
+                         class_fractions=None, radar_loss_cfg=None):
     """Load a base model, freeze it, and graft on a Swin head.
 
     Args:
@@ -1042,6 +1166,7 @@ def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
             # Loss + metrics (only present if the base was saved with
             # compile=True, but cheap to include unconditionally):
             "WeightedFocalLoss": WeightedFocalLoss,
+            "WeightedFocalCategoricalCrossentropy": WeightedFocalCategoricalCrossentropy,
             "iou_metric":        iou_metric,
             "true_pos":          true_pos,
             "false_pos":         false_pos,
@@ -1090,11 +1215,15 @@ def build_finetune_model(base_model_path, finetune_cfg, ones_fraction):
         loss = WeightedFocalLoss(ones_fraction=ones_fraction, gamma=2.0)
         metrics = [iou_metric, true_pos, false_pos, false_neg]
     else:
-        # label_smoothing=0.01 prevents log(0) on the forward pass if the
-        # Swin head's softmax saturates a class to exact 0 under mixed_float16
-        # (intermediate attention/MLP layers run in fp16 and can produce
-        # extreme pre-softmax logits that round-trip to inf).
-        loss = tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.01)
+        # _build_radar_loss falls back to plain CategoricalCrossentropy
+        # (label_smoothing=0.01) when radar_loss_cfg is None / 'none' so
+        # existing finetune runs stay numerically identical. The label
+        # smoothing default mirrors the historical behaviour - it prevents
+        # log(0) when the Swin head's softmax saturates a class to exact
+        # 0 under mixed_float16 (intermediate attention/MLP layers run in
+        # fp16 and can produce extreme pre-softmax logits that round-trip
+        # to inf).
+        loss = _build_radar_loss(class_fractions, radar_loss_cfg)
         metrics = ['accuracy']
 
     return finetuned, loss, metrics
@@ -1241,6 +1370,38 @@ def load_ones_fraction(data_root, source):
     return ones_fraction
 
 
+def load_class_fractions(data_root, source):
+    """Load OPERA rainfall-rate per-class pixel fractions from the prior JSON.
+
+    Reads `our_data/opera_rainfall_fraction_<source>.json` (produced by
+    `opera_rainfall_fraction.py --source <source>`) and returns the
+    5-element fractions list used by
+    WeightedFocalCategoricalCrossentropy. Per-source like the lightning
+    prior, because the dbscan / lightning tracks pull different timesteps
+    and therefore see different rainfall distributions.
+    """
+    json_path = Path(data_root) / f"opera_rainfall_fraction_{source}.json"
+    if not json_path.is_file():
+        raise FileNotFoundError(
+            f"OPERA class-fraction file not found: {json_path}\n"
+            f"Run `python opera_rainfall_fraction.py --source {source}` first."
+        )
+    with open(json_path) as f:
+        stats = json.load(f)
+    if "fractions" not in stats or len(stats["fractions"]) != 5:
+        raise KeyError(
+            f"{json_path}: expected a 5-element 'fractions' list, "
+            f"got {stats.get('fractions')!r}"
+        )
+    fractions = [float(x) for x in stats["fractions"]]
+    labels = stats.get("classes", [f"c{i}" for i in range(5)])
+    print(f"  Loaded class_fractions from {json_path}")
+    for k, (lab, fr) in enumerate(zip(labels, fractions)):
+        ratio = f"1:{int(1/fr):,}" if fr > 0 else "1:inf"
+        print(f"    class {k} ({lab:>5}): {fr:.6f}  ({ratio})")
+    return fractions
+
+
 # ============================================================================
 # Wall-time callback
 # ============================================================================
@@ -1317,6 +1478,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
           lr_schedule_cfg=None,
           early_stopping_cfg=None,
           checkpoint_cfg=None,
+          radar_loss_cfg=None,
           resume=True):
     """Main training function (base stage).
 
@@ -1420,8 +1582,15 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     # model actually sees during training.
     if label_type == "lightning":
         ones_fraction = load_ones_fraction(data_root, source)
+        class_fractions = None
     else:
         ones_fraction = 0.0106  # unused for radar
+        # Only load the radar prior when the configured loss actually
+        # needs it - keeps plain-CCE runs from failing on a missing JSON.
+        needs_prior = (radar_loss_cfg or {}).get("weighting", "none") != "none"
+        class_fractions = (
+            load_class_fractions(data_root, source) if needs_prior else None
+        )
 
     # Load datasets
     print("\nLoading datasets...")
@@ -1441,6 +1610,8 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         dropout=dropout,
         norm=norm,
         ones_fraction=ones_fraction,
+        class_fractions=class_fractions,
+        radar_loss_cfg=radar_loss_cfg,
     )
     model.summary(print_fn=lambda x: print(f"  {x}"))
     print()
@@ -1583,6 +1754,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                    mixed_precision=True,
                    early_stopping_cfg=None,
                    checkpoint_cfg=None,
+                   radar_loss_cfg=None,
                    resume=True):
     """Domain-adaptation fine-tune: freeze base, attach Swin head, train.
 
@@ -1647,8 +1819,13 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
 
     if label_type == "lightning":
         ones_fraction = load_ones_fraction(data_root, source)
+        class_fractions = None
     else:
         ones_fraction = 0.0106  # unused for radar
+        needs_prior = (radar_loss_cfg or {}).get("weighting", "none") != "none"
+        class_fractions = (
+            load_class_fractions(data_root, source) if needs_prior else None
+        )
 
     print("\nLoading datasets...")
     train_ds = load_dataset(train_dir, batch_size,
@@ -1662,6 +1839,8 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
         base_model_path=base_model_path,
         finetune_cfg=finetune_cfg,
         ones_fraction=ones_fraction,
+        class_fractions=class_fractions,
+        radar_loss_cfg=radar_loss_cfg,
     )
 
     # Pick optimizer. AdamW is the default for fine-tune; falling back
@@ -2002,6 +2181,7 @@ def main():
                 lr_schedule_cfg=cfg["lr_schedule"],
                 early_stopping_cfg=cfg["early_stopping"],
                 checkpoint_cfg=cfg["checkpointing"],
+                radar_loss_cfg=cfg["radar_loss"],
                 resume=cfg["checkpointing"].get("resume", True)
                        and not args.fresh,
             )
@@ -2024,6 +2204,7 @@ def main():
                 mixed_precision=params["mixed_precision"],
                 early_stopping_cfg=cfg["early_stopping"],
                 checkpoint_cfg=cfg["checkpointing"],
+                radar_loss_cfg=cfg["radar_loss"],
                 resume=cfg["checkpointing"].get("resume", True)
                        and not args.fresh,
             )
