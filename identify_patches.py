@@ -461,9 +461,9 @@ def identify_active_patches(binary_mask):
 # =============================================================================
 
 def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str,
-                    output_dir):
+                    output_dir, source='radar'):
     """
-    Plot the reprojected RZC data with the 6×3 patch grid overlay.
+    Plot the EPSG:31700-reprojected RZC / OPERA data with the 6×3 patch grid overlay.
 
     Styled to match `visualize_full_domain_predictions.py`: Romania
     sits centred in the figure, neighbour-country borders frame the
@@ -471,7 +471,9 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     and active patches get a red highlight on top.
 
     Args:
-        reprojected: 2D array (768×1536) of reprojected RZC values
+        reprojected: 2D array (768×1536) of reprojected rain-rate values
+            (RZC mm/h when source='radar', OPERA instantaneous rain rate
+            mm/h when source='opera').
         binary_mask: 2D array (768×1536) of DBSCAN binary mask
         active_patches: list of active patch numbers (1-indexed)
         date_str: 'YYYY-MM-DD'
@@ -481,6 +483,17 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     _ensure_borders_cached()
     c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
 
+    # Source-aware labels for the rain-rate panel. Both products are
+    # KD-tree reprojected into the Romania EPSG:31700 grid in mm/h;
+    # only the title + colorbar label change so the same plot reads
+    # correctly for either track.
+    if source == 'opera':
+        field_title = 'OPERA instantaneous rain rate (reprojected)'
+        field_cbar  = 'OPERA rain rate (mm/h)'
+    else:
+        field_title = 'RZC (reprojected)'
+        field_cbar  = 'RZC (mm/h)'
+
     fig, axes = plt.subplots(1, 2, figsize=(20, 8),
                              constrained_layout=True)
 
@@ -489,12 +502,12 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     for ax_idx, (ax, data, title_suffix) in enumerate(zip(
         axes,
         [reprojected, binary_mask],
-        ['RZC (regridded)', 'DBSCAN binary mask']
+        [field_title, 'DBSCAN binary mask']
     )):
         if ax_idx == 0:
             im = ax.imshow(data, cmap='viridis', aspect='equal',
                            interpolation='nearest')
-            fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label='RZC')
+            fig.colorbar(im, ax=ax, fraction=0.03, pad=0.02, label=field_cbar)
         else:
             cmap = ListedColormap(['#e0e0e0', '#d32f2f'])
             im = ax.imshow(data, cmap=cmap, vmin=0, vmax=1, aspect='equal',
@@ -989,7 +1002,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                 # (open the .nc in QGIS to overlay on satellite basemap).
                 if save_plots:
                     plot_patch_grid(
-                        reprojected, binary_mask, active, d, t, plot_dir
+                        reprojected, binary_mask, active, d, t, plot_dir,
+                        source=source,
                     )
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
