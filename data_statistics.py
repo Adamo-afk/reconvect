@@ -1,20 +1,30 @@
 """
 COALITION-4 dataset statistics and visualizations.
 
-Generates 6 diagnostic plots from patch_index.csv and sequences.csv:
+Generates 6 diagnostic plots from patch_index.csv and the per-source
+split CSVs written by extract_patch_seq_for_datasets.py:
     1. Diurnal cycle of convective activity
     2. Spatial heatmap of patch activation frequency
     3. Daily activity timeline (dates × hours)
     4. Distribution of simultaneously active patches
-    5. Valid training samples per date (from sequences.csv)
+    5. Valid training samples per date
     6. Patch survival rate (active vs qualifying for sequences)
 
 All plots are saved to our_data/data_statistics/
 
 Usage:
-    python dataset_statistics.py
-    python dataset_statistics.py -d F:/nowcasting/coalition4-rcnn/our_data
-    python dataset_statistics.py --sequences my_sequences.csv
+    # Default: DBSCAN-driven train split
+    python data_statistics.py
+
+    # Lightning-driven train split
+    python data_statistics.py --source lightning
+
+    # Validation / test for either track
+    python data_statistics.py --source dbscan --split validation
+    python data_statistics.py --source lightning --split test
+
+    # Explicit override (any CSV with the per-source schema)
+    python data_statistics.py --sequences our_data/train_data_dbscan.csv
 """
 
 import numpy as np
@@ -464,24 +474,46 @@ def plot_patch_survival(patch_data, seq_data, out_dir, prefix='sequences'):
 def main():
     parser = argparse.ArgumentParser(
         description="Generate diagnostic plots from patch_index.csv "
-                    "and sequences.csv."
+                    "and the per-source split CSVs written by "
+                    "extract_patch_seq_for_datasets.py."
     )
     parser.add_argument(
         "--data_root", "-d", type=str, default=DEFAULT_DATA_ROOT,
         help="Path to our_data directory"
     )
     parser.add_argument(
+        "--source", type=str, default="dbscan",
+        choices=["dbscan", "lightning"],
+        help="Sample-selection track. Selects which per-source split "
+             "CSV to read by default (train_data_<source>.csv). "
+             "Ignored when --sequences is given explicitly. "
+             "Default: dbscan."
+    )
+    parser.add_argument(
+        "--split", type=str, default="train",
+        choices=["train", "validation", "test"],
+        help="Which split to plot when --sequences is auto-resolved "
+             "from --source. Ignored when --sequences is given "
+             "explicitly. Default: train."
+    )
+    parser.add_argument(
         "--sequences", "-s", type=str, default=None,
-        help="Path to sequences.csv (default: our_data/sequences.csv)"
+        help="Explicit path to a sequence CSV. Overrides --source / "
+             "--split. Default: <data_root>/<split>_data_<source>.csv."
     )
 
     args = parser.parse_args()
-    seq_path = args.sequences or os.path.join(args.data_root, 'sequences.csv')
-    # If provided path doesn't exist, try resolving relative to data_root
-    if args.sequences and not os.path.isfile(seq_path):
-        alt_path = os.path.join(args.data_root, args.sequences)
-        if os.path.isfile(alt_path):
-            seq_path = alt_path
+    if args.sequences is not None:
+        seq_path = args.sequences
+        # If provided path doesn't exist, try resolving relative to data_root
+        if not os.path.isfile(seq_path):
+            alt_path = os.path.join(args.data_root, args.sequences)
+            if os.path.isfile(alt_path):
+                seq_path = alt_path
+    else:
+        seq_path = os.path.join(
+            args.data_root, f"{args.split}_data_{args.source}.csv",
+        )
     out_dir = os.path.join(args.data_root, 'data_statistics')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -489,6 +521,8 @@ def main():
     print("COALITION-4 Dataset Statistics")
     print("=" * 60)
     print(f"Data root : {args.data_root}")
+    print(f"Source    : {args.source}  (split={args.split})")
+    print(f"Sequences : {seq_path}")
     print(f"Output    : {out_dir}")
 
     # Load data
