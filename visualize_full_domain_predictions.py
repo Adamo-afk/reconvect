@@ -143,22 +143,35 @@ _ROMANIA_OUTLINE_LONLAT_FALLBACK = [
     (20.79, 46.30), (21.06, 46.83), (22.13, 47.59), (22.69, 47.99),
 ]
 
-# Module-level cache for all country boundaries in pixel coords. Populated
-# lazily on first overlay call. With cartopy installed: Romania + the six
-# neighbours (Hungary, Serbia, Bulgaria, Moldova, Ukraine, Black Sea is
-# water - no neighbour to the east). Without cartopy: only Romania's
-# hardcoded polygon.
+# Module-level cache for country boundaries in pixel coords. Populated
+# lazily on first overlay call. With cartopy installed: all visible
+# European countries within range of the data canvas; without cartopy:
+# only Romania's coarse hardcoded polygon.
 # Each entry is (col_px, row_px, name).
 _BORDERS_PIXEL_CACHE: list[tuple[np.ndarray, np.ndarray, str]] | None = None
 _BORDERS_SOURCE: str | None = None
+# Romania-centred view extent (col_lo, col_hi, row_lo, row_hi), populated
+# lazily alongside the border cache. The view is sized so the entire
+# data canvas plus VIEW_EXTRA_PAD pixels of breathing room is always
+# visible regardless of how off-centre Romania sits within the canvas.
+_VIEW_EXTENT: tuple[float, float, float, float] | None = None
 
-# How many pixels of padding to add around the 768x1536 data canvas so
-# Romania sits centred with visible neighbour context. The pad is sized
-# to roughly the width of a single patch (256 px) which corresponds to
-# ~250 km in UTM 35N at this grid resolution.
-VIEW_PAD = 220
-NEIGHBOUR_NAMES = {"Hungary", "Serbia", "Bulgaria", "Moldova", "Ukraine",
-                   "Republic of Moldova"}
+# Pixels of breathing room beyond the farthest data-canvas edge from
+# Romania's centroid. Sized to roughly one patch-width (~256 px / 250 km
+# in UTM 35N at the grid's 1 km/pixel resolution).
+VIEW_EXTRA_PAD = 80
+
+# Names of countries whose borders we want to render (alongside Romania).
+# Names match Natural Earth 10m admin_0_countries; aliases included
+# because the shapefile attribute key varies across NE versions.
+NEIGHBOUR_NAMES = {
+    "Hungary", "Serbia", "Bulgaria", "Moldova", "Republic of Moldova",
+    "Ukraine", "Slovakia", "Austria", "Czech Republic", "Czechia",
+    "Poland", "Belarus", "Russia", "Croatia", "Bosnia and Herz.",
+    "Bosnia and Herzegovina", "Greece", "North Macedonia", "Macedonia",
+    "Albania", "Italy", "Slovenia", "Turkey", "Montenegro", "Kosovo",
+    "Republic of Serbia",
+}
 
 
 def latlon_to_pixel(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -237,28 +250,77 @@ def _load_country_borders_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray, s
     return [(col, row, "Romania")], "hardcoded_coarse"
 
 
-def overlay_borders(ax, *, romania_color="black", romania_lw=1.3,
-                    neighbour_color="dimgray", neighbour_lw=0.7,
-                    neighbour_alpha=0.75):
+def overlay_borders(ax, *, color="black", linewidth=1.3,
+                    neighbour_linestyle=(0, (5, 3))):
     """Draw Romania + neighbour-country borders onto an axis that already
     shows the 768x1536 data canvas in default (pixel) coords. Romania is
-    drawn last (on top) and slightly heavier so it stays prominent.
-    Caches the geometry at module level after the first call."""
+    solid; neighbours use the same color/linewidth but a dashed pattern
+    (default = 5 px on, 3 px off) so they read as context borders rather
+    than the focal country. Caches geometry at module level."""
     global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE
     if _BORDERS_PIXEL_CACHE is None:
         _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = \
             _load_country_borders_pixels()
-    # Neighbours first (under), Romania last (on top).
+    # Neighbours first (under), Romania last (on top) so it stays
+    # unambiguous when borders meet.
     for col, row, name in _BORDERS_PIXEL_CACHE:
         if name == "Romania":
             continue
-        ax.plot(col, row, color=neighbour_color, linewidth=neighbour_lw,
-                alpha=neighbour_alpha, zorder=5)
+        ax.plot(col, row, color=color, linewidth=linewidth,
+                linestyle=neighbour_linestyle, zorder=5)
     for col, row, name in _BORDERS_PIXEL_CACHE:
         if name != "Romania":
             continue
-        ax.plot(col, row, color=romania_color, linewidth=romania_lw,
-                zorder=6)
+        ax.plot(col, row, color=color, linewidth=linewidth, zorder=6)
+
+
+def _compute_view_extent() -> tuple[float, float, float, float]:
+    """Romania-centred view extent in pixel coords.
+
+    Strategy: place Romania's bbox centroid at the figure centre, then
+    pick a half-extent large enough to contain BOTH the full data canvas
+    (so no patch ever clips out of view) and a VIEW_EXTRA_PAD buffer of
+    additional padding on every side. When Romania is off-centre within
+    the data canvas (which it is - the canvas extends north past
+    Romania's actual border), this gives more padding on the
+    closer-to-Romania side and less on the farther side, which visually
+    re-centres the country.
+
+    Returns (col_lo, col_hi, row_lo, row_hi). row_lo < row_hi (call sites
+    flip the y-axis afterwards via set_ylim(row_hi, row_lo) for image
+    coords).
+    """
+    assert _BORDERS_PIXEL_CACHE is not None, \
+        "Border cache must be populated before computing the view extent"
+    ro_cols, ro_rows = [], []
+    for col, row, name in _BORDERS_PIXEL_CACHE:
+        if name == "Romania":
+            ro_cols.append(col)
+            ro_rows.append(row)
+    if not ro_cols:
+        # Pathological fallback: just centre on the canvas.
+        c_x, c_y = W_FULL / 2.0, H_FULL / 2.0
+    else:
+        all_col = np.concatenate(ro_cols)
+        all_row = np.concatenate(ro_rows)
+        c_x = float((all_col.min() + all_col.max()) / 2)
+        c_y = float((all_row.min() + all_row.max()) / 2)
+
+    half_w = max(c_x - 0.0, W_FULL - c_x) + VIEW_EXTRA_PAD
+    half_h = max(c_y - 0.0, H_FULL - c_y) + VIEW_EXTRA_PAD
+    return (c_x - half_w, c_x + half_w,
+            c_y - half_h, c_y + half_h)
+
+
+def _ensure_view_cached():
+    """Populate _BORDERS_PIXEL_CACHE / _BORDERS_SOURCE / _VIEW_EXTENT.
+    Cheap when already cached."""
+    global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE, _VIEW_EXTENT
+    if _BORDERS_PIXEL_CACHE is None:
+        _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = \
+            _load_country_borders_pixels()
+    if _VIEW_EXTENT is None:
+        _VIEW_EXTENT = _compute_view_extent()
 
 
 # ============================================================================
@@ -530,11 +592,13 @@ def plot_full_domain(
                      f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
-        # Padded view: keep imshow at its native (0..W_FULL, 0..H_FULL)
-        # pixel range but expand the axis limits so Romania sits
-        # centred with neighbour-country context visible around it.
-        ax.set_xlim(-VIEW_PAD, W_FULL + VIEW_PAD)
-        ax.set_ylim(H_FULL + VIEW_PAD, -VIEW_PAD)
+        # Romania-centred padded view (see _compute_view_extent). Keeps
+        # the full data canvas in frame while putting Romania's bbox
+        # centroid at the figure centre.
+        _ensure_view_cached()
+        c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)  # image y is flipped
         ax.set_aspect("equal")
 
     # --- Bottom row: predictions -----------------------------------------
@@ -842,14 +906,14 @@ def main() -> int:
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
-    # Resolve the country borders once now (populates the module cache)
-    # so we can report which source got picked (cartopy Natural Earth vs
-    # hardcoded fallback) rather than learning it from a difference in
-    # plot quality.
-    global _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE
-    _BORDERS_PIXEL_CACHE, _BORDERS_SOURCE = _load_country_borders_pixels()
+    # Resolve country borders + Romania-centred view extent once now so
+    # the script reports both the border source (cartopy Natural Earth
+    # vs hardcoded fallback) and the countries it loaded, without
+    # having to wait for the first plot.
+    _ensure_view_cached()
     countries = sorted({n for _, _, n in _BORDERS_PIXEL_CACHE})
-    print(f"  Border src:  {_BORDERS_SOURCE}  ({', '.join(countries)})")
+    print(f"  Border src:  {_BORDERS_SOURCE}  "
+          f"({len(countries)} countries: {', '.join(countries)})")
 
     print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
     df_top = load_top_n_rows(csv_path, args.top_n)
