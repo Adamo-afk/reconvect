@@ -1,14 +1,17 @@
 """
 COALITION-4 dataset statistics and visualizations.
 
-Generates 6 diagnostic plots from patch_index.csv and the per-source
-split CSVs written by extract_patch_seq_for_datasets.py:
+Generates 6 diagnostic plots derived entirely from the per-source
+split CSV that --source / --split point at (train_data_<source>.csv,
+validation_data_<source>.csv, test_data_<source>.csv) so the
+diagnostics always reflect what the model actually trains on:
     1. Diurnal cycle of convective activity
     2. Spatial heatmap of patch activation frequency
     3. Daily activity timeline (dates × hours)
     4. Distribution of simultaneously active patches
     5. Valid training samples per date
-    6. Patch survival rate (active vs qualifying for sequences)
+    6. Per-patch qualifying frequency + overall survival rate
+       (uses `patch_numbers`, `n_qualifying`, `n_total_active`)
 
 All plots are saved to our_data/data_statistics/
 
@@ -94,63 +97,17 @@ COLORS = {
 # Data loaders
 # =============================================================================
 
-def _resolve_patch_activity_csv(data_root, source):
-    """Per-source path to the upstream patch-activity CSV. Both files
-    share the same schema (date, time_utc, iso_timestamp, patch_1..
-    patch_18 binary flags) so the parser below is identical."""
-    if source == "lightning":
-        return os.path.join(
-            data_root, 'lightning_periods', 'lightning_patches.csv',
-        )
-    return os.path.join(data_root, 'patch_index', 'patch_index.csv')
-
-
-def load_patch_index(data_root, source="dbscan"):
-    """
-    Load the per-source patch-activity CSV:
-      - source='dbscan'   -> our_data/patch_index/patch_index.csv
-      - source='lightning'-> our_data/lightning_periods/lightning_patches.csv
-
-    Returns:
-        list[dict]: Each dict has 'date', 'time', 'hour', 'active_patches'
-    """
-    csv_path = _resolve_patch_activity_csv(data_root, source)
-    if not os.path.isfile(csv_path):
-        print(f"  Patch-activity CSV not found at {csv_path}")
-        return []
-
-    rows = []
-    with open(csv_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            active = [
-                p for p in range(1, N_PATCHES + 1)
-                if row.get(f'patch_{p}', '0') == '1'
-            ]
-            if active:
-                time_str = row['time_utc']
-                hour = int(time_str.split(':')[0])
-                rows.append({
-                    'date': row['date'],
-                    'time': time_str,
-                    'hour': hour,
-                    'minute': int(time_str.split(':')[1]),
-                    'active_patches': active,
-                    'n_active': len(active),
-                })
-    return rows
-
-
 def load_sequences(seq_path):
     """
-    Load sequences.csv.
+    Load a per-source split CSV (train_data_<source>.csv /
+    validation_data_<source>.csv / test_data_<source>.csv).
 
     Returns:
-        list[dict]: Each dict has 'date', 'reference_utc', 'patch_numbers',
-                    'n_qualifying'
+        list[dict]: each dict has 'date', 'reference_utc', 'patch_numbers',
+                    'n_qualifying', 'n_total_active'.
     """
     if not os.path.isfile(seq_path):
-        print(f"  sequences.csv not found at {seq_path}")
+        print(f"  sequence CSV not found at {seq_path}")
         return []
 
     rows = []
@@ -165,6 +122,35 @@ def load_sequences(seq_path):
                 'n_qualifying': int(row['n_qualifying']),
                 'n_total_active': int(row['n_total_active']),
             })
+    return rows
+
+
+def patch_activity_from_sequences(seq_data):
+    """Derive per-(date, time) patch-activity rows from the sequence CSV.
+
+    Each sequence row's `patch_numbers` IS the activity ground truth
+    for what the model trains on at that reference timestep, so
+    plots 1-4 build directly from this rather than the upstream
+    patch_index.csv / lightning_patches.csv. Consequence: the
+    diagnostics always reflect the split CSV on disk (no risk of a
+    stale upstream file showing one date while the training CSV
+    spans eighty).
+    """
+    rows = []
+    for r in seq_data:
+        time_str = r["reference_utc"].strip()
+        active = r["patch_numbers"]
+        if not active:
+            continue
+        parts = time_str.split(":")
+        rows.append({
+            "date":           r["date"],
+            "time":           time_str,
+            "hour":           int(parts[0]),
+            "minute":         int(parts[1]),
+            "active_patches": active,
+            "n_active":       len(active),
+        })
     return rows
 
 
@@ -394,83 +380,75 @@ def plot_samples_per_date(seq_data, out_dir, prefix='sequences'):
 # Plot 6: Patch survival rate
 # =============================================================================
 
-def plot_patch_survival(patch_data, seq_data, out_dir, prefix='sequences'):
+def plot_patch_survival(seq_data, out_dir, prefix='sequences'):
     """
-    Grouped bar: how often each patch is active (patch_index) vs how often
-    it serves as the reference centre of a qualifying sequence.
+    Per-patch survival diagnostic, derived entirely from the sequence
+    CSV (no upstream patch_index.csv dependency).
 
-    Two distinct counts are plotted on the same axis:
+    Per row, the CSV gives us:
+      - `patch_numbers` = patches that qualified (passed every filter
+        and have data across the whole input+future window).
+      - `n_total_active` = scalar count of patches that were initially
+        active at the reference timestep, before window filtering.
 
-      - Blue (`Active`): number of (date, time) rows in `patch_index.csv`
-        where the patch has a DBSCAN cluster. Unit: timesteps.
-      - Green (`Qualifying`): number of sequence rows whose reference time
-        has this patch in its `patch_numbers` (i.e. the patch is active
-        continuously across the whole input+future window). Unit:
-        sequence rows (each sequence has a unique reference timestep).
+    `n_total_active` is per-row, not per-patch, so we can't directly
+    plot a per-patch "active" bar. Instead this plot does two things
+    in one figure:
 
-    The printed percentage is the centre-rate:
-        rate = seq_count[p] / active_count[p]
-
-    It measures "fraction of this patch's active timesteps that are valid
-    sequence reference centres". Note that with the standard
-    past=2 / future=3 / step=15-min window, a patch active for 8
-    consecutive timesteps yields at most ~3 valid centres (positions
-    3-5), so the rate is capped near 38% even for perfect continuity.
-    Every timestep that falls inside any qualifying window still
-    contributes to a training sample — it just is not the centre.
+      1. Per-patch QUALIFYING bars (green): how many sequence rows had
+         patch p in their `patch_numbers`. Identical to the old green
+         bars, just computed from the sequence CSV directly.
+      2. Aggregate survival annotation: sum(n_total_active) vs
+         sum(n_qualifying) reported as a percent in the title. That's
+         the overall fraction of initially-active patches that
+         survived the window filter — same idea as the old
+         centre-rate, just collapsed to a single number because the
+         CSV doesn't carry per-patch active counts.
 
     All 18 patches are always listed for layout consistency, including
-    those with no DBSCAN activity (e.g. P6 / P12 / P18 over the Black
-    Sea / outside the OPERA footprint) — they show as zero-height bars
-    with a 0% label rather than dropping off the chart entirely.
+    those that never qualified (e.g. patches over the Black Sea or
+    outside the OPERA footprint) - they show as zero-height bars.
     """
-    # Count from patch_index
-    active_counts = Counter()
-    for row in patch_data:
-        for p in row['active_patches']:
-            active_counts[p] += 1
-
-    # Count from sequences
     seq_counts = Counter()
     for row in seq_data:
         for p in row['patch_numbers']:
             seq_counts[p] += 1
 
-    # Always render the full 6x3 grid (18 patches).
+    total_active = sum(r['n_total_active'] for r in seq_data)
+    total_qualifying = sum(r['n_qualifying'] for r in seq_data)
+    overall_survival = (
+        (total_qualifying / total_active * 100.0) if total_active > 0 else 0.0
+    )
+
     patches_present = list(range(1, N_PATCHES + 1))
 
     fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(patches_present))
-    width = 0.35
 
-    active_vals = [active_counts.get(p, 0) for p in patches_present]
     seq_vals = [seq_counts.get(p, 0) for p in patches_present]
-
-    ax.bar(x - width / 2, active_vals, width, label='Active (patch_index)',
-           color=COLORS['primary'], edgecolor='white', linewidth=0.5,
-           alpha=0.85, zorder=3)
-    ax.bar(x + width / 2, seq_vals, width, label='Qualifying centres (sequences)',
+    ax.bar(x, seq_vals, 0.6,
            color=COLORS['accent'], edgecolor='white', linewidth=0.5,
-           alpha=0.85, zorder=3)
+           alpha=0.9, zorder=3,
+           label='Qualifying rows (this patch in patch_numbers)')
 
-    # Centre-rate labels for every patch (including inactive ones — 0%).
-    max_h = max(active_vals + seq_vals + [1])
+    max_h = max(seq_vals + [1])
     for i, p in enumerate(patches_present):
-        a = active_counts.get(p, 0)
-        s = seq_counts.get(p, 0)
-        rate = s / a * 100 if a > 0 else 0
-        ax.text(x[i], max(a, s) + max_h * 0.02,
-                f'{rate:.0f}%', ha='center', va='bottom',
+        ax.text(x[i], seq_vals[i] + max_h * 0.02,
+                f'{seq_vals[i]:,}', ha='center', va='bottom',
                 fontsize=7, color=COLORS['text'])
 
     ax.set_xticks(x)
     ax.set_xticklabels([f'P{p}' for p in patches_present], fontsize=9)
     ax.set_xlabel('Patch number (1..18, row-major over the 6x3 grid)',
                   fontsize=11)
-    ax.set_ylabel('Count (timesteps for blue, sequences for green)',
+    ax.set_ylabel('Sequence rows where this patch qualified',
                   fontsize=11)
-    ax.set_title(f'Patch centre-rate: active vs qualifying ({prefix})',
-                 fontsize=13, fontweight='bold')
+    ax.set_title(
+        f'Per-patch qualifying frequency ({prefix})  |  '
+        f'overall survival = {total_qualifying:,} / {total_active:,} '
+        f'patch-timesteps  ({overall_survival:.1f}%)',
+        fontsize=12, fontweight='bold',
+    )
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
 
@@ -538,30 +516,28 @@ def main():
     print(f"Sequences : {seq_path}")
     print(f"Output    : {out_dir}")
 
-    # Load data
-    patch_csv = _resolve_patch_activity_csv(args.data_root, args.source)
-    print(f"\nLoading patch-activity CSV ({os.path.basename(patch_csv)})...")
-    patch_data = load_patch_index(args.data_root, args.source)
-    if not patch_data:
-        print(f"Cannot proceed without {patch_csv}")
+    # Load the per-source split CSV. Everything else - per-(date, time)
+    # patch activity for plots 1-4, the qualifying counts for plot 6 -
+    # is derived from it, so the diagnostics always match what the
+    # model trains on.
+    print(f"\nLoading sequence CSV ({os.path.basename(seq_path)})...")
+    seq_data = load_sequences(seq_path)
+    if not seq_data:
+        print(f"Cannot proceed without {seq_path}")
         return
+    seq_dates = sorted(set(r['date'] for r in seq_data))
+    print(f"  {len(seq_data)} valid sequences across {len(seq_dates)} dates")
 
-    dates = sorted(set(r['date'] for r in patch_data))
-    print(f"  {len(patch_data)} active timesteps across {len(dates)} dates")
+    patch_data = patch_activity_from_sequences(seq_data)
+    activity_dates = sorted(set(r['date'] for r in patch_data))
+    print(f"  Derived patch-activity: {len(patch_data)} active "
+          f"timesteps across {len(activity_dates)} dates")
 
     # Cadence is read from sequence_meta.json / timestep_config.json so
     # the daily-timeline grid sizes itself correctly for any --step_minutes
     # validate_timestep.py was run with.
     step_minutes = _load_step_minutes(args.data_root)
     print(f"  step_minutes: {step_minutes} (from config)")
-
-    print("\nLoading sequences.csv...")
-    seq_data = load_sequences(seq_path)
-    if seq_data:
-        seq_dates = sorted(set(r['date'] for r in seq_data))
-        print(f"  {len(seq_data)} valid sequences across {len(seq_dates)} dates")
-    else:
-        print("  Not found — plots 5 and 6 will be skipped")
 
     # Generate plots
     print("\nGenerating plots...")
@@ -571,11 +547,9 @@ def main():
     plot_daily_timeline(patch_data, out_dir, step_minutes=step_minutes)
     plot_active_distribution(patch_data, out_dir)
 
-    if seq_data:
-        # Derive prefix from sequences filename (e.g. "train_data.csv" → "train_data")
-        seq_prefix = os.path.splitext(os.path.basename(seq_path))[0]
-        plot_samples_per_date(seq_data, out_dir, seq_prefix)
-        plot_patch_survival(patch_data, seq_data, out_dir, seq_prefix)
+    seq_prefix = os.path.splitext(os.path.basename(seq_path))[0]
+    plot_samples_per_date(seq_data, out_dir, seq_prefix)
+    plot_patch_survival(seq_data, out_dir, seq_prefix)
 
     print(f"\nDone. All plots saved to {out_dir}")
 
