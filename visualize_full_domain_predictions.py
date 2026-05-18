@@ -128,12 +128,12 @@ def get_patch_bounds(patch_number: int) -> tuple[int, int, int, int]:
 
 
 # ============================================================================
-# Country outline (cartopy preferred, pyproj fallback)
+# Country outline (cartopy Natural Earth preferred, pyproj fallback)
 # ============================================================================
-# Coarse hardcoded Romania boundary in (lon, lat) used only when cartopy is
-# not installed. Smooth enough to read as "this is Romania" but not
-# politically precise.
-_ROMANIA_OUTLINE_LONLAT = [
+# Coarse hardcoded Romania boundary in (lon, lat) used as fallback when
+# cartopy is not installed. Smooth enough to read as "this is Romania"
+# but obviously rough vs. the Natural Earth 10m boundaries.
+_ROMANIA_OUTLINE_LONLAT_FALLBACK = [
     (22.69, 47.99), (23.14, 48.10), (24.30, 47.91), (25.41, 47.93),
     (26.40, 48.22), (27.05, 47.99), (27.55, 47.40), (28.10, 46.81),
     (28.21, 45.97), (28.83, 45.30), (29.65, 45.18), (29.69, 44.81),
@@ -142,6 +142,12 @@ _ROMANIA_OUTLINE_LONLAT = [
     (21.56, 44.77), (21.36, 45.04), (20.79, 45.46), (20.25, 46.10),
     (20.79, 46.30), (21.06, 46.83), (22.13, 47.59), (22.69, 47.99),
 ]
+
+# Module-level cache for the resolved Romania boundary in pixel coords.
+# Populated lazily on first overlay call so we don't pay the
+# shapefile-read cost for every figure (or at all if cartopy is missing).
+_ROMANIA_BORDER_PIXEL_CACHE: list[tuple[np.ndarray, np.ndarray]] | None = None
+_ROMANIA_BORDER_SOURCE: str | None = None
 
 
 def latlon_to_pixel(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -164,12 +170,71 @@ def latlon_to_pixel(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.nd
     return col, row
 
 
-def overlay_romania(ax, *, color="black", linewidth=1.2):
-    """Draw the Romania border onto an ax that already shows the 768x1536
-    canvas via imshow with default (pixel) coords."""
-    lonlat = np.asarray(_ROMANIA_OUTLINE_LONLAT, dtype=np.float64)
+def _load_romania_border_pixels() -> tuple[list[tuple[np.ndarray, np.ndarray]], str]:
+    """Resolve Romania's national boundary to a list of (col, row) pixel
+    pairs. Each tuple is one ring (a polygon's exterior or one piece of a
+    multipolygon - Romania doesn't have islands so it's typically one).
+
+    Strategy:
+      1. If cartopy is installed: read Natural Earth 10m
+         `admin_0_countries`, filter for Romania, return every ring of
+         every geometry. Smooth, politically accurate, cached by cartopy
+         under ~/.cache/cartopy after first download.
+      2. Otherwise: convert the coarse hardcoded polygon. Visually
+         identifies the country but obviously not for any use beyond
+         "where are we?".
+    """
+    try:
+        import cartopy.io.shapereader as shpreader
+        shp = shpreader.natural_earth(
+            resolution="10m", category="cultural",
+            name="admin_0_countries",
+        )
+        rings: list[tuple[np.ndarray, np.ndarray]] = []
+        for country in shpreader.Reader(shp).records():
+            name = country.attributes.get("NAME") \
+                or country.attributes.get("ADMIN") \
+                or country.attributes.get("name")
+            if name != "Romania":
+                continue
+            geom = country.geometry
+            geoms = list(geom.geoms) if geom.geom_type == "MultiPolygon" \
+                else [geom]
+            for poly in geoms:
+                lon = np.asarray(poly.exterior.coords.xy[0], dtype=np.float64)
+                lat = np.asarray(poly.exterior.coords.xy[1], dtype=np.float64)
+                col, row = latlon_to_pixel(lon, lat)
+                rings.append((col, row))
+                for interior in poly.interiors:
+                    lon_i = np.asarray(interior.coords.xy[0],
+                                       dtype=np.float64)
+                    lat_i = np.asarray(interior.coords.xy[1],
+                                       dtype=np.float64)
+                    c_i, r_i = latlon_to_pixel(lon_i, lat_i)
+                    rings.append((c_i, r_i))
+            break
+        if rings:
+            return rings, "natural_earth_10m"
+    except Exception:
+        # Cartopy missing, network failed, or attribute layout differs.
+        # Drop through to the fallback.
+        pass
+
+    lonlat = np.asarray(_ROMANIA_OUTLINE_LONLAT_FALLBACK, dtype=np.float64)
     col, row = latlon_to_pixel(lonlat[:, 0], lonlat[:, 1])
-    ax.plot(col, row, color=color, linewidth=linewidth, zorder=5)
+    return [(col, row)], "hardcoded_coarse"
+
+
+def overlay_romania(ax, *, color="black", linewidth=1.0):
+    """Draw the Romania border onto an axis that already shows the
+    768x1536 canvas via imshow in default (pixel) coords. Caches the
+    border data at module level after the first call."""
+    global _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE
+    if _ROMANIA_BORDER_PIXEL_CACHE is None:
+        _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE = \
+            _load_romania_border_pixels()
+    for col, row in _ROMANIA_BORDER_PIXEL_CACHE:
+        ax.plot(col, row, color=color, linewidth=linewidth, zorder=5)
 
 
 # ============================================================================
@@ -348,9 +413,29 @@ def build_full_pred(predictions: np.ndarray, valid_patches: list[int],
 # ============================================================================
 # Plotting
 # ============================================================================
-def _plot_inactive_mask(ax, valid_patches: list[int]):
-    """Hatch-shade the patch slots that are NOT in `valid_patches` so the
-    viewer can tell which regions have no model output."""
+def _plot_patch_grid(ax, *, color="black", linewidth=0.7,
+                     linestyle=(0, (1, 3))):
+    """Outline every 256x256 patch slot with a dashed/dotted rectangle so
+    the viewer can read the 6x3 tile structure of the Romania canvas.
+    Default linestyle is loosely-dotted (`(0, (1, 3))` = 1px on, 3px off)."""
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        rect = Rectangle(
+            (c0, r0), PATCH_SIZE, PATCH_SIZE,
+            linewidth=linewidth, edgecolor=color,
+            linestyle=linestyle, facecolor="none",
+            zorder=3,
+        )
+        ax.add_patch(rect)
+
+
+def _plot_radar_inactive_mask(ax, valid_patches: list[int]):
+    """Hatch-shade non-qualifying patches in the RADAR case only. For the
+    5-class radar head, value 0 = class "R<10" (low rain), which is NOT
+    the same as "no model output here"; we need the explicit hatching to
+    distinguish. The lightning case doesn't need this because the
+    canvas's natural 0 == "no lightning here" reads correctly under the
+    probability colormap."""
     valid_set = set(valid_patches)
     for p in range(1, N_PATCHES + 1):
         if p in valid_set:
@@ -399,9 +484,11 @@ def plot_full_domain(
         if label_type == "radar":
             display = np.where(canvas < 0, np.nan, canvas.astype(float))
             im_gt = ax.imshow(display, **gt_kwargs)
+            # For radar GT, non-qualifying slots are NaN -> transparent;
+            # the dashed grid alone makes the structure readable.
         else:
             im_gt = ax.imshow(canvas, **gt_kwargs)
-        _plot_inactive_mask(ax, valid_patches)
+        _plot_patch_grid(ax)
         try:
             overlay_romania(ax)
         except Exception:
@@ -440,9 +527,17 @@ def plot_full_domain(
         if label_type == "radar":
             display = np.where(canvas < 0, np.nan, canvas.astype(float))
             im_pred = ax.imshow(display, **pred_kwargs)
+            # Radar: class 0 means "R<10", not "no data". Keep the
+            # explicit no-data hatching so the viewer can't mistake an
+            # empty patch slot for a "no rain" prediction.
+            _plot_radar_inactive_mask(ax, valid_patches)
         else:
+            # Lightning: non-qualifying patches stay at canvas[..] = 0,
+            # which the diverging colormap paints as deep blue (well
+            # below threshold). Reads visually as "no activity here",
+            # which is the realistic interpretation the user asked for.
             im_pred = ax.imshow(canvas, **pred_kwargs)
-        _plot_inactive_mask(ax, valid_patches)
+        _plot_patch_grid(ax)
         try:
             overlay_romania(ax)
         except Exception:
@@ -715,6 +810,14 @@ def main() -> int:
         Path(args.model_dir), args.mode, args.source, args.finetuned,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
+
+    # Resolve the Romania border once now (populates the module cache)
+    # so we can report which source got picked (cartopy vs hardcoded)
+    # rather than learning it from a difference in plot quality.
+    global _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE
+    _ROMANIA_BORDER_PIXEL_CACHE, _ROMANIA_BORDER_SOURCE = \
+        _load_romania_border_pixels()
+    print(f"  Border src:  {_ROMANIA_BORDER_SOURCE}")
 
     print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
     df_top = load_top_n_rows(csv_path, args.top_n)
