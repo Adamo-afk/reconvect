@@ -39,6 +39,27 @@ Usage:
     python process_lightning_kml.py -d F:/nowcasting/.../lightning_data -o ./output/lightning
 """
 
+import os
+
+# On Windows/conda envs pyproj and pyogrio (used by geopandas) can
+# ship separate copies of PROJ whose proj.db databases disagree.
+# The failure signature is:
+#   CRSError: Invalid projection: EPSG:4326:
+#     (Internal Proj Error: proj_create: no database context specified)
+# Fix: point PROJ at pyproj's bundled database via PROJ_DATA (the
+# modern env var) and PROJ_LIB (the legacy fallback). Do it BEFORE
+# importing geopandas so pyogrio initialises with the right path.
+try:
+    import pyproj as _pyproj
+    _proj_data_dir = _pyproj.datadir.get_data_dir()
+    os.environ.setdefault("PROJ_DATA", _proj_data_dir)
+    os.environ.setdefault("PROJ_LIB", _proj_data_dir)
+except Exception:
+    # pyproj not installed / broken import - let the downstream
+    # geopandas import surface the real error instead of swallowing
+    # it here.
+    pass
+
 import geopandas as gpd
 import pandas as pd
 import numpy as np
@@ -50,7 +71,6 @@ import sys
 import json
 from pathlib import Path
 import argparse
-import os
 
 
 # =============================================================================
