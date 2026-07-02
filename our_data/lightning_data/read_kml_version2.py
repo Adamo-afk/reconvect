@@ -56,7 +56,7 @@ try:
     os.environ.setdefault("PROJ_LIB", _proj_data_dir)
 except Exception:
     # pyproj not installed / broken import - let the downstream
-    # geopandas import surface the real error instead of swallowing
+    # geopandas import surface the real error instead of suppressing
     # it here.
     pass
 
