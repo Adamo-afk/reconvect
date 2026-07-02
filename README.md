@@ -50,50 +50,64 @@ The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% 
 
 ### Installation
 
-On Windows the install order matters. Following the steps in this exact sequence avoids the pip / conda ABI conflicts described in [Troubleshooting](#troubleshooting).
+Follow the steps in this exact order. The two Windows-specific traps to know about are (a) `conda install cudatoolkit=... cudnn=...` silently downgrades Python 3.10 to 3.9 because conda-forge has no CUDA 11.2 builds for Python 3.10, and (b) pip-installing pyproj / geopandas on Windows produces mismatched PROJ database paths. Both are avoided below.
 
-1. Create a conda environment with Python 3.10 (one of the last versions with native Windows GPU support for TensorFlow):
+1. **Install CUDA 11.2 and cuDNN 8.1 system-wide via NVIDIA installers.** DO NOT use `conda install cudatoolkit=11.2 cudnn=8.1.0` — that installs old packages that pin Python to 3.9. Use the NVIDIA installers instead:
 
-```bash
-conda create -n tfenv python=3.10 -y
-conda activate tfenv
-```
+   - CUDA Toolkit 11.2 (any of 11.2.0 / 11.2.1 / 11.2.2 — they ship identical DLL names): download from https://developer.nvidia.com/cuda-11.2.2-download-archive. Run the installer with defaults. Installs to `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\` and adds itself to Windows `PATH`.
+   - cuDNN 8.1 for CUDA 11.2: download from https://developer.nvidia.com/rdp/cudnn-archive (requires a free NVIDIA developer account). Unzip and merge `bin\`, `include\`, and `lib\x64\` into the matching subdirectories under the CUDA install root above.
 
-2. Install CUDA toolkit and cuDNN via conda-forge:
+   After the CUDA install, make sure the `CUDA_PATH` environment variable is set — Python 3.8+ on Windows no longer honours PATH for DLL loading in C extensions, so TensorFlow finds CUDA via `CUDA_PATH` specifically. If the NVIDIA installer didn't set it (some builds miss this), do it manually and open a fresh terminal:
 
-```bash
-conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 -y
-```
+   ```powershell
+   setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"
+   ```
 
-3. Install the geospatial / cartography stack via **conda-forge** — this must come before the `pip install` step. Installing `pyproj` and `geopandas` via pip on Windows produces mismatched PROJ database paths, and every CRS lookup then fails with `Invalid projection: ... no database context specified`. Using conda-forge here makes `pyproj`, `proj`, `geopandas`, `pyogrio`, `shapely`, and `cartopy` share the same PROJ ABI:
+2. Create a conda environment with Python 3.10 (one of the last Python versions with native Windows GPU support for TensorFlow):
 
-```bash
-conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy -y
-```
+   ```powershell
+   conda create -n tfenv python=3.10 -y
+   conda activate tfenv
+   python --version    # MUST print Python 3.10.x before continuing
+   ```
 
-**On a fresh `conda create` env this is enough.** If you're rescuing an environment that previously had these packages installed via pip and you already ran `pip uninstall`, physically wipe the leftover directories before the conda install — otherwise conda will see the empty dirs and skip repopulating them, and the packages import as empty namespace stubs. See the [Troubleshooting](#local-package--imports) entry for the tell-tale `AttributeError: module 'pyproj' has no attribute 'CRS'` symptom.
+3. Install the geospatial / cartography stack via **conda-forge**. This must come before the `pip install` step so `pyproj`, `proj`, `geopandas`, `pyogrio`, `shapely`, `cartopy`, `pyresample`, and `pykdtree` all share the same PROJ ABI — pip-installing them on Windows produces mismatched `proj.db` locations and every CRS lookup then fails with `Invalid projection: ... no database context specified`.
 
-4. Install the remaining Python dependencies (pip picks up what conda-forge didn't cover):
+   ```powershell
+   conda install -c conda-forge -y `
+       pyproj proj geopandas pyogrio shapely cartopy `
+       pyresample pykdtree `
+       netCDF4 xarray hdf5plugin h5py
+   ```
 
-```bash
-pip install -r requirements.txt
-```
+   Also verify no downgrade happened:
+
+   ```powershell
+   python --version    # still Python 3.10.x
+   ```
+
+   *(Rescuing an env that previously pip-installed any of these? Wipe the leftover `site-packages\<pkg>\` directories before the conda install, otherwise conda sees the empty dirs, skips repopulating them, and the packages import as empty namespace stubs — see the [Troubleshooting](#local-package--imports) entry for the tell-tale `AttributeError: module 'pyproj' has no attribute 'CRS'` symptom.)*
+
+4. Install the remaining Python dependencies (pip picks up what conda-forge didn't cover, including TensorFlow):
+
+   ```powershell
+   pip install -r requirements.txt
+   ```
 
 5. Install the local `c4dl` package in editable mode. One-time per environment. Several scripts (`read_kml_version2.py`, `reproject.py`, `identify_patches.py`, ...) import from `c4dl.projection` and `c4dl.datasets`; without this step they fail with `ModuleNotFoundError: No module named 'c4dl'`.
 
-```bash
-pip install -e .
-```
+   ```powershell
+   pip install -e .
+   ```
 
 6. Verify PROJ and the GPU are both working:
 
-```python
-import pyproj
-print(pyproj.CRS('EPSG:4326'))     # should print a CRS block without error
+   ```powershell
+   python -c "import pyproj; print(pyproj.CRS('EPSG:4326'))"
+   python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+   ```
 
-import tensorflow as tf
-print(tf.config.list_physical_devices('GPU'))   # should list your GPU
-```
+   Both should print without warnings — the CRS as a full projection block, and the TensorFlow line as a Python list containing your GPU. If TF prints `Could not load dynamic library 'cudart64_110.dll'` and an empty list `[]`, `CUDA_PATH` is not being seen by this shell — re-open the terminal (`setx` only affects newly-launched shells) and try again.
 
 ## Directory Structure
 
@@ -1284,6 +1298,8 @@ Consolidated notes from failure modes we've actually hit. Each entry lists the s
 - **Windows fatal exception: access violation during training.** Mid-batch VRAM spikes past the block TensorFlow reserved on first use → null-pointer deref inside the CUDA runtime. `train_models.py` calls `configure_tf_runtime()` at start, which enables memory growth + disables XLA to keep the footprint predictable, so the failure now surfaces as a clean `ResourceExhaustedError` you can react to (lower `batch_size` in `[defaults]` or the per-mode override).
 - **Recovering from a crashed training run.** The per-epoch resumable checkpoint under `models/checkpoints/<run_tag>_latest.keras` (base) or `<run_tag>_finetune_latest.keras` (fine-tune) is the safety net. At most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two `--source` tracks have completely separate checkpoint paths so they never collide on the same disk.
 - **Fine-tune loss is NaN from the first few steps.** Historically two things dragged the loss to `NaN` under `mixed_float16`: the Swin head's pre-softmax `Q@Kᵀ` overflowing fp16 and the multiclass softmax saturating to a class probability of exactly 0. The build fixed both in place — `train_finetune()` now sets `global_clipnorm=1.0` on AdamW, and `build_finetune_model()` uses `CategoricalCrossentropy(label_smoothing=0.01)` for the radar branch. If you still see NaNs, verify the base checkpoint is finite (i.e. wasn't produced by an earlier crashed run) before blaming the fine-tune.
+- **`Could not load dynamic library 'cudart64_110.dll'` on `import tensorflow`.** All the CUDA DLLs are on Windows `PATH` but Python 3.8+ no longer honours `PATH` for C-extension DLL loading — TensorFlow finds CUDA via the `CUDA_PATH` environment variable specifically. Fix: `setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"`, then close and reopen the terminal (`setx` only affects new shells). Verify in the new shell with `$env:CUDA_PATH` (PowerShell) or `echo %CUDA_PATH%` (cmd) — must print the CUDA install root before the TF check succeeds.
+- **`conda install cudatoolkit=11.2 cudnn=8.1.0` silently downgraded Python to 3.9.** conda-forge only has 2021-era CUDA 11.2 packages, which were built for Python 3.6–3.9. Installing them into a 3.10 env forces conda to downgrade Python. Fix — do NOT install CUDA via conda; use the NVIDIA installers as described in [Installation](#installation) step 1 and let CUDA live at system level. Recover an already-broken env by removing it (`conda env remove -n tfenv`) and starting the install recipe from scratch.
 
 ### Local package / imports
 
