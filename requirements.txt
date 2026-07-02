@@ -4,29 +4,46 @@
 #
 # IMPORTANT: On Windows this project needs Python 3.10 and a conda env.
 # TensorFlow < 2.11 is one of the last versions with native Windows GPU
-# support. Install in this exact order to avoid pip / conda ABI conflicts:
+# support. Full install recipe (see README.md 'Installation' for prose):
 #
-#   conda create -n tfenv python=3.10 -y
-#   conda activate tfenv
-#   conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 -y
+#   1. Install CUDA 11.2 and cuDNN 8.1 at SYSTEM level via the NVIDIA
+#      installers (NOT via conda). `conda install cudatoolkit=11.2
+#      cudnn=8.1.0` silently downgrades Python 3.10 to 3.9 because
+#      conda-forge has no CUDA 11.2 builds for Python 3.10.
+#      After the CUDA install, also make sure the CUDA_PATH env var is
+#      set (Python 3.8+ on Windows finds CUDA via CUDA_PATH, not PATH):
+#          setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"
+#      then open a fresh terminal.
 #
-#   # Install the geospatial / cartography stack via conda-forge FIRST,
-#   # so pyproj, proj, geopandas, pyogrio, shapely and cartopy all share
-#   # the same PROJ ABI. pip-installing pyproj / geopandas on Windows
-#   # produces mismatched proj.db locations and every CRS lookup fails
-#   # with "Invalid projection ... no database context specified".
-#   #
-#   # If you are RESCUING an env that previously pip-installed any of
-#   # these packages and you already ran `pip uninstall`, physically
-#   # delete the leftover site-packages\<pkg>\ directory before the
-#   # conda install. Otherwise conda sees the empty dir, skips writing
-#   # into it, and the package imports as an empty namespace package
-#   # (symptom: AttributeError: module 'pyproj' has no attribute 'CRS').
-#   conda install -c conda-forge \
-#       pyproj proj geopandas pyogrio shapely cartopy -y
+#   2. Create the Python 3.10 conda env:
+#          conda create -n tfenv python=3.10 -y
+#          conda activate tfenv
+#          python --version    # must print Python 3.10.x
 #
-#   pip install -r requirements.txt
-#   pip install -e .              # local c4dl package
+#   3. Install the geospatial / cartography stack via conda-forge FIRST,
+#      so pyproj, proj, geopandas, pyogrio, shapely, cartopy, pyresample
+#      and pykdtree all share the same PROJ ABI. pip-installing pyproj
+#      / geopandas on Windows produces mismatched proj.db locations and
+#      every CRS lookup fails with "Invalid projection ... no database
+#      context specified".
+#
+#      If you are RESCUING an env that previously pip-installed any of
+#      these packages and you already ran `pip uninstall`, physically
+#      delete the leftover site-packages\<pkg>\ directory before the
+#      conda install. Otherwise conda sees the empty dir, skips writing
+#      into it, and the package imports as an empty namespace package
+#      (symptom: AttributeError: module 'pyproj' has no attribute 'CRS').
+#          conda install -c conda-forge \
+#              pyproj proj geopandas pyogrio shapely cartopy \
+#              pyresample pykdtree \
+#              netCDF4 xarray hdf5plugin h5py -y
+#
+#   4. Install the pip requirements below (TensorFlow, numpy, and
+#      everything else that isn't in the geo stack):
+#          pip install -r requirements.txt
+#
+#   5. Install the local c4dl package:
+#          pip install -e .
 #
 # =============================================================================
 
@@ -43,11 +60,15 @@ scipy
 scikit-learn
 
 # Geospatial / meteorological
-# NOTE: pyproj / geopandas / cartopy / pyogrio / shapely should be
-# installed via `conda install -c conda-forge` BEFORE this file runs
-# (see header). Listing them here anyway so pip can fill in gaps on
-# non-Windows platforms, but on Windows the conda-forge install is
-# what makes PROJ actually work.
+# NOTE: on Windows the following must have been installed via
+# `conda install -c conda-forge` BEFORE `pip install -r requirements.txt`
+# runs (see header):
+#     pyproj proj geopandas pyogrio shapely cartopy
+#     pyresample pykdtree
+#     netCDF4 xarray hdf5plugin h5py
+# Pip will see they're already present in the env and skip them.
+# Listing them here so pip can still resolve them on non-Windows
+# platforms where a conda-forge preinstall isn't required.
 pyresample
 pyproj
 netCDF4
