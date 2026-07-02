@@ -2,15 +2,24 @@
 # COALITION-4 Nowcasting System — Requirements
 # =============================================================================
 #
-# IMPORTANT: This project requires Python 3.10 and a conda environment.
+# IMPORTANT: On Windows this project needs Python 3.10 and a conda env.
 # TensorFlow < 2.11 is one of the last versions with native Windows GPU
-# support. CUDA and cuDNN must be installed via conda BEFORE pip installing
-# TensorFlow:
+# support. Install in this exact order to avoid pip / conda ABI conflicts:
 #
-#   conda create -n tfenv python=3.10
+#   conda create -n tfenv python=3.10 -y
 #   conda activate tfenv
-#   conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
+#   conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 -y
+#
+#   # Install the geospatial / cartography stack via conda-forge FIRST,
+#   # so pyproj, proj, geopandas, pyogrio, shapely and cartopy all share
+#   # the same PROJ ABI. pip-installing pyproj / geopandas on Windows
+#   # produces mismatched proj.db locations and every CRS lookup fails
+#   # with "Invalid projection ... no database context specified".
+#   conda install -c conda-forge \
+#       pyproj proj geopandas pyogrio shapely cartopy -y
+#
 #   pip install -r requirements.txt
+#   pip install -e .              # local c4dl package
 #
 # =============================================================================
 
@@ -18,11 +27,20 @@
 tensorflow<2.11
 
 # Scientific computing
-numpy
+# numpy is pinned to 1.x because TensorFlow < 2.11 was compiled against
+# the numpy 1.x C API. numpy 2.x raises "_ARRAY_API not found" on every
+# TF import; leaving numpy unpinned means pip picks the latest and TF
+# refuses to load. numpy >=1.23 is required by TF 2.10.
+numpy<2,>=1.23
 scipy
 scikit-learn
 
 # Geospatial / meteorological
+# NOTE: pyproj / geopandas / cartopy / pyogrio / shapely should be
+# installed via `conda install -c conda-forge` BEFORE this file runs
+# (see header). Listing them here anyway so pip can fill in gaps on
+# non-Windows platforms, but on Windows the conda-forge install is
+# what makes PROJ actually work.
 pyresample
 pyproj
 netCDF4
@@ -49,9 +67,9 @@ plotly           # feature_importance_analysis.py — interactive Xi heatmap / b
 # plots and on identify_patches' diagnostic figures. Without cartopy
 # those scripts fall back to a coarse hardcoded Romania polygon (no
 # neighbour borders). Conda is strongly preferred on Windows because
-# the pip wheels for cartopy's GEOS/PROJ dependencies are flaky:
+# the pip wheels for cartopy's GEOS/PROJ dependencies are unreliable:
 #     conda install -c conda-forge cartopy
-cartopy          
+cartopy
 
 # Data processing
 pandas
