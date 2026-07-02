@@ -188,7 +188,7 @@ coalition4-rcnn/
 ├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
 ├── evaluate_coalition.py              # Step 7: Evaluate, generate metrics + plots (--source / --finetuned)
 ├── bundle_eval_scores.py              # Bundle per-mode eval results into Shapley-ready per-leadtime CSVs (--source / --finetuned)
-├── visualize_full_domain_predictions.py  # Training-scope viz: top-N ref timesteps from a split CSV, full-domain GT vs Pred with zoom-in
+├── visualize_gt_vs_pred.py  # Training-scope viz: top-N ref timesteps from a split CSV, full-domain GT vs Pred with zoom-in
 ├── predict_full_domain.py             # Inference-only: run a trained model against reprojected full-domain fields for any date, no training-pipeline artefacts needed
 │
 ├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
@@ -783,17 +783,17 @@ python bundle_eval_scores.py --source dbscan --prefix lightning \
 
 ##### Full-domain GT vs Pred visualisation
 
-`visualize_full_domain_predictions.py` is a richer companion to `evaluate_coalition.py`'s per-patch plots. For every top-N reference timestep (by qualifying-patch count in the chosen CSV), it builds full 768×1536 Romania-canvas GT and prediction maps for all three lead times, in a single batched `model.predict(...)` call, with everything in memory (no disk writes). The plot is centred on Romania with neighbour-country borders, all 18 patch slots are outlined with a dashed grid, and a second figure zooms into the patch with the most GT activity per timestep.
+`visualize_gt_vs_pred.py` is a richer companion to `evaluate_coalition.py`'s per-patch plots. For every top-N reference timestep (by qualifying-patch count in the chosen CSV), it builds full 768×1536 Romania-canvas GT and prediction maps for all three lead times, in a single batched `model.predict(...)` call, with everything in memory (no disk writes). The plot is centred on Romania with neighbour-country borders, all 18 patch slots are outlined with a dashed grid, and a second figure zooms into the patch with the most GT activity per timestep.
 
 ```bash
 # OPERA multiclass base model
-python visualize_full_domain_predictions.py \
+python visualize_gt_vs_pred.py \
     --csv our_data/test_data_dbscan.csv \
     --mode mtg_lightning_opera \
     --source dbscan --top_n 3
 
 # Lightning occurrence fine-tuned model; threshold from evaluation_results.json
-python visualize_full_domain_predictions.py \
+python visualize_gt_vs_pred.py \
     --csv our_data/test_data_dbscan.csv \
     --mode mtg_lightning_opera_occurrence \
     --source dbscan --top_n 3 --finetuned
@@ -828,7 +828,7 @@ python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
 
 Output: `inference/predict_<mode>_<source>[_finetuned]/predict_<date>_<HHMM>.png` per reference timestep, showing the three lead-time predictions on the same Romania-centred canvas with neighbour-country borders. Pass `--save-npy` to also dump the raw `(3, 768, 1536)` prediction canvases as `.npy`, and `--no-plot` to skip the PNGs when you only want the raw arrays. `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
 
-**When to use which**: [`visualize_full_domain_predictions.py`](visualize_full_domain_predictions.py) reads from the split CSVs so it can also render GT alongside predictions and rank timesteps by qualifying-patch count — use it for training-time diagnostics and post-hoc sanity checks on the test split. [`predict_full_domain.py`](predict_full_domain.py) skips all that so you can drop it on freshly downloaded observation data — use it for operational inference on a new date.
+**When to use which**: [`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py) reads from the split CSVs so it can also render GT alongside predictions and rank timesteps by qualifying-patch count — use it for training-time diagnostics and post-hoc sanity checks on the test split. [`predict_full_domain.py`](predict_full_domain.py) skips all that so you can drop it on freshly downloaded observation data — use it for operational inference on a new date.
 
 ### Utility Scripts
 

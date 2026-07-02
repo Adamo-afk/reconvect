@@ -51,7 +51,7 @@ plotly           # feature_importance_analysis.py — interactive Xi heatmap / b
 # neighbour borders). Conda is strongly preferred on Windows because
 # the pip wheels for cartopy's GEOS/PROJ dependencies are flaky:
 #     conda install -c conda-forge cartopy
-cartopy          # optional — see comment above
+cartopy          
 
 # Data processing
 pandas
