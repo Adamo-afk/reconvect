@@ -37,6 +37,14 @@ except ImportError:
 
 try:
     import hdf5plugin  # noqa: F401 — required for CharLS-compressed FCI L1c
+    # Export the plugin directory as HDF5_PLUGIN_PATH before netCDF4 (and
+    # its bundled libhdf5) get imported anywhere. On Windows/anaconda the
+    # libhdf5 that netCDF4 loads doesn't always scan hdf5plugin's own
+    # registration, so we fall back to the env var it *does* honour.
+    # Without this the FCI CharLS/JPEG-LS chunks fail with
+    # "NetCDF: Filter error: undefined filter encountered" on every read.
+    # setdefault so a user-supplied HDF5_PLUGIN_PATH is not clobbered.
+    os.environ.setdefault("HDF5_PLUGIN_PATH", hdf5plugin.PLUGIN_PATH)
 except ImportError:
     print(
         "WARNING: hdf5plugin not installed. FCI L1c reading may fail.\n"
