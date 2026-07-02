@@ -15,6 +15,13 @@
 #   # the same PROJ ABI. pip-installing pyproj / geopandas on Windows
 #   # produces mismatched proj.db locations and every CRS lookup fails
 #   # with "Invalid projection ... no database context specified".
+#   #
+#   # If you are RESCUING an env that previously pip-installed any of
+#   # these packages and you already ran `pip uninstall`, physically
+#   # delete the leftover site-packages\<pkg>\ directory before the
+#   # conda install. Otherwise conda sees the empty dir, skips writing
+#   # into it, and the package imports as an empty namespace package
+#   # (symptom: AttributeError: module 'pyproj' has no attribute 'CRS').
 #   conda install -c conda-forge \
 #       pyproj proj geopandas pyogrio shapely cartopy -y
 #

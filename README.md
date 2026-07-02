@@ -71,6 +71,8 @@ conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 -y
 conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy -y
 ```
 
+**On a fresh `conda create` env this is enough.** If you're rescuing an environment that previously had these packages installed via pip and you already ran `pip uninstall`, physically wipe the leftover directories before the conda install — otherwise conda will see the empty dirs and skip repopulating them, and the packages import as empty namespace stubs. See the [Troubleshooting](#local-package--imports) entry for the tell-tale `AttributeError: module 'pyproj' has no attribute 'CRS'` symptom.
+
 4. Install the remaining Python dependencies (pip picks up what conda-forge didn't cover):
 
 ```bash
@@ -1288,6 +1290,13 @@ Consolidated notes from failure modes we've actually hit. Each entry lists the s
 - **`ModuleNotFoundError: No module named 'c4dl'`.** The local `c4dl/` package hasn't been installed into the active environment. Every script that reprojects (radar, MTG, OPERA, lightning) imports `c4dl.projection`, and every script that reads the on-disk datasets imports `c4dl.datasets`. Fix: from the project root with the environment active, run `pip install -e .` once. Same install works for both `tfenv` and any secondary Python you use (e.g. a diagnostic-only env without TensorFlow).
 - **`_ARRAY_API not found` on `import tensorflow`.** TensorFlow <2.11 was compiled against the numpy 1.x C API and refuses to load under numpy 2.x. `requirements.txt` now pins `numpy<2`, so fresh installs are fine. If an old environment already installed numpy 2.x before the pin landed, downgrade explicitly: `pip install "numpy<2"`.
 - **`CRSError: Invalid projection ... no database context specified`.** pyproj was pip-installed on Windows, so its bundled `proj.db` sits at `site-packages\pyproj\proj_dir\share\proj\`; conda's `PROJ_DATA` env var still points at `<env>\Library\share\proj\`, which pip does not populate. Two databases in two places, and the env var wins. Fix: install the geo stack via conda-forge (`conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy`) — that populates `Library\share\proj` so the env var actually points at a valid database, and everything downstream (`pyogrio`, `geopandas`, `cartopy`, `read_kml_version2.py`) shares the same PROJ ABI. Follow the [install order](#installation) from a clean env if the current one has mixed pip / conda installs.
+- **`AttributeError: module 'pyproj' has no attribute 'CRS'`** *(or `pyproj.__file__` prints `None`).* This is the ghost-package pattern that appears after switching pyproj from pip to conda-forge on Windows. `pip uninstall pyproj` removes the module files but leaves the `site-packages\pyproj\` directory in place. When `conda install pyproj` runs next, it sees the directory already exists and skips repopulating it. Python then imports the empty directory as an implicit namespace package with no code inside, and every attribute lookup (`CRS`, `__version__`, `__file__`) misses. `importlib.util.find_spec('pyproj').submodule_search_locations` will point at the leftover directory. Fix — physically wipe the directory, then reinstall:
+  ```cmd
+  conda remove -y pyproj
+  rmdir /s /q <env>\Lib\site-packages\pyproj
+  conda install -c conda-forge --force-reinstall pyproj proj -y
+  ```
+  Same pattern applies to any geo package flipped from pip to conda-forge (`geopandas`, `pyogrio`, `shapely`, `cartopy`). If in doubt, `rmdir` the leftover directory before the conda install.
 
 ### Data ingest
 
