@@ -50,37 +50,47 @@ The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% 
 
 ### Installation
 
+On Windows the install order matters. Following the steps in this exact sequence avoids the pip / conda ABI conflicts described in [Troubleshooting](#troubleshooting).
+
 1. Create a conda environment with Python 3.10 (one of the last versions with native Windows GPU support for TensorFlow):
 
 ```bash
-conda create -n tfenv python=3.10
+conda create -n tfenv python=3.10 -y
 conda activate tfenv
 ```
 
 2. Install CUDA toolkit and cuDNN via conda-forge:
 
 ```bash
-conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
+conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0 -y
 ```
 
-3. Install Python dependencies:
+3. Install the geospatial / cartography stack via **conda-forge** — this must come before the `pip install` step. Installing `pyproj` and `geopandas` via pip on Windows produces mismatched PROJ database paths, and every CRS lookup then fails with `Invalid projection: ... no database context specified`. Using conda-forge here makes `pyproj`, `proj`, `geopandas`, `pyogrio`, `shapely`, and `cartopy` share the same PROJ ABI:
+
+```bash
+conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy -y
+```
+
+4. Install the remaining Python dependencies (pip picks up what conda-forge didn't cover):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Install the local `c4dl` package in editable mode. This is a one-time step per environment. Several scripts (`read_kml_version2.py`, `reproject.py`, `identify_patches.py`, ...) import from `c4dl.projection` and `c4dl.datasets`; without this step they fail with `ModuleNotFoundError: No module named 'c4dl'`.
+5. Install the local `c4dl` package in editable mode. One-time per environment. Several scripts (`read_kml_version2.py`, `reproject.py`, `identify_patches.py`, ...) import from `c4dl.projection` and `c4dl.datasets`; without this step they fail with `ModuleNotFoundError: No module named 'c4dl'`.
 
 ```bash
 pip install -e .
 ```
 
-5. Verify GPU access:
+6. Verify PROJ and the GPU are both working:
 
 ```python
+import pyproj
+print(pyproj.CRS('EPSG:4326'))     # should print a CRS block without error
+
 import tensorflow as tf
-tf.config.list_physical_devices('GPU')
-tf.test.is_gpu_available()
+print(tf.config.list_physical_devices('GPU'))   # should list your GPU
 ```
 
 ## Directory Structure
@@ -1276,6 +1286,8 @@ Consolidated notes from failure modes we've actually hit. Each entry lists the s
 ### Local package / imports
 
 - **`ModuleNotFoundError: No module named 'c4dl'`.** The local `c4dl/` package hasn't been installed into the active environment. Every script that reprojects (radar, MTG, OPERA, lightning) imports `c4dl.projection`, and every script that reads the on-disk datasets imports `c4dl.datasets`. Fix: from the project root with the environment active, run `pip install -e .` once. Same install works for both `tfenv` and any secondary Python you use (e.g. a diagnostic-only env without TensorFlow).
+- **`_ARRAY_API not found` on `import tensorflow`.** TensorFlow <2.11 was compiled against the numpy 1.x C API and refuses to load under numpy 2.x. `requirements.txt` now pins `numpy<2`, so fresh installs are fine. If an old environment already installed numpy 2.x before the pin landed, downgrade explicitly: `pip install "numpy<2"`.
+- **`CRSError: Invalid projection ... no database context specified`.** pyproj was pip-installed on Windows, so its bundled `proj.db` sits at `site-packages\pyproj\proj_dir\share\proj\`; conda's `PROJ_DATA` env var still points at `<env>\Library\share\proj\`, which pip does not populate. Two databases in two places, and the env var wins. Fix: install the geo stack via conda-forge (`conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy`) — that populates `Library\share\proj` so the env var actually points at a valid database, and everything downstream (`pyogrio`, `geopandas`, `cartopy`, `read_kml_version2.py`) shares the same PROJ ABI. Follow the [install order](#installation) from a clean env if the current one has mixed pip / conda installs.
 
 ### Data ingest
 
