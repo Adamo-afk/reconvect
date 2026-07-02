@@ -196,9 +196,17 @@ def read_kml_extract_coordinates(kml_file):
               f"{exc}) - treating as no-stroke day, skipping.")
         return _empty_lightning_df()
     print(f"  Raw placemarks: {len(gdf)}")
-    if len(gdf) == 0 or 'Description' not in gdf.columns:
-        # Valid KML structure but zero placemarks (or no Description
-        # column to parse) - same treatment as the read failure.
+    if len(gdf) == 0:
+        return _empty_lightning_df()
+
+    # Locate the description column. Older GDAL versions expose it as
+    # capitalised 'Description'; newer GDAL / pyogrio uses lowercase
+    # 'description'. Fall through to no-strokes if neither is present.
+    desc_col = next(
+        (c for c in ('Description', 'description') if c in gdf.columns),
+        None,
+    )
+    if desc_col is None:
         return _empty_lightning_df()
 
     latitudes = []
@@ -210,7 +218,7 @@ def read_kml_extract_coordinates(kml_file):
     current_pattern = r"Current: ([-+]?\d*\.?\d+) kA"
     time_pattern = r"Time: (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{3})"
 
-    for desc in gdf['Description']:
+    for desc in gdf[desc_col]:
         pos_match = re.search(position_pattern, desc)
         current_match = re.search(current_pattern, desc)
         time_match = re.search(time_pattern, desc)
