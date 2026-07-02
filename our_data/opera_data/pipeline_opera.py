@@ -273,6 +273,32 @@ def download_opera(
         ssh.close()
         return stats
 
+    # Auto-fallback for the remote root. EWC image variants mount OPERA
+    # data under `/eumetsatdata` OR `/home/eumetsatdata`. Rather than
+    # asking the user to pick, probe the first product's subdir on the
+    # explicitly-passed base first; if it does not exist, try the
+    # alternate; if neither works fall through with the original value
+    # so the per-date loop below surfaces a clear "cannot list ..."
+    # error for the user to diagnose.
+    if products:
+        probe_subdir = PRODUCTS[products[0]]['remote_subdir']
+        candidates = [remote_base]
+        for alt in ('/home/eumetsatdata', '/eumetsatdata'):
+            if alt not in candidates:
+                candidates.append(alt)
+        for candidate in candidates:
+            probe = f"{candidate.rstrip('/')}/{probe_subdir}"
+            try:
+                sftp.listdir(probe)
+            except (FileNotFoundError, IOError):
+                continue
+            if candidate != remote_base:
+                print(f"Default --remote_base {remote_base!r} has no "
+                      f"{probe_subdir!r} subdir; falling back to "
+                      f"{candidate!r}.")
+            remote_base = candidate
+            break
+
     # Enumerate (product, date) -> list of (remote_path, local_path) to transfer
     to_download: list[tuple[str, str, str]] = []
 
