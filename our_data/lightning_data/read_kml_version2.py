@@ -52,8 +52,19 @@ import os
 try:
     import pyproj as _pyproj
     _proj_data_dir = _pyproj.datadir.get_data_dir()
-    os.environ.setdefault("PROJ_DATA", _proj_data_dir)
-    os.environ.setdefault("PROJ_LIB", _proj_data_dir)
+    # Force-override any pre-existing PROJ_DATA / PROJ_LIB / GDAL_DATA
+    # values in the OS environment. On Windows conda envs the system-
+    # level PROJ_DATA often points at Library\share\proj (conda's
+    # system-wide PROJ install), which is a DIFFERENT database than
+    # pyproj's bundled one and produces "Invalid projection ... no
+    # database context specified" for every CRS lookup. Direct
+    # assignment (not setdefault) makes sure our value wins.
+    os.environ["PROJ_DATA"] = _proj_data_dir
+    os.environ["PROJ_LIB"] = _proj_data_dir
+    # Also point pyproj at its own data dir via the C API in case the
+    # env var change happens too late (PROJ may have already been
+    # initialised by a transitively-imported module).
+    _pyproj.datadir.set_data_dir(_proj_data_dir)
 except Exception:
     # pyproj not installed / broken import - let the downstream
     # geopandas import surface the real error instead of suppressing
