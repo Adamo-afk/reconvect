@@ -69,7 +69,13 @@ conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
 pip install -r requirements.txt
 ```
 
-4. Verify GPU access:
+4. Install the local `c4dl` package in editable mode. This is a one-time step per environment. Several scripts (`read_kml_version2.py`, `reproject.py`, `identify_patches.py`, ...) import from `c4dl.projection` and `c4dl.datasets`; without this step they fail with `ModuleNotFoundError: No module named 'c4dl'`.
+
+```bash
+pip install -e .
+```
+
+5. Verify GPU access:
 
 ```python
 import tensorflow as tf
@@ -1266,6 +1272,10 @@ Consolidated notes from failure modes we've actually hit. Each entry lists the s
 - **Windows fatal exception: access violation during training.** Mid-batch VRAM spikes past the block TensorFlow reserved on first use → null-pointer deref inside the CUDA runtime. `train_models.py` calls `configure_tf_runtime()` at start, which enables memory growth + disables XLA to keep the footprint predictable, so the failure now surfaces as a clean `ResourceExhaustedError` you can react to (lower `batch_size` in `[defaults]` or the per-mode override).
 - **Recovering from a crashed training run.** The per-epoch resumable checkpoint under `models/checkpoints/<run_tag>_latest.keras` (base) or `<run_tag>_finetune_latest.keras` (fine-tune) is the safety net. At most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two `--source` tracks have completely separate checkpoint paths so they never collide on the same disk.
 - **Fine-tune loss is NaN from the first few steps.** Historically two things dragged the loss to `NaN` under `mixed_float16`: the Swin head's pre-softmax `Q@Kᵀ` overflowing fp16 and the multiclass softmax saturating to a class probability of exactly 0. The build fixed both in place — `train_finetune()` now sets `global_clipnorm=1.0` on AdamW, and `build_finetune_model()` uses `CategoricalCrossentropy(label_smoothing=0.01)` for the radar branch. If you still see NaNs, verify the base checkpoint is finite (i.e. wasn't produced by an earlier crashed run) before blaming the fine-tune.
+
+### Local package / imports
+
+- **`ModuleNotFoundError: No module named 'c4dl'`.** The local `c4dl/` package hasn't been installed into the active environment. Every script that reprojects (radar, MTG, OPERA, lightning) imports `c4dl.projection`, and every script that reads the on-disk datasets imports `c4dl.datasets`. Fix: from the project root with the environment active, run `pip install -e .` once. Same install works for both `tfenv` and any secondary Python you use (e.g. a diagnostic-only env without TensorFlow).
 
 ### Data ingest
 
