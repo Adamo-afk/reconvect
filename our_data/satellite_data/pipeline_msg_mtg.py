@@ -884,7 +884,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--output_dir', '-o', type=str, default=None,
-        help='Output directory (default: ./MTG in cwd)',
+        help='Output directory (default: <script_dir>/MTG, i.e. '
+             'our_data/satellite_data/MTG). Anchored to the script '
+             "location, NOT the caller's cwd, so running from any "
+             'working directory keeps the on-disk layout the rest of '
+             'the pipeline expects.',
     )
     parser.add_argument(
         '--full_disk', action='store_true',
@@ -909,9 +913,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Resolve output directory
-    base_dir = os.getcwd()
-    data_dir = args.output_dir or os.path.join(base_dir, 'MTG')
+    # Resolve output directory. Anchor to the script's OWN location
+    # (our_data/satellite_data/) rather than the caller's cwd, so
+    # running `python our_data/satellite_data/pipeline_msg_mtg.py ...`
+    # from the project root lands data at
+    # our_data/satellite_data/MTG/ (matches the tree diagram in
+    # README.md) instead of ./MTG at the project root.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = args.output_dir or os.path.join(script_dir, 'MTG')
     os.makedirs(data_dir, exist_ok=True)
 
     # Resolve products file
