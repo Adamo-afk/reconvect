@@ -1,6 +1,22 @@
 """
-visualize_full_domain_predictions.py
-=====================================
+visualize_gt_vs_pred.py
+=======================
+Training-scope visualiser: reads the per-source split CSVs the
+training pipeline produces (train_data_<source>.csv /
+validation_data_<source>.csv / test_data_<source>.csv), picks the
+top-N reference timesteps by qualifying-patch count, runs one
+batched model.predict per timestep, and saves a 2x3 GT (top row) vs
+Pred (bottom row) figure per timestep plus a companion zoom-in on
+the highest-activity patch.
+
+For inference-only work on a date the training pipeline has never
+touched (no split CSV, no extracted .npy patches), use
+`predict_full_domain.py` instead. That script slices patches on the
+fly from the reprojected full-domain fields and reuses the pred-panel
+rendering here via `plot_full_domain_predictions_only` (defined
+below), so both scripts produce pixel-identical Pred panels - only
+the 2x3 GT vs Pred layout is exclusive to this file.
+
 Top-N timestep aggregator: read a per-source split CSV, pick the
 reference timesteps with the most qualifying patches, build full
 768x1536 Romania-canvas GT and prediction maps for every future lead
@@ -25,19 +41,19 @@ Per top-N reference timestep:
 Example commands
 ----------------
     # Top 5 lightning-occurrence base-model timesteps, OPERA-driven
-    python visualize_full_domain_predictions.py \
+    python visualize_gt_vs_pred.py \
         --csv our_data/test_data_dbscan.csv \
         --mode mtg_lightning_opera_occurrence \
         --source dbscan --top_n 5
 
     # Same but fine-tuned model, manual threshold override
-    python visualize_full_domain_predictions.py \
+    python visualize_gt_vs_pred.py \
         --csv our_data/test_data_dbscan.csv \
         --mode mtg_lightning_opera_occurrence \
         --source dbscan --top_n 5 --finetuned --threshold 0.5
 
     # OPERA 5-class on the lightning-driven split CSV
-    python visualize_full_domain_predictions.py \
+    python visualize_gt_vs_pred.py \
         --csv our_data/validation_data_lightning.csv \
         --mode mtg_opera_mtgmr \
         --source lightning --top_n 3
@@ -532,6 +548,119 @@ def _plot_radar_inactive_mask(ax, valid_patches: list[int]):
         ax.add_patch(rect)
 
 
+def _gt_kwargs_for(label_type: str) -> dict:
+    """imshow kwargs for the GT panel of a given label type. Shared
+    between plot_full_domain (2x3 GT vs Pred) and any other renderer
+    that wants the same GT styling."""
+    if label_type == "lightning":
+        gt_cmap = mcolors.LinearSegmentedColormap.from_list(
+            "gt_red", ["#fff5f0", "#67000d"]
+        )
+        return dict(cmap=gt_cmap, vmin=0.0, vmax=1.0,
+                    aspect="equal", interpolation="nearest")
+    return dict(cmap=plt.get_cmap("viridis", 5), vmin=0, vmax=4,
+                aspect="equal", interpolation="nearest")
+
+
+def _pred_kwargs_for(label_type: str, threshold: float | None) -> dict:
+    """imshow kwargs for the Pred panel of a given label type. Shared
+    between plot_full_domain (2x3) and plot_full_domain_predictions_only
+    (1x3), so the inference-only script's single-row figure is
+    guaranteed to match the bottom row of the 2x3 figure the training-
+    scope script produces."""
+    if label_type == "lightning":
+        thr = threshold if threshold is not None else 0.5
+        norm = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=thr, vmax=1.0)
+        return dict(cmap="RdYlBu_r", norm=norm,
+                    aspect="equal", interpolation="nearest")
+    return dict(cmap=plt.get_cmap("viridis", 5), vmin=0, vmax=4,
+                aspect="equal", interpolation="nearest")
+
+
+def _apply_view_and_frame(ax):
+    """Set the Romania-centred view extent + hide ticks. Shared so both
+    the 2x3 and 1x3 figures use the identical framing."""
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(c_lo, c_hi)
+    ax.set_ylim(r_hi, r_lo)  # image y is flipped
+    ax.set_aspect("equal")
+
+
+def _render_gt_axes(ax, canvas: np.ndarray, label_type: str,
+                    *, lead_title: str, lead_hhmm: str,
+                    gt_kwargs: dict):
+    """Render a single GT panel onto `ax`. Returns the imshow handle so
+    the caller can wire a colorbar."""
+    if label_type == "radar":
+        display = np.where(canvas < 0, np.nan, canvas.astype(float))
+        im = ax.imshow(display, **gt_kwargs)
+        # Radar GT: non-qualifying slots are NaN -> transparent; the
+        # dashed grid alone makes the structure readable.
+    else:
+        im = ax.imshow(canvas, **gt_kwargs)
+    _plot_patch_grid(ax)
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    active_px = (int(np.sum(canvas > 0)) if label_type == "lightning"
+                 else int(np.sum((canvas != 0) & (canvas != -1))))
+    ax.text(
+        8, H_FULL - 12, f"pixels={active_px}",
+        color="white", fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.25",
+                  facecolor="black", alpha=0.55, edgecolor="none"),
+        va="bottom", ha="left", zorder=6,
+    )
+    ax.set_title(f"GT — {lead_title} ({lead_hhmm} UTC)", fontsize=11)
+    _apply_view_and_frame(ax)
+    return im
+
+
+def _render_pred_axes(ax, canvas: np.ndarray, valid_patches: list[int],
+                     label_type: str, threshold: float | None,
+                     *, lead_title: str, lead_hhmm: str,
+                     pred_kwargs: dict):
+    """Render a single Pred panel onto `ax`. Returns the imshow handle."""
+    if label_type == "radar":
+        display = np.where(canvas < 0, np.nan, canvas.astype(float))
+        im = ax.imshow(display, **pred_kwargs)
+        # Radar: class 0 means "R<10", NOT "no data". Keep the explicit
+        # no-data hatching so the viewer cannot mistake an empty patch
+        # slot for a "no rain" prediction.
+        _plot_radar_inactive_mask(ax, valid_patches)
+    else:
+        # Lightning: non-qualifying patches stay at canvas[..] = 0,
+        # which the diverging colormap paints as deep blue (well below
+        # threshold). Reads visually as "no activity here".
+        im = ax.imshow(canvas, **pred_kwargs)
+    _plot_patch_grid(ax)
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    if label_type == "lightning":
+        thr_for_count = threshold if threshold is not None else 0.5
+        above = int(np.sum(canvas >= thr_for_count))
+        ax.text(
+            8, H_FULL - 12,
+            f"pixels≥{thr_for_count:.2f}={above}  max={canvas.max():.3f}",
+            color="white", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25",
+                      facecolor="black", alpha=0.55, edgecolor="none"),
+            va="bottom", ha="left", zorder=6,
+        )
+        title_suffix = f"(≥{thr_for_count:.2f})"
+    else:
+        title_suffix = ""
+    ax.set_title(f"Pred {title_suffix} — {lead_title} ({lead_hhmm} UTC)",
+                 fontsize=11)
+    _apply_view_and_frame(ax)
+    return im
+
+
 def plot_full_domain(
     gt_canvases: list[np.ndarray],
     pred_canvases: list[np.ndarray],
@@ -544,117 +673,28 @@ def plot_full_domain(
     output_path: Path,
     step_minutes: int,
 ):
+    """Draw the GT-over-Pred 2x3 figure for one reference timestep."""
     lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
     label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
-    """Draw the GT-over-Pred 2x3 figure for one reference timestep."""
+
     fig, axes = plt.subplots(2, 3, figsize=(20, 10), constrained_layout=True)
 
-    # --- Top row: ground truth -------------------------------------------
-    if label_type == "lightning":
-        gt_cmap = mcolors.LinearSegmentedColormap.from_list(
-            "gt_red", ["#fff5f0", "#67000d"]
-        )
-        gt_kwargs = dict(cmap=gt_cmap, vmin=0.0, vmax=1.0,
-                         aspect="equal", interpolation="nearest")
-    else:
-        cmap_radar = plt.get_cmap("viridis", 5)
-        gt_kwargs = dict(cmap=cmap_radar, vmin=0, vmax=4,
-                         aspect="equal", interpolation="nearest")
+    gt_kwargs = _gt_kwargs_for(label_type)
+    pred_kwargs = _pred_kwargs_for(label_type, threshold)
 
+    im_gt = im_pred = None
     for t in range(3):
-        ax = axes[0, t]
-        canvas = gt_canvases[t]
-        if label_type == "radar":
-            display = np.where(canvas < 0, np.nan, canvas.astype(float))
-            im_gt = ax.imshow(display, **gt_kwargs)
-            # For radar GT, non-qualifying slots are NaN -> transparent;
-            # the dashed grid alone makes the structure readable.
-        else:
-            im_gt = ax.imshow(canvas, **gt_kwargs)
-        _plot_patch_grid(ax)
-        try:
-            overlay_borders(ax)
-        except Exception:
-            pass
-        active_px = int(np.sum(canvas > 0)) if label_type == "lightning" \
-            else int(np.sum((canvas != 0) & (canvas != -1)))
-        ax.text(
-            8, H_FULL - 12, f"pixels={active_px}",
-            color="white", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.25",
-                      facecolor="black", alpha=0.55, edgecolor="none"),
-            va="bottom", ha="left", zorder=6,
+        lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
+        im_gt = _render_gt_axes(
+            axes[0, t], gt_canvases[t], label_type,
+            lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+            gt_kwargs=gt_kwargs,
         )
-        ax.set_title(f"GT — {lead_titles[t]} "
-                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
-                     fontsize=11)
-        ax.set_xticks([]); ax.set_yticks([])
-        # Romania-centred padded view (see _compute_view_extent). Keeps
-        # the full data canvas in frame while putting Romania's bbox
-        # centroid at the figure centre.
-        _ensure_view_cached()
-        c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
-        ax.set_xlim(c_lo, c_hi)
-        ax.set_ylim(r_hi, r_lo)  # image y is flipped
-        ax.set_aspect("equal")
-
-    # --- Bottom row: predictions -----------------------------------------
-    if label_type == "lightning":
-        # Diverging blue->white->red centred on the operative threshold so
-        # the visual encodes "above threshold" without hiding the raw scores.
-        thr = threshold if threshold is not None else 0.5
-        norm = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=thr, vmax=1.0)
-        pred_kwargs = dict(cmap="RdYlBu_r", norm=norm,
-                           aspect="equal", interpolation="nearest")
-    else:
-        pred_kwargs = dict(cmap=plt.get_cmap("viridis", 5),
-                           vmin=0, vmax=4,
-                           aspect="equal", interpolation="nearest")
-
-    for t in range(3):
-        ax = axes[1, t]
-        canvas = pred_canvases[t]
-        if label_type == "radar":
-            display = np.where(canvas < 0, np.nan, canvas.astype(float))
-            im_pred = ax.imshow(display, **pred_kwargs)
-            # Radar: class 0 means "R<10", not "no data". Keep the
-            # explicit no-data hatching so the viewer can't mistake an
-            # empty patch slot for a "no rain" prediction.
-            _plot_radar_inactive_mask(ax, valid_patches)
-        else:
-            # Lightning: non-qualifying patches stay at canvas[..] = 0,
-            # which the diverging colormap paints as deep blue (well
-            # below threshold). Reads visually as "no activity here",
-            # which is the realistic interpretation the user asked for.
-            im_pred = ax.imshow(canvas, **pred_kwargs)
-        _plot_patch_grid(ax)
-        try:
-            overlay_borders(ax)
-        except Exception:
-            pass
-        if label_type == "lightning":
-            thr_for_count = threshold if threshold is not None else 0.5
-            above = int(np.sum(canvas >= thr_for_count))
-            ax.text(
-                8, H_FULL - 12,
-                f"pixels≥{thr_for_count:.2f}={above}  max={canvas.max():.3f}",
-                color="white", fontsize=10,
-                bbox=dict(boxstyle="round,pad=0.25",
-                          facecolor="black", alpha=0.55, edgecolor="none"),
-                va="bottom", ha="left", zorder=6,
-            )
-            title_suffix = f"(≥{thr_for_count:.2f})"
-        else:
-            title_suffix = ""
-        ax.set_title(f"Pred {title_suffix} — {lead_titles[t]} "
-                     f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
-                     fontsize=11)
-        ax.set_xticks([]); ax.set_yticks([])
-        _ensure_view_cached()
-        c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
-        ax.set_xlim(c_lo, c_hi)
-        ax.set_ylim(r_hi, r_lo)
-        ax.set_aspect("equal")
+        im_pred = _render_pred_axes(
+            axes[1, t], pred_canvases[t], valid_patches, label_type,
+            threshold, lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+            pred_kwargs=pred_kwargs,
+        )
 
     # Colorbars (one per row).
     if label_type == "lightning":
@@ -678,6 +718,67 @@ def plot_full_domain(
         fontsize=14, fontweight="bold",
     )
 
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_full_domain_predictions_only(
+    pred_canvases: list[np.ndarray],
+    valid_patches: list[int],
+    label_type: str,
+    *,
+    date_str: str,
+    ref_utc: str,
+    threshold: float | None,
+    output_path: Path,
+    step_minutes: int,
+    suptitle_prefix: str = "Inference",
+):
+    """Draw a 1x3 Pred-only figure for one reference timestep.
+
+    Uses the SAME _render_pred_axes helper as plot_full_domain, so the
+    output is guaranteed to be pixel-identical to the bottom row of the
+    2x3 figure that plot_full_domain would produce. Meant for
+    inference-only callers (predict_full_domain.py) that have no ground
+    truth to render.
+
+    `suptitle_prefix` lets the caller distinguish the figure title from
+    the training-scope "prediction" wording, e.g. "Inference" vs the
+    default 2x3 "Lightning prediction" phrasing.
+    """
+    lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
+    label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6.5),
+                             constrained_layout=True)
+    pred_kwargs = _pred_kwargs_for(label_type, threshold)
+
+    im_pred = None
+    for t in range(3):
+        lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
+        im_pred = _render_pred_axes(
+            axes[t], pred_canvases[t], valid_patches, label_type,
+            threshold, lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+            pred_kwargs=pred_kwargs,
+        )
+
+    if label_type == "lightning":
+        cbar = fig.colorbar(im_pred, ax=axes.ravel().tolist(),
+                            shrink=0.7, pad=0.01, location="right")
+        cbar.set_label("Probability")
+    else:
+        cbar = fig.colorbar(im_pred, ax=axes.ravel().tolist(),
+                            ticks=[0, 1, 2, 3, 4],
+                            shrink=0.7, pad=0.01, location="right")
+        cbar.set_ticklabels(RADAR_CLASS_NAMES)
+        cbar.set_label("Rain-rate class")
+
+    kind = "Lightning" if label_type == "lightning" else "OPERA 5-class"
+    fig.suptitle(
+        f"{suptitle_prefix} - {kind} - Date: {date_str}  |  "
+        f"Ref: {ref_utc} UTC  |  Patches: {len(valid_patches)}/{N_PATCHES}",
+        fontsize=14, fontweight="bold",
+    )
     fig.savefig(output_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 

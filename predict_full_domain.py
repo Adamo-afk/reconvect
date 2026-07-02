@@ -18,7 +18,7 @@ tooling stays untouched.
 For a training-adjacent visualiser that ALSO renders ground-truth labels
 alongside predictions (top-N reference selection driven by qualifying
 patch counts in a split CSV, plus a highest-activity patch zoom-in), use
-`visualize_full_domain_predictions.py` instead. That script assumes the
+`visualize_gt_vs_pred.py` instead. That script assumes the
 full pipeline has run and reads from the per-source split CSVs. This one
 does not.
 
@@ -59,9 +59,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.patches import Rectangle
 
 import tensorflow as tf
 
@@ -77,18 +74,15 @@ from extract_patches import (
     average_pool,
     _resolve_hhmm as snap_hhmm_to_product,
 )
-from visualize_full_domain_predictions import (
-    N_ROWS, N_COLS, PATCH_SIZE, N_PATCHES, H_FULL, W_FULL,
-    RADAR_CLASS_NAMES,
+from visualize_gt_vs_pred import (
+    PATCH_SIZE, N_PATCHES, H_FULL, W_FULL,
     get_patch_bounds,
-    overlay_borders,
     _ensure_view_cached,
     _load_country_borders_pixels,
-    _custom_objects,
     load_model_artifact,
     resolve_threshold,
+    plot_full_domain_predictions_only,
 )
-import visualize_full_domain_predictions as _vf
 
 
 # ============================================================================
@@ -368,126 +362,6 @@ def paste_predictions_to_canvas(predictions: np.ndarray,
     return canvases
 
 
-def _plot_patch_grid(ax, *, color="black", linewidth=0.7,
-                    linestyle=(0, (1, 3))):
-    """Outline every patch slot with a dotted rectangle (matches
-    visualize_full_domain_predictions._plot_patch_grid)."""
-    for p in range(1, N_PATCHES + 1):
-        r0, _, c0, _ = get_patch_bounds(p)
-        ax.add_patch(Rectangle(
-            (c0, r0), PATCH_SIZE, PATCH_SIZE,
-            linewidth=linewidth, edgecolor=color,
-            linestyle=linestyle, facecolor="none",
-            zorder=3,
-        ))
-
-
-def _plot_radar_inactive_mask(ax, valid_patches: list[int]):
-    """Same hatch as visualize_full_domain's - lets the reader tell
-    'no model output here' from 'model predicted class 0'."""
-    keep = set(valid_patches)
-    for p in range(1, N_PATCHES + 1):
-        if p in keep:
-            continue
-        r0, _, c0, _ = get_patch_bounds(p)
-        ax.add_patch(Rectangle(
-            (c0, r0), PATCH_SIZE, PATCH_SIZE,
-            facecolor="lightgray", alpha=0.55,
-            edgecolor="none", zorder=2,
-        ))
-
-
-def plot_prediction_row(canvases: list[np.ndarray],
-                        valid_patches: list[int],
-                        label_type: str,
-                        *,
-                        date_str: str, ref_utc: str,
-                        step_minutes: int,
-                        threshold: float | None,
-                        output_path: Path):
-    """Save a 1x3 figure - just the predictions, one per lead time.
-    (This script is inference-only, so there is no GT row.)"""
-    _ensure_view_cached()
-    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
-
-    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
-    label_offsets_min = [o * step_minutes for o in LEAD_STEP_OFFSETS]
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6.5),
-                             constrained_layout=True)
-
-    if label_type == "lightning":
-        thr = threshold if threshold is not None else 0.5
-        norm = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=thr, vmax=1.0)
-        pred_kwargs = dict(cmap="RdYlBu_r", norm=norm,
-                           aspect="equal", interpolation="nearest")
-    else:
-        pred_kwargs = dict(cmap=plt.get_cmap("viridis", 5),
-                           vmin=0, vmax=4,
-                           aspect="equal", interpolation="nearest")
-
-    for t in range(3):
-        ax = axes[t]
-        canvas = canvases[t]
-        if label_type == "radar":
-            display = np.where(canvas < 0, np.nan, canvas.astype(float))
-            im = ax.imshow(display, **pred_kwargs)
-            _plot_radar_inactive_mask(ax, valid_patches)
-        else:
-            im = ax.imshow(canvas, **pred_kwargs)
-        _plot_patch_grid(ax)
-        try:
-            overlay_borders(ax)
-        except Exception:
-            pass
-        if label_type == "lightning":
-            thr_for_count = threshold if threshold is not None else 0.5
-            above = int(np.sum(canvas >= thr_for_count))
-            ax.text(
-                8, H_FULL - 12,
-                f"pixels>={thr_for_count:.2f}={above}  "
-                f"max={canvas.max():.3f}",
-                color="white", fontsize=10,
-                bbox=dict(boxstyle="round,pad=0.25",
-                          facecolor="black", alpha=0.55, edgecolor="none"),
-                va="bottom", ha="left", zorder=6,
-            )
-            title_suffix = f"(>={thr_for_count:.2f})"
-        else:
-            title_suffix = ""
-        # Wall-clock label at this lead time
-        h, m = int(ref_utc.split(":")[0]), int(ref_utc.split(":")[1])
-        base = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=h, minute=m)
-        lead_wallclock = (base + timedelta(minutes=label_offsets_min[t])).strftime("%H:%M")
-
-        ax.set_title(f"Pred {title_suffix} - {lead_titles[t]} "
-                     f"({lead_wallclock} UTC)", fontsize=11)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_xlim(c_lo, c_hi)
-        ax.set_ylim(r_hi, r_lo)
-        ax.set_aspect("equal")
-
-    if label_type == "lightning":
-        fig.colorbar(im, ax=axes.ravel().tolist(),
-                     shrink=0.7, pad=0.01, location="right",
-                     label="Probability")
-    else:
-        cbar = fig.colorbar(im, ax=axes.ravel().tolist(),
-                            ticks=[0, 1, 2, 3, 4],
-                            shrink=0.7, pad=0.01, location="right")
-        cbar.set_ticklabels(RADAR_CLASS_NAMES)
-        cbar.set_label("Rain-rate class")
-
-    fig.suptitle(
-        f"Inference - Date: {date_str}  |  Ref: {ref_utc} UTC  |  "
-        f"Patches: {len(valid_patches)}/{N_PATCHES}",
-        fontsize=14, fontweight="bold",
-    )
-    fig.savefig(output_path, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-
 # ============================================================================
 # CLI
 # ============================================================================
@@ -616,12 +490,16 @@ def main() -> int:
         safe_ref = ref_utc.replace(":", "")
         out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
         if not args.no_plot:
-            plot_prediction_row(
+            # Shared renderer from visualize_gt_vs_pred so the pred
+            # panels are pixel-identical to the bottom row of the 2x3
+            # figure the training-scope script produces.
+            plot_full_domain_predictions_only(
                 canvases, valid_patches, label_type,
                 date_str=args.date, ref_utc=ref_utc,
                 step_minutes=step_minutes,
                 threshold=threshold,
                 output_path=out_stem.with_suffix(".png"),
+                suptitle_prefix="Inference",
             )
             print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
         if args.save_npy:

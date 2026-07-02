@@ -120,7 +120,7 @@ DBSCAN_MIN_SAMPLES = 20  # minimum cluster size
 # =============================================================================
 # Country-border overlay (cartopy Natural Earth preferred, pyproj fallback)
 # =============================================================================
-# Mirrors the helpers in visualize_full_domain_predictions.py so the
+# Mirrors the helpers in visualize_gt_vs_pred.py so the
 # patch-selection diagnostic plot reads as a consistent panel of the same
 # Romania visualisation - just with the GT/Pred rows swapped for the
 # RZC field + DBSCAN mask. Coords go lat/lon -> EPSG:31700 -> pixel via
@@ -465,7 +465,7 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     """
     Plot the EPSG:31700-reprojected RZC / OPERA data with the 6×3 patch grid overlay.
 
-    Styled to match `visualize_full_domain_predictions.py`: Romania
+    Styled to match `visualize_gt_vs_pred.py`: Romania
     sits centred in the figure, neighbour-country borders frame the
     canvas, every patch slot is outlined with a dashed grid in black,
     and active patches get a red highlight on top.
