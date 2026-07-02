@@ -807,12 +807,48 @@ Output: `full_domain_plots/full_domain_<run_tag>[_finetuned]/ts<NN>_<date>_<HHMM
 
 Minimum on-disk requirements: raw data downloaded and reprojected through step 3 of the pipeline (reproject.py) plus the trained model in `models/` and the existing `normalization_stats_<source>.json` / `sequence_meta_<source>.json` / `timestep_config.json`. Nothing else.
 
+**End-to-end recipe for a new date** (2026-06-30 example, step-aligned reference times every 15 minutes). Steps 1-5 fetch and reproject the raw inputs; steps 6-7 do inference.
+
 ```bash
-# All 96 references in a day (step_minutes=15) for the OPERA multiclass model
+# 1. MTG FCI download (needs HDF5_PLUGIN_PATH auto-set by the pipeline)
+python our_data/satellite_data/pipeline_msg_mtg.py \
+    --start 2026/06/29-0000 --end 2026/06/30-2350 \
+    --password_file password.txt \
+    --products_file our_data/satellite_data/satellite_products.json
+
+# 2. OPERA composite download. --remote_base /home/eumetsatdata switches
+#    to the alternate EWC mount root; drop it if the default
+#    /eumetsatdata is where the data lives on your VM. See the OPERA
+#    Step 1 troubleshooting note below.
+python our_data/opera_data/pipeline_opera.py \
+    -s 2026/06/29-0000 -e 2026/06/30-2350 \
+    --password_file password.txt \
+    --remote_base /home/eumetsatdata
+
+# 3. Arrange LINET KMLs
+python our_data/raw_data/lightning_arrange.py \
+    -s our_data/raw_data/lightning \
+    --start-date 2026-06-29 --end-date 2026-06-30
+
+# 4. Rasterise LINET onto the Romania grid
+python our_data/lightning_data/read_kml_version2.py
+
+# 5. Reproject MTG + OPERA to EPSG:31700
+python reproject.py --all --workers 12
+
+# 6. Inference - OPERA multiclass (5-class rainfall)
 python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
     --date 2026-06-30
 
-# One hour only (00, 15, 30, 45 within 14 UTC)
+# 7. Inference - Lightning binary occurrence (same input stack, different head)
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30
+```
+
+Once the raw data is on disk, other useful subsets of the CLI:
+
+```bash
+# One hour only (references 14:00, 14:15, 14:30, 14:45)
 python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
     --date 2026-06-30 --hour 14
 
@@ -973,10 +1009,14 @@ Connects to `claudiu@64.225.128.186` via SFTP and pulls files from `/eumetsatdat
 # 1. Pick the training cadence (writes our_data/timestep_config.json)
 python validate_timestep.py --step_minutes 15
 
-# 2. Download OPERA for a date range
+# 2. Download OPERA for a date range. If the default --remote_base
+#    /eumetsatdata errors with "No such file", swap in
+#    /home/eumetsatdata as shown below - the mount root differs
+#    between EWC images.
 python our_data/opera_data/pipeline_opera.py \
     --start 2025/06/15-0000 --end 2025/06/15-2359 \
-    --password_file password.txt
+    --password_file password.txt \
+    --remote_base /home/eumetsatdata
 ```
 
 **Required arguments:**
