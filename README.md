@@ -188,7 +188,8 @@ coalition4-rcnn/
 ├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
 ├── evaluate_coalition.py              # Step 7: Evaluate, generate metrics + plots (--source / --finetuned)
 ├── bundle_eval_scores.py              # Bundle per-mode eval results into Shapley-ready per-leadtime CSVs (--source / --finetuned)
-├── visualize_full_domain_predictions.py  # Top-N reference timesteps -> full-domain GT vs Pred (Romania-centred, country borders, zoom-in)
+├── visualize_full_domain_predictions.py  # Training-scope viz: top-N ref timesteps from a split CSV, full-domain GT vs Pred with zoom-in
+├── predict_full_domain.py             # Inference-only: run a trained model against reprojected full-domain fields for any date, no training-pipeline artefacts needed
 │
 ├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
 ├── lightning_fraction.py              # Per-source lightning-occurrence prior for the binary focal loss (--source dbscan / lightning)
@@ -799,6 +800,35 @@ python visualize_full_domain_predictions.py \
 ```
 
 Output: `full_domain_plots/full_domain_<run_tag>[_finetuned]/ts<NN>_<date>_<HHMM>.png` plus a `..._zoom_p<NN>.png` per timestep. With cartopy installed, neighbour-country borders draw from Natural Earth's 10m `admin_0_countries` shapefile; without it the script falls back to a coarse hardcoded Romania polygon and prints `Border src: hardcoded_coarse` in the startup banner.
+
+##### Inference-only on a new date
+
+`predict_full_domain.py` is the **standalone inference script**. It runs a trained model against the reprojected full-domain fields directly and does **not** touch `patch_index.csv`, the per-source split CSVs, or the pre-extracted `.npy` patch tiles. Use it to predict on a date the model has never seen without running (or re-running) `identify_patches.py`, `extract_patch_seq_for_datasets.py`, or `extract_patches.py`.
+
+Minimum on-disk requirements: raw data downloaded and reprojected through step 3 of the pipeline (reproject.py) plus the trained model in `models/` and the existing `normalization_stats_<source>.json` / `sequence_meta_<source>.json` / `timestep_config.json`. Nothing else.
+
+```bash
+# All 96 references in a day (step_minutes=15) for the OPERA multiclass model
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30
+
+# One hour only (00, 15, 30, 45 within 14 UTC)
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30 --hour 14
+
+# One specific reference time
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30 --time 14:30
+
+# Range mode with the Swin fine-tuned model
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30 \
+    --start-time 12:00 --end-time 15:45 --finetuned
+```
+
+Output: `inference/predict_<mode>_<source>[_finetuned]/predict_<date>_<HHMM>.png` per reference timestep, showing the three lead-time predictions on the same Romania-centred canvas with neighbour-country borders. Pass `--save-npy` to also dump the raw `(3, 768, 1536)` prediction canvases as `.npy`, and `--no-plot` to skip the PNGs when you only want the raw arrays. `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
+
+**When to use which**: [`visualize_full_domain_predictions.py`](visualize_full_domain_predictions.py) reads from the split CSVs so it can also render GT alongside predictions and rank timesteps by qualifying-patch count — use it for training-time diagnostics and post-hoc sanity checks on the test split. [`predict_full_domain.py`](predict_full_domain.py) skips all that so you can drop it on freshly downloaded observation data — use it for operational inference on a new date.
 
 ### Utility Scripts
 
