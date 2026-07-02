@@ -38,7 +38,7 @@ For end-to-end commands per track, see the runbooks at the project root:
 
 ### Optional class-weighted focal loss for the radar / OPERA multiclass head
 
-The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% of pixels, class 4 (`R≥40`) is sparser by orders of magnitude. The `[radar_loss]` section of [`training.config`](training.config) lets you swap the historical `CategoricalCrossentropy(label_smoothing=0.01)` for `WeightedFocalCategoricalCrossentropy` — focal modulation `(1 − p_t)^gamma` plus per-class weights derived from the training-distribution pixel fractions (read from `our_data/opera_rainfall_fraction_<source>.json`, produced by `opera_rainfall_fraction.py --source <source>`). `weighting` accepts `inverse`, `median`, or `none`; setting `weighting = none` and `gamma = 0` reproduces the plain-CCE baseline exactly. Per-source like the lightning prior, so the dbscan / lightning tracks each compute their own.
+The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% of pixels, class 4 (`R≥40`) is sparser by orders of magnitude. The `[radar_loss]` section of [`training.config`](training.config) lets you swap the historical `CategoricalCrossentropy(label_smoothing=0.01)` for `WeightedFocalCategoricalCrossentropy` — focal modulation `(1 − p_t)^gamma` plus per-class weights derived from the training-distribution pixel fractions (read from **_base_dir_**/opera_rainfall_fraction_<source>.json, produced by `opera_rainfall_fraction.py --source <source>`). `weighting` accepts `inverse`, `median`, or `none`; setting `weighting = none` and `gamma = 0` reproduces the plain-CCE baseline exactly. Per-source like the lightning prior, so the dbscan / lightning tracks each compute their own.
 
 ## Environment Setup
 
@@ -248,11 +248,11 @@ INPUT  past_hr (256×256, 1 km) ─┐
 
 | Source | Products | Native cadence | Native resolution | Role | Pipeline entry point |
 |---|---|---|---|---|---|
-| **ANM radar** (legacy) | RZC, BZC, CZC, EZC-20, LZC, CPCH | 10 min | ~1 km | Precipitation target + features (MSG/MTG experiments) | `our_data/raw_data/radar_arrange.py` |
-| **LINET lightning** | density, current, occurrence | 10 min native; filter-aligned to `products.lightning.filter` | Native KML → 1 km grid (variable-width windows that cover every minute of the day) | Lightning target + features | `our_data/raw_data/lightning_arrange.py`, `our_data/lightning_data/read_kml_version2.py` |
-| **MSG SEVIRI** *(disabled in active build)* | VIS006, IR_039, IR_108, WV_062, WV_073 | 15 min | 3 km | Satellite features (LR branch) | `our_data/satellite_data/pipeline_msg_mtg.py` |
-| **MTG FCI L1C** | vis_06, ir_38, ir_105, wv_63, wv_73 | 10 min | 1 km (vis_06) / 2 km (IR/WV) | Satellite features (HR + MR branches) | `our_data/satellite_data/pipeline_msg_mtg.py` |
-| **OPERA composite** | reflectivity (dBZ), rainfall_rate (mm/h) | 15 min | 2 km | Precipitation target + features for the **MTG+OPERA experiment** (replaces ANM radar) | `our_data/opera_data/pipeline_opera.py` |
+| **ANM radar** (legacy) | RZC, BZC, CZC, EZC-20, LZC, CPCH | 10 min | ~1 km | Precipitation target + features (MSG/MTG experiments) | **_base_dir_**/raw_data/radar_arrange.py |
+| **LINET lightning** | density, current, occurrence | 10 min native; filter-aligned to `products.lightning.filter` | Native KML → 1 km grid (variable-width windows that cover every minute of the day) | Lightning target + features | **_base_dir_**/raw_data/lightning_arrange.py, **_base_dir_**/lightning_data/read_kml_version2.py |
+| **MSG SEVIRI** *(disabled in active build)* | VIS006, IR_039, IR_108, WV_062, WV_073 | 15 min | 3 km | Satellite features (LR branch) | **_base_dir_**/satellite_data/pipeline_msg_mtg.py |
+| **MTG FCI L1C** | vis_06, ir_38, ir_105, wv_63, wv_73 | 10 min | 1 km (vis_06) / 2 km (IR/WV) | Satellite features (HR + MR branches) | **_base_dir_**/satellite_data/pipeline_msg_mtg.py |
+| **OPERA composite** | reflectivity (dBZ), rainfall_rate (mm/h) | 15 min | 2 km | Precipitation target + features for the **MTG+OPERA experiment** (replaces ANM radar) | **_base_dir_**/opera_data/pipeline_opera.py |
 
 ### Satellite Channel Selection
 
@@ -275,7 +275,7 @@ Romania grid on EPSG:31700 (Stereo70):
 
 ## Pipeline
 
-### Full Pipeline (run in order)
+### Pipeline steps (run in order)
 
 All scripts are run from the project root (`coalition4-rcnn/`):
 
@@ -284,7 +284,7 @@ cd F:\nowcasting\coalition4-rcnn
 conda activate tfenv
 ```
 
-#### Step 0 — Set the training cadence
+### Step 0 — Set the training cadence
 
 The pipeline supports any training step that is at least as coarse as the
 highest native data cadence. Native cadences are declared in
@@ -356,7 +356,7 @@ is closest to the OPERA nominal time, giving an alternating 10–20–10–20
 spacing between consecutive samples. The `extract_patches.py` cadence
 snap (see Step 3) translates between the two grids automatically.
 
-The script writes `our_data/timestep_config.json` with the chosen
+The script writes **_base_dir_**/timestep_config.json with the chosen
 `step_minutes`, the per-product `minute_filter` (the native minutes to keep
 when arranging or downloading), the `steps_per_day`, and a
 `cadences_source` pointer back to the JSON file it loaded. All downstream
@@ -372,7 +372,7 @@ flow interpolation is used).
 > **MSG**: the MSG SEVIRI ingestion path is currently disabled in
 > `pipeline_msg_mtg.py` and `create_datasets.py`. Only MTG FCI L1C is supported.
 
-#### Step 1 — Identify convective patches from RZC radar
+### Step 1 — Identify convective patches from RZC radar
 
 Runs DBSCAN on RZC rain rate data at 15-minute resolution. Produces a patch index mapping each timestamp to the active patches (1–18) on the fixed 6×3 grid.
 
@@ -385,9 +385,9 @@ python identify_patches.py --source opera
 python identify_patches.py --source opera --start 2026-03-13 --end 2026-05-11
 ```
 
-Output: `our_data/patch_index/patch_index.csv` and `patch_index.json`. The `--source opera` flag reads from `reprojected_data/opera_data/rainfall_rate/` instead of reprojection RZC on the fly; OPERA-source runs require `reproject.py --opera` to have been run first.
+Output: **_base_dir_**/patch_index/patch_index.csv and `patch_index.json`. The `--source opera` flag reads from `reprojected_data/opera_data/rainfall_rate/` instead of reprojection RZC on the fly; OPERA-source runs require `reproject.py --opera` to have been run first.
 
-#### Step 2 — Reproject all products to the Romania grid
+### Step 2 — Reproject all products to the Romania grid
 
 Regrids radar, satellite (MSG/MTG), lightning, **and OPERA** to the 1536×768 grid. Uses precomputed KD-tree mappings (built once per source geometry) and parallel day-folder processing for speed.
 
@@ -402,9 +402,9 @@ python reproject.py --all --workers 8              # 8 parallel workers
 python reproject.py --radar --date 2025-05-15      # single date
 ```
 
-**Every product family writes `.npy`** under `our_data/reprojected_data/...`. The shared Romania-grid lat/lon arrays are written once at `our_data/reprojected_data/romania_grid_{lats,lons}.npy`, and each non-trivial source (MTG, OPERA) drops a sidecar `*_constants.json` with the source projection so an `.npy` can be re-attached to its projection at any later step (e.g. by `inspect_mtg.py --reprojected`).
+**Every product family writes `.npy`** under **_base_dir_**/reprojected_data/.... The shared Romania-grid lat/lon arrays are written once at **_base_dir_**/reprojected_data/romania_grid_{lats,lons}.npy, and each non-trivial source (MTG, OPERA) drops a sidecar `*_constants.json` with the source projection so an `.npy` can be re-attached to its projection at any later step (e.g. by `inspect_mtg.py --reprojected`).
 
-#### Step 3 — Extract 256×256 patches
+### Step 3 — Extract 256×256 patches
 
 > **Order of operations:** this step now runs **after Step 4.1** (`extract_patch_seq_for_datasets.py`). The split CSVs that step produces (with the manifest gate baked in) are the exact list of (date, time) pairs extract_patches needs to walk — driving off them avoids the previous patch_index + manifest filtering loop and guarantees the saved patches stay in sync with what training will load.
 
@@ -419,15 +419,15 @@ python extract_patches.py --source dbscan --date 2025-05-15
 python extract_patches.py --source dbscan --products satellite_MTG opera lightning
 ```
 
-Output: `our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy` (shape `(num_active_patches, H, W)`; the per-patch order at each timestep matches whichever index file `--source` selected, so the `idx_t*` columns in the split CSVs address the right slice).
+Output: **_base_dir_**/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy (shape `(num_active_patches, H, W)`; the per-patch order at each timestep matches whichever index file `--source` selected, so the `idx_t*` columns in the split CSVs address the right slice).
 
-#### Step 4.1 — Extract temporally continuous sequences and split dataset
+### Step 4.1 — Extract temporally continuous sequences and split dataset
 
 Analyzes the patch index to find patches with uninterrupted activity over a 6-step window (2 past + current + 3 future, 90 minutes total). Produces per-timestep npy indices accounting for index shifts when the active patch set changes.
 
 Dataset splitting follows Czibula et al. (2024): each day is divided into equal temporal blocks (default 6h). Within each block, qualifying sequences are ordered chronologically — the first 10% go to test, next 10% to validation, remaining 80% to training. This ensures all three splits sample from the same diurnal distribution, avoiding hour-based bias.
 
-**Manifest gate (final cross-product filter).** Step 4.1 auto-discovers `our_data/timestep_manifest.csv` (from Step 4.2 below) and intersects the patch index with it before searching for sequences. This is the final filter that decides which `(date, time)` tuples can become training samples: a slot only survives if every product in the intersect set had data there. The intersection is reported on stdout with a top-N "dates by drop count" table, and every dropped `(date, time)` is written to `our_data/extract_patch_seq_drops_<source>.csv` for audit. Pass `--manifest none` to disable the gate (debug only).
+**Manifest gate (final cross-product filter).** Step 4.1 auto-discovers **_base_dir_**/timestep_manifest.csv (from Step 4.2 below) and intersects the patch index with it before searching for sequences. This is the final filter that decides which `(date, time)` tuples can become training samples: a slot only survives if every product in the intersect set had data there. The intersection is reported on stdout with a top-N "dates by drop count" table, and every dropped `(date, time)` is written to **_base_dir_**/extract_patch_seq_drops_<source>.csv for audit. Pass `--manifest none` to disable the gate (debug only).
 
 ```bash
 python extract_patch_seq_for_datasets.py --source dbscan            # DBSCAN track (reads patch_index.csv)
@@ -439,11 +439,11 @@ python extract_patch_seq_for_datasets.py --source dbscan --manifest none        
 
 Outputs (suffixed by source so the two tracks coexist on disk):
 
-- `our_data/train_data_<source>.csv`
-- `our_data/validation_data_<source>.csv`
-- `our_data/test_data_<source>.csv`
-- `our_data/sequence_meta_<source>.json` — source, effective step, past/future window length
-- `our_data/extract_patch_seq_drops_<source>.csv` — every (date, time) the manifest gate removed
+- **_base_dir_**/train_data_<source>.csv
+- **_base_dir_**/validation_data_<source>.csv
+- **_base_dir_**/test_data_<source>.csv
+- **_base_dir_**/sequence_meta_<source>.json — source, effective step, past/future window length
+- **_base_dir_**/extract_patch_seq_drops_<source>.csv — every (date, time) the manifest gate removed
 
 ##### Lightning-source sequences
 
@@ -460,11 +460,11 @@ python identify_lightning_periods.py
 python extract_patch_seq_for_datasets.py --source lightning
 ```
 
-#### Lightning periods (occurrence-fraction filter)
+### Lightning periods (occurrence-fraction filter)
 
 `identify_lightning_periods.py` produces the lightning-activity index that drives `extract_patch_seq_for_datasets.py --source lightning`. Lightning is much sparser than radar, so the model is trained on a separate sample list filtered to lightning-active windows only.
 
-**Two upstream files at project root**, both produced by `our_data/lightning_data/summarize_lightning_data.py`:
+**Two upstream files at project root**, both produced by **_base_dir_**/lightning_data/summarize_lightning_data.py:
 
 | File | Purpose |
 |---|---|
@@ -477,8 +477,8 @@ python extract_patch_seq_for_datasets.py --source lightning
 |---|---|---|---|
 | **Fraction threshold ratio** | `--fraction_threshold_ratio` | `0.30` | Keep maps whose occurrence-fraction is at least this fraction of the mean fraction over the active set. |
 | Active CSV path | `--active_csv` | `lightning_active_steps.csv` at project root | Source of candidate `(date, HH:MM)` pairs. |
-| Lightning data root | `--lightning_dir` | `our_data/lightning_data` | Where to find the `occurrence/...npy` files. |
-| Output dir | `--output_dir` | `our_data/lightning_periods` | Where to write the index. |
+| Lightning data root | `--lightning_dir` | **_base_dir_**/lightning_data | Where to find the `occurrence/...npy` files. |
+| Output dir | `--output_dir` | **_base_dir_**/lightning_periods | Where to write the index. |
 
 ```bash
 # All defaults: reads lightning_active_steps.csv, threshold = 0.30 × mean.
@@ -488,7 +488,7 @@ python identify_lightning_periods.py
 python identify_lightning_periods.py --fraction_threshold_ratio 1.0
 ```
 
-Outputs in `our_data/lightning_periods/`:
+Outputs in **_base_dir_**/lightning_periods/:
 
 | File | Purpose |
 |---|---|
@@ -512,7 +512,7 @@ python lightning_fraction.py --source lightning
 python lightning_fraction.py --source dbscan --scope_csv lightning_active_steps.csv
 ```
 
-#### Step 4.2 — Intersect per-product timestep coverage
+### Step 4.2 — Intersect per-product timestep coverage
 
 `intersect_product_coverage.py` computes the per-timestep intersection of available data across the chosen product set and writes a manifest that Step 4.1 (`extract_patch_seq_for_datasets.py`, the final filter) consumes directly. `extract_patches.py` does **not** read the manifest itself any more — it walks the train/val/test CSVs produced by Step 4.1, which already incorporate the manifest gate.
 
@@ -553,12 +553,12 @@ python intersect_product_coverage.py \
 
 | File | Purpose |
 |---|---|
-| `our_data/timestep_manifest.csv` | One row per surviving `(date, HHMM)`; columns also include the per-product snapped HHMM each product loaded so the manifest doubles as an audit trail. Consumed by `extract_patch_seq_for_datasets.py` (Step 4.1) as the final cross-product gate before the split CSVs are written. |
-| `our_data/intersect_summary.png` | Per-date stacked bar: kept timesteps + drops attributed to each product / error log. Shows the quantitative impact of the intersection. |
+| **_base_dir_**/timestep_manifest.csv | One row per surviving `(date, HHMM)`; columns also include the per-product snapped HHMM each product loaded so the manifest doubles as an audit trail. Consumed by `extract_patch_seq_for_datasets.py` (Step 4.1) as the final cross-product gate before the split CSVs are written. |
+| **_base_dir_**/intersect_summary.png | Per-date stacked bar: kept timesteps + drops attributed to each product / error log. Shows the quantitative impact of the intersection. |
 
 > **Why this comes before Step 4.3**: the normalization stats are computed on the surviving timesteps, so they never see slots that would later be discarded for missing inputs — fewer file reads and stats that match the eventual training distribution.
 
-#### Step 4.3 — Compute normalization statistics
+### Step 4.3 — Compute normalization statistics
 
 `compute_normalization_stats.py` derives per-variable mean / std from the reprojected data so the model trains on values centred for the **Romanian** distribution, not the Swiss one. This step is **mandatory** before Step 5: `create_datasets.py` no longer falls back to the Leinonen Table A1 constants — if `normalization_stats_<source>.json` is missing, the run fails with an explicit pointer back to this script.
 
@@ -589,7 +589,7 @@ python compute_normalization_stats.py --source dbscan --no_split_filter
 |---|---|---|
 | Sample scope | training-set only, expanded across each row's past + current + future window | Stats from val / test would leak distributional info into the model |
 | Spatial scope | single scalar mean / std per variable | Per-pixel climatology would overfit to training-domain geography (e.g. permanent radar beam blockage) |
-| Source data | `our_data/reprojected_data/` (full 1536 × 768 grids) | The pre-built patches in `our_data/patches/` are filtered by RZC / lightning activity — computing stats on them would bias every variable's distribution toward convective scenes |
+| Source data | **_base_dir_**/reprojected_data/ (full 1536 × 768 grids) | The pre-built patches in **_base_dir_**/patches/ are filtered by RZC / lightning activity — computing stats on them would bias every variable's distribution toward convective scenes |
 | Missing values | NaN and per-variable "missing sentinel" pixels are **dropped** from the Welford accumulator | Replacing them with `fill` (as the inference-time transforms still do) would silently drag the mean toward the fill value |
 | Pre-norm for heavy-tailed | `log10` after clipping to a positive floor | RZC, LZC, lightning density / current, `cmic_cot`, `opera_rainfall_rate` are zero-inflated with long right tails — z-scoring them directly would compress the bulk into a tiny range |
 | Near-constant flag | `std < 1e-3 · |mean|` → flagged in JSON | Standardising near-constant variables amplifies noise in the rare non-zero pixels; the consumer should consider clipping / robust scaling |
@@ -617,14 +617,14 @@ python compute_normalization_stats.py --source dbscan --no_split_filter
 
 When `--with_percentiles` is passed, each variable block additionally carries `p01`, `p50`, `p99`, and `mad` (median absolute deviation) — useful for sanity-checking against the mean/std, and as robust alternatives if a variable is flagged `near_constant: true`.
 
-#### Step 5 — Build TF datasets
+### Step 5 — Build TF datasets
 
 Transforms patches using the **data-driven** mean / std from
-`our_data/normalization_stats_<source>.json` (Step 4.3, matching the chosen `--source`) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
+**_base_dir_**/normalization_stats_<source>.json (Step 4.3, matching the chosen `--source`) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
 
 Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr`, and the dual-target full-input pair `mtg_lightning_opera` (OPERA rainfall label) / `mtg_lightning_opera_occurrence` (lightning binary label). The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
 
-The new `--source {dbscan, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at `our_data/datasets/<mode>_<source>/`. Mode and source are independent: a single mode can be built once per source so the lightning- and DBSCAN-driven tracks have separate dataset directories.
+The new `--source {dbscan, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at **_base_dir_**/datasets/<mode>_<source>/. Mode and source are independent: a single mode can be built once per source so the lightning- and DBSCAN-driven tracks have separate dataset directories.
 
 ```bash
 # DBSCAN-driven sample selection (uses patch_index.csv produced by
@@ -656,7 +656,7 @@ The OPERA modes replace radar (RZC and friends) with OPERA `opera_reflectivity` 
 
 Custom modes can be defined by adding a new configuration in `create_datasets.py`. The training script requires no code changes — it reads whatever inputs are in the dataset.
 
-Output: `our_data/datasets/{mode}_{source}/train|validation|test/` (each with `metadata.json`)
+Output: **_base_dir_**/datasets/{mode}_{source}/train|validation|test/ (each with `metadata.json`)
 
 ##### When `--mode` is required vs. optional
 
@@ -678,7 +678,7 @@ python train_models.py --mode my_label \
 
 For `create_datasets.py` and `evaluate_coalition.py`, the mode name **must** exist in code — adding a new product combination still requires a one-line edit in each. `train_models.py` is unaffected: it reads `metadata.json` and adapts to whatever inputs the dataset declares.
 
-#### Step 6 — Train
+### Step 6 — Train
 
 Builds the COALITION recurrent-convolutional architecture (ResBlock + ConvGRU encoder-decoder) dynamically from the dataset's `metadata.json`. The model architecture adapts automatically to whatever inputs are present — number of input groups, channel counts, and resolutions are all read from metadata rather than hardcoded. This means training with different input configurations (MSG vs MTG, different precipitation targets) requires no code changes; only the dataset needs to change.
 
@@ -744,7 +744,7 @@ history_<run_tag>_finetuned.json
 
 The per-epoch checkpoint is the run's safety net for the occasional CUDA crash — at most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two tracks (`--source dbscan` vs `--source lightning`) have completely separate checkpoint paths so they can train in parallel on different machines without colliding.
 
-#### Step 7 — Evaluate
+### Step 7 — Evaluate
 
 Loads the trained model, runs evaluation on the test set, and generates diagnostic plots. Both `--source` (sample-selection track) and `--finetuned` (Swin-head model) are wired through every on-disk path so the four artefact combinations (`{base, finetuned} × {dbscan, lightning}`) never collide.
 
@@ -801,70 +801,7 @@ python visualize_gt_vs_pred.py \
 
 Output: `full_domain_plots/full_domain_<run_tag>[_finetuned]/ts<NN>_<date>_<HHMM>.png` plus a `..._zoom_p<NN>.png` per timestep. With cartopy installed, neighbour-country borders draw from Natural Earth's 10m `admin_0_countries` shapefile; without it the script falls back to a coarse hardcoded Romania polygon and prints `Border src: hardcoded_coarse` in the startup banner.
 
-##### Inference-only on a new date
-
-`predict_full_domain.py` is the **standalone inference script**. It runs a trained model against the reprojected full-domain fields directly and does **not** touch `patch_index.csv`, the per-source split CSVs, or the pre-extracted `.npy` patch tiles. Use it to predict on a date the model has never seen without running (or re-running) `identify_patches.py`, `extract_patch_seq_for_datasets.py`, or `extract_patches.py`.
-
-Minimum on-disk requirements: raw data downloaded and reprojected through step 3 of the pipeline (reproject.py) plus the trained model in `models/` and the existing `normalization_stats_<source>.json` / `sequence_meta_<source>.json` / `timestep_config.json`. Nothing else.
-
-**End-to-end recipe for a new date** (2026-06-30 example, step-aligned reference times every 15 minutes). Steps 1-5 fetch and reproject the raw inputs; steps 6-7 do inference.
-
-```bash
-# 1. MTG FCI download (needs HDF5_PLUGIN_PATH auto-set by the pipeline)
-python our_data/satellite_data/pipeline_msg_mtg.py \
-    --start 2026/06/29-0000 --end 2026/06/30-2350 \
-    --password_file password.txt \
-    --products_file our_data/satellite_data/satellite_products.json
-
-# 2. OPERA composite download. --remote_base /home/eumetsatdata switches
-#    to the alternate EWC mount root; drop it if the default
-#    /eumetsatdata is where the data lives on your VM. See the OPERA
-#    Step 1 troubleshooting note below.
-python our_data/opera_data/pipeline_opera.py \
-    -s 2026/06/29-0000 -e 2026/06/30-2350 \
-    --password_file password.txt \
-    --remote_base /home/eumetsatdata
-
-# 3. Arrange LINET KMLs
-python our_data/raw_data/lightning_arrange.py \
-    -s our_data/raw_data/lightning \
-    --start-date 2026-06-29 --end-date 2026-06-30
-
-# 4. Rasterise LINET onto the Romania grid
-python our_data/lightning_data/read_kml_version2.py
-
-# 5. Reproject MTG + OPERA to EPSG:31700
-python reproject.py --all --workers 12
-
-# 6. Inference - OPERA multiclass (5-class rainfall)
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30
-
-# 7. Inference - Lightning binary occurrence (same input stack, different head)
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30
-```
-
-Once the raw data is on disk, other useful subsets of the CLI:
-
-```bash
-# One hour only (references 14:00, 14:15, 14:30, 14:45)
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30 --hour 14
-
-# One specific reference time
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30 --time 14:30
-
-# Range mode with the Swin fine-tuned model
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30 \
-    --start-time 12:00 --end-time 15:45 --finetuned
-```
-
-Output: `inference/predict_<mode>_<source>[_finetuned]/predict_<date>_<HHMM>.png` per reference timestep, showing the three lead-time predictions on the same Romania-centred canvas with neighbour-country borders. Pass `--save-npy` to also dump the raw `(3, 768, 1536)` prediction canvases as `.npy`, and `--no-plot` to skip the PNGs when you only want the raw arrays. `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
-
-**When to use which**: [`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py) reads from the split CSVs so it can also render GT alongside predictions and rank timesteps by qualifying-patch count — use it for training-time diagnostics and post-hoc sanity checks on the test split. [`predict_full_domain.py`](predict_full_domain.py) skips all that so you can drop it on freshly downloaded observation data — use it for operational inference on a new date.
+For inference on a date the training pipeline has never seen — no split CSV, no extracted patches, no ranking by qualifying patch count — see the top-level [Inference](#inference) section.
 
 ### Utility Scripts
 
@@ -985,7 +922,7 @@ python our_data/satellite_data/inspect_mtg.py --raw --npy <path> --constants <pa
 
 Two changes were needed to align `reproject.py` with the new pipeline output:
 
-1. **Source grid reconstruction**: previously `reproject_satellite_mtg()` loaded the precomputed `coordinates/lat_{1,2}km.npy` / `lon_{1,2}km.npy` files written by the old pipeline. Those files no longer exist. The new code reads `our_data/satellite_data/MTG/mtg_constants.json`, builds a `pyproj.Proj(proj='geos', h=..., a=..., b=..., lon_0=..., sweep=...)` from the embedded projection parameters, and reconstructs 2-D source lat/lon arrays from `x_geos` / `y_geos` once per resolution. The KD-tree (`PrecomputedMapping`) caching strategy is unchanged.
+1. **Source grid reconstruction**: previously `reproject_satellite_mtg()` loaded the precomputed `coordinates/lat_{1,2}km.npy` / `lon_{1,2}km.npy` files written by the old pipeline. Those files no longer exist. The new code reads **_base_dir_**/satellite_data/MTG/mtg_constants.json, builds a `pyproj.Proj(proj='geos', h=..., a=..., b=..., lon_0=..., sweep=...)` from the embedded projection parameters, and reconstructs 2-D source lat/lon arrays from `x_geos` / `y_geos` once per resolution. The KD-tree (`PrecomputedMapping`) caching strategy is unchanged.
 2. **Input format**: MTG and lightning inputs are now `.npy` arrays (MTG written by `pipeline_msg_mtg.py`, lightning written by `read_kml_version2.py`). Radar and MSG (disabled) paths still use `.nc`. To get a CF-compliant `.nc` for GIS inspection from any reprojected `.npy`, see `inspect_mtg.py --reprojected` and `inspect_lightning.py`.
 
 The reproject output for MTG remains `.npy` on the Romania 1536×768 grid. Use `inspect_mtg.py --reprojected` to get a CF NetCDF for any single reprojected sample.
@@ -1003,7 +940,7 @@ Both products are listed in `product_cadences.config` as `opera_reflectivity = 1
 
 ##### Step 1 — Download (`pipeline_opera.py`)
 
-Connects to `claudiu@64.225.128.186` via SFTP and pulls files from `/eumetsatdata/opera-reflectivity/` and `/eumetsatdata/opera-rainfall-rate/`. Server-side dirs are already partitioned as `{YYYY}/{MM}/{DD}/`, so the local mirror reuses the same hierarchy under `our_data/opera_data/`. Per-product minute filters are read from `timestep_config.json`; the script skips files already present in the cache for resumability.
+Connects to `claudiu@64.225.128.186` via SFTP and pulls files from `/eumetsatdata/opera-reflectivity/` and `/eumetsatdata/opera-rainfall-rate/`. Server-side dirs are already partitioned as `{YYYY}/{MM}/{DD}/`, so the local mirror reuses the same hierarchy under **_base_dir_**/opera_data/. Per-product minute filters are read from `timestep_config.json`; the script skips files already present in the cache for resumability.
 
 ```bash
 # 1. Pick the training cadence (writes our_data/timestep_config.json)
@@ -1030,7 +967,7 @@ python our_data/opera_data/pipeline_opera.py \
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--cache_dir`, `-c` | Local OPERA root | `our_data/opera_data/` |
+| `--cache_dir`, `-c` | Local OPERA root | **_base_dir_**/opera_data/ |
 | `--products` | `opera_reflectivity`, `opera_rainfall_rate`, or both | both |
 | `--timesteps` | Override the per-product minute filter (one filter applied to all chosen products); `all` keeps every native timestep | per-product filter from `timestep_config.json` |
 | `--remote_host` | Override the SSH host | `64.225.128.186` |
@@ -1044,11 +981,7 @@ Only `.h5` files are transferred; OPERA-internal metadata or index files in the 
 - ISO (current EWC dump): `2026-05-11T000500Z-reflectivity-composite-opera.h5`
 - Compact (legacy / EUMETSAT): `T_PAAH21_C_LFPW_20250615120000.h5`, `composite_201801011500.h5`
 
-**Troubleshooting**
-
-- `cannot list /eumetsatdata/opera-reflectivity/...: [Errno 2] No such file` → the data is mounted under a different prefix. Try `--remote_base /home/eumetsatdata`.
-- `cannot list ...: Permission denied` → password auth is being rejected. Switch to `--ssh_key ~/.ssh/id_ed25519`.
-- Per-date `cannot list ...` messages with the right base path mean the remote dirs simply don't exist for those dates (incomplete archive). That's an upstream data gap, not a script issue.
+See the top-level [Troubleshooting](#troubleshooting) section for the common OPERA SFTP failure modes (auth, missing dates, alternate mount root).
 
 ##### Step 2 — Coverage report (`summarize_opera_data.py`)
 
@@ -1072,7 +1005,7 @@ The CSV has per-product `_files`, `_on_grid`, `_off_grid`, `_expected`, `_covera
 
 ##### Step 3 — Reproject to the Romania grid (via `reproject.py --opera`)
 
-OPERA reprojection lives inside the unified `reproject.py` (the old standalone `reproject_opera.py` was removed). Reads each `.h5` file's `/where` metadata, builds `pyproj.Proj(projdef)` source projection, projects via `pyresample` KD-tree onto the EPSG:31700 Stereo70 grid (1536×768), and saves one **`.npy` per file** under `our_data/reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/`. The KD-tree mapping is built **once per product** from the first file and reused across the rest. Day folders run in parallel via the shared `ThreadPoolExecutor`, same as the other product families.
+OPERA reprojection lives inside the unified `reproject.py` (the old standalone `reproject_opera.py` was removed). Reads each `.h5` file's `/where` metadata, builds `pyproj.Proj(projdef)` source projection, projects via `pyresample` KD-tree onto the EPSG:31700 Stereo70 grid (1536×768), and saves one **`.npy` per file** under **_base_dir_**/reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/. The KD-tree mapping is built **once per product** from the first file and reused across the rest. Day folders run in parallel via the shared `ThreadPoolExecutor`, same as the other product families.
 
 ```bash
 # Both OPERA products
@@ -1099,7 +1032,7 @@ To rebuild a CF-compliant NetCDF for inspection in Panoply / QGIS, point `inspec
 
 #### Timestep Selection (no interpolation)
 
-Both radar composites and MTG FCI data are acquired at native 10-minute cadence (:00, :10, :20, :30, :40, :50). The training cadence is chosen via [`validate_timestep.py`](#step-0--set-the-training-cadence) and stored in `our_data/timestep_config.json`; both `radar_arrange.py` and `pipeline_msg_mtg.py` read that config to decide which native minutes to keep. No optical flow interpolation is used.
+Both radar composites and MTG FCI data are acquired at native 10-minute cadence (:00, :10, :20, :30, :40, :50). The training cadence is chosen via [`validate_timestep.py`](#step-0--set-the-training-cadence) and stored in **_base_dir_**/timestep_config.json; both `radar_arrange.py` and `pipeline_msg_mtg.py` read that config to decide which native minutes to keep. No optical flow interpolation is used.
 
 For step = 15 min with 10-min sources, the script picks `{00, 10, 30, 40}` — the natives that minimise distance to each grid slot, breaking equidistant ties by preferring the minute closer to the hour boundary. This produces an alternating 10-20-10-20 spacing across the day:
 
@@ -1117,7 +1050,7 @@ Both scripts accept `--timesteps all` (keep every native timestep) or `--timeste
 
 These scripts organize raw data files into the COALITION-4 directory structure:
 
-Raw data is stored under `our_data/raw_data/` with the following layout:
+Raw data is stored under **_base_dir_**/raw_data/ with the following layout:
 
 ```
 our_data/raw_data/
@@ -1154,6 +1087,79 @@ python our_data/lightning_data/read_kml_version2.py --force
 ```
 
 The sequential lightning arrangement mode also generates a `lightning_filename_mapping.csv` at the target root mapping each original filename to its assigned date (with `source_kind` and `embedded_ts` columns so timestamped vs. numbered ordering decisions are auditable).
+
+## Inference
+
+Two entry points, chosen by what data you have on disk:
+
+- **[`predict_full_domain.py`](predict_full_domain.py)** — standalone inference on any date. Reads the reprojected full-domain fields directly (`reproject.py` output), slices all 18 patches on the fly at inference time, runs one batched `model.predict(...)`, and pastes the results onto a 768×1536 Romania canvas. **Does not** touch `patch_index.csv`, the per-source split CSVs, or the pre-extracted `.npy` patch tiles. Use this for operational inference on a date the training pipeline has never seen.
+- **[`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py)** — training-scope visualiser. Reads a per-source split CSV, ranks reference timesteps by qualifying-patch count, and renders GT vs Pred plus a zoom-in on the highest-activity patch. Use it for post-hoc sanity checks against the test split.
+
+Both scripts share the same rendering code (`plot_full_domain_predictions_only` lives in `visualize_gt_vs_pred.py` and is imported by `predict_full_domain.py`), so the prediction panels are pixel-identical between the two.
+
+### End-to-end recipe for a new date
+
+2026-06-30 example, step-aligned reference times every 15 minutes. Steps 1-5 fetch and reproject the raw inputs; steps 6-7 do inference.
+
+```bash
+# 1. MTG FCI download
+python our_data/satellite_data/pipeline_msg_mtg.py \
+    --start 2026/06/29-0000 --end 2026/06/30-2350 \
+    --password_file password.txt \
+    --products_file our_data/satellite_data/satellite_products.json
+
+# 2. OPERA composite download (--remote_base auto-fallback picks the
+#    right EWC mount root; no flag needed on first run)
+python our_data/opera_data/pipeline_opera.py \
+    -s 2026/06/29-0000 -e 2026/06/30-2350 \
+    --password_file password.txt
+
+# 3. Arrange LINET KMLs
+python our_data/raw_data/lightning_arrange.py \
+    -s our_data/raw_data/lightning \
+    --start-date 2026-06-29 --end-date 2026-06-30
+
+# 4. Rasterise LINET onto the Romania grid
+python our_data/lightning_data/read_kml_version2.py
+
+# 5. Reproject MTG + OPERA to EPSG:31700
+python reproject.py --all --workers 12
+
+# 6. Inference - OPERA multiclass (5-class rainfall)
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30
+
+# 7. Inference - Lightning binary occurrence (same input stack, different head)
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30
+```
+
+### Useful subsets of the inference CLI
+
+Once the raw data is on disk:
+
+```bash
+# One hour only (references 14:00, 14:15, 14:30, 14:45)
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30 --hour 14
+
+# One specific reference time
+python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    --date 2026-06-30 --time 14:30
+
+# Range mode with the Swin fine-tuned model
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30 \
+    --start-time 12:00 --end-time 15:45 --finetuned
+```
+
+### Output
+
+`inference/predict_<mode>_<source>[_finetuned]/predict_<date>_<HHMM>.png` per reference timestep, showing the three lead-time predictions (t+15, t+30, t+45) on the same Romania-centred canvas with neighbour-country borders.
+
+- `--save-npy` also dumps the raw `(3, 768, 1536)` prediction canvases as `.npy` next to each PNG.
+- `--no-plot` skips the PNGs when you only want the raw arrays.
+- `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
 
 ## Architecture Summary
 
@@ -1250,6 +1256,26 @@ All results are saved to `--output` (default `results/feature_importance/`):
 | `method_comparison.csv` | Grad-CAM + Xi vs SHAP side-by-side |
 | `method_correlations.csv` | Spearman + Pearson between methods |
 | `method_comparison.html` | Normalised bar chart comparing methods |
+
+## Troubleshooting
+
+Consolidated notes from failure modes we've actually hit. Each entry lists the symptom, the root cause, and the fix — commands that used to need a manual workaround have been patched to work on first run, so what's here is the residue that still requires human attention.
+
+### GPU / training runtime
+
+- **Windows fatal exception: access violation during training.** Mid-batch VRAM spikes past the block TensorFlow reserved on first use → null-pointer deref inside the CUDA runtime. `train_models.py` calls `configure_tf_runtime()` at start, which enables memory growth + disables XLA to keep the footprint predictable, so the failure now surfaces as a clean `ResourceExhaustedError` you can react to (lower `batch_size` in `[defaults]` or the per-mode override).
+- **Recovering from a crashed training run.** The per-epoch resumable checkpoint under `models/checkpoints/<run_tag>_latest.keras` (base) or `<run_tag>_finetune_latest.keras` (fine-tune) is the safety net. At most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two `--source` tracks have completely separate checkpoint paths so they never collide on the same disk.
+- **Fine-tune loss is NaN from the first few steps.** Historically two things dragged the loss to `NaN` under `mixed_float16`: the Swin head's pre-softmax `Q@Kᵀ` overflowing fp16 and the multiclass softmax saturating to a class probability of exactly 0. The build fixed both in place — `train_finetune()` now sets `global_clipnorm=1.0` on AdamW, and `build_finetune_model()` uses `CategoricalCrossentropy(label_smoothing=0.01)` for the radar branch. If you still see NaNs, verify the base checkpoint is finite (i.e. wasn't produced by an earlier crashed run) before blaming the fine-tune.
+
+### Data ingest
+
+- **`cannot list ...: Permission denied` on the OPERA SFTP.** Password auth is being rejected by the EWC VM. Switch to key auth: pass `--ssh_key ~/.ssh/id_ed25519` (or another key registered under `claudiu@` on the server).
+- **`cannot list ...` after the mount root has resolved.** The `--remote_base` auto-fallback picks the correct EWC mount, so seeing "no such file" per date at the *right* base means the remote dirs genuinely don't exist for those dates. Upstream OPERA archive gap; nothing to fix on our end. Ask the ANM data operators when the target range will land.
+- **Stale `patch_index.csv` after an `identify_patches.py --date <one>` test.** Older versions of `identify_patches.py` overwrote the master CSV with just the single date's rows on every `--date` run. The current version writes the master only when `--date` is *not* set, so a single-day `--plot` no longer clobbers the historical index. If you need to refresh the whole thing, re-run without `--date` (with `--start` / `--end` for a range).
+
+### Plotting / visualisation
+
+- **`Border src: hardcoded_coarse` in the startup banner of `visualize_gt_vs_pred.py` / `predict_full_domain.py` / `identify_patches.py --plot`.** `cartopy` isn't installed in this environment, so the script fell back to a coarse hardcoded Romania polygon (no neighbour borders). Install with `conda install -c conda-forge cartopy` and the banner will report `natural_earth_10m` instead — the pip wheels for cartopy's GEOS/PROJ deps are flaky on Windows, so conda is strongly preferred.
 
 ## References
 
