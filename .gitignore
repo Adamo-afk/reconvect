@@ -73,6 +73,11 @@ desktop.ini
 *.json
 *.html
 
+# Static assets that MUST be tracked (README banner, logos, ...) — allow
+# them back through despite the broad *.png / *.gif ignores above.
+!assets/
+!assets/**
+
 # Tracked config files (whitelist exceptions to *.json)
 !product_cadences.config
 
