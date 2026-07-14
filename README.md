@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/reconvect-logo.gif" alt="reconvect logo" width="480">
+</p>
+
 # COALITION-4 Nowcasting System — Romanian Adaptation
 
 Adaptation of the [COALITION-4](https://doi.org/10.1175/MWR-D-22-0084.1) deep learning nowcasting system (Leinonen et al., 2022, MeteoSwiss) for Romanian meteorological conditions. Developed at Romania's National Meteorological Administration (ANM) as part of the EUMETSAT Training Placement Scheme.
