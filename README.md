@@ -1197,6 +1197,52 @@ python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
 - `--no-plot` skips the PNGs when you only want the raw arrays.
 - `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
 
+## Validation
+
+[`validate_predictions.py`](validate_predictions.py) sweeps a (year, month) of OPERA rainfall samples and quantifies how well a trained model tracks convective events at each lead time. Two modes, chosen by the presence of `--date`:
+
+### Extraction (no `--date`)
+
+Iterates every OPERA `rainfall_rate` sample in the month, keeps the ones with **at least one pixel ≥ 10 mm/h** as the convective-event set, runs the model in-process for each, and computes two coverage metrics per (sample, lead time):
+
+- **`iou_mask`** — IoU of the binary ≥10 mm/h masks between GT and Pred. Structure-only.
+- **`class_wt`** — per-class weighted overlap macro-averaged across the 5 rainfall classes. Semantic-aware.
+
+Aggregate FAR / POD / CSI are computed per lead time on the binary ≥10 mm/h event across all selected samples.
+
+Emits three files under `validation/`:
+
+| File | Contents |
+|---|---|
+| `<track>_<year>_<month>_samples.csv` | One row per sample, columns for both metrics × each lead time. |
+| `<track>_<year>_<month>_summary.json` | Aggregate: total selected, count above 90% per lead × per metric, difference-in-percent, FAR/POD/CSI per lead, initial selection list, high-coverage lists. |
+| `<track>_<year>_<month>_metrics.png` | Left: grouped bars for FAR/POD/CSI per lead. Right: scatter of per-sample coverages (IoU vs per-class weighted, marker per lead time). |
+
+```bash
+python validate_predictions.py --track rainfall --year 2025 --month 5
+python validate_predictions.py --track rainfall --year 2025 --month 5 --finetuned
+```
+
+### Visualization (`--date` given)
+
+Reads the JSON produced by an earlier extraction and, for **every reference on that date** that was selected, writes three figures (one per lead time). Each figure has two panels:
+
+- **Left**: structure overlay — red pixels where GT class == Pred class AND both are ≥ 10 mm/h. The percentage of GT-active pixels matched is in the panel title.
+- **Right**: 256×256 zoom into the patch (out of 18) with the most GT-active pixels. Matched pixels red, GT-only pixels blue (misses), Pred-only pixels orange (false alarms).
+
+Title colour: **green** if the date cleared the 90% coverage threshold for that lead time / metric; **orange** if the date is in the initial selection but did not clear 90%; raises `SystemExit` if the date is not in the initial selection at all.
+
+```bash
+python validate_predictions.py --track rainfall --year 2025 --month 5 --date 2025-05-14
+```
+
+Output: `validation/<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` per (reference, lead time). If a date has 8 selected references, that's 8 × 3 = 24 figures.
+
+### Notes
+
+- The `--track lightning` variant is not yet implemented — the current script only wires up `rainfall`. The lightning branch will follow the same skeleton but with a binary-occurrence GT.
+- The model, source, and finetuned toggle default to `mtg_lightning_opera` / `dbscan` / base; override with `--mode`, `--source`, `--finetuned` if needed.
+
 ## Architecture Summary
 
 The model uses a multi-branch encoder with resolution-specific input streams:
