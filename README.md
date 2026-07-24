@@ -1094,6 +1094,14 @@ our_data/raw_data/
 └── lightning/*.kml
 ```
 
+LINET KMLs are fetched from the LinetView HTTP export endpoint by [`our_data/lightning_data/linet_export.py`](our_data/lightning_data/linet_export.py) — it replaces the manual UI workflow (Historic → date → *Statistics and Data Export* → *Export Stroke data of rectangle* → draw box) with direct GETs to `/export/lightning.export`. Credentials come from the `LINET_USER` / `LINET_PASS` env vars (a POST to `/functions/doLogin.function` yields an `LVSESSION` cookie that `requests.Session` re-uses across the batch). Coordinates in the exported KMLs are in EPSG:4326 (WGS84 lat/lon); the Romania grid transform happens inside [`read_kml_version2.py`](our_data/lightning_data/read_kml_version2.py) via `GridProjection.__call__(lon, lat)`, so no pre-reprojection is needed on the arrange side. The default bbox is Romania + margin (`20.0 43.5 30.0 48.5`); the day is chunked into continuous 24 h windows unless `--daily-window HH:MM HH:MM` restricts each day to a slice.
+
+```bash
+set LINET_USER=...
+set LINET_PASS=...
+python our_data/lightning_data/linet_export.py --start 2026-06-01 --end 2026-07-01 --format kml --out linet_kml_june2026
+```
+
 Run all arrange scripts from the project root:
 
 ```bash
@@ -1135,7 +1143,7 @@ Both scripts share the same rendering code (`plot_full_domain_predictions_only` 
 
 ### End-to-end recipe for a new date
 
-2026-06-30 example, step-aligned reference times every 15 minutes. Steps 1-5 fetch and reproject the raw inputs; steps 6-7 do inference.
+2026-06-30 example, step-aligned reference times every 15 minutes. Steps 1-6 fetch and reproject the raw inputs; steps 7-8 do inference.
 
 ```bash
 # 1. MTG FCI download
@@ -1150,22 +1158,28 @@ python our_data/opera_data/pipeline_opera.py \
     -s 2026/06/29-0000 -e 2026/06/30-2350 \
     --password_file password.txt
 
-# 3. Arrange LINET KMLs
+# 3. Download LINET KMLs (Romania + margin, one KML per 24 h window)
+#    Credentials must be in the LINET_USER / LINET_PASS env vars first.
+python our_data/lightning_data/linet_export.py \
+    --start 2026-06-29 --end 2026-07-01 --format kml \
+    --out our_data/raw_data/lightning
+
+# 4. Arrange LINET KMLs
 python our_data/raw_data/lightning_arrange.py \
     -s our_data/raw_data/lightning \
     --start-date 2026-06-29 --end-date 2026-06-30
 
-# 4. Rasterise LINET onto the Romania grid
+# 5. Rasterise LINET onto the Romania grid
 python our_data/lightning_data/read_kml_version2.py
 
-# 5. Reproject MTG + OPERA to EPSG:31700
+# 6. Reproject MTG + OPERA to EPSG:31700
 python reproject.py --all --workers 12
 
-# 6. Inference - OPERA multiclass (5-class rainfall)
+# 7. Inference - OPERA multiclass (5-class rainfall)
 python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
     --date 2026-06-30
 
-# 7. Inference - Lightning binary occurrence (same input stack, different head)
+# 8. Inference - Lightning binary occurrence (same input stack, different head)
 python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
     --source dbscan --date 2026-06-30
 ```
