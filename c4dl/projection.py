@@ -147,6 +147,44 @@ romania_grid_area = {
     "area_extent": (-177324, 77148, 1331353, 723370)
 }
 
+
+def grid_extent_lonlat_bbox(area_def, densify_pts=21):
+    """Return the tight WGS84 bbox (lon_min, lat_min, lon_max, lat_max) that
+    encloses a projected area extent.
+
+    Delegates to pyproj.Transformer.transform_bounds, which places
+    `densify_pts` samples along each of the 4 edges of the projected
+    rectangle (4 * densify_pts around the perimeter) and takes the outer
+    envelope of their unprojected (lon, lat). Corner-only unprojection
+    under-covers whenever the projection is not affine — for Romania at
+    Stereo70 the top edge bulges ~0.35 deg north of either top corner, so
+    the true northernmost latitude of the grid is not at a corner but
+    somewhere along the middle of the top edge.
+
+    21 samples per edge is what pyproj itself defaults to and is
+    sub-metre-accurate along a 1500 km edge at mid-latitudes.
+
+    `area_def` may be an AreaDefinition, a dict in the form used in this
+    module (with `projection` and `area_extent` keys), or one of the
+    forms accepted by known_area.
+    """
+    area = parse_area(area_def)
+    x_min, y_min, x_max, y_max = area.area_extent
+    transformer = pyproj.Transformer.from_crs(
+        area.crs, "EPSG:4326", always_xy=True,
+    )
+    return transformer.transform_bounds(
+        x_min, y_min, x_max, y_max, densify_pts=densify_pts,
+    )
+
+
+# Precomputed at import: the Romania grid's densified WGS84 envelope.
+# Anything that needs a lat/lon bbox matching the Romania grid (currently
+# our_data/lightning_data/linet_export.py) should import this constant
+# instead of hardcoding numbers, so a change to romania_grid_area
+# propagates through the whole pipeline automatically.
+ROMANIA_GRID_LONLAT_BBOX = grid_extent_lonlat_bbox(romania_grid_area)
+
 def geostationary_area(
         *, area_id, description, a, b, lon_0, h,
         nrow, ncol, coff, cfac, loff, lfac  

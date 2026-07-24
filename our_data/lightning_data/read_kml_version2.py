@@ -263,6 +263,62 @@ def grid_accumulate(i, j, grid=None, weights=None, weighted_grid=None):
         np.add.at(weighted_grid, (i[valid_mask], j[valid_mask]), weights[valid_mask])
 
 
+def filter_to_grid_extent(lightning_df, grid_projection):
+    """Split the day's strokes into (inside, outside) w.r.t. the Romania grid.
+
+    A stroke's projected pixel index does not depend on the time bin, so the
+    same in-vs-out decision applies to every downstream call to
+    grid_accumulate. Doing the filter once at the day level lets us report
+    which strokes never contributed to any map (grid_accumulate's internal
+    valid_mask would drop them silently otherwise) and speeds up the per-bin
+    loop a little because np.add.at no longer has to reject them.
+
+    Returns (inside_df, outside_df) — both preserve the original column order
+    and reset their index so the caller can iterate without .loc surprises.
+    """
+    if len(lightning_df) == 0:
+        return lightning_df, lightning_df
+    (i, j) = grid_projection(lightning_df["lon"].values, lightning_df["lat"].values)
+    H = grid_projection.area.height
+    W = grid_projection.area.width
+    valid = (i >= 0) & (j >= 0) & (i < H) & (j < W)
+    inside = lightning_df[valid].reset_index(drop=True)
+    outside = lightning_df[~valid].reset_index(drop=True)
+    return inside, outside
+
+
+def write_filtered_out_report(output_root, date_str, grid_projection,
+                              inside_df, outside_df):
+    """Write the per-day JSON audit of strokes that fell outside the grid.
+
+    Path: {output_root}/lightning_filtered_out_{date_str}.json
+    Contents: totals + every dropped stroke's (lat, lon) in EPSG:4326.
+    """
+    output_root = Path(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+    report = {
+        "date": date_str,
+        "grid_extent_epsg31700": list(grid_projection.area.area_extent),
+        "grid_size_pixels": [
+            int(grid_projection.area.height),
+            int(grid_projection.area.width),
+        ],
+        "total_strokes": int(len(inside_df) + len(outside_df)),
+        "kept_strokes": int(len(inside_df)),
+        "filtered_out_strokes": int(len(outside_df)),
+        "filtered_out": [
+            {"lat": float(lat), "lon": float(lon)}
+            for lat, lon in zip(
+                outside_df["lat"].values, outside_df["lon"].values
+            )
+        ],
+    }
+    report_path = output_root / f"lightning_filtered_out_{date_str}.json"
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+    return report_path, report
+
+
 def lightning_for_window(lightning_df, start_time, end_time):
     """Extract lightning rows whose timestamp falls in [start_time, end_time)."""
     mask = (
@@ -646,6 +702,23 @@ def process_single_date(kml_path, date_str, output_root, force=False):
 
     # Create grid projection
     grid_projection = GridProjection(romania_grid_area)
+
+    # Drop strokes whose projected pixel index falls outside the Romania
+    # grid. grid_accumulate would silently mask them anyway; doing it once
+    # here lets us emit an audit JSON with the dropped lat/lon so the user
+    # can tell how much a wider LINET bbox is spilling past the grid edge.
+    inside_df, outside_df = filter_to_grid_extent(lightning_df, grid_projection)
+    report_path, report = write_filtered_out_report(
+        output_root, date_str, grid_projection, inside_df, outside_df
+    )
+    print(f"  Strokes inside  grid: {report['kept_strokes']}")
+    print(f"  Strokes outside grid: {report['filtered_out_strokes']} "
+          f"(audit: {report_path.name})")
+    lightning_df = inside_df
+    if len(lightning_df) == 0:
+        print(f"  WARNING: no in-grid strokes for {date_str}, "
+              f"skipping map generation")
+        return
 
     # Generate filter-aligned time grid (or fixed-cadence fallback when
     # products.lightning.filter is null). Each timestamp comes paired

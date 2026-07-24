@@ -18,12 +18,24 @@ Usage:
 
 import argparse
 import os
+import sys
 import time
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+# Make the project root importable when the script is launched with its
+# full path from anywhere (e.g. `python our_data/lightning_data/linet_export.py`
+# from the project root, or via an absolute path from a sibling directory).
+# We need `c4dl.projection` reachable so DEFAULT_BBOX can auto-track the
+# Romania grid extent rather than hardcoding lat/lon numbers.
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from c4dl.projection import ROMANIA_GRID_LONLAT_BBOX
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("linet_export")
@@ -38,8 +50,13 @@ EXPORT_PATH = "/export/lightning.export"
 USERNAME = os.environ.get("LINET_USER", "")
 PASSWORD = os.environ.get("LINET_PASS", "")
 
-# Defaults (all overridable from the CLI). Bbox is EPSG:4326: Romania + margin.
-DEFAULT_BBOX = (20.0, 43.5, 30.0, 48.5)  # min_lon min_lat max_lon max_lat
+# Default bbox auto-derived from the Romania grid: the densified WGS84
+# envelope of romania_grid_area["area_extent"] (see c4dl.projection.
+# grid_extent_lonlat_bbox). Any future change to the grid definition
+# propagates to the LINET download automatically, and the bbox always
+# covers the full grid — no strip along any edge gets silently cropped
+# at the server side.
+DEFAULT_BBOX = ROMANIA_GRID_LONLAT_BBOX  # (min_lon, min_lat, max_lon, max_lat)
 DEFAULT_FORMAT = "txt"
 DEFAULT_OUT = "linet_exports"
 REQUEST_TIMEOUT = 300          # export of an active day can be slow
@@ -171,7 +188,9 @@ def parse_args() -> argparse.Namespace:
                    help="end of period, UTC, exclusive")
     p.add_argument("--bbox", nargs=4, type=float, default=list(DEFAULT_BBOX),
                    metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
-                   help="rectangle in EPSG:4326 (default: Romania + margin)")
+                   help="rectangle in EPSG:4326 (default: densified WGS84 "
+                        "envelope of the Romania grid, computed from "
+                        "c4dl.projection.romania_grid_area)")
     p.add_argument("--format", choices=["txt", "kml", "asc"], default=DEFAULT_FORMAT,
                    help="asc = stroke density raster instead of point list")
     p.add_argument("--lightning-type", type=int, choices=[0, 1, 2], default=0,
