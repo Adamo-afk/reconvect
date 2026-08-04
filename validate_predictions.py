@@ -29,8 +29,12 @@ Validation branch for two tracks selectable via --track:
   LIGHTNING (Hann-blended overlap + hysteresis, per-lead threshold tuning)
   -----------------------------------------------------------------------
   EXTRACTION MODE (no --date):
-    - Scan every LINET occurrence .npy in (year, month); keep samples
-      with >= --min_active_pixels active GT pixels.
+    - OPERA-driven sample selection (>=10 mm/h anywhere on the canvas at
+      the reference timestep), SAME list as the rainfall track. This is a
+      parity choice: identical selected references let coupling analysis
+      and cross-track comparison line up cleanly. select_samples_lightning
+      (LINET-driven, >=1 active pixel) remains available as a Python
+      helper if a LINET-only cut is ever needed.
     - Run Hann-blended overlapping inference (default stride 128 -> 55
       patches, weights = 2-D Hann window). Yields a smooth probability
       canvas per lead, seam-free vs the non-overlapping paste path.
@@ -874,13 +878,14 @@ def _write_json_lightning(
     best_high_per_lead: dict[int, float],
     low_threshold: float,
     step_minutes: int,
-    min_active_pixels: int,
     path: Path,
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
     tuned per-lead high thresholds. `tuning_scores` is the full grid so
-    the choice can be re-audited later."""
+    the choice can be re-audited later. Selection is OPERA-driven (>=10
+    mm/h) - the field `selection_criterion` in the JSON documents that,
+    matching the rainfall track for cross-track coupling analysis."""
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
     total = len(rows)
     above = {lt: {"iou": 0} for lt in lead_titles}
@@ -921,7 +926,11 @@ def _write_json_lightning(
         "track": "lightning",
         "year": year,
         "month": month,
-        "min_active_pixels_for_selection": min_active_pixels,
+        "selection_criterion": (
+            f"OPERA-driven: >= {RAINFALL_THRESHOLD_MMH:g} mm/h anywhere on the "
+            f"768x1536 canvas at the reference timestep (shared with the "
+            f"rainfall track for parity)"
+        ),
         "high_coverage_threshold_pct": HIGH_COVERAGE_PCT,
         "total_selected_samples": total,
         "initial_selection": [[d, h] for d, h in selected],
@@ -1018,7 +1027,6 @@ def run_extraction_lightning(
     stride: int = DEFAULT_STRIDE,
     low_threshold: float = LIGHTNING_LOW_THRESHOLD,
     high_grid: tuple[float, ...] = LIGHTNING_HIGH_GRID,
-    min_active_pixels: int = LIGHTNING_MIN_ACTIVE_PIXELS,
     batch_size: int = 32,
 ):
     """Extraction mode for the lightning track. Two-phase:
@@ -1028,6 +1036,13 @@ def run_extraction_lightning(
     Phase 2 - pick the high that maximises aggregate CSI PER LEAD, then
     derive per-sample IoU/FAR/POD/CSI at that chosen high from the
     already-stored per-(sample, high, lead) confusions. No re-inference.
+
+    Sample selection is OPERA-driven (>=10 mm/h) via select_samples, the
+    SAME criterion the rainfall track uses. This is a deliberate parity
+    choice from the spec: coupling analysis + cross-track comparison land
+    on the same reference set. select_samples_lightning (LINET-driven,
+    >=1 active pixel) remains available for anyone who deliberately
+    wants a LINET-only cut, but is not the default.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1038,6 +1053,8 @@ def run_extraction_lightning(
     print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
     print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
           f"high grid={list(high_grid)}")
+    print(f"  Sample selection: OPERA-driven (>= {RAINFALL_THRESHOLD_MMH:g} mm/h) "
+          f"- shared with rainfall track for parity")
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
@@ -1052,10 +1069,8 @@ def run_extraction_lightning(
         )
     step_minutes = _load_step_minutes(data_root)
 
-    print(f"\nSelecting LINET samples with >= {min_active_pixels} active pixel(s) ...")
-    selected = select_samples_lightning(
-        data_root, year, month, min_active_pixels=min_active_pixels,
-    )
+    print(f"\nSelecting samples via OPERA (>= {RAINFALL_THRESHOLD_MMH:g} mm/h) ...")
+    selected = select_samples(data_root, year, month)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -1168,7 +1183,6 @@ def run_extraction_lightning(
         year, month, selected, rows,
         aggregate_confusion_per_lead, tuning_scores,
         best_high_per_lead, low_threshold, step_minutes,
-        min_active_pixels,
         output_dir / f"{stem}_summary.json",
     )
     _plot_metrics_figure_lightning(
@@ -1271,18 +1285,19 @@ def run_visualization_lightning(
                 _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
             )
 
-        # Colour marker logged alongside the save: green if the date
-        # cleared 90% IoU on any lead, orange if only in the initial
-        # selection. (The saved figure's suptitle is coloured by the
-        # renderer's default; we log the colour intent here rather than
-        # re-open + re-save the figure just to recolour a title string.)
+        # 90% coverage title colour, matching the rainfall track:
+        #   green  = this date cleared >=90% IoU on AT LEAST ONE lead
+        #            (post-processed binary vs GT binary; see the note
+        #            about lightning's post-processing step turning
+        #            surviving pixels into 1s)
+        #   orange = this date is in the initial selection but no lead
+        #            cleared 90%
         any_high = any(
             _date_is_in(date_str,
                         summary["high_coverage_samples_per_lead"][lt]["iou"])
             for lt in lead_titles
         )
-        marker = ("green (>= 90% IoU on some lead)" if any_high
-                  else "orange (in selection only, no lead cleared 90%)")
+        suptitle_color = _colour_for_title(True, any_high)
 
         safe_ref = ref_utc.replace(":", "")
         out_png = output_dir / f"{stem}_{date_str}_{safe_ref}.png"
@@ -1293,7 +1308,10 @@ def run_visualization_lightning(
             low=low_threshold, high_per_lead=high_per_lead,
             output_path=out_png,
             suptitle_prefix=f"Validation lightning ({date_str} ref={ref_utc})",
+            suptitle_color=suptitle_color,
         )
+        marker = ("green (>= 90% IoU on some lead)" if any_high
+                  else "orange (in selection only, no lead cleared 90%)")
         print(f"  Saved -> {out_png.name}  [{marker}]")
 
 
@@ -1340,11 +1358,10 @@ def main() -> int:
                         default=LIGHTNING_LOW_THRESHOLD,
                         help="Hysteresis LOW threshold (lightning). "
                              f"Default {LIGHTNING_LOW_THRESHOLD}.")
-    parser.add_argument("--min_active_pixels", type=int,
-                        default=LIGHTNING_MIN_ACTIVE_PIXELS,
-                        help="Minimum active GT pixels for a LINET file to "
-                             "be selected (lightning extraction only). "
-                             f"Default {LIGHTNING_MIN_ACTIVE_PIXELS}.")
+    # NOTE: --min_active_pixels was removed - lightning selection is now
+    # OPERA-driven for parity with the rainfall track. select_samples_lightning
+    # (LINET-driven, >=1 active pixel) remains callable from Python for anyone
+    # who deliberately wants a LINET-only cut.
     parser.add_argument("--batch_size", type=int, default=32,
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
@@ -1383,7 +1400,6 @@ def main() -> int:
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.low_threshold,
-                min_active_pixels=args.min_active_pixels,
                 batch_size=args.batch_size,
             )
         else:

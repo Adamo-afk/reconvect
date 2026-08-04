@@ -445,6 +445,7 @@ def _plot_lightning_2x3(
     high_per_lead: dict[int, float],
     output_path: Path,
     suptitle_prefix: str = "Lightning inference",
+    suptitle_color: str = "black",
 ) -> None:
     """Render the 2x3 lightning figure and save it to `output_path`.
 
@@ -544,7 +545,7 @@ def _plot_lightning_2x3(
 
     fig.suptitle(
         f"{suptitle_prefix}  |  {date_str}  ref={ref_utc}",
-        fontsize=14, fontweight="bold",
+        fontsize=14, fontweight="bold", color=suptitle_color,
     )
     fig.savefig(output_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
