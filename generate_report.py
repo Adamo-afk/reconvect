@@ -265,6 +265,10 @@ def _print_loaded(loaded: dict) -> None:
 # to *observe* them.
 
 RAINFALL_THRESHOLD_MMH = 10.0        # matches validate_predictions.RAINFALL_THRESHOLD_MMH
+MIN_CELL_SIZE_PIXELS = 10             # ignore coupled cells smaller than this
+                                       # (1-2 px specks would balloon the FACTS
+                                       # block with noise, and are visually
+                                       # invisible in the coupling PNG anyway)
 
 CARDINAL_LABELS = (
     "north", "north-east", "east", "south-east",
@@ -369,6 +373,61 @@ def _load_lightning_field(data_root: Path, day: str, hhmm: str):
     return (field > 0).astype(np.int8)
 
 
+def _extract_coupled_cell_metadata(
+    coupled_mask, rain_field, light_mask, gp,
+    centre_lat: float, centre_lon: float,
+    min_size_pixels: int = MIN_CELL_SIZE_PIXELS,
+) -> list[dict]:
+    """Run 8-connected labelling on the coupled mask, drop specks under
+    `min_size_pixels`, return per-cell metadata (biggest cell first).
+
+    Each cell dict has:
+        bounding_box_pixels:      (row_min, row_max, col_min, col_max)
+        size_pixels:              int (component area)
+        centroid_lat_lon:         (lat, lon)
+        centroid_cardinal:        N/NE/E/SE/S/SW/W/NW relative to grid centre
+        peak_mmh_inside:          max mm/h inside this component
+        lightning_active_inside:  active lightning pixels inside this component
+
+    This is what replaces the coupling-mask VISION call: Gemma gets a
+    text description of every coupled cell rather than reading the PNG.
+    """
+    import numpy as np
+    from scipy.ndimage import label as _cc_label
+    if not coupled_mask.any():
+        return []
+    structure_8conn = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=bool)
+    labelled, n_components = _cc_label(coupled_mask, structure=structure_8conn)
+    cells: list[dict] = []
+    for label_id in range(1, n_components + 1):
+        component_mask = (labelled == label_id)
+        size = int(component_mask.sum())
+        if size < min_size_pixels:
+            continue
+        rows, cols = np.where(component_mask)
+        row_min, row_max = int(rows.min()), int(rows.max())
+        col_min, col_max = int(cols.min()), int(cols.max())
+        row_c = float(rows.mean()); col_c = float(cols.mean())
+        lon_arr, lat_arr = gp.inverse(
+            np.atleast_1d(row_c), np.atleast_1d(col_c),
+        )
+        centroid_lat = float(lat_arr[0]); centroid_lon = float(lon_arr[0])
+        cardinal = _cardinal_from_latlon(
+            centroid_lat, centroid_lon, centre_lat, centre_lon,
+        )
+        cells.append({
+            "bounding_box_pixels":     (row_min, row_max, col_min, col_max),
+            "size_pixels":             size,
+            "centroid_lat_lon":        (centroid_lat, centroid_lon),
+            "centroid_cardinal":       cardinal,
+            "peak_mmh_inside":         float(rain_field[component_mask].max()),
+            "lightning_active_inside": int(light_mask[component_mask].sum()),
+        })
+    # Largest cell first - Gemma tends to weight the first item in a list.
+    cells.sort(key=lambda c: c["size_pixels"], reverse=True)
+    return cells
+
+
 def compute_facts_for_reference(
     date_str: str, ref_utc: str, lead_minutes_list: list[int],
     data_root: Path, gp, centre_lat_lon: tuple[float, float],
@@ -451,18 +510,26 @@ def compute_facts_for_reference(
                 ),
             }
 
-        # ---- coupling numeric hooks (visual interpretation is Gemma's) ---
+        # ---- coupling numeric hooks + per-cell metadata -----------------
+        # The per-cell metadata lets us drop the vision call for prompt C:
+        # Gemma reads the per-cell dict list instead of looking at the
+        # coupling-mask PNG. The PNG is still rendered by the report - it
+        # ends up embedded in the PDF as a decoration for the human reader.
         coupling: dict | None = None
         if rain_field is not None and light_field is not None:
             mask_rain = rain_field >= RAINFALL_THRESHOLD_MMH
             mask_light = light_field > 0
-            n_rain = int(mask_rain.sum())
             n_light = int(mask_light.sum())
             inter = mask_rain & mask_light
             n_coupled = int(inter.sum())
             n_rain_only = int(mask_rain.sum() - n_coupled)
             n_light_only = int(mask_light.sum() - n_coupled)
             coupled_centroid = _mask_centroid_latlon(inter, gp)
+            coupled_cells = _extract_coupled_cell_metadata(
+                inter, rain_field, mask_light, gp,
+                centre_lat, centre_lon,
+                min_size_pixels=MIN_CELL_SIZE_PIXELS,
+            )
             coupling = {
                 "n_pixels_rain_only":        n_rain_only,
                 "n_pixels_lightning_only":   n_light_only,
@@ -478,6 +545,10 @@ def compute_facts_for_reference(
                                           centre_lat, centre_lon)
                     if coupled_centroid is not None else None
                 ),
+                # NEW: list of per-cell dicts, biggest cell first, cells
+                # smaller than MIN_CELL_SIZE_PIXELS dropped. Empty list when
+                # no coupled component survives the size cut.
+                "coupled_cells": coupled_cells,
             }
 
         out[lead_min] = {
@@ -639,8 +710,13 @@ def build_facts_index(
     lightning_available = "lightning" in per_track_loaded
     lead_minutes = [step_minutes, 2 * step_minutes, 3 * step_minutes]
 
+    # Union the selections across whichever tracks are loaded. Under the
+    # OPERA-driven parity convention (both tracks share select_samples)
+    # this union == either track's initial_selection; the loop preserves
+    # correctness if someone runs with just one track loaded, or if a
+    # legacy summary from before the parity fix produces a diverging list.
     ref_set: set[tuple[str, str]] = set()
-    for track, loaded in per_track_loaded.items():
+    for loaded in per_track_loaded.values():
         for entry in loaded["summary"].get("initial_selection", []):
             date_str, hhmm = entry[0], entry[1]
             # summary stores HHMM (no colon); normalise to HH:MM for facts.
@@ -841,11 +917,9 @@ You are a meteorological analyst writing for other meteorologists who \
 have never seen the internal model or code behind this nowcasting \
 system. Your job is to interpret validation metrics and event snapshots \
 using ONLY the numbers explicitly provided in the FACTS block of the \
-user message. Do NOT invent values, do NOT infer numbers from the \
-attached image, do NOT read off pixel coordinates. If an image is \
-attached, use it ONLY to interpret the presence and spatial arrangement \
-of the coloured regions described in the image legend; every numeric \
-value in your output must come from FACTS.
+user message. Do NOT invent values, do NOT infer numbers not in FACTS. \
+Every claim in your output must be traceable to a specific value in \
+FACTS.
 
 General rules:
 - On first mention every metric carries its unit or scale:
@@ -859,19 +933,19 @@ General rules:
   lead time.
 - Locate affected zones by the cardinal labels supplied in FACTS \
   (north / north-east / east / south-east / south / south-west / west / \
-  north-west). Never derive cardinal position from the image.
-- If the coupling-mask image shows RED regions (both rainfall >=10 mm/h \
-  AND active lightning in the same cell), use the paired phrasing: \
-  "precipitation of X mm/h paired with Y% of the lightning strokes \
-  inside the same convective cell, in the <cardinal> of Romania" - \
-  filling X, Y and <cardinal> from FACTS (peak_mmh_in_coupled_cells, \
-  lightning_pct_in_coupled, coupled_centroid_cardinal). If NO red \
-  regions are visible, describe rainfall and lightning as SEPARATE \
-  observations (their own cardinal positions, their own peaks, their \
-  own evolutions across the three lead times).
-- Concise and professional wording. No "we", no "our model". \
-  Two to four sentences per \
-  requested block unless the user asks for more.
+  north-west). Never guess cardinal position.
+- If FACTS lists coupled_cells with one or more entries (rainfall \
+  >=10 mm/h AND active lightning inside the same connected component, \
+  each cell >= 10 pixels), use the paired phrasing: "precipitation of \
+  X mm/h paired with Y% of the lightning strokes inside the same \
+  convective cell, in the <cardinal> of Romania" - filling X from the \
+  cell's peak_mmh_inside, Y from lightning_pct_in_coupled, and \
+  <cardinal> from that cell's centroid_cardinal. If coupled_cells is \
+  empty, describe rainfall and lightning as SEPARATE observations \
+  (their own cardinal positions, their own peaks, their own \
+  evolutions across the three lead times).
+- Concise and professional wording. No "we", no "our model". Two to \
+  four sentences per requested block unless the user asks for more.
 """
 
 # ----- Prompt A - Executive summary (text-only) -----------------------------
@@ -883,9 +957,10 @@ FACTS (source of truth for every number below):
 {facts_block}
 
 Structure:
-1. One paragraph naming the period, the number of selected samples per \
-   track, and each track's selection criterion (precipitation >=10 mm/h \
-   for the rainfall track; >=1 active LINET pixel for the lightning track).
+1. One paragraph naming the period, the number of selected samples \
+   (identical across both tracks - selection is shared, OPERA-driven, \
+   at precipitation >=10 mm/h anywhere on the canvas at the reference \
+   timestep).
 2. One paragraph reporting per-lead FAR / POD / CSI for each track \
    across t+15, t+30, t+45. Frame it as "start value -> end value" with \
    the extremum highlighted, and comment on whether skill degrades with \
@@ -918,44 +993,59 @@ Requirements:
   unusual value for this lead.
 """
 
-# ----- Prompt C - Per-reference figure caption (VISION, one call per ref) ---
+# ----- Prompt C - Per-reference event caption (TEXT-ONLY, one call per ref)
+# NOTE: this used to be a vision call over the coupling-mask PNG. It is
+# now purely text-based: the FACTS block carries a per-cell
+# `coupled_cells` list (bounding box, centroid cardinal, size in pixels,
+# peak mm/h inside, active lightning inside) produced by scipy.ndimage.
+# label with a >= 10-pixel filter, which is what Gemma reads to decide
+# whether coupling is meteorologically meaningful. The PNG is still
+# rendered and embedded in the PDF for the human reader; Gemma doesn't
+# see it. Rationale: vision head hallucinates on scientific charts;
+# text is deterministic, cheaper, and lets us apply a hard minimum-cell-
+# size cut so single-pixel specks don't drive prose.
 PROMPT_FIGURE_CAPTION_EN = """\
-Write a meteorological caption (4-6 sentences) for the attached \
-COUPLING-MASK figure for date {date_str}, reference time {ref_utc} UTC. \
-The figure has three panels, one per lead time (t+15, t+30, t+45 min); \
-in each panel the colours mean:
-  * BLUE   = rainfall >=10 mm/h ONLY (no lightning in the same cell)
-  * ORANGE = active lightning ONLY  (no rainfall >=10 mm/h in that cell)
-  * RED    = coupled cells (both rainfall >=10 mm/h AND active lightning)
-  * grey   = neither, or GT unavailable for that lead
+Write a meteorological caption (4-6 sentences) for date {date_str}, \
+reference time {ref_utc} UTC, describing the convective event across \
+the three lead times (t+15, t+30, t+45 minutes).
 
 FACTS (source of truth for every number you cite):
 {facts_block}
 
-Coupling rule (this is important):
-- If a lead's panel shows RED regions of visible size, use the coupled \
-  phrasing: "precipitation of X mm/h paired with Y% of the lightning \
-  strokes inside the same convective cell, in the <cardinal> of \
-  Romania". Fill X from FACTS.per_lead[<lead>].coupling.peak_mmh_in_coupled_cells; \
-  Y from FACTS.per_lead[<lead>].coupling.lightning_pct_in_coupled; \
-  <cardinal> from FACTS.per_lead[<lead>].coupling.coupled_centroid_cardinal.
-- If a lead's panel shows only BLUE and ORANGE with no significant RED, \
-  describe rainfall and lightning as SEPARATE observations for that lead, \
-  each with its own peak / active-pixel count / cardinal position.
-- If a lead's panel is mostly grey, note that GT is unavailable at that \
-  lead and skip numeric claims for it.
+Coupling rule (this is important - it lives in FACTS, not an image):
+- Each lead's coupling.coupled_cells list contains ONE ENTRY PER \
+  coupled convective cell (rainfall >=10 mm/h AND active lightning \
+  inside the same 8-connected component, minimum 10 pixels per cell). \
+  If the list is non-empty for that lead, describe the biggest cell \
+  first using the paired phrasing: "precipitation of X mm/h paired \
+  with Y% of the lightning strokes inside the same convective cell, \
+  in the <cardinal> of Romania". Fill X from that cell's \
+  peak_mmh_inside; Y from lightning_pct_in_coupled (percentage of \
+  ALL active lightning in the whole canvas that fell inside the \
+  coupled region for that lead); <cardinal> from that cell's \
+  centroid_cardinal. When multiple cells are listed, briefly note \
+  their count and cardinal spread.
+- If coupled_cells is EMPTY for a lead but rainfall or lightning has \
+  activity, describe them as SEPARATE observations for that lead \
+  (rainfall's own peak_mmh + cardinal + n_pixels_ge10, lightning's \
+  own n_active_pixels + cardinal). Never fabricate a coupling that \
+  isn't in FACTS.
+- If a lead's rainfall AND lightning are both null, note that GT is \
+  unavailable at that lead and skip numeric claims for it.
 
 Structure:
 1. One opening sentence naming the event, the dominant cardinal zone \
-   (use FACTS.per_lead[<earliest lead with activity>] to pick one), \
-   and whether the panels indicate a coupled convective system.
+   at the earliest lead with activity, and whether the FACTS coupled_cells \
+   list indicates a coupled convective system at that lead.
 2. Two to three sentences tracking the evolution across t+15 -> t+45: \
    name the start value, the end value, and the extremum (min or max) \
    across the interval for whichever quantity matters most \
-   (peak_mmh, n_pixels_ge10, or n_active_pixels).
+   (peak_mmh_inside for coupled cells, or peak_mmh / n_active_pixels for \
+   the separate-observations case).
 3. One closing sentence noting whether the coupling pattern strengthens, \
-   holds, or weakens across the three lead times, and roughly where in \
-   Romania the coupled cells are located (cardinals from FACTS).
+   holds, or weakens across the three lead times (compare coupled_cells \
+   sizes / counts across leads), and roughly where in Romania the \
+   coupled cells sit (cardinals from FACTS).
 """
 
 # ============================================================================
@@ -1149,7 +1239,9 @@ def _facts_block_lead_metrics(loaded: dict, lead_min: int,
 
 
 def _fmt_cardinal_facts(slot_key: str, slot: dict | None) -> list[str]:
-    """Format one (rainfall|lightning|coupling) slot for the vision prompt."""
+    """Format one (rainfall|lightning|coupling) slot for prompt C.
+    The coupling slot now enumerates its coupled_cells list explicitly
+    so Gemma has one dict per convective cell to paraphrase."""
     if slot is None:
         return [f"  {slot_key}: N/A (track absent or GT missing at this lead)"]
     if slot_key == "rainfall":
@@ -1169,7 +1261,7 @@ def _fmt_cardinal_facts(slot_key: str, slot: dict | None) -> list[str]:
         ]
     if slot_key == "coupling":
         card = slot.get("coupled_centroid_cardinal") or "n/a"
-        return [
+        out = [
             f"  coupling:",
             f"    n_pixels_rain_only:         {slot['n_pixels_rain_only']}",
             f"    n_pixels_lightning_only:    {slot['n_pixels_lightning_only']}",
@@ -1178,15 +1270,32 @@ def _fmt_cardinal_facts(slot_key: str, slot: dict | None) -> list[str]:
             f"    lightning_pct_in_coupled:   {slot['lightning_pct_in_coupled']:.1f} %",
             f"    coupled_centroid_cardinal:  {card}",
         ]
+        cells = slot.get("coupled_cells") or []
+        if not cells:
+            out.append("    coupled_cells: [] (no coupled component >= 10 px)")
+        else:
+            out.append(f"    coupled_cells: {len(cells)} cell(s), biggest first:")
+            for i, cell in enumerate(cells, 1):
+                r_min, r_max, c_min, c_max = cell["bounding_box_pixels"]
+                out.extend([
+                    f"      cell #{i}:",
+                    f"        size_pixels:             {cell['size_pixels']}",
+                    f"        bounding_box_pixels:     rows {r_min}..{r_max}, cols {c_min}..{c_max}",
+                    f"        centroid_cardinal:       {cell['centroid_cardinal']}",
+                    f"        peak_mmh_inside:         {cell['peak_mmh_inside']:.1f} mm/h",
+                    f"        lightning_active_inside: {cell['lightning_active_inside']}",
+                ])
+        return out
     return []
 
 
 def _facts_block_figure_caption(ref_data: dict, lead_minutes: list[int]
                                  ) -> str:
-    """FACTS block for prompt C (per-reference figure caption). Emits the
-    full per-lead structure so Gemma can cite peak_mmh_in_coupled_cells /
-    lightning_pct_in_coupled / coupled_centroid_cardinal for each lead
-    when the RED regions in the attached image tell it to."""
+    """FACTS block for prompt C (per-reference event caption, text-only).
+    Emits per-lead rainfall + lightning summaries + a coupling block that
+    lists every coupled cell (>= 10 px) with its own peak_mmh, centroid
+    cardinal and lightning-active count. Gemma paraphrases those cell
+    dicts directly - the coupling PNG is no longer sent to the model."""
     lines: list[str] = []
     for lead_min in lead_minutes:
         slot = ref_data["per_lead"].get(lead_min)
@@ -1272,20 +1381,27 @@ def generate_english_paragraphs(
                 "lead_min": lead_min,
             })
 
-    # ---- Prompt C: per-reference figure caption (vision) --------------
+    # ---- Prompt C: per-reference event caption (TEXT-ONLY) ------------
+    # Gemma no longer sees the coupling-mask PNG; it reads the per-cell
+    # metadata from the FACTS block. The PNG is still rendered upstream
+    # (build_facts_index) and gets embedded in the PDF for the human.
     lead_minutes = facts_index["lead_minutes"]
     for (date_str, ref_utc), ref_data in facts_index["references"].items():
-        coupling_path = ref_data.get("coupling_figure_path")
-        if coupling_path is None:
-            # No GT for either track at any lead -> nothing to caption.
+        # Only emit a caption when at least one lead has coupling metadata
+        # (i.e. both GTs were on disk for at least one lead). Same guard
+        # as before, just phrased in terms of facts rather than PNG.
+        has_any_data = any(
+            slot["rainfall"] is not None or slot["lightning"] is not None
+            for slot in ref_data["per_lead"].values()
+        )
+        if not has_any_data:
             continue
-        print(f"  [C] figure caption {date_str} {ref_utc} ...", flush=True)
+        print(f"  [C] event caption {date_str} {ref_utc} ...", flush=True)
         facts = _facts_block_figure_caption(ref_data, lead_minutes)
-        english = ollama_generate_vision(
+        english = ollama_generate_text(
             PROMPT_FIGURE_CAPTION_EN.format(
                 date_str=date_str, ref_utc=ref_utc, facts_block=facts,
             ),
-            image_path=coupling_path,
             model=model, system=PROMPT_SYSTEM_EN,
             seed=seed, temperature=temperature,
         )
@@ -1296,7 +1412,9 @@ def generate_english_paragraphs(
             "english": english.strip(),
             "date": date_str,
             "ref_utc": ref_utc,
-            "figure_path": coupling_path,
+            # figure_path kept so the PDF layout still embeds the coupling PNG
+            # as decoration below the caption; it just isn't sent to Gemma.
+            "figure_path": ref_data.get("coupling_figure_path"),
         })
     return sections
 
