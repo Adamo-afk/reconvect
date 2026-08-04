@@ -322,9 +322,14 @@ def _write_json(track: str, year: int, month: int,
                 selected: list[tuple[str, str]],
                 rows: list[dict],
                 confusion_per_lead: dict[int, dict],
-                step_minutes: int, path: Path):
+                step_minutes: int, path: Path,
+                *,
+                rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+                high_coverage_pct: float = HIGH_COVERAGE_PCT):
     """Aggregate summary with per-lead-time counts + metrics + the
-    lists of (date, reference_utc) that met the 90% threshold."""
+    lists of (date, reference_utc) that met the high-coverage threshold.
+    Both thresholds are recorded in the JSON so a run's outputs are
+    self-documenting when the CLI overrides the defaults."""
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
     total = len(rows)
     above = {lt: {"iou_mask": 0, "class_wt": 0} for lt in lead_titles}
@@ -335,12 +340,12 @@ def _write_json(track: str, year: int, month: int,
             lt = lead_titles[i]
             iou = r[f"iou_mask_t+{offset}"]
             cwt = r[f"class_wt_t+{offset}"]
-            if iou >= HIGH_COVERAGE_PCT:
+            if iou >= high_coverage_pct:
                 above[lt]["iou_mask"] += 1
                 high_cov_lists[lt]["iou_mask"].append(
                     [r["date"], r["reference_utc"]]
                 )
-            if cwt >= HIGH_COVERAGE_PCT:
+            if cwt >= high_coverage_pct:
                 above[lt]["class_wt"] += 1
                 high_cov_lists[lt]["class_wt"].append(
                     [r["date"], r["reference_utc"]]
@@ -362,8 +367,8 @@ def _write_json(track: str, year: int, month: int,
         "track": track,
         "year": year,
         "month": month,
-        "threshold_mmh": RAINFALL_THRESHOLD_MMH,
-        "high_coverage_threshold_pct": HIGH_COVERAGE_PCT,
+        "threshold_mmh": rainfall_threshold_mmh,
+        "high_coverage_threshold_pct": high_coverage_pct,
         "total_selected_samples": total,
         "initial_selection": [[d, h] for d, h in selected],
         "samples_above_threshold_per_lead": above,
@@ -382,10 +387,14 @@ def _write_json(track: str, year: int, month: int,
 def _plot_metrics_figure(track: str, year: int, month: int,
                          rows: list[dict],
                          confusion_per_lead: dict[int, dict],
-                         step_minutes: int, path: Path):
+                         step_minutes: int, path: Path,
+                         *,
+                         rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+                         high_coverage_pct: float = HIGH_COVERAGE_PCT):
     """Left: grouped bars for FAR/POD/CSI, one group per lead time.
     Right: scatter of per-sample coverages (all three lead times on the
-    same axes, marker per lead time)."""
+    same axes, marker per lead time). Both threshold overrides feed the
+    axis title text and the 90%-guide lines respectively."""
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
@@ -407,7 +416,7 @@ def _plot_metrics_figure(track: str, year: int, month: int,
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(metric_names)
     axes[0].set_ylabel("Score")
-    axes[0].set_title(f"FAR / POD / CSI on the >= {RAINFALL_THRESHOLD_MMH:g} mm/h event")
+    axes[0].set_title(f"FAR / POD / CSI on the >= {rainfall_threshold_mmh:g} mm/h event")
     axes[0].set_ylim(0.0, 1.0)
     axes[0].grid(axis="y", alpha=0.3)
     axes[0].legend()
@@ -420,11 +429,11 @@ def _plot_metrics_figure(track: str, year: int, month: int,
         axes[1].scatter(ious, cwts, marker=markers[i], color=colors[i],
                         alpha=0.55, s=25, edgecolor="none",
                         label=lead_titles[i])
-    axes[1].axhline(HIGH_COVERAGE_PCT, color="gray", linestyle=":",
+    axes[1].axhline(high_coverage_pct, color="gray", linestyle=":",
                     alpha=0.6, linewidth=1)
-    axes[1].axvline(HIGH_COVERAGE_PCT, color="gray", linestyle=":",
+    axes[1].axvline(high_coverage_pct, color="gray", linestyle=":",
                     alpha=0.6, linewidth=1)
-    axes[1].set_xlabel("IoU on >=10 mm/h binary mask (%)")
+    axes[1].set_xlabel(f"IoU on >={rainfall_threshold_mmh:g} mm/h binary mask (%)")
     axes[1].set_ylabel("Per-class weighted overlap (%)")
     axes[1].set_title("Per-sample coverage scatter")
     axes[1].set_xlim(-2, 102); axes[1].set_ylim(-2, 102)
@@ -446,7 +455,21 @@ def _plot_metrics_figure(track: str, year: int, month: int,
 # ============================================================================
 def run_extraction(track: str, year: int, month: int,
                    mode: str, source: str, finetuned: bool,
-                   data_root: Path, model_dir: Path, output_dir: Path):
+                   data_root: Path, model_dir: Path, output_dir: Path,
+                   *,
+                   rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+                   high_coverage_pct: float = HIGH_COVERAGE_PCT):
+    """Extraction mode for the rainfall track.
+
+    IMPORTANT scope note for `rainfall_threshold_mmh`: this override
+    affects sample SELECTION (which OPERA files get in) and label text on
+    the metrics figure. It does NOT change the per-class boundaries the
+    trained model was optimised against (10 / 20 / 30 / 40 mm/h). If you
+    push this above 10 mm/h you'll simply keep fewer samples; if you
+    lower it, you'll keep weaker samples but the binary confusion
+    (IoU / FAR / POD / CSI) is still computed on the >=10 mm/h event
+    (class >= 1), because that's the model's decision boundary.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
@@ -454,6 +477,8 @@ def run_extraction(track: str, year: int, month: int,
     print("=" * 70)
     print(f"  Data root: {data_root}")
     print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
+    print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
+          f"high_coverage_pct={high_coverage_pct:g}")
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
@@ -463,8 +488,9 @@ def run_extraction(track: str, year: int, month: int,
     step_minutes = _load_step_minutes(data_root)
 
     print(f"\nSelecting OPERA samples with >= "
-          f"{RAINFALL_THRESHOLD_MMH:g} mm/h ...")
-    selected = select_samples(data_root, year, month)
+          f"{rainfall_threshold_mmh:g} mm/h ...")
+    selected = select_samples(data_root, year, month,
+                              threshold_mmh=rainfall_threshold_mmh)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -523,9 +549,13 @@ def run_extraction(track: str, year: int, month: int,
     stem = f"{track}_{year:04d}_{month:02d}"
     _write_csv(rows, output_dir / f"{stem}_samples.csv")
     _write_json(track, year, month, selected, rows, confusion_per_lead,
-                step_minutes, output_dir / f"{stem}_summary.json")
+                step_minutes, output_dir / f"{stem}_summary.json",
+                rainfall_threshold_mmh=rainfall_threshold_mmh,
+                high_coverage_pct=high_coverage_pct)
     _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
-                         step_minutes, output_dir / f"{stem}_metrics.png")
+                         step_minutes, output_dir / f"{stem}_metrics.png",
+                         rainfall_threshold_mmh=rainfall_threshold_mmh,
+                         high_coverage_pct=high_coverage_pct)
 
 
 def _resolve_gt(ref_utc: str, offset_min: int,
@@ -879,6 +909,9 @@ def _write_json_lightning(
     low_threshold: float,
     step_minutes: int,
     path: Path,
+    *,
+    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+    high_coverage_pct: float = HIGH_COVERAGE_PCT,
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
@@ -894,7 +927,7 @@ def _write_json_lightning(
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             lt = lead_titles[i]
             iou = r[f"iou_t+{offset * step_minutes}"]
-            if iou >= HIGH_COVERAGE_PCT:
+            if iou >= high_coverage_pct:
                 above[lt]["iou"] += 1
                 high_cov_lists[lt]["iou"].append(
                     [r["date"], r["reference_utc"]]
@@ -927,11 +960,11 @@ def _write_json_lightning(
         "year": year,
         "month": month,
         "selection_criterion": (
-            f"OPERA-driven: >= {RAINFALL_THRESHOLD_MMH:g} mm/h anywhere on the "
+            f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
             f"768x1536 canvas at the reference timestep (shared with the "
             f"rainfall track for parity)"
         ),
-        "high_coverage_threshold_pct": HIGH_COVERAGE_PCT,
+        "high_coverage_threshold_pct": high_coverage_pct,
         "total_selected_samples": total,
         "initial_selection": [[d, h] for d, h in selected],
         "samples_above_threshold_per_lead": above,
@@ -1028,6 +1061,8 @@ def run_extraction_lightning(
     low_threshold: float = LIGHTNING_LOW_THRESHOLD,
     high_grid: tuple[float, ...] = LIGHTNING_HIGH_GRID,
     batch_size: int = 32,
+    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+    high_coverage_pct: float = HIGH_COVERAGE_PCT,
 ):
     """Extraction mode for the lightning track. Two-phase:
     Phase 1 - loop selected samples, run Hann-blended inference (raw prob
@@ -1053,7 +1088,9 @@ def run_extraction_lightning(
     print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
     print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
           f"high grid={list(high_grid)}")
-    print(f"  Sample selection: OPERA-driven (>= {RAINFALL_THRESHOLD_MMH:g} mm/h) "
+    print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
+          f"high_coverage_pct={high_coverage_pct:g}")
+    print(f"  Sample selection: OPERA-driven (>= {rainfall_threshold_mmh:g} mm/h) "
           f"- shared with rainfall track for parity")
 
     init_sequence_config(str(data_root), source)
@@ -1069,8 +1106,9 @@ def run_extraction_lightning(
         )
     step_minutes = _load_step_minutes(data_root)
 
-    print(f"\nSelecting samples via OPERA (>= {RAINFALL_THRESHOLD_MMH:g} mm/h) ...")
-    selected = select_samples(data_root, year, month)
+    print(f"\nSelecting samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
+    selected = select_samples(data_root, year, month,
+                              threshold_mmh=rainfall_threshold_mmh)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -1184,6 +1222,8 @@ def run_extraction_lightning(
         aggregate_confusion_per_lead, tuning_scores,
         best_high_per_lead, low_threshold, step_minutes,
         output_dir / f"{stem}_summary.json",
+        rainfall_threshold_mmh=rainfall_threshold_mmh,
+        high_coverage_pct=high_coverage_pct,
     )
     _plot_metrics_figure_lightning(
         year, month, rows,
@@ -1362,6 +1402,24 @@ def main() -> int:
     # OPERA-driven for parity with the rainfall track. select_samples_lightning
     # (LINET-driven, >=1 active pixel) remains callable from Python for anyone
     # who deliberately wants a LINET-only cut.
+    parser.add_argument("--rainfall_threshold_mmh", type=float,
+                        default=RAINFALL_THRESHOLD_MMH,
+                        help=f"OPERA rainfall threshold in mm/h for sample "
+                             f"selection (both tracks - selection is shared). "
+                             f"Default {RAINFALL_THRESHOLD_MMH:g}. NOTE: this "
+                             f"overrides ONLY the selection cut and the "
+                             f"metrics-figure label text; the binary event "
+                             f"used for FAR/POD/CSI/IoU stays anchored to "
+                             f"class >= 1 (10 mm/h), which is the trained "
+                             f"model's decision boundary.")
+    parser.add_argument("--high_coverage_pct", type=float,
+                        default=HIGH_COVERAGE_PCT,
+                        help=f"Coverage %% above which a sample is added to "
+                             f"the high-coverage list per lead in the summary "
+                             f"JSON, and above which the visualisation "
+                             f"suptitle is coloured green. Default "
+                             f"{HIGH_COVERAGE_PCT:g}. Lowering makes the "
+                             f"grading more lenient; raising is stricter.")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
@@ -1385,8 +1443,14 @@ def main() -> int:
                 args.track, args.year, args.month,
                 args.mode, args.source, args.finetuned,
                 data_root, model_dir, output_dir,
+                rainfall_threshold_mmh=args.rainfall_threshold_mmh,
+                high_coverage_pct=args.high_coverage_pct,
             )
         else:
+            # Visualization mode reads high-coverage lists from the JSON
+            # produced by extraction, so it inherits whatever
+            # --high_coverage_pct was in effect then. --rainfall_threshold_mmh
+            # is likewise a selection-time knob and has no effect here.
             run_visualization(
                 args.track, args.year, args.month, args.date,
                 args.mode, args.source, args.finetuned,
@@ -1401,6 +1465,8 @@ def main() -> int:
                 stride=args.stride,
                 low_threshold=args.low_threshold,
                 batch_size=args.batch_size,
+                rainfall_threshold_mmh=args.rainfall_threshold_mmh,
+                high_coverage_pct=args.high_coverage_pct,
             )
         else:
             run_visualization_lightning(
