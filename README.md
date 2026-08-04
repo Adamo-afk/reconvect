@@ -1230,10 +1230,79 @@ python validate_predictions.py --track rainfall --year 2025 --month 5 --date 202
 
 Output: `validation/<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` per (reference, lead time). If a date has 8 selected references, that's 8 × 3 = 24 figures.
 
+### Lightning track (`--track lightning`)
+
+Structural clone of the rainfall extractor with three lightning-specific twists:
+
+- **Sample selection**: keeps LINET occurrence samples with `≥ --min_active_pixels` active pixels (default 1).
+- **Inference**: Hann-blended overlapping-patch inference at `--stride` (default 128 → 55 patches per reference, 3× the non-overlapping cost, kills the 256-pixel tiling seams). Post-processing is hysteresis thresholding with a fixed low = 0.90 and a **per-lead high threshold tuned inside the extraction run** by sweeping a 0.91..0.99 grid and picking the value that maximises aggregate CSI at that lead. The tuning table + chosen thresholds are persisted in `summary.json → post_processing`.
+- **Visualisation**: one 2×3 figure per selected reference (rows = pipeline stage, cols = lead times) — row 1 is the GT lightning occurrence, row 2 is the same GT with the post-processed positive pixels overlaid in red. All three lead times on a single figure, matching the spec.
+
+```bash
+# Extraction (tunes per-lead high threshold)
+python validate_predictions.py --track lightning --year 2025 --month 5 \
+    --mode mtg_lightning_opera_occurrence --source dbscan
+
+# Visualisation (reads tuned thresholds from the summary JSON)
+python validate_predictions.py --track lightning --year 2025 --month 5 \
+    --mode mtg_lightning_opera_occurrence --source dbscan --date 2025-05-14
+```
+
+The tuned per-lead thresholds are consumable by [`predict_full_domain.py`](predict_full_domain.py) via `--validation_summary <summary.json>` so the operational inference pipeline uses the exact same post-processing values.
+
 ### Notes
 
-- The `--track lightning` variant is not yet implemented — the current script only wires up `rainfall`. The lightning branch will follow the same skeleton but with a binary-occurrence GT.
 - The model, source, and finetuned toggle default to `mtg_lightning_opera` / `dbscan` / base; override with `--mode`, `--source`, `--finetuned` if needed.
+
+## Automated Report Generation
+
+[`generate_report.py`](generate_report.py) turns the outputs of `validate_predictions.py` into a standalone Romanian PDF for meteorologists who have never seen the internal model. It runs a local Ollama-hosted vision LLM (default `gemma4:12b`) for data-first commentary, then translates each paragraph to Romanian in a second Gemma call with a meteorological glossary in the system prompt. Everything is deterministic given the same validation outputs, model tag, `temperature=0`, and seed.
+
+### Prerequisites
+
+```powershell
+# 1. Install pip deps into the tfenv (or your project env)
+& "C:\path\to\tfenv\python.exe" -m pip install fpdf2 ollama Pillow
+
+# 2. Ollama server running on http://localhost:11434 and the target model pulled
+ollama pull gemma4:12b
+```
+
+### What the report contains
+
+For each selected month × track combination, `generate_report.py` produces one PDF with:
+
+1. **Cover** — header banner from [`assets/`](assets/), title, period, tracks included, generation timestamp.
+2. **Executive summary** — one Gemma-generated paragraph naming the period, selection criteria per track, and the per-lead FAR/POD/CSI evolution across t+15/+30/+45.
+3. **Per-lead metrics sections** — one per (track × lead time), with the aggregate `metrics.png` embedded and a Romanian paragraph interpreting that lead's performance vs the other two.
+4. **Per-reference figure sections** — for every selected reference, a purpose-built **coupling-mask figure** (blue = rainfall ≥ 10 mm/h only, orange = active lightning only, red = both coupled cells) fed to Gemma's vision head, plus a caption that uses the paired phrasing *"precipitation of X mm/h paired with Y% of the lightning strokes inside the same convective cell, in the &lt;cardinal&gt; of Romania"* wherever red regions appear and the individual-observation phrasing otherwise.
+5. **Data appendix** — min / mean / max IoU per lead per track from `samples.csv`.
+
+Every numeric claim comes from a pre-computed FACTS block (peak mm/h, active-pixel counts, 8-way cardinal centroids from `GridProjection.inverse`, coupled-cell counts). Gemma paraphrases the facts, never invents them; the vision head is used only to see the spatial arrangement of the coloured regions.
+
+### Usage
+
+```bash
+# Combined rainfall + lightning report (requires both tracks' extraction outputs)
+python generate_report.py --year 2025 --month 5
+
+# Single track
+python generate_report.py --year 2025 --month 5 --track rainfall
+
+# Non-default model / paths, bilingual PDF (Romanian + English)
+python generate_report.py --year 2025 --month 5 \
+    --model gemma4:12b \
+    --validation_dir ./validation \
+    --output ./validation/report_2025_05.pdf \
+    --bilingual
+
+# Iterate on prompts / facts extractor without spending Gemma calls
+python generate_report.py --year 2025 --month 5 --skip_pdf
+```
+
+### Cost
+
+Per report with N selected references and both tracks: `2 × (7 + N)` Gemma calls (English generation + Romanian translation). For N = 10 that's ~34 calls, ~5-6 minutes on CPU with `gemma4:12b`. All prompts are standalone per call so nothing risks context-window truncation.
 
 ## Architecture Summary
 

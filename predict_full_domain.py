@@ -77,12 +77,15 @@ from extract_patches import (
 from visualize_gt_vs_pred import (
     PATCH_SIZE, N_PATCHES, H_FULL, W_FULL,
     get_patch_bounds,
+    overlay_borders,
     _ensure_view_cached,
     _load_country_borders_pixels,
+    _gt_kwargs_for,
     load_model_artifact,
     resolve_threshold,
     plot_full_domain_predictions_only,
 )
+import visualize_gt_vs_pred as _vf
 
 
 # ============================================================================
@@ -363,6 +366,191 @@ def paste_predictions_to_canvas(predictions: np.ndarray,
 
 
 # ============================================================================
+# Lightning post-processing helpers (Hann overlap + hysteresis + GT/overlay plot)
+# ============================================================================
+def _load_gt_lightning_canvas(data_root: Path, date_str: str,
+                              hhmm: str) -> np.ndarray | None:
+    """Load the LINET binary occurrence canvas for one (date, HHMM). Returns
+    a (768, 1536) int8 array, or None when the file is not on disk.
+
+    Lightning is emitted on the Romania grid natively (read_kml_version2
+    bins strokes into GridProjection pixels), so we route the lookup through
+    find_reprojected_file with group='lightning' and it walks the standard
+    per-date directory tree - same discovery logic every other product uses.
+    """
+    from extract_patches import find_reprojected_file, load_reprojected  # local import: avoid circular
+    path = find_reprojected_file(
+        str(data_root), "occurrence", "lightning", date_str, hhmm,
+    )
+    if path is None:
+        return None
+    field = load_reprojected(path)
+    if field.ndim == 3:
+        field = np.squeeze(field, axis=0)
+    # Occurrence maps come out as int8 (0/1) or float (0.0/1.0) depending on
+    # the writer; normalise to int8.
+    return (field > 0).astype(np.int8)
+
+
+def _resolve_high_threshold_per_lead(
+    args: argparse.Namespace,
+    step_minutes: int,
+) -> dict[int, float]:
+    """Return {lead_offset_steps: high_threshold} for hysteresis.
+
+    Priority:
+      1. --validation_summary <path> -> read `high_threshold_per_lead`
+         from the JSON produced by validate_predictions.py --track lightning.
+         Values are indexed by "t+<minutes>" strings; we map them back to
+         step-offsets via LEAD_STEP_OFFSETS + step_minutes.
+      2. --high_threshold <x> -> same x used for every lead.
+      3. Fallback: 0.95 for every lead (lightning_postproc.DEFAULT_HIGH_THRESHOLD).
+    """
+    from lightning_postproc import DEFAULT_HIGH_THRESHOLD  # local import: keep top clean
+    if args.validation_summary:
+        summary_path = Path(args.validation_summary)
+        if not summary_path.is_file():
+            raise SystemExit(
+                f"--validation_summary points at a missing file: {summary_path}"
+            )
+        with open(summary_path) as f:
+            summary = json.load(f)
+        pp = summary.get("post_processing") or {}
+        per_lead_named = pp.get("high_threshold_per_lead") or {}
+        result: dict[int, float] = {}
+        for offset in LEAD_STEP_OFFSETS:
+            key = f"t+{offset * step_minutes}"
+            if key not in per_lead_named:
+                raise SystemExit(
+                    f"validation summary {summary_path} is missing "
+                    f"post_processing.high_threshold_per_lead[{key}]."
+                )
+            result[offset] = float(per_lead_named[key])
+        return result
+    if args.high_threshold is not None:
+        return {offset: float(args.high_threshold)
+                for offset in LEAD_STEP_OFFSETS}
+    return {offset: DEFAULT_HIGH_THRESHOLD for offset in LEAD_STEP_OFFSETS}
+
+
+def _plot_lightning_2x3(
+    prob_canvases: list[np.ndarray],
+    bin_canvases: list[np.ndarray],
+    gt_canvases: list[np.ndarray | None],
+    *,
+    date_str: str,
+    ref_utc: str,
+    step_minutes: int,
+    low: float,
+    high_per_lead: dict[int, float],
+    output_path: Path,
+    suptitle_prefix: str = "Lightning inference",
+) -> None:
+    """Render the 2x3 lightning figure and save it to `output_path`.
+
+    Row 1 (columns = t+15/+30/+45): GT lightning occurrence rendered in the
+    same base "gt_red" colormap the training-scope visualiser uses. Where GT
+    is not on disk, the panel is a blank canvas with a "GT unavailable" tag.
+
+    Row 2 (columns = t+15/+30/+45): the SAME GT rendered underneath, then
+    every post-processed (Hann + hysteresis) positive pixel drawn on top as
+    opaque red. So: black-on-red pattern = miss (GT lit, pred missed), red
+    on top of red-gradient = hit, red on background = false alarm.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+    gt_kwargs = _gt_kwargs_for("lightning")
+
+    fig, axes = plt.subplots(2, 3, figsize=(21, 8.5),
+                             constrained_layout=True)
+
+    def _apply_frame(ax):
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)
+        ax.set_aspect("equal")
+
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        lead_min = offset * step_minutes
+        lead_hhmm, _ = _ref_to_hhmm(ref_utc, lead_min, date_str)
+        lead_wall = f"{lead_hhmm[:2]}:{lead_hhmm[2:]}"
+
+        # ------------------------------ Row 1: GT
+        ax_gt = axes[0, i]
+        gt = gt_canvases[i]
+        if gt is None:
+            ax_gt.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                         cmap="gray", vmin=0.0, vmax=1.0,
+                         aspect="equal", interpolation="nearest")
+            ax_gt.text(0.5, 0.5, "GT unavailable\n(no LINET file for this lead)",
+                       transform=ax_gt.transAxes, ha="center", va="center",
+                       fontsize=13, color="#555")
+        else:
+            ax_gt.imshow(gt.astype(np.float32), **gt_kwargs)
+        try:
+            overlay_borders(ax_gt)
+        except Exception:
+            pass
+        _apply_frame(ax_gt)
+        gt_pixels = int((gt > 0).sum()) if gt is not None else 0
+        ax_gt.set_title(
+            f"GT lightning occurrence - t+{lead_min} ({lead_wall} UTC)"
+            + (f"  |  active px = {gt_pixels}" if gt is not None else ""),
+            fontsize=11,
+        )
+
+        # ------------------------------ Row 2: GT underneath + post-proc overlay
+        ax_ov = axes[1, i]
+        if gt is not None:
+            ax_ov.imshow(gt.astype(np.float32), **gt_kwargs)
+        else:
+            ax_ov.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                         cmap="gray", vmin=0.0, vmax=1.0,
+                         aspect="equal", interpolation="nearest")
+        # Post-processed positives as opaque red on top.
+        pp_display = np.where(bin_canvases[i] > 0, 1.0, np.nan)
+        ax_ov.imshow(
+            pp_display,
+            cmap=mcolors.ListedColormap(["#d62728"]),
+            vmin=0.5, vmax=1.5, aspect="equal", interpolation="nearest",
+        )
+        try:
+            overlay_borders(ax_ov)
+        except Exception:
+            pass
+        _apply_frame(ax_ov)
+        n_pred = int((bin_canvases[i] > 0).sum())
+        # If GT is present, break the count out into hit/miss/false-alarm.
+        if gt is not None:
+            gt_pos = gt > 0
+            pr_pos = bin_canvases[i] > 0
+            hits = int((gt_pos & pr_pos).sum())
+            misses = int((gt_pos & ~pr_pos).sum())
+            false_alarms = int((~gt_pos & pr_pos).sum())
+            subtitle = (
+                f"post-proc (low={low:.2f}, high={high_per_lead[offset]:.2f}) "
+                f"|  hits={hits}  miss={misses}  FA={false_alarms}  "
+                f"pred px={n_pred}"
+            )
+        else:
+            subtitle = (
+                f"post-proc (low={low:.2f}, high={high_per_lead[offset]:.2f}) "
+                f"|  pred px={n_pred}"
+            )
+        ax_ov.set_title(subtitle, fontsize=11)
+
+    fig.suptitle(
+        f"{suptitle_prefix}  |  {date_str}  ref={ref_utc}",
+        fontsize=14, fontweight="bold",
+    )
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 def main() -> int:
@@ -405,18 +593,49 @@ def main() -> int:
     parser.add_argument("--threshold", type=float, default=None,
                         help="Manual probability threshold for the lightning "
                              "prediction map (defaults to 0.5 when the "
-                             "evaluation_results.json is not present).")
+                             "evaluation_results.json is not present). "
+                             "Ignored for lightning modes when the Hann-"
+                             "overlap + hysteresis path is used (see "
+                             "--low_threshold / --high_threshold / "
+                             "--validation_summary).")
     parser.add_argument("--batch_size", type=int, default=18,
                         help="Per-reference-time batch size passed to "
-                             "model.predict (default 18 = max patches).")
+                             "model.predict (default 18 = max patches; "
+                             "for lightning Hann overlap you may want to "
+                             "raise this to 32 or 64 since ~55 positions "
+                             "are batched per reference).")
     parser.add_argument("--no-plot", action="store_true",
                         help="Skip PNG rendering; save raw predictions only.")
     parser.add_argument("--save-npy", action="store_true",
                         help="Save the raw prediction canvases to .npy "
-                             "next to each PNG.")
+                             "next to each PNG. For lightning modes, this "
+                             "saves BOTH the raw probability canvas and the "
+                             "post-processed binary canvas as separate files.")
     parser.add_argument("--patches", type=str, default=None,
                         help="Comma-separated 1-indexed patch numbers to "
-                             "restrict inference to (default: all 18).")
+                             "restrict inference to (default: all 18). "
+                             "Ignored for lightning modes (Hann-overlap "
+                             "always covers the full canvas).")
+    # --- Lightning post-processing controls (ignored for radar/rainfall) ---
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Overlap stride for the Hann-blended inference "
+                             "path (lightning only). Default 128 = 50%% "
+                             "overlap, giving 55 patches on a 768x1536 "
+                             "canvas.")
+    parser.add_argument("--low_threshold", type=float, default=None,
+                        help="Hysteresis LOW threshold for lightning post-"
+                             "processing. Default 0.90 (operational).")
+    parser.add_argument("--high_threshold", type=float, default=None,
+                        help="Hysteresis HIGH threshold applied to every "
+                             "lead time (lightning only). Superseded by "
+                             "--validation_summary if that flag is also "
+                             "given. Default 0.95.")
+    parser.add_argument("--validation_summary", type=str, default=None,
+                        help="Path to the {track}_{yyyy}_{mm}_summary.json "
+                             "produced by validate_predictions.py --track "
+                             "lightning. When present, the per-lead tuned "
+                             "high-threshold values are read from it and "
+                             "override --high_threshold.")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -471,8 +690,86 @@ def main() -> int:
     print(f"  Loaded: {model.count_params():,} parameters")
 
     # 3. Per-reference-time inference
+    # Prepare lightning post-processing state once (no cost when unused).
+    is_lightning = (label_type == "lightning")
+    stride = args.stride if args.stride is not None else 128
+    low_threshold = (args.low_threshold if args.low_threshold is not None
+                     else 0.90)
+    if is_lightning:
+        high_per_lead = _resolve_high_threshold_per_lead(args, step_minutes)
+        print(f"  Lightning post-proc: stride={stride}  low={low_threshold:.2f}  "
+              f"high per lead={{{', '.join(f't+{o*step_minutes}={h:.2f}' for o, h in high_per_lead.items())}}}")
+        if restrict_to_patches is not None:
+            print("  (ignoring --patches: Hann-overlap always covers the full canvas)")
+        # Import here so radar/rainfall runs pay zero import cost.
+        from lightning_postproc import (
+            run_hann_overlapped_inference,
+            hysteresis_binary,
+        )
+
     for i, ref_utc in enumerate(ref_times, 1):
         print(f"\n[{i}/{len(ref_times)}] {args.date} {ref_utc} UTC")
+
+        if is_lightning:
+            # ---- Lightning: Hann-overlap inference + hysteresis + 2x3 plot
+            prob_canvases = run_hann_overlapped_inference(
+                model, data_root, mode_config, args.date, ref_utc,
+                step_minutes, stride=stride, batch_size=args.batch_size,
+            )
+            if prob_canvases is None:
+                print("  No reprojected data available for the input window. "
+                      "Skipping.")
+                continue
+            bin_canvases = [
+                hysteresis_binary(
+                    prob_canvases[k], low=low_threshold,
+                    high=high_per_lead[LEAD_STEP_OFFSETS[k]],
+                )
+                for k in range(len(prob_canvases))
+            ]
+            gt_canvases = []
+            for offset in LEAD_STEP_OFFSETS:
+                gt_hhmm, gt_day = _ref_to_hhmm(
+                    ref_utc, offset * step_minutes, args.date,
+                )
+                gt_canvases.append(
+                    _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+                )
+            print(f"  Predicted {len(prob_canvases)} lead(s); "
+                  f"canvas shape {prob_canvases[0].shape}; "
+                  f"GT panels available: "
+                  f"{sum(1 for g in gt_canvases if g is not None)}/{len(gt_canvases)}")
+
+            safe_ref = ref_utc.replace(":", "")
+            out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
+            if not args.no_plot:
+                _plot_lightning_2x3(
+                    prob_canvases, bin_canvases, gt_canvases,
+                    date_str=args.date, ref_utc=ref_utc,
+                    step_minutes=step_minutes,
+                    low=low_threshold, high_per_lead=high_per_lead,
+                    output_path=out_stem.with_suffix(".png"),
+                    suptitle_prefix="Lightning inference (Hann + hysteresis)",
+                )
+                print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
+            if args.save_npy:
+                # Per-lead per-artefact filenames so downstream tooling can
+                # pick either one without re-splitting a stacked array.
+                for k, offset in enumerate(LEAD_STEP_OFFSETS):
+                    lead_min = offset * step_minutes
+                    raw_path = out_stem.parent / (
+                        out_stem.name + f"_prob_raw_t+{lead_min}.npy"
+                    )
+                    bin_path = out_stem.parent / (
+                        out_stem.name + f"_bin_hyst_t+{lead_min}.npy"
+                    )
+                    np.save(raw_path, prob_canvases[k].astype(np.float32))
+                    np.save(bin_path, bin_canvases[k].astype(np.int8))
+                print(f"  Saved 2 x {len(prob_canvases)} .npy artefacts "
+                      f"(*_prob_raw_t+*.npy and *_bin_hyst_t+*.npy)")
+            continue
+
+        # ---- Radar / rainfall: unchanged patch-based path
         inputs, valid_patches = build_inputs_for_reference(
             data_root, mode_config, args.date, ref_utc,
             step_minutes, restrict_to_patches=restrict_to_patches,
