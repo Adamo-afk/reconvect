@@ -1,46 +1,69 @@
 """
 validate_predictions.py
 =======================
-Validation branch for the OPERA rainfall track (lightning follows the
-same skeleton later, guided by the user).
+Validation branch for two tracks selectable via --track:
 
-Two modes, chosen by the presence of --date:
-
-  EXTRACTION MODE  (no --date):
+  RAINFALL (OPERA multiclass, structural + semantic coverage)
+  ------------------------------------------------------------
+  EXTRACTION MODE (no --date):
     - Scan every OPERA rainfall_rate .npy for the given (year, month).
     - Keep the sample if AT LEAST ONE pixel is >= 10 mm/h.
-    - For each kept sample: run predict_full_domain's in-process
-      inference, load OPERA GT at t+15/+30/+45, compute per-sample
-      coverage per lead time.
+    - Run the model via the non-overlapping 18-patch path
+      (predict_full_domain.build_inputs_for_reference +
+      paste_predictions_to_canvas).
     - Two coverage metrics per (sample, lead time):
-        * `iou_mask`  = IoU of the binary >=10 mm/h masks (structure).
-        * `class_wt`  = per-class weighted overlap, macro-averaged
-                        across the 5 rainfall classes (semantic).
-    - Aggregate FAR/POD/CSI per lead time on the binary >=10 mm/h event.
-    - Emit:
-        validation/rainfall_<YYYY>_<MM>_samples.csv    (per-sample rows)
-        validation/rainfall_<YYYY>_<MM>_summary.json   (aggregate)
-        validation/rainfall_<YYYY>_<MM>_metrics.png    (bars + scatter)
+        * iou_mask -> IoU of the binary >=10 mm/h masks (structure)
+        * class_wt -> per-class weighted overlap macro-averaged across
+                      the 5 rainfall classes (semantic)
+    - Aggregate FAR/POD/CSI per lead on the binary >=10 mm/h event.
+    - Emits rainfall_<YYYY>_<MM>_{samples.csv, summary.json, metrics.png}.
 
-  VISUALIZATION MODE  (--date given):
-    - Read the JSON produced by a previous extraction run.
-    - Raise SystemExit if the date is not in the initial selected set.
-    - For each lead time save one figure:
-        left  panel: structure overlay - red pixels where GT class ==
-                     Pred class AND both are >= 10 mm/h. Percentage
-                     shown as annotation.
-        right panel: zoom into the patch (out of 18) with the most
-                     GT-active pixels at that lead time.
-    - Title colour:
-        green  = the date is in the >=90% coverage list for this lead
-        orange = the date is only in the initial selection
+  VISUALIZATION MODE (--date given):
+    - Per selected reference, saves ONE figure per lead time (3 total):
+      left = structure overlay (red pixels where GT class == Pred class
+      AND both >= 10 mm/h); right = zoom on the 256x256 patch with
+      the most GT-active pixels.
+    - Suptitle colour: green if the lead cleared 90% coverage on either
+      metric; orange if only in the initial selection.
+
+  LIGHTNING (Hann-blended overlap + hysteresis, per-lead threshold tuning)
+  -----------------------------------------------------------------------
+  EXTRACTION MODE (no --date):
+    - Scan every LINET occurrence .npy in (year, month); keep samples
+      with >= --min_active_pixels active GT pixels.
+    - Run Hann-blended overlapping inference (default stride 128 -> 55
+      patches, weights = 2-D Hann window). Yields a smooth probability
+      canvas per lead, seam-free vs the non-overlapping paste path.
+    - Per candidate high threshold in a 0.91..0.99 (step 0.01) grid,
+      apply hysteresis (low=0.90 by default) and score confusion
+      counts against LINET GT.
+    - After all samples: pick the high that maximises aggregate CSI
+      PER LEAD; persist the full sweep and the choices to the
+      summary's `post_processing` block. predict_full_domain.py can
+      consume that block via --validation_summary to get the same
+      per-lead thresholds at inference time.
+    - Emits lightning_<YYYY>_<MM>_{samples.csv, summary.json, metrics.png}
+      (metrics figure: FAR/POD/CSI bars at chosen high + CSI sweep curves).
+
+  VISUALIZATION MODE (--date given):
+    - Per selected reference on the date, saves ONE 2x3 figure:
+        Row 1 (t+15 / +30 / +45): GT lightning occurrence
+        Row 2 (t+15 / +30 / +45): GT with post-processed positives
+                                  overlaid in red.
+      All three lead times on the same figure per user's spec.
+    - Colour marker logged (green/orange) using the same convention
+      as rainfall.
 
 CLI examples:
+    # Rainfall
     python validate_predictions.py --track rainfall --year 2025 --month 5
-    python validate_predictions.py --track rainfall --year 2025 --month 5 \
-        --date 2025-05-14
-    python validate_predictions.py --track rainfall --year 2025 --month 5 \
-        --mode mtg_lightning_opera --source dbscan --finetuned
+    python validate_predictions.py --track rainfall --year 2025 --month 5 --date 2025-05-14
+
+    # Lightning (extraction tunes per-lead high threshold; viz reads it back)
+    python validate_predictions.py --track lightning --year 2025 --month 5 \
+        --mode mtg_lightning_opera_occurrence --source dbscan
+    python validate_predictions.py --track lightning --year 2025 --month 5 --date 2025-05-14 \
+        --mode mtg_lightning_opera_occurrence --source dbscan
 """
 
 from __future__ import annotations
@@ -89,6 +112,14 @@ from predict_full_domain import (
     LEAD_STEP_OFFSETS,
     _load_step_minutes,
     _ref_to_hhmm,
+    _load_gt_lightning_canvas,
+    _plot_lightning_2x3,
+)
+from lightning_postproc import (
+    DEFAULT_STRIDE, DEFAULT_LOW_THRESHOLD,
+    build_inputs_for_reference_overlapped,
+    paste_predictions_hann_blended,
+    hysteresis_binary,
 )
 
 
@@ -727,6 +758,546 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
 
 
 # ============================================================================
+# ==========================  LIGHTNING TRACK  ===============================
+# ============================================================================
+# Structural clone of the rainfall track, differing only in:
+#   - sample selection driven by LINET occurrence (>= N active pixels)
+#   - inference via Hann-blended overlap + hysteresis (from lightning_postproc)
+#   - per-lead high-threshold TUNING as part of extraction (sweep CSI over a
+#     grid of candidate high values, pick argmax per lead, persist to JSON)
+#   - binary GT and binary post-processed prediction; no per-class weighting
+#   - visualization reuses predict_full_domain._plot_lightning_2x3
+#     (2 rows x 3 leads on ONE figure per reference)
+# ============================================================================
+
+LIGHTNING_LOW_THRESHOLD = DEFAULT_LOW_THRESHOLD          # 0.90 (operational)
+LIGHTNING_HIGH_GRID = tuple(round(x, 2)
+                            for x in np.arange(0.91, 1.00, 0.01))
+LIGHTNING_MIN_ACTIVE_PIXELS = 1
+
+
+_LIGHTNING_FILENAME_RE = re.compile(
+    r"^lightning_occurrence_(\d{8})_(\d{4})\.npy$"
+)
+
+
+def _iter_lightning_files(data_root: Path, year: int, month: int):
+    """Yield (date_str, hhmm, path) for every LINET occurrence .npy matching
+    (year, month). Layout: {data_root}/lightning_data/occurrence/
+    nc4_YYYY-MM-DD-Romania_occurrence/lightning_occurrence_YYYYMMDD_HHMM.npy
+    (that's the native-grid write path from read_kml_version2)."""
+    root = data_root / "lightning_data" / "occurrence"
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"LINET occurrence root not found: {root}. "
+            f"Run read_kml_version2.py first."
+        )
+    date_prefix = f"nc4_{year:04d}-{month:02d}-"
+    for day_folder in sorted(root.iterdir()):
+        if not day_folder.is_dir() or not day_folder.name.startswith(date_prefix):
+            continue
+        for f in sorted(day_folder.iterdir()):
+            m = _LIGHTNING_FILENAME_RE.match(f.name)
+            if m is None:
+                continue
+            ymd = m.group(1)
+            date_str = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
+            yield date_str, m.group(2), f
+
+
+def select_samples_lightning(data_root: Path, year: int, month: int,
+                              min_active_pixels: int = LIGHTNING_MIN_ACTIVE_PIXELS,
+                              ) -> list[tuple[str, str]]:
+    """Iterate every LINET occurrence file in the month, keep those with
+    at least `min_active_pixels` active pixels. Returns list of
+    (date_str, hhmm) tuples sorted chronologically."""
+    kept: list[tuple[str, str]] = []
+    scanned = 0
+    for date_str, hhmm, path in _iter_lightning_files(data_root, year, month):
+        scanned += 1
+        data = np.load(path)
+        if data.ndim == 3:
+            data = np.squeeze(data, axis=0)
+        n_active = int((data > 0).sum())
+        if n_active >= min_active_pixels:
+            kept.append((date_str, hhmm))
+    print(f"  Scanned {scanned} LINET occurrence files; "
+          f"kept {len(kept)} with >= {min_active_pixels} active pixel(s)")
+    return kept
+
+
+def _binary_confusion_lightning(gt_bin: np.ndarray,
+                                pred_bin: np.ndarray
+                                ) -> tuple[int, int, int, int]:
+    """(TP, FP, FN, TN) over the full 768x1536 canvas. Both inputs are
+    treated as binary via a `> 0` cast, so any dtype works."""
+    gt_pos = gt_bin > 0
+    pr_pos = pred_bin > 0
+    tp = int((gt_pos & pr_pos).sum())
+    fp = int((~gt_pos & pr_pos).sum())
+    fn = int((gt_pos & ~pr_pos).sum())
+    tn = int((~gt_pos & ~pr_pos).sum())
+    return tp, fp, fn, tn
+
+
+def _iou_lightning(tp: int, fp: int, fn: int) -> float:
+    denom = tp + fp + fn
+    return (tp / denom) * 100.0 if denom > 0 else 0.0
+
+
+def _write_csv_lightning(rows: list[dict], path: Path, step_minutes: int):
+    """Per-sample CSV: (date, reference_utc) + IoU/FAR/POD/CSI per lead at
+    the CHOSEN high-threshold. Complements the summary JSON which persists
+    the full tuning sweep."""
+    if not rows:
+        print(f"  No rows to write for {path}")
+        return
+    fieldnames = ["date", "reference_utc"]
+    for offset in LEAD_STEP_OFFSETS:
+        m = offset * step_minutes
+        fieldnames += [
+            f"iou_t+{m}", f"far_t+{m}", f"pod_t+{m}", f"csi_t+{m}",
+        ]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  Wrote {len(rows)} rows to {path}")
+
+
+def _write_json_lightning(
+    year: int, month: int,
+    selected: list[tuple[str, str]],
+    rows: list[dict],
+    aggregate_confusion_per_lead: dict[int, dict],
+    tuning_scores: dict[int, dict[float, dict]],
+    best_high_per_lead: dict[int, float],
+    low_threshold: float,
+    step_minutes: int,
+    min_active_pixels: int,
+    path: Path,
+):
+    """Aggregate summary that mirrors the rainfall JSON schema and adds
+    the `post_processing` block predict_full_domain.py consumes for the
+    tuned per-lead high thresholds. `tuning_scores` is the full grid so
+    the choice can be re-audited later."""
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    total = len(rows)
+    above = {lt: {"iou": 0} for lt in lead_titles}
+    high_cov_lists = {lt: {"iou": []} for lt in lead_titles}
+    for r in rows:
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            lt = lead_titles[i]
+            iou = r[f"iou_t+{offset * step_minutes}"]
+            if iou >= HIGH_COVERAGE_PCT:
+                above[lt]["iou"] += 1
+                high_cov_lists[lt]["iou"].append(
+                    [r["date"], r["reference_utc"]]
+                )
+    diff_pct = {}
+    for lt in lead_titles:
+        diff_pct[lt] = {}
+        if total == 0:
+            diff_pct[lt]["iou"] = 0.0
+            continue
+        diff_pct[lt]["iou"] = ((total - above[lt]["iou"]) / total) * 100.0
+    metrics_at_best = {
+        lead_titles[i]: _summarise_confusion(aggregate_confusion_per_lead[i])
+        for i in range(len(LEAD_STEP_OFFSETS))
+    }
+    # Reshape tuning_scores from {lead_idx: {high: agg_dict}} to
+    # {lead_title: {high_str: agg_dict}} so JSON keeps stable string keys.
+    tuning_scores_named = {}
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        lt = lead_titles[i]
+        tuning_scores_named[lt] = {
+            f"{h:.2f}": tuning_scores[i][h] for h in sorted(tuning_scores[i])
+        }
+    high_named = {
+        f"t+{offset * step_minutes}": best_high_per_lead[offset]
+        for offset in LEAD_STEP_OFFSETS
+    }
+    doc = {
+        "track": "lightning",
+        "year": year,
+        "month": month,
+        "min_active_pixels_for_selection": min_active_pixels,
+        "high_coverage_threshold_pct": HIGH_COVERAGE_PCT,
+        "total_selected_samples": total,
+        "initial_selection": [[d, h] for d, h in selected],
+        "samples_above_threshold_per_lead": above,
+        "difference_pct_per_lead": diff_pct,
+        "metrics_per_lead": metrics_at_best,
+        "high_coverage_samples_per_lead": high_cov_lists,
+        "post_processing": {
+            "low_threshold": low_threshold,
+            "high_grid": list(LIGHTNING_HIGH_GRID),
+            "high_threshold_per_lead": high_named,
+            "tuning_scores": tuning_scores_named,
+            "tuning_metric": "csi",
+        },
+    }
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+    print(f"  Wrote summary to {path}")
+
+
+def _plot_metrics_figure_lightning(
+    year: int, month: int,
+    rows: list[dict],
+    aggregate_confusion_per_lead: dict[int, dict],
+    tuning_scores: dict[int, dict[float, dict]],
+    best_high_per_lead: dict[int, float],
+    step_minutes: int, path: Path,
+):
+    """Left: grouped bars for FAR/POD/CSI at the CHOSEN high per lead.
+    Right: CSI vs high-threshold sweep, one line per lead time, vertical
+    markers at each lead's chosen best_high. Makes the tuning decision
+    visually auditable."""
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
+
+    # Left: bars at best_high per lead
+    metric_names = ["FAR", "POD", "CSI"]
+    metric_values = np.zeros((len(lead_titles), len(metric_names)))
+    for i in range(len(LEAD_STEP_OFFSETS)):
+        agg = _summarise_confusion(aggregate_confusion_per_lead[i])
+        for j, m in enumerate(metric_names):
+            metric_values[i, j] = agg[m]
+    x = np.arange(len(metric_names))
+    width = 0.25
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    for i, lt in enumerate(lead_titles):
+        offset = LEAD_STEP_OFFSETS[i]
+        axes[0].bar(x + (i - 1) * width, metric_values[i], width,
+                    label=f"{lt} (high={best_high_per_lead[offset]:.2f})",
+                    color=colors[i], edgecolor="white", linewidth=0.5)
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(metric_names)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title(
+        f"FAR / POD / CSI on binary lightning occurrence "
+        f"(post-proc: Hann + hysteresis)"
+    )
+    axes[0].set_ylim(0.0, 1.0)
+    axes[0].grid(axis="y", alpha=0.3)
+    axes[0].legend()
+
+    # Right: CSI sweep
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        highs = sorted(tuning_scores[i])
+        csis = [tuning_scores[i][h]["CSI"] for h in highs]
+        axes[1].plot(highs, csis, marker="o", color=colors[i],
+                     label=lead_titles[i], linewidth=1.5)
+        axes[1].axvline(best_high_per_lead[offset],
+                        color=colors[i], linestyle="--", alpha=0.5,
+                        linewidth=1)
+    axes[1].set_xlabel("High threshold")
+    axes[1].set_ylabel("Aggregate CSI over selected samples")
+    axes[1].set_title(
+        f"CSI vs high-threshold sweep  "
+        f"(low={LIGHTNING_LOW_THRESHOLD:.2f} fixed)"
+    )
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.suptitle(
+        f"Validation - lightning - {year:04d}-{month:02d}  |  "
+        f"{len(rows)} selected samples",
+        fontsize=13, fontweight="bold",
+    )
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote metrics figure to {path}")
+
+
+def run_extraction_lightning(
+    year: int, month: int, mode: str, source: str, finetuned: bool,
+    data_root: Path, model_dir: Path, output_dir: Path,
+    *,
+    stride: int = DEFAULT_STRIDE,
+    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
+    high_grid: tuple[float, ...] = LIGHTNING_HIGH_GRID,
+    min_active_pixels: int = LIGHTNING_MIN_ACTIVE_PIXELS,
+    batch_size: int = 32,
+):
+    """Extraction mode for the lightning track. Two-phase:
+    Phase 1 - loop selected samples, run Hann-blended inference (raw prob
+    canvases), and accumulate binary-confusion counts vs LINET GT at every
+    candidate (high, lead) combination.
+    Phase 2 - pick the high that maximises aggregate CSI PER LEAD, then
+    derive per-sample IoU/FAR/POD/CSI at that chosen high from the
+    already-stored per-(sample, high, lead) confusions. No re-inference.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"Validation extraction - track=lightning  {year:04d}-{month:02d}")
+    print("=" * 70)
+    print(f"  Data root: {data_root}")
+    print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
+    print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
+          f"high grid={list(high_grid)}")
+
+    init_sequence_config(str(data_root), source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
+    mode_config = get_mode_config(mode)
+    if mode_config["label_type"] != "lightning":
+        raise SystemExit(
+            f"--mode {mode} has label_type={mode_config['label_type']!r}; "
+            f"--track lightning requires a lightning-headed mode "
+            f"(e.g. mtg_lightning, mtg_lightning_opera_occurrence)."
+        )
+    step_minutes = _load_step_minutes(data_root)
+
+    print(f"\nSelecting LINET samples with >= {min_active_pixels} active pixel(s) ...")
+    selected = select_samples_lightning(
+        data_root, year, month, min_active_pixels=min_active_pixels,
+    )
+    if not selected:
+        print("No samples selected. Nothing to do.")
+        return
+
+    print(f"\nLoading model ...")
+    model = load_model_artifact(model_dir, mode, source, finetuned)
+    print(f"  Loaded: {model.count_params():,} parameters")
+
+    # Per-(sample, lead_idx, high) confusion tuples: we need them at
+    # per-sample granularity for the CSV rows, so store as a list of
+    # dicts. Aggregate (lead_idx, high) counts are computed by summing.
+    # Memory footprint: N_samples * 3 leads * 9 highs * 4 ints -> tiny.
+    per_sample_confusion: list[dict] = []  # each dict: {(lead_idx, high): (tp, fp, fn, tn)}
+    n_skipped = 0
+
+    print(f"\nRunning inference on {len(selected)} samples "
+          f"(Hann overlap, stride={stride}) ...")
+    for k, (date_str, hhmm) in enumerate(selected, 1):
+        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+        if k == 1 or k % 20 == 0 or k == len(selected):
+            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
+
+        inputs, positions = build_inputs_for_reference_overlapped(
+            data_root, mode_config, date_str, ref_utc, step_minutes,
+            stride=stride,
+        )
+        if not positions:
+            n_skipped += 1
+            continue
+        preds = model.predict(inputs, batch_size=batch_size, verbose=0)
+        prob_canvases = paste_predictions_hann_blended(preds, positions)
+
+        sample_confusion: dict[tuple[int, float], tuple[int, int, int, int]] = {}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            gt_hhmm, gt_day = _resolve_gt(
+                ref_utc, offset * step_minutes, date_str,
+            )
+            gt_bin = _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            if gt_bin is None:
+                # No GT for this lead -> can't score this sample at this lead.
+                # Store zero-confusion so the row exists but IoU stays 0.
+                for h in high_grid:
+                    sample_confusion[(i, h)] = (0, 0, 0, H_FULL * W_FULL)
+                continue
+            for h in high_grid:
+                pred_bin = hysteresis_binary(
+                    prob_canvases[i], low=low_threshold, high=float(h),
+                )
+                sample_confusion[(i, h)] = _binary_confusion_lightning(gt_bin, pred_bin)
+        per_sample_confusion.append({
+            "date": date_str,
+            "reference_utc": ref_utc,
+            "confusion": sample_confusion,
+        })
+
+    print(f"\nDone Phase 1. {len(per_sample_confusion)} samples scored, "
+          f"{n_skipped} skipped (missing inputs).")
+    if not per_sample_confusion:
+        print("No samples produced predictions. Nothing to write.")
+        return
+
+    # ---- Phase 2: aggregate over samples, pick best high per lead ----
+    tuning_scores: dict[int, dict[float, dict]] = {
+        i: {} for i in range(len(LEAD_STEP_OFFSETS))
+    }
+    for i in range(len(LEAD_STEP_OFFSETS)):
+        for h in high_grid:
+            tp = fp = fn = tn = 0
+            for s in per_sample_confusion:
+                t, f, n, tt = s["confusion"][(i, float(h))]
+                tp += t; fp += f; fn += n; tn += tt
+            tuning_scores[i][float(h)] = _summarise_confusion(
+                {"TP": tp, "FP": fp, "FN": fn, "TN": tn}
+            )
+
+    best_high_per_lead: dict[int, float] = {}
+    aggregate_confusion_per_lead: dict[int, dict] = {}
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        best_h = max(tuning_scores[i],
+                     key=lambda h: tuning_scores[i][h]["CSI"])
+        best_high_per_lead[offset] = best_h
+        agg = tuning_scores[i][best_h]
+        aggregate_confusion_per_lead[i] = {
+            "TP": agg["TP"], "FP": agg["FP"],
+            "FN": agg["FN"], "TN": agg["TN"],
+        }
+        print(f"  Best high for t+{offset * step_minutes}: {best_h:.2f} "
+              f"(CSI={agg['CSI']:.3f}, POD={agg['POD']:.3f}, "
+              f"FAR={agg['FAR']:.3f})")
+
+    # ---- Emit per-sample rows at chosen best_high per lead ----
+    rows: list[dict] = []
+    for s in per_sample_confusion:
+        row = {"date": s["date"], "reference_utc": s["reference_utc"]}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            best_h = best_high_per_lead[offset]
+            tp, fp, fn, _ = s["confusion"][(i, best_h)]
+            m = offset * step_minutes
+            row[f"iou_t+{m}"] = _iou_lightning(tp, fp, fn)
+            per = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": 0})
+            row[f"far_t+{m}"] = per["FAR"]
+            row[f"pod_t+{m}"] = per["POD"]
+            row[f"csi_t+{m}"] = per["CSI"]
+        rows.append(row)
+
+    stem = f"lightning_{year:04d}_{month:02d}"
+    _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
+                          step_minutes)
+    _write_json_lightning(
+        year, month, selected, rows,
+        aggregate_confusion_per_lead, tuning_scores,
+        best_high_per_lead, low_threshold, step_minutes,
+        min_active_pixels,
+        output_dir / f"{stem}_summary.json",
+    )
+    _plot_metrics_figure_lightning(
+        year, month, rows,
+        aggregate_confusion_per_lead, tuning_scores,
+        best_high_per_lead, step_minutes,
+        output_dir / f"{stem}_metrics.png",
+    )
+
+
+def run_visualization_lightning(
+    year: int, month: int, date_str: str,
+    mode: str, source: str, finetuned: bool,
+    data_root: Path, model_dir: Path, output_dir: Path,
+    *,
+    stride: int = DEFAULT_STRIDE,
+    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
+    batch_size: int = 32,
+):
+    """One figure per selected reference on the given date. Layout:
+      Row 1 (columns = t+15/+30/+45): GT lightning occurrence
+      Row 2 (columns = t+15/+30/+45): GT rendered underneath + post-processed
+                                       positive pixels overlaid in red
+
+    The per-lead high threshold is read from
+    post_processing.high_threshold_per_lead in the summary JSON produced
+    by run_extraction_lightning."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"lightning_{year:04d}_{month:02d}"
+    summary = _load_summary_json(output_dir / f"{stem}_summary.json")
+    if "post_processing" not in summary:
+        raise SystemExit(
+            f"Summary {stem}_summary.json is missing the post_processing "
+            f"block. Re-run extraction (--track lightning without --date)."
+        )
+    step_minutes = _load_step_minutes(data_root)
+    high_named = summary["post_processing"]["high_threshold_per_lead"]
+    high_per_lead: dict[int, float] = {}
+    for offset in LEAD_STEP_OFFSETS:
+        key = f"t+{offset * step_minutes}"
+        if key not in high_named:
+            raise SystemExit(
+                f"post_processing.high_threshold_per_lead is missing {key}"
+            )
+        high_per_lead[offset] = float(high_named[key])
+
+    date_in_selection = _date_is_in(date_str, summary["initial_selection"])
+    if not date_in_selection:
+        raise SystemExit(
+            f"Date {date_str} is not in the initial selection for "
+            f"{year:04d}-{month:02d}. Nothing to visualise."
+        )
+
+    init_sequence_config(str(data_root), source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
+    mode_config = get_mode_config(mode)
+    if mode_config["label_type"] != "lightning":
+        raise SystemExit(
+            f"--mode {mode} has label_type={mode_config['label_type']!r}; "
+            f"--track lightning requires a lightning-headed mode."
+        )
+
+    refs = sorted(
+        h for d, h in summary["initial_selection"] if d == date_str
+    )
+    if not refs:
+        raise SystemExit(f"Selection has no references for {date_str}.")
+
+    print(f"Loading model ...")
+    model = load_model_artifact(model_dir, mode, source, finetuned)
+    print(f"  Loaded: {model.count_params():,} parameters")
+
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    for ref_utc in refs:
+        print(f"\n{date_str} {ref_utc} - building figure ...")
+        inputs, positions = build_inputs_for_reference_overlapped(
+            data_root, mode_config, date_str, ref_utc, step_minutes,
+            stride=stride,
+        )
+        if not positions:
+            print("  No inputs available - skipping.")
+            continue
+        preds = model.predict(inputs, batch_size=batch_size, verbose=0)
+        prob_canvases = paste_predictions_hann_blended(preds, positions)
+        bin_canvases = [
+            hysteresis_binary(
+                prob_canvases[i], low=low_threshold,
+                high=high_per_lead[LEAD_STEP_OFFSETS[i]],
+            )
+            for i in range(len(prob_canvases))
+        ]
+        gt_canvases = []
+        for offset in LEAD_STEP_OFFSETS:
+            gt_hhmm, gt_day = _resolve_gt(
+                ref_utc, offset * step_minutes, date_str,
+            )
+            gt_canvases.append(
+                _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            )
+
+        # Colour marker logged alongside the save: green if the date
+        # cleared 90% IoU on any lead, orange if only in the initial
+        # selection. (The saved figure's suptitle is coloured by the
+        # renderer's default; we log the colour intent here rather than
+        # re-open + re-save the figure just to recolour a title string.)
+        any_high = any(
+            _date_is_in(date_str,
+                        summary["high_coverage_samples_per_lead"][lt]["iou"])
+            for lt in lead_titles
+        )
+        marker = ("green (>= 90% IoU on some lead)" if any_high
+                  else "orange (in selection only, no lead cleared 90%)")
+
+        safe_ref = ref_utc.replace(":", "")
+        out_png = output_dir / f"{stem}_{date_str}_{safe_ref}.png"
+        _plot_lightning_2x3(
+            prob_canvases, bin_canvases, gt_canvases,
+            date_str=date_str, ref_utc=ref_utc,
+            step_minutes=step_minutes,
+            low=low_threshold, high_per_lead=high_per_lead,
+            output_path=out_png,
+            suptitle_prefix=f"Validation lightning ({date_str} ref={ref_utc})",
+        )
+        print(f"  Saved -> {out_png.name}  [{marker}]")
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 def main() -> int:
@@ -739,10 +1310,11 @@ def main() -> int:
                     "plots structure-overlay + zoom for a given date.",
     )
     parser.add_argument("--track", type=str, required=True,
-                        choices=["rainfall"],
-                        help="Validation track. 'rainfall' is the only "
-                             "one wired up in this file; 'lightning' "
-                             "will follow.")
+                        choices=["rainfall", "lightning"],
+                        help="Validation track. 'rainfall' is the OPERA "
+                             "multiclass pipeline; 'lightning' runs the "
+                             "Hann-blended overlap + hysteresis pipeline "
+                             "and tunes the high threshold per lead time.")
     parser.add_argument("--year", type=int, required=True)
     parser.add_argument("--month", type=int, required=True,
                         help="Month as an integer 1..12.")
@@ -760,6 +1332,23 @@ def main() -> int:
     parser.add_argument("--data_root", type=str, default="./our_data")
     parser.add_argument("--model_dir", type=str, default="./models")
     parser.add_argument("--output_dir", type=str, default="./validation")
+    # --- Lightning-only knobs (ignored when --track rainfall) ---
+    parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
+                        help="Overlap stride for Hann inference (lightning). "
+                             f"Default {DEFAULT_STRIDE} = 50%% overlap.")
+    parser.add_argument("--low_threshold", type=float,
+                        default=LIGHTNING_LOW_THRESHOLD,
+                        help="Hysteresis LOW threshold (lightning). "
+                             f"Default {LIGHTNING_LOW_THRESHOLD}.")
+    parser.add_argument("--min_active_pixels", type=int,
+                        default=LIGHTNING_MIN_ACTIVE_PIXELS,
+                        help="Minimum active GT pixels for a LINET file to "
+                             "be selected (lightning extraction only). "
+                             f"Default {LIGHTNING_MIN_ACTIVE_PIXELS}.")
+    parser.add_argument("--batch_size", type=int, default=32,
+                        help="model.predict batch size. For lightning the "
+                             "Hann overlap produces ~55 patches per reference "
+                             "so 32-64 is a good range.")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -773,18 +1362,39 @@ def main() -> int:
     # extraction ignores it but the cost is a few ms).
     _load_country_borders_pixels()
 
-    if args.date is None:
-        run_extraction(
-            args.track, args.year, args.month,
-            args.mode, args.source, args.finetuned,
-            data_root, model_dir, output_dir,
-        )
-    else:
-        run_visualization(
-            args.track, args.year, args.month, args.date,
-            args.mode, args.source, args.finetuned,
-            data_root, model_dir, output_dir,
-        )
+    if args.track == "rainfall":
+        if args.date is None:
+            run_extraction(
+                args.track, args.year, args.month,
+                args.mode, args.source, args.finetuned,
+                data_root, model_dir, output_dir,
+            )
+        else:
+            run_visualization(
+                args.track, args.year, args.month, args.date,
+                args.mode, args.source, args.finetuned,
+                data_root, model_dir, output_dir,
+            )
+    else:  # lightning
+        if args.date is None:
+            run_extraction_lightning(
+                args.year, args.month,
+                args.mode, args.source, args.finetuned,
+                data_root, model_dir, output_dir,
+                stride=args.stride,
+                low_threshold=args.low_threshold,
+                min_active_pixels=args.min_active_pixels,
+                batch_size=args.batch_size,
+            )
+        else:
+            run_visualization_lightning(
+                args.year, args.month, args.date,
+                args.mode, args.source, args.finetuned,
+                data_root, model_dir, output_dir,
+                stride=args.stride,
+                low_threshold=args.low_threshold,
+                batch_size=args.batch_size,
+            )
     return 0
 
 
