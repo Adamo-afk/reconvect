@@ -1202,9 +1202,17 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
         # Sidecar metadata. `format` lets the loader know which on-disk
         # layout to expect; the eventual reader path is
         # `load_tfrecord_dataset(split_dir, mode_config)`.
+        # `track` and `run_tag` mirror the naming convention documented in
+        # train_models.build_run_tag - `track` is the human-facing label
+        # ("rainfall"/"occurrence") and `run_tag` is the full artefact
+        # tag with "rainfall" inserted for radar-labelled modes.
+        _track = ("occurrence" if mode_config["label_type"] == "lightning"
+                  else "rainfall")
         meta = {
             "mode": mode,
             "source": source,
+            "track": _track,
+            "run_tag": build_run_tag(mode, source),
             "split": split_name,
             "csv": csv_name,
             "format": "tfrecord",
