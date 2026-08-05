@@ -609,6 +609,25 @@ def get_mode_config(mode):
             "label_suffix": "HR",
             "label_type": "lightning",
         }
+    elif mode == "mtg_opera_occurrence":
+        # KNOWLEDGE-DISTILLATION STUDENT (see train_lightning_kd.py).
+        # Same MR/label stack as the teacher `mtg_lightning_opera_occurrence`
+        # so predictions from both models land on the exact same 768x1536
+        # binary-occurrence canvases and can be diffed directly; the ONLY
+        # difference is the HR branch, which loses LINET here (MTG vis_06
+        # only vs. HR_LIGHTNING_CONFIG + MTG vis_06 for the teacher).
+        # Rationale: student produces a lightning-occurrence prognosis
+        # from satellite-only inputs at inference time, useful whenever
+        # the LINET feed is late, missing, or being validated.
+        return {
+            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
+            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
+            "past_lr": None,
+            "label_var": "occurrence",
+            "label_transform": label_transform_occurrence,
+            "label_suffix": "HR",
+            "label_type": "lightning",
+        }
     elif mode == "mtg_opera_nwcsaf":
         return {
             "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
@@ -634,7 +653,7 @@ def get_mode_config(mode):
             f"Unknown mode: {mode}. Use: mtg_lightning, mtg_radar, "
             f"mtg_radar_continuous, mtg_opera_radar_only, "
             f"mtg_opera_mtgmr, mtg_lightning_opera, "
-            f"mtg_lightning_opera_occurrence. "
+            f"mtg_lightning_opera_occurrence, mtg_opera_occurrence. "
             f"(MSG modes are currently disabled.)"
         )
 

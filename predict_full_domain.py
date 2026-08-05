@@ -565,7 +565,8 @@ def main() -> int:
                                  "mtg_radar_continuous",
                                  "mtg_opera_radar_only", "mtg_opera_mtgmr",
                                  "mtg_lightning_opera",
-                                 "mtg_lightning_opera_occurrence"])
+                                 "mtg_lightning_opera_occurrence",
+                                 "mtg_opera_occurrence"])
     parser.add_argument("--source", type=str, default="dbscan",
                         choices=["dbscan", "lightning"],
                         help="Selects normalization_stats_<source>.json and "
@@ -591,6 +592,14 @@ def main() -> int:
                         help="Load coalition_<run_tag>_finetuned.keras "
                              "(rebuilt + load_weights, same trick as "
                              "evaluate_coalition).")
+    parser.add_argument("--kd", action="store_true",
+                        help="Load the knowledge-distillation student weights "
+                             "coalition_<run_tag>_kd.keras produced by "
+                             "train_lightning_kd.py. Mirrors --finetuned; "
+                             "the two flags are mutually exclusive (KD "
+                             "student is trained fresh, no swin head). "
+                             "Only meaningful for the student mode "
+                             "mtg_opera_occurrence.")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Manual probability threshold for the lightning "
                              "prediction map (defaults to 0.5 when the "
@@ -639,11 +648,17 @@ def main() -> int:
                              "override --high_threshold.")
     args = parser.parse_args()
 
+    if args.kd and args.finetuned:
+        parser.error("--kd and --finetuned are mutually exclusive "
+                     "(the KD student has no swin head).")
+
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
+    variant_suffix = ("_finetuned" if args.finetuned
+                      else "_kd" if args.kd
+                      else "")
     output_dir = Path(args.output_dir) / (
-        f"predict_{args.mode}_{args.source}"
-        + ("_finetuned" if args.finetuned else "")
+        f"predict_{args.mode}_{args.source}{variant_suffix}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -667,9 +682,11 @@ def main() -> int:
     print("=" * 70)
     print("COALITION-4 Inference (full-domain)")
     print("=" * 70)
+    variant_label = ("finetuned" if args.finetuned
+                     else "KD student" if args.kd
+                     else "base")
     print(f"  Mode:            {args.mode}  (label_type={label_type})")
-    print(f"  Source:          {args.source}  "
-          f"{'(finetuned)' if args.finetuned else '(base)'}")
+    print(f"  Source:          {args.source}  ({variant_label})")
     print(f"  Date:            {args.date}")
     print(f"  Reference times: {len(ref_times)} step-aligned slots "
           f"(step={step_minutes} min)")
@@ -686,7 +703,7 @@ def main() -> int:
     )
     print("\nLoading model...")
     model = load_model_artifact(
-        model_dir, args.mode, args.source, args.finetuned,
+        model_dir, args.mode, args.source, args.finetuned, kd=args.kd,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 

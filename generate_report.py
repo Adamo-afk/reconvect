@@ -54,6 +54,7 @@ DEFAULT_OLLAMA_TEMPERATURE = 0.0
 # single source of truth.
 RAINFALL_STEM_TEMPLATE = "rainfall_{year:04d}_{month:02d}"
 LIGHTNING_STEM_TEMPLATE = "lightning_{year:04d}_{month:02d}"
+KD_STEM_TEMPLATE = "kd_{year:04d}_{month:02d}"
 
 
 # ============================================================================
@@ -249,6 +250,86 @@ def _print_loaded(loaded: dict) -> None:
         pp = s["post_processing"]
         print(f"  post-proc: low={pp.get('low_threshold')} | "
               f"tuned high per lead={pp.get('high_threshold_per_lead')}")
+
+
+# ============================================================================
+# Knowledge-distillation artefact discovery (auto-added to report)
+# ============================================================================
+# The KD comparison section is included whenever kd_{yyyy}_{mm}_summary.json
+# is present in the validation dir. Distinct from the tracks[] lookup: KD
+# is orthogonal to which base tracks the user asked for (--track rainfall
+# etc.) - it's a separate section that piggybacks on the same report.
+
+def discover_kd_artefacts(validation_dir: Path, year: int, month: int) -> dict:
+    """Return {stem, summary_json, samples_csv, metric_pngs (dict metric->Path),
+    per_ref_pngs (list)}. Every field is None / empty when the corresponding
+    file is not on disk, so the caller can degrade cleanly."""
+    stem = KD_STEM_TEMPLATE.format(year=year, month=month)
+    summary_json = validation_dir / f"{stem}_summary.json"
+    samples_csv = validation_dir / f"{stem}_samples.csv"
+
+    metric_pngs: dict[str, Path] = {}
+    for metric in ("FAR", "POD", "CSI", "IoU"):
+        p = validation_dir / f"{stem}_metrics_{metric}.png"
+        if p.is_file():
+            metric_pngs[metric] = p
+
+    # Per-reference 3x3 comparison PNGs land at kd_YYYY_MM_YYYY-MM-DD_HHMM.png
+    per_ref_pngs = sorted(validation_dir.glob(f"{stem}_20*-*-*_*.png"))
+
+    return {
+        "stem": stem,
+        "summary_json": summary_json if summary_json.is_file() else None,
+        "samples_csv":  samples_csv if samples_csv.is_file() else None,
+        "metric_pngs":  metric_pngs,
+        "per_ref_pngs": per_ref_pngs,
+    }
+
+
+def _facts_block_kd_summary(kd_summary: dict) -> str:
+    """FACTS block for the KD comparison paragraph. Compact side-by-side
+    table of teacher vs student per-lead FAR/POD/CSI + the tuned high
+    thresholds that each model landed on."""
+    lines: list[str] = [
+        f"Total selected samples: {kd_summary.get('total_selected_samples', 0)}",
+        f"Teacher mode: {kd_summary.get('teacher_mode', 'unknown')}",
+        f"Student mode: {kd_summary.get('student_mode', 'unknown')} "
+        f"(HR channels: {kd_summary.get('student_hr_channels', '?')} "
+        f"- LINET dropped; MTG vis_06 only)",
+        f"Selection criterion: {kd_summary.get('selection_criterion', 'n/a')}",
+        "",
+        "Per-lead aggregate metrics (teacher | student):",
+    ]
+    t_metrics = kd_summary["teacher"]["metrics_per_lead"]
+    s_metrics = kd_summary["student"]["metrics_per_lead"]
+    for lead_title in t_metrics:
+        t = t_metrics[lead_title]
+        s = s_metrics.get(lead_title, {})
+        lines.append(
+            f"  {lead_title}: "
+            f"FAR {t.get('FAR', 0):.3f} | {s.get('FAR', 0):.3f}    "
+            f"POD {t.get('POD', 0):.3f} | {s.get('POD', 0):.3f}    "
+            f"CSI {t.get('CSI', 0):.3f} | {s.get('CSI', 0):.3f}"
+        )
+    lines.append("")
+    lines.append("High-coverage-bar (>=90% IoU) count per lead:")
+    t_hi = kd_summary["teacher"]["samples_above_threshold_per_lead"]
+    s_hi = kd_summary["student"]["samples_above_threshold_per_lead"]
+    for lead_title in t_hi:
+        lines.append(
+            f"  {lead_title}: teacher={t_hi[lead_title]}   "
+            f"student={s_hi.get(lead_title, {})}"
+        )
+    lines.append("")
+    lines.append("Tuned hysteresis high threshold per lead:")
+    t_pp = kd_summary["teacher"]["post_processing"]["high_threshold_per_lead"]
+    s_pp = kd_summary["student"]["post_processing"]["high_threshold_per_lead"]
+    for lead_title in t_pp:
+        lines.append(
+            f"  {lead_title}: teacher={t_pp[lead_title]}   "
+            f"student={s_pp.get(lead_title, '?')}"
+        )
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -1110,6 +1191,38 @@ and date character-for-character. Output ONLY the translation.
 """
 
 
+# ----- Prompt E - KD teacher-vs-student comparison (text-only, 1 call) ------
+# One paragraph that summarises the KD experiment: how the student
+# (satellite-only inputs) compares to the teacher (with LINET) across
+# every lead time, whether the gap widens or narrows with lead, and how
+# each model's tuned high-threshold behaves. Emitted only when a
+# kd_{yyyy}_{mm}_summary.json is present.
+PROMPT_KD_SUMMARY_EN = """\
+Write ONE meteorological paragraph (4-6 sentences) comparing the \
+teacher and student models in the knowledge-distillation experiment \
+for the validation period. Audience: meteorologists reviewing whether \
+the LINET-free student is operationally usable.
+
+FACTS (source of truth for every number below):
+{facts_block}
+
+Requirements:
+- Report per-lead FAR / POD / CSI for BOTH models. Frame each metric \
+  as "teacher X vs student Y" using the exact values in FACTS.
+- Comment on how the gap between teacher and student EVOLVES across \
+  t+15 -> t+30 -> t+45: does the student catch up, hold the gap, or \
+  fall further behind at longer leads?
+- Note how many samples cleared the 90% coverage bar for each model at \
+  each lead - this is a proxy for how often the student is "good \
+  enough" to substitute for the teacher.
+- Briefly comment on the tuned per-lead hysteresis high thresholds: \
+  are the student's operating points more or less conservative than \
+  the teacher's, and does that make meteorological sense given the \
+  student's reduced input stack (no LINET at inference)?
+- Do NOT use "we" or "our model"; write as an independent analyst.
+"""
+
+
 def _print_facts(facts_index: dict) -> None:
     """Compact human-readable dump of the facts index. Scaffold-only."""
     centre_lat, centre_lon = facts_index["grid_centre_lat_lon"]
@@ -1322,6 +1435,7 @@ def generate_english_paragraphs(
     per_track_loaded: dict, facts_index: dict, *,
     year: int, month: int, step_minutes: int,
     model: str, seed: int, temperature: float,
+    kd_artefacts: dict | None = None,
 ) -> list[dict]:
     """Run prompts A, B (per track x per lead), C (per reference) through
     Gemma and return a list of section dicts:
@@ -1415,6 +1529,32 @@ def generate_english_paragraphs(
             # figure_path kept so the PDF layout still embeds the coupling PNG
             # as decoration below the caption; it just isn't sent to Gemma.
             "figure_path": ref_data.get("coupling_figure_path"),
+        })
+
+    # ---- Prompt E: KD teacher-vs-student comparison (auto-detected) ---
+    # Emitted only when kd_{yyyy}_{mm}_summary.json is on disk. One
+    # additional Gemma call + one translation. The 4 metric PNGs and
+    # per-reference 3x3 PNGs are embedded in the PDF as decoration; no
+    # per-figure vision call.
+    if kd_artefacts and kd_artefacts.get("summary_json"):
+        print(f"  [E] KD teacher vs student summary ...", flush=True)
+        with open(kd_artefacts["summary_json"]) as f:
+            kd_summary = json.load(f)
+        facts = _facts_block_kd_summary(kd_summary)
+        english = ollama_generate_text(
+            PROMPT_KD_SUMMARY_EN.format(facts_block=facts),
+            model=model, system=PROMPT_SYSTEM_EN,
+            seed=seed, temperature=temperature,
+        )
+        sections.append({
+            "id": "kd_summary",
+            "kind": "kd_summary",
+            "title": f"Knowledge distillation - teacher vs student "
+                     f"({year:04d}-{month:02d})",
+            "english": english.strip(),
+            "kd_summary": kd_summary,
+            "kd_metric_pngs": kd_artefacts["metric_pngs"],
+            "kd_per_ref_pngs": kd_artefacts["per_ref_pngs"],
         })
     return sections
 
@@ -1645,6 +1785,51 @@ class _ReportPDF:
         if bilingual and english:
             self.body(english, size=9, italic=True)
 
+    def kd_section(self, title_ro: str, romanian: str,
+                   metric_pngs: dict, per_ref_pngs: list,
+                   english: str | None = None,
+                   bilingual: bool = False):
+        """Knowledge-distillation comparison section:
+             1 title,
+             1 Romanian body paragraph,
+             (optional) 1 English body paragraph in italics,
+             4 metric PNGs (FAR / POD / CSI / IoU) embedded in fixed order,
+             per-reference 3x3 comparison figures embedded one-per-page.
+        The metric PNGs live in the SAME validation dir as the other artefacts;
+        we resolve them by the (metric -> Path) dict produced by
+        discover_kd_artefacts.
+        """
+        self.new_page()
+        self._record_toc(title_ro)
+        self.title(title_ro, size=16)
+        self.body(romanian, size=11)
+        if bilingual and english:
+            self.body(english, size=9, italic=True)
+        # Metric bars (4 files, canonical order)
+        for metric in ("FAR", "POD", "CSI", "IoU"):
+            path = metric_pngs.get(metric)
+            if path is not None and path.is_file():
+                self.pdf.ln(2)
+                self.pdf.set_font("DejaVu", "B", 11)
+                self._mc(6, f"Metrica {metric}")
+                self.image_full_width(path, max_height_mm=95)
+        # Per-reference 3x3 comparison figures — one per page so each
+        # renders large enough to actually read.
+        for p in per_ref_pngs:
+            if not p.is_file():
+                continue
+            self.new_page()
+            self.pdf.set_font("DejaVu", "B", 12)
+            # e.g. kd_2025_05_2025-05-14_1230.png -> "2025-05-14 12:30 UTC"
+            stem = p.stem
+            parts = stem.split("_")
+            if len(parts) >= 4:
+                caption = f"{parts[-2]} ref {parts[-1][:2]}:{parts[-1][2:]} UTC"
+            else:
+                caption = p.name
+            self._mc(6, f"Comparație KD - {caption}")
+            self.image_full_width(p, max_height_mm=200)
+
     def data_appendix(self, per_track_loaded: dict, step_minutes: int):
         """Per-track table: min / mean / max coverage per lead time."""
         import numpy as np
@@ -1775,6 +1960,17 @@ def render_pdf_report(
             ref_title_ro=ref_title,
             figure_path=sec.get("figure_path"),
             romanian=sec["romanian"],
+            english=sec.get("english"),
+            bilingual=bilingual,
+        )
+
+    # -------- KD comparison (auto-detected; may be absent for pure rain/light runs)
+    for sec in by_kind.get("kd_summary", []):
+        doc.kd_section(
+            title_ro="Distilare cunoștințe — profesor vs. student",
+            romanian=sec["romanian"],
+            metric_pngs=sec.get("kd_metric_pngs", {}),
+            per_ref_pngs=sec.get("kd_per_ref_pngs", []),
             english=sec.get("english"),
             bilingual=bilingual,
         )
@@ -1960,12 +2156,26 @@ def main() -> int:
             "facts_index is not available; cannot generate paragraphs. "
             "See the WARN above (typically GT canvases missing on disk)."
         )
+    # KD comparison section is auto-detected: if kd_{yyyy}_{mm}_summary.json
+    # is present in the validation dir, we include a Teacher-vs-Student
+    # section (1 extra Gemma call + Romanian translation, plus embedded
+    # metric + per-reference PNGs).
+    kd_artefacts = discover_kd_artefacts(validation_dir, args.year, args.month)
+    if kd_artefacts["summary_json"] is not None:
+        print(f"  KD outputs detected ({kd_artefacts['stem']}): "
+              f"{len(kd_artefacts['metric_pngs'])} metric PNG(s), "
+              f"{len(kd_artefacts['per_ref_pngs'])} per-reference PNG(s). "
+              f"Including KD comparison section.")
+    else:
+        print("  No KD outputs present; skipping KD comparison section.")
+
     print()
     print("Generating English paragraphs via Gemma ...")
     sections = generate_english_paragraphs(
         per_track_loaded, facts_index,
         year=args.year, month=args.month, step_minutes=step_minutes,
         model=args.model, seed=args.seed, temperature=args.temperature,
+        kd_artefacts=kd_artefacts if kd_artefacts["summary_json"] else None,
     )
     print(f"  {len(sections)} sections generated in English.")
 
