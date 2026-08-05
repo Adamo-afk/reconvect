@@ -1254,6 +1254,89 @@ The tuned per-lead thresholds are consumable by [`predict_full_domain.py`](predi
 
 - The model, source, and finetuned toggle default to `mtg_lightning_opera` / `dbscan` / base; override with `--mode`, `--source`, `--finetuned` if needed.
 
+## Knowledge Distillation (lightning track)
+
+Standard Hinton-style teacher-student distillation for the lightning-occurrence head. Trains a **student** model that produces the same lightning-occurrence prognosis as the full-input **teacher**, but WITHOUT access to LINET at inference time — only MTG (satellite) + OPERA (composite radar). Useful whenever the LINET feed is late, missing, or being validated.
+
+| | Teacher | Student |
+|---|---|---|
+| Mode | `mtg_lightning_opera_occurrence` | `mtg_opera_occurrence` (new — see [`create_datasets.py`](create_datasets.py)) |
+| HR inputs | LINET (density + current + occurrence) + MTG vis_06 | MTG vis_06 only |
+| MR inputs | OPERA reflectivity + rainfall_rate + MTG IR/WV | (same) |
+| Label | Binary lightning occurrence at t+15/+30/+45 | (same) |
+| Weights file | `coalition_mtg_lightning_opera_occurrence_dbscan.keras` (base) or `..._finetuned.keras` (Swin head) | `coalition_mtg_opera_occurrence_dbscan_kd.keras` (produced by the KD trainer) |
+
+### KD loss (Hinton, adapted for binary sigmoid outputs)
+
+```
+logit(p) = log(p / (1 - p))                        # inverse sigmoid
+soft_x   = sigmoid(logit(p_x) / T)                 # temperature-softened
+L_soft   = BCE(soft_teacher, soft_student) * T ** 2
+L_hard   = WeightedFocalLoss(y_gt, student)        # supervised anchor
+L_total  = alpha * L_soft + (1 - alpha) * L_hard
+```
+
+Defaults are the canonical Hinton values: `alpha = 0.7`, `temperature = 4.0`. Both configurable per-run via `--kd_alpha` and `--kd_temperature` on [`train_lightning_kd.py`](train_lightning_kd.py) — see the [Thresholds Reference](#thresholds-reference) for tuning implications.
+
+### Training
+
+The KD script reuses the teacher's dataset directly — the student sees the same shuffled batches, with LINET channels sliced away on the fly (`teacher_hr[..., -1:]` = the last MTG vis_06 channel).
+
+```bash
+# Train the student (teacher checkpoint must already exist under models/)
+python train_lightning_kd.py --data_root ./our_data --model_dir ./models \
+    --epochs 50 --batch_size 8
+
+# Non-default hyperparameters
+python train_lightning_kd.py --kd_alpha 0.5 --kd_temperature 6.0
+
+# Distil from the finetuned teacher (Swin head) instead of the base
+python train_lightning_kd.py --teacher_finetuned
+```
+
+Outputs:
+- `models/coalition_mtg_opera_occurrence_dbscan_kd.keras`
+- `models/history_mtg_opera_occurrence_dbscan_kd.json` (records `kd_alpha`, `kd_temperature`, per-epoch losses, wall time)
+
+### Inference
+
+Same `predict_full_domain.py` flow as the teacher, with `--kd` to select the KD-trained student weights:
+
+```bash
+python predict_full_domain.py --mode mtg_opera_occurrence --source dbscan \
+    --kd --date 2026-06-30
+```
+
+`--kd` and `--finetuned` are mutually exclusive (the KD student is trained fresh, no Swin head).
+
+### Validation — teacher vs student on the same samples
+
+New `--track kd` in [`validate_predictions.py`](validate_predictions.py) runs BOTH models on the same OPERA-selected samples and tunes each model's per-lead hysteresis high threshold **independently**:
+
+```bash
+# Extraction: emits kd_YYYY_MM_{samples.csv, summary.json, metrics_{FAR,POD,CSI,IoU}.png}
+python validate_predictions.py --track kd --year 2025 --month 5
+
+# Visualisation: emits kd_YYYY_MM_YYYY-MM-DD_HHMM.png per selected reference
+python validate_predictions.py --track kd --year 2025 --month 5 --date 2025-05-14
+
+# Alternative teacher / student modes or checkpoints
+python validate_predictions.py --track kd --year 2025 --month 5 \
+    --teacher_finetuned                 # distil from swin teacher
+python validate_predictions.py --track kd --year 2025 --month 5 \
+    --no_student_kd                      # load plain student (rare)
+```
+
+Output figures:
+- **`kd_YYYY_MM_metrics_{FAR|POD|CSI|IoU}.png`** — 4 files, one per metric. Teacher vs student bars grouped per lead time (t+15/+30/+45).
+- **`kd_YYYY_MM_YYYY-MM-DD_HHMM.png`** — 3×3 comparison per reference: row 1 = GT alone, row 2 = GT + teacher red overlay, row 3 = GT + student red overlay, columns = lead times.
+
+Summary JSON contains BOTH tracks' `post_processing.high_threshold_per_lead` blocks so predict-side inference can consume either model's tuned thresholds via `--validation_summary`.
+
+### Report generation
+
+If `kd_YYYY_MM_summary.json` exists in `--validation_dir` when [`generate_report.py`](generate_report.py) runs, a **Knowledge Distillation** section is auto-added to the PDF: one Gemma-generated Romanian paragraph interpreting teacher vs student performance, followed by the 4 metric figures and per-reference 3×3 figures embedded. No CLI flag needed — pure auto-detect. Cost: 1 additional English call + 1 translation.
+
 ## Automated Report Generation
 
 [`generate_report.py`](generate_report.py) turns the outputs of `validate_predictions.py` into a standalone Romanian PDF for meteorologists who have never seen the internal model. It runs a local Ollama-hosted LLM (default `gemma4:12b`) for data-first commentary, then translates each paragraph to Romanian in a second Gemma call with a meteorological glossary in the system prompt. All prompts are **text-only** — the coupling-mask PNG is rendered for the human reader but never sent to the model; Gemma reads pre-computed per-coupled-cell metadata instead. Everything is deterministic given the same validation outputs, model tag, `temperature=0`, and seed.
@@ -1343,6 +1426,15 @@ Every knob in the codebase that decides "what counts" — sample selection, even
 |---|---|---|---|---|---|
 | `THRESHOLDS_NORM` | $\color{red}{[10/70, 20/70, 30/70, 40/70]}$ | [sepconv_ensemble_training.py:65](sepconv_ensemble_training.py#L65) & [evaluate_sepconv_ensemble.py:42](evaluate_sepconv_ensemble.py#L42) | n/a (source edit) | Class boundaries for the 5-class rainfall multiclass head (normalised by the 70 mm/h scale factor: R<10, 10-20, 20-30, 30-40, ≥40 mm/h). | Changing boundaries → different class definitions; requires retraining the multiclass head. |
 | `N_RAINFALL_CLASSES` | $\color{red}{5}$ | [validate_predictions.py:140](validate_predictions.py#L140) | n/a (source edit) | Number of classes the rainfall multiclass head outputs. Must match `THRESHOLDS_NORM` (N_classes = len(boundaries) + 1). | Only change if you retrain the head with a different class scheme; validate_predictions expects 5. |
+
+### Knowledge distillation (student training)
+
+| Constant | Default | Location | CLI override | Purpose | Impact if changed |
+|---|---|---|---|---|---|
+| `DEFAULT_KD_ALPHA` | $\color{red}{0.7}$ | [train_lightning_kd.py:82](train_lightning_kd.py#L82) | `--kd_alpha` (train_lightning_kd.py) | Weight on the soft-teacher (distillation) loss in `L = alpha*L_soft + (1-alpha)*L_hard`. Canonical Hinton value. | Higher → student mimics teacher more, weaker GT anchoring. Lower → student behaves more like a from-scratch supervised model. |
+| `DEFAULT_KD_TEMPERATURE` | $\color{red}{4.0}$ | [train_lightning_kd.py:83](train_lightning_kd.py#L83) | `--kd_temperature` (train_lightning_kd.py) | Temperature for softening both teacher and student sigmoid outputs before the BCE distillation loss. Canonical Hinton value. | Higher → softer distribution (more subtle knowledge). Lower → sharper, distillation approaches hard-label BCE. `T=1` disables softening. |
+| `STUDENT_HR_CHANNELS` | $\color{red}{1}$ | [train_lightning_kd.py:88](train_lightning_kd.py#L88) & [validate_predictions.py](validate_predictions.py) (`KD_STUDENT_HR_CHANNELS`) | n/a (source edit) | Number of trailing HR channels the student keeps from the teacher's input (= MTG vis_06, last one in the dict-merge order). Changing this requires a matching change to `create_datasets.HR_LIGHTNING_CONFIG` and re-training. | Only change if the teacher's HR channel layout changes; the split point defines what the student sees at inference. |
+| `KD_TEACHER_MODE` / `KD_STUDENT_MODE` | $\color{red}{\text{mtg\_lightning\_opera\_occurrence}}$ / $\color{red}{\text{mtg\_opera\_occurrence}}$ | [validate_predictions.py](validate_predictions.py) | `--teacher_mode` / `--student_mode` (validate_predictions.py --track kd) | Which mode configs get loaded in the KD extraction / visualisation. | Almost never overridden; kept as CLI hooks in case an alt teacher/student pair is added later. |
 
 ### Deterministic-generation knobs (report only)
 

@@ -1010,17 +1010,41 @@ def _custom_objects():
 
 
 def load_model_artifact(model_dir: Path, mode: str, source: str,
-                        finetuned: bool) -> tf.keras.Model:
-    """Load either the base or the Swin-head model for (mode, source).
+                        finetuned: bool, kd: bool = False) -> tf.keras.Model:
+    """Load a saved model checkpoint. Three variants, mutually exclusive:
 
-    For fine-tuned models, rebuild the architecture via
-    train_models.build_finetune_model (same rebuild + load_weights trick
-    evaluate_coalition.py uses to dodge the nested-sub-Model load_model
-    shape mismatch in TF 2.10).
+      kd=True                 -> coalition_<run_tag>_kd.keras
+                                 (KD student, saved by train_lightning_kd.py -
+                                  plain tf.keras save, no swin rebuild dance)
+      finetuned=True          -> coalition_<run_tag>_finetuned.keras
+                                 (rebuilt via train_models.build_finetune_model
+                                 + load_weights; TF 2.10 nested-sub-Model
+                                 shape workaround)
+      neither                 -> coalition_<run_tag>.keras   (base)
     """
+    if kd and finetuned:
+        raise ValueError(
+            "kd=True and finetuned=True are mutually exclusive: the KD "
+            "student is trained fresh from scratch (no swin head), so a "
+            "'finetuned KD' variant does not exist. Pass one or neither."
+        )
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
     run_tag = f"{mode}_{source}"
     base_path = model_dir / f"coalition_{run_tag}.keras"
+
+    if kd:
+        # KD student is saved via .save() so a straight load_model works;
+        # the custom_objects list handles ResBlock / ResGRU / ConvBlock /
+        # WeightedFocalLoss registration same as the base path.
+        kd_path = model_dir / f"coalition_{run_tag}_kd.keras"
+        if not kd_path.is_file():
+            raise FileNotFoundError(
+                f"KD-student checkpoint not found: {kd_path}. "
+                f"Train it via `train_lightning_kd.py`."
+            )
+        return tf.keras.models.load_model(
+            str(kd_path), custom_objects=_custom_objects(),
+        )
 
     if not finetuned:
         if not base_path.is_file():

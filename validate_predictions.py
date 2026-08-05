@@ -1356,6 +1356,640 @@ def run_visualization_lightning(
 
 
 # ============================================================================
+# ==========================  KD TRACK (teacher vs student)  =================
+# ============================================================================
+# Structural clone of the lightning track, wrapped around BOTH models:
+#   * OPERA-driven sample selection (same shared list as rainfall/lightning)
+#   * Hann-overlapped inputs built once per reference; TEACHER consumes them
+#     as-is (LINET + MTG vis_06 in HR), STUDENT consumes a slice of the
+#     LAST N HR channels (vis_06 only). Same MR / LR pass through.
+#   * Per candidate high in the sweep grid we hysteresis-binarise EACH model
+#     against LINET GT independently, so each ends up with its own tuned
+#     per-lead high threshold.
+#   * Outputs: kd_<yyyy>_<mm>_{samples.csv, summary.json, metrics_{FAR,POD,
+#     CSI,IoU}.png}. summary.json has BOTH teacher.post_processing and
+#     student.post_processing blocks.
+
+KD_TEACHER_MODE = "mtg_lightning_opera_occurrence"
+KD_STUDENT_MODE = "mtg_opera_occurrence"
+# Same constant as train_lightning_kd.STUDENT_HR_CHANNELS - kept in sync by
+# a comment (no runtime import to keep this module free of TF at CLI time).
+KD_STUDENT_HR_CHANNELS = 1
+
+KD_METRIC_NAMES = ("FAR", "POD", "CSI", "IoU")
+
+
+def _kd_slice_student_inputs(inputs: dict) -> dict:
+    """Derive the student's inputs from a teacher-format Hann-overlapped
+    inputs dict by keeping only the LAST N HR channels (= MTG vis_06)."""
+    student_hr = inputs["past_hr"][..., -KD_STUDENT_HR_CHANNELS:]
+    out = dict(inputs)
+    out["past_hr"] = student_hr
+    return out
+
+
+def _write_csv_kd(rows: list[dict], path: Path, step_minutes: int):
+    """Per-sample CSV with teacher + student columns side by side per lead.
+
+    Columns: date, reference_utc,
+             iou_teacher_t+{m}, iou_student_t+{m},
+             far_teacher_t+{m}, far_student_t+{m}, ... (per lead).
+    """
+    if not rows:
+        print(f"  No rows to write for {path}")
+        return
+    fieldnames = ["date", "reference_utc"]
+    for offset in LEAD_STEP_OFFSETS:
+        m = offset * step_minutes
+        for metric in ("iou", "far", "pod", "csi"):
+            fieldnames.append(f"{metric}_teacher_t+{m}")
+            fieldnames.append(f"{metric}_student_t+{m}")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  Wrote {len(rows)} rows to {path}")
+
+
+def _write_json_kd(
+    year: int, month: int,
+    selected: list[tuple[str, str]],
+    rows: list[dict],
+    teacher_conf_per_lead: dict[int, dict],
+    student_conf_per_lead: dict[int, dict],
+    teacher_tuning: dict[int, dict[float, dict]],
+    student_tuning: dict[int, dict[float, dict]],
+    teacher_best_high: dict[int, float],
+    student_best_high: dict[int, float],
+    low_threshold: float,
+    step_minutes: int,
+    path: Path,
+    *,
+    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+    high_coverage_pct: float = HIGH_COVERAGE_PCT,
+):
+    """KD summary JSON: rainfall-track-style metadata + BOTH tracks'
+    metrics_per_lead / high-coverage lists + BOTH post_processing blocks
+    (per-lead high tuned independently per model)."""
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+
+    def _build_side(name_col: str) -> tuple[dict, dict, dict, dict]:
+        """Compute (above, diff_pct, high_cov_lists, metrics_per_lead) for
+        one side (teacher or student) from the rows + confusion dicts."""
+        above = {lt: {"iou": 0} for lt in lead_titles}
+        high_cov = {lt: {"iou": []} for lt in lead_titles}
+        for r in rows:
+            for i, offset in enumerate(LEAD_STEP_OFFSETS):
+                lt = lead_titles[i]
+                if r[f"iou_{name_col}_t+{offset * step_minutes}"] >= high_coverage_pct:
+                    above[lt]["iou"] += 1
+                    high_cov[lt]["iou"].append(
+                        [r["date"], r["reference_utc"]]
+                    )
+        total = len(rows)
+        diff_pct = {}
+        for lt in lead_titles:
+            diff_pct[lt] = {}
+            if total == 0:
+                diff_pct[lt]["iou"] = 0.0
+                continue
+            diff_pct[lt]["iou"] = ((total - above[lt]["iou"]) / total) * 100.0
+        conf_source = (teacher_conf_per_lead if name_col == "teacher"
+                       else student_conf_per_lead)
+        metrics_at_best = {
+            lead_titles[i]: _summarise_confusion(conf_source[i])
+            for i in range(len(LEAD_STEP_OFFSETS))
+        }
+        return above, diff_pct, high_cov, metrics_at_best
+
+    def _pp_block(tuning: dict, best_high: dict) -> dict:
+        tuning_named = {}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            lt = lead_titles[i]
+            tuning_named[lt] = {
+                f"{h:.2f}": tuning[i][h] for h in sorted(tuning[i])
+            }
+        high_named = {
+            f"t+{offset * step_minutes}": best_high[offset]
+            for offset in LEAD_STEP_OFFSETS
+        }
+        return {
+            "low_threshold": low_threshold,
+            "high_grid": list(LIGHTNING_HIGH_GRID),
+            "high_threshold_per_lead": high_named,
+            "tuning_scores": tuning_named,
+            "tuning_metric": "csi",
+        }
+
+    t_above, t_diff, t_hcov, t_metrics = _build_side("teacher")
+    s_above, s_diff, s_hcov, s_metrics = _build_side("student")
+
+    doc = {
+        "track": "kd",
+        "year": year, "month": month,
+        "selection_criterion": (
+            f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
+            f"768x1536 canvas at the reference timestep (shared with rainfall + "
+            f"lightning tracks for parity)."
+        ),
+        "high_coverage_threshold_pct": high_coverage_pct,
+        "total_selected_samples": len(rows),
+        "initial_selection": [[d, h] for d, h in selected],
+        "teacher_mode": KD_TEACHER_MODE,
+        "student_mode": KD_STUDENT_MODE,
+        "student_hr_channels": KD_STUDENT_HR_CHANNELS,
+        "teacher": {
+            "samples_above_threshold_per_lead": t_above,
+            "difference_pct_per_lead":         t_diff,
+            "metrics_per_lead":                t_metrics,
+            "high_coverage_samples_per_lead":  t_hcov,
+            "post_processing":                 _pp_block(teacher_tuning, teacher_best_high),
+        },
+        "student": {
+            "samples_above_threshold_per_lead": s_above,
+            "difference_pct_per_lead":         s_diff,
+            "metrics_per_lead":                s_metrics,
+            "high_coverage_samples_per_lead":  s_hcov,
+            "post_processing":                 _pp_block(student_tuning, student_best_high),
+        },
+    }
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2)
+    print(f"  Wrote KD summary to {path}")
+
+
+def _plot_metrics_figure_kd_per_metric(
+    year: int, month: int,
+    teacher_conf_per_lead: dict[int, dict],
+    student_conf_per_lead: dict[int, dict],
+    rows: list[dict],
+    step_minutes: int,
+    output_dir: Path,
+):
+    """Emit ONE figure per metric (FAR / POD / CSI / IoU%) with teacher
+    vs student bars grouped per lead. Four files:
+       kd_{yyyy}_{mm}_{FAR,POD,CSI,IoU}.png
+    """
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    stem = f"kd_{year:04d}_{month:02d}"
+
+    # Bar values per (metric, model, lead).
+    t_agg = [_summarise_confusion(teacher_conf_per_lead[i])
+             for i in range(len(LEAD_STEP_OFFSETS))]
+    s_agg = [_summarise_confusion(student_conf_per_lead[i])
+             for i in range(len(LEAD_STEP_OFFSETS))]
+
+    def _iou_series(rows_side_key: str) -> list[float]:
+        # Aggregate IoU per lead as the mean of the per-sample column so
+        # the IoU figure lines up with what the CSV shows. FAR/POD/CSI use
+        # the aggregate-confusion form since that's how the summary metric
+        # is defined; IoU is a coverage ratio per sample, better averaged.
+        vals = []
+        for offset in LEAD_STEP_OFFSETS:
+            col = f"iou_{rows_side_key}_t+{offset * step_minutes}"
+            xs = [r[col] for r in rows]
+            vals.append(float(np.mean(xs)) if xs else 0.0)
+        return vals
+
+    x = np.arange(len(lead_titles))
+    width = 0.35
+    t_color = "#1f77b4"   # blue
+    s_color = "#ff7f0e"   # orange
+
+    for metric in KD_METRIC_NAMES:
+        fig, ax = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
+        if metric in ("FAR", "POD", "CSI"):
+            t_vals = [agg[metric] for agg in t_agg]
+            s_vals = [agg[metric] for agg in s_agg]
+            ylabel = f"{metric} (0..1)"
+            ylim = (0.0, 1.0)
+        else:  # IoU is a percentage per sample -> average
+            t_vals = _iou_series("teacher")
+            s_vals = _iou_series("student")
+            ylabel = "Mean IoU per sample (%)"
+            ylim = (0.0, 100.0)
+        ax.bar(x - width / 2, t_vals, width,
+               label="Teacher (mtg_lightning_opera_occurrence)",
+               color=t_color, edgecolor="white", linewidth=0.5)
+        ax.bar(x + width / 2, s_vals, width,
+               label="Student (mtg_opera_occurrence, KD)",
+               color=s_color, edgecolor="white", linewidth=0.5)
+        ax.set_xticks(x)
+        ax.set_xticklabels(lead_titles)
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(*ylim)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(loc="best", fontsize=10)
+        ax.set_title(
+            f"{metric} - teacher vs student (KD) - "
+            f"{year:04d}-{month:02d}  |  {len(rows)} selected samples",
+            fontsize=12, fontweight="bold",
+        )
+        out = output_dir / f"{stem}_metrics_{metric}.png"
+        fig.savefig(out, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Wrote {out.name}")
+
+
+def _plot_kd_3x3(
+    gt_canvases: list[np.ndarray | None],
+    teacher_bin: list[np.ndarray],
+    student_bin: list[np.ndarray],
+    *,
+    date_str: str, ref_utc: str, step_minutes: int,
+    output_path: Path, suptitle_color: str = "black",
+) -> None:
+    """3 rows x 3 lead cols. Row 1 = GT alone; row 2 = GT + teacher red
+    overlay; row 3 = GT + student red overlay. Same base colormap +
+    border overlay as _plot_lightning_2x3 for visual continuity."""
+    import matplotlib.colors as mcolors
+    from visualize_gt_vs_pred import (
+        H_FULL, W_FULL, overlay_borders, _ensure_view_cached,
+        _gt_kwargs_for,
+    )
+    import visualize_gt_vs_pred as _vf
+
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+    gt_kwargs = _gt_kwargs_for("lightning")
+
+    fig, axes = plt.subplots(3, 3, figsize=(21, 12.5),
+                             constrained_layout=True)
+
+    def _apply_frame(ax):
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)
+        ax.set_aspect("equal")
+
+    row_labels = ("GT", "GT + teacher (red)", "GT + student (red)")
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        lead_min = offset * step_minutes
+        gt = gt_canvases[i]
+
+        # --- Row 1: GT alone ---
+        ax_gt = axes[0, i]
+        if gt is None:
+            ax_gt.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                         cmap="gray", vmin=0.0, vmax=1.0,
+                         aspect="equal", interpolation="nearest")
+            ax_gt.text(0.5, 0.5, "GT unavailable",
+                       transform=ax_gt.transAxes, ha="center", va="center",
+                       fontsize=13, color="#555")
+        else:
+            ax_gt.imshow(gt.astype(np.float32), **gt_kwargs)
+        try: overlay_borders(ax_gt)
+        except Exception: pass
+        _apply_frame(ax_gt)
+        gt_px = int((gt > 0).sum()) if gt is not None else 0
+        ax_gt.set_title(f"GT - t+{lead_min} min  |  active px = {gt_px}",
+                        fontsize=11)
+
+        for row_idx, (bin_can, colour) in enumerate(
+            ((teacher_bin[i], "#d62728"),
+             (student_bin[i], "#d62728")), start=1,
+        ):
+            ax = axes[row_idx, i]
+            if gt is not None:
+                ax.imshow(gt.astype(np.float32), **gt_kwargs)
+            else:
+                ax.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                          cmap="gray", vmin=0.0, vmax=1.0,
+                          aspect="equal", interpolation="nearest")
+            overlay = np.where(bin_can > 0, 1.0, np.nan)
+            ax.imshow(overlay, cmap=mcolors.ListedColormap([colour]),
+                      vmin=0.5, vmax=1.5, aspect="equal", interpolation="nearest")
+            try: overlay_borders(ax)
+            except Exception: pass
+            _apply_frame(ax)
+            n_pred = int((bin_can > 0).sum())
+            if gt is not None:
+                gt_pos = gt > 0
+                pr_pos = bin_can > 0
+                hits = int((gt_pos & pr_pos).sum())
+                misses = int((gt_pos & ~pr_pos).sum())
+                fa = int((~gt_pos & pr_pos).sum())
+                subtitle = (f"{row_labels[row_idx]}  t+{lead_min}  |  "
+                            f"hits={hits} miss={misses} FA={fa}  "
+                            f"pred px={n_pred}")
+            else:
+                subtitle = (f"{row_labels[row_idx]}  t+{lead_min}  |  "
+                            f"pred px={n_pred}")
+            ax.set_title(subtitle, fontsize=10)
+
+    fig.suptitle(
+        f"KD comparison  |  {date_str}  ref={ref_utc}",
+        fontsize=14, fontweight="bold", color=suptitle_color,
+    )
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_extraction_kd(
+    year: int, month: int,
+    teacher_mode: str, student_mode: str,
+    source: str,
+    teacher_finetuned: bool, student_kd: bool,
+    data_root: Path, model_dir: Path, output_dir: Path,
+    *,
+    stride: int = DEFAULT_STRIDE,
+    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
+    high_grid: tuple[float, ...] = LIGHTNING_HIGH_GRID,
+    batch_size: int = 32,
+    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+    high_coverage_pct: float = HIGH_COVERAGE_PCT,
+):
+    """KD extraction: load both models, run each on the same OPERA-selected
+    samples with the same Hann-overlapped inputs (student sees only the
+    last HR channel = vis_06), tune each model's per-lead high threshold
+    independently, emit joint CSV / JSON / 4 metric figures."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"Validation extraction - track=kd  {year:04d}-{month:02d}")
+    print("=" * 70)
+    print(f"  Teacher: {teacher_mode} ({source}"
+          f"{' finetuned' if teacher_finetuned else ''})")
+    print(f"  Student: {student_mode} ({source}"
+          f"{' KD' if student_kd else ' base'})")
+    print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
+          f"high grid={list(high_grid)}")
+    print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
+          f"high_coverage_pct={high_coverage_pct:g}")
+
+    init_sequence_config(str(data_root), source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
+    teacher_cfg = get_mode_config(teacher_mode)
+    student_cfg = get_mode_config(student_mode)
+    if teacher_cfg["label_type"] != "lightning":
+        raise SystemExit(f"Teacher --mode {teacher_mode} is not lightning-headed.")
+    if student_cfg["label_type"] != "lightning":
+        raise SystemExit(f"Student --mode {student_mode} is not lightning-headed.")
+    step_minutes = _load_step_minutes(data_root)
+
+    print(f"\nSelecting samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
+    selected = select_samples(data_root, year, month,
+                              threshold_mmh=rainfall_threshold_mmh)
+    if not selected:
+        print("No samples selected. Nothing to do.")
+        return
+
+    print(f"\nLoading TEACHER ...")
+    teacher = load_model_artifact(model_dir, teacher_mode, source,
+                                  teacher_finetuned)
+    print(f"  Teacher params: {teacher.count_params():,}")
+    print(f"Loading STUDENT ...")
+    student = load_model_artifact(model_dir, student_mode, source,
+                                  finetuned=False, kd=student_kd)
+    print(f"  Student params: {student.count_params():,}")
+
+    # Store per-(sample, side, lead_idx, high) confusion tuples.
+    per_sample: list[dict] = []
+    n_skipped = 0
+
+    print(f"\nRunning both models on {len(selected)} samples "
+          f"(Hann overlap, stride={stride}) ...")
+    for k, (date_str, hhmm) in enumerate(selected, 1):
+        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+        if k == 1 or k % 20 == 0 or k == len(selected):
+            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
+
+        inputs, positions = build_inputs_for_reference_overlapped(
+            data_root, teacher_cfg, date_str, ref_utc, step_minutes,
+            stride=stride,
+        )
+        if not positions:
+            n_skipped += 1
+            continue
+        student_inputs = _kd_slice_student_inputs(inputs)
+
+        t_preds = teacher.predict(inputs, batch_size=batch_size, verbose=0)
+        s_preds = student.predict(student_inputs, batch_size=batch_size, verbose=0)
+        t_prob = paste_predictions_hann_blended(t_preds, positions)
+        s_prob = paste_predictions_hann_blended(s_preds, positions)
+
+        conf_t: dict[tuple[int, float], tuple[int, int, int, int]] = {}
+        conf_s: dict[tuple[int, float], tuple[int, int, int, int]] = {}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            gt_hhmm, gt_day = _resolve_gt(
+                ref_utc, offset * step_minutes, date_str,
+            )
+            gt_bin = _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            if gt_bin is None:
+                # No GT for this lead -> zero confusion so per-sample IoU
+                # collapses to 0 without crashing the aggregation.
+                for h in high_grid:
+                    conf_t[(i, float(h))] = (0, 0, 0, H_FULL * W_FULL)
+                    conf_s[(i, float(h))] = (0, 0, 0, H_FULL * W_FULL)
+                continue
+            for h in high_grid:
+                t_bin = hysteresis_binary(
+                    t_prob[i], low=low_threshold, high=float(h),
+                )
+                s_bin = hysteresis_binary(
+                    s_prob[i], low=low_threshold, high=float(h),
+                )
+                conf_t[(i, float(h))] = _binary_confusion_lightning(gt_bin, t_bin)
+                conf_s[(i, float(h))] = _binary_confusion_lightning(gt_bin, s_bin)
+        per_sample.append({
+            "date": date_str, "reference_utc": ref_utc,
+            "conf_teacher": conf_t, "conf_student": conf_s,
+        })
+
+    print(f"\nDone Phase 1. {len(per_sample)} samples scored, "
+          f"{n_skipped} skipped (missing inputs).")
+    if not per_sample:
+        print("No samples produced predictions.")
+        return
+
+    # ---- Phase 2: independent per-lead sweep for each model -----------
+    def _tune(side_key: str) -> tuple[dict, dict, dict]:
+        tuning: dict[int, dict[float, dict]] = {
+            i: {} for i in range(len(LEAD_STEP_OFFSETS))
+        }
+        for i in range(len(LEAD_STEP_OFFSETS)):
+            for h in high_grid:
+                tp = fp = fn = tn = 0
+                for s in per_sample:
+                    t, f, n, tt = s[side_key][(i, float(h))]
+                    tp += t; fp += f; fn += n; tn += tt
+                tuning[i][float(h)] = _summarise_confusion(
+                    {"TP": tp, "FP": fp, "FN": fn, "TN": tn}
+                )
+        best: dict[int, float] = {}
+        agg_conf: dict[int, dict] = {}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            best_h = max(tuning[i], key=lambda h: tuning[i][h]["CSI"])
+            best[offset] = best_h
+            a = tuning[i][best_h]
+            agg_conf[i] = {"TP": a["TP"], "FP": a["FP"],
+                           "FN": a["FN"], "TN": a["TN"]}
+        return tuning, best, agg_conf
+
+    t_tuning, t_best, t_agg = _tune("conf_teacher")
+    s_tuning, s_best, s_agg = _tune("conf_student")
+
+    for offset in LEAD_STEP_OFFSETS:
+        print(f"  t+{offset * step_minutes} min | "
+              f"teacher best_high={t_best[offset]:.2f} "
+              f"(CSI={t_tuning[LEAD_STEP_OFFSETS.index(offset)][t_best[offset]]['CSI']:.3f})  "
+              f"student best_high={s_best[offset]:.2f} "
+              f"(CSI={s_tuning[LEAD_STEP_OFFSETS.index(offset)][s_best[offset]]['CSI']:.3f})")
+
+    # ---- Emit per-sample rows at each model's chosen best_high per lead
+    rows: list[dict] = []
+    for s in per_sample:
+        row = {"date": s["date"], "reference_utc": s["reference_utc"]}
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            m = offset * step_minutes
+            for side_key, best_map, out_key in (
+                ("conf_teacher", t_best, "teacher"),
+                ("conf_student", s_best, "student"),
+            ):
+                tp, fp, fn, _ = s[side_key][(i, best_map[offset])]
+                per = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": 0})
+                row[f"iou_{out_key}_t+{m}"] = _iou_lightning(tp, fp, fn)
+                row[f"far_{out_key}_t+{m}"] = per["FAR"]
+                row[f"pod_{out_key}_t+{m}"] = per["POD"]
+                row[f"csi_{out_key}_t+{m}"] = per["CSI"]
+        rows.append(row)
+
+    stem = f"kd_{year:04d}_{month:02d}"
+    _write_csv_kd(rows, output_dir / f"{stem}_samples.csv", step_minutes)
+    _write_json_kd(
+        year, month, selected, rows,
+        t_agg, s_agg, t_tuning, s_tuning, t_best, s_best,
+        low_threshold, step_minutes,
+        output_dir / f"{stem}_summary.json",
+        rainfall_threshold_mmh=rainfall_threshold_mmh,
+        high_coverage_pct=high_coverage_pct,
+    )
+    _plot_metrics_figure_kd_per_metric(
+        year, month, t_agg, s_agg, rows, step_minutes, output_dir,
+    )
+
+
+def run_visualization_kd(
+    year: int, month: int, date_str: str,
+    teacher_mode: str, student_mode: str,
+    source: str,
+    teacher_finetuned: bool, student_kd: bool,
+    data_root: Path, model_dir: Path, output_dir: Path,
+    *,
+    stride: int = DEFAULT_STRIDE,
+    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
+    batch_size: int = 32,
+):
+    """One 3x3 figure per selected reference on `date_str`:
+       Row 1 GT / Row 2 GT+teacher red / Row 3 GT+student red, cols = leads.
+    Per-lead high thresholds come from the KD summary JSON (tuned during
+    the extraction run)."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"kd_{year:04d}_{month:02d}"
+    summary = _load_summary_json(output_dir / f"{stem}_summary.json")
+    if "teacher" not in summary or "student" not in summary:
+        raise SystemExit(
+            f"{stem}_summary.json is missing teacher/student blocks. "
+            f"Re-run extraction (`--track kd` without --date)."
+        )
+    step_minutes = _load_step_minutes(data_root)
+
+    def _load_pp_map(side: str) -> dict[int, float]:
+        m: dict[int, float] = {}
+        pp = summary[side]["post_processing"]["high_threshold_per_lead"]
+        for offset in LEAD_STEP_OFFSETS:
+            key = f"t+{offset * step_minutes}"
+            if key not in pp:
+                raise SystemExit(
+                    f"{side}.post_processing.high_threshold_per_lead is missing {key}"
+                )
+            m[offset] = float(pp[key])
+        return m
+
+    t_high_per_lead = _load_pp_map("teacher")
+    s_high_per_lead = _load_pp_map("student")
+
+    if not _date_is_in(date_str, summary["initial_selection"]):
+        raise SystemExit(
+            f"Date {date_str} not in the initial selection for "
+            f"{year:04d}-{month:02d}. Nothing to visualise."
+        )
+
+    init_sequence_config(str(data_root), source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{source}.json"
+    )
+    teacher_cfg = get_mode_config(teacher_mode)
+
+    refs = sorted(h for d, h in summary["initial_selection"] if d == date_str)
+    if not refs:
+        raise SystemExit(f"Selection has no references for {date_str}.")
+
+    print("Loading TEACHER + STUDENT ...")
+    teacher = load_model_artifact(model_dir, teacher_mode, source,
+                                  teacher_finetuned)
+    student = load_model_artifact(model_dir, student_mode, source,
+                                  finetuned=False, kd=student_kd)
+    print(f"  Teacher params: {teacher.count_params():,}")
+    print(f"  Student params: {student.count_params():,}")
+
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    for ref_utc in refs:
+        print(f"\n{date_str} {ref_utc} - building 3x3 KD figure ...")
+        inputs, positions = build_inputs_for_reference_overlapped(
+            data_root, teacher_cfg, date_str, ref_utc, step_minutes,
+            stride=stride,
+        )
+        if not positions:
+            print("  No inputs available - skipping.")
+            continue
+        student_inputs = _kd_slice_student_inputs(inputs)
+        t_preds = teacher.predict(inputs, batch_size=batch_size, verbose=0)
+        s_preds = student.predict(student_inputs, batch_size=batch_size,
+                                   verbose=0)
+        t_prob = paste_predictions_hann_blended(t_preds, positions)
+        s_prob = paste_predictions_hann_blended(s_preds, positions)
+        t_bin = [hysteresis_binary(t_prob[i], low=low_threshold,
+                                    high=t_high_per_lead[LEAD_STEP_OFFSETS[i]])
+                 for i in range(len(t_prob))]
+        s_bin = [hysteresis_binary(s_prob[i], low=low_threshold,
+                                    high=s_high_per_lead[LEAD_STEP_OFFSETS[i]])
+                 for i in range(len(s_prob))]
+        gt_canvases = []
+        for offset in LEAD_STEP_OFFSETS:
+            gt_hhmm, gt_day = _resolve_gt(
+                ref_utc, offset * step_minutes, date_str,
+            )
+            gt_canvases.append(
+                _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            )
+
+        # Colour rule: green if EITHER model cleared 90% on any lead;
+        # orange if only in the initial selection (matches lightning viz).
+        any_high = False
+        for side in ("teacher", "student"):
+            for lt in lead_titles:
+                if _date_is_in(date_str,
+                               summary[side]["high_coverage_samples_per_lead"][lt]["iou"]):
+                    any_high = True; break
+            if any_high: break
+        suptitle_color = _colour_for_title(True, any_high)
+
+        safe_ref = ref_utc.replace(":", "")
+        out_png = output_dir / f"{stem}_{date_str}_{safe_ref}.png"
+        _plot_kd_3x3(
+            gt_canvases, t_bin, s_bin,
+            date_str=date_str, ref_utc=ref_utc, step_minutes=step_minutes,
+            output_path=out_png, suptitle_color=suptitle_color,
+        )
+        marker = ("green (a model cleared 90% IoU on some lead)"
+                  if any_high else "orange (in selection only)")
+        print(f"  Saved -> {out_png.name}  [{marker}]")
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 def main() -> int:
@@ -1368,11 +2002,16 @@ def main() -> int:
                     "plots structure-overlay + zoom for a given date.",
     )
     parser.add_argument("--track", type=str, required=True,
-                        choices=["rainfall", "lightning"],
+                        choices=["rainfall", "lightning", "kd"],
                         help="Validation track. 'rainfall' is the OPERA "
                              "multiclass pipeline; 'lightning' runs the "
                              "Hann-blended overlap + hysteresis pipeline "
-                             "and tunes the high threshold per lead time.")
+                             "and tunes the high threshold per lead time; "
+                             "'kd' runs BOTH teacher (mtg_lightning_opera_"
+                             "occurrence) and student (mtg_opera_occurrence, "
+                             "loaded from the _kd checkpoint) on the same "
+                             "OPERA-selected samples and tunes each model's "
+                             "per-lead high threshold independently.")
     parser.add_argument("--year", type=int, required=True)
     parser.add_argument("--month", type=int, required=True,
                         help="Month as an integer 1..12.")
@@ -1424,6 +2063,18 @@ def main() -> int:
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
                              "so 32-64 is a good range.")
+    # ---- KD-track-only knobs (ignored when --track != kd) ----
+    parser.add_argument("--teacher_mode", type=str, default=KD_TEACHER_MODE,
+                        help=f"KD teacher mode. Default {KD_TEACHER_MODE}.")
+    parser.add_argument("--student_mode", type=str, default=KD_STUDENT_MODE,
+                        help=f"KD student mode. Default {KD_STUDENT_MODE}.")
+    parser.add_argument("--teacher_finetuned", action="store_true",
+                        help="Load coalition_<teacher_mode>_<source>_finetuned.keras "
+                             "instead of the base for the KD teacher.")
+    parser.add_argument("--no_student_kd", action="store_true",
+                        help="Load the STUDENT from coalition_<student_mode>_<source>"
+                             ".keras (plain, no _kd suffix). Default is to load "
+                             "the KD-trained student produced by train_lightning_kd.py.")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
@@ -1456,7 +2107,7 @@ def main() -> int:
                 args.mode, args.source, args.finetuned,
                 data_root, model_dir, output_dir,
             )
-    else:  # lightning
+    elif args.track == "lightning":
         if args.date is None:
             run_extraction_lightning(
                 args.year, args.month,
@@ -1475,6 +2126,31 @@ def main() -> int:
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.low_threshold,
+                batch_size=args.batch_size,
+            )
+    else:  # kd
+        if args.date is None:
+            run_extraction_kd(
+                args.year, args.month,
+                args.teacher_mode, args.student_mode, args.source,
+                teacher_finetuned=args.teacher_finetuned,
+                student_kd=(not args.no_student_kd),
+                data_root=data_root, model_dir=model_dir,
+                output_dir=output_dir,
+                stride=args.stride, low_threshold=args.low_threshold,
+                batch_size=args.batch_size,
+                rainfall_threshold_mmh=args.rainfall_threshold_mmh,
+                high_coverage_pct=args.high_coverage_pct,
+            )
+        else:
+            run_visualization_kd(
+                args.year, args.month, args.date,
+                args.teacher_mode, args.student_mode, args.source,
+                teacher_finetuned=args.teacher_finetuned,
+                student_kd=(not args.no_student_kd),
+                data_root=data_root, model_dir=model_dir,
+                output_dir=output_dir,
+                stride=args.stride, low_threshold=args.low_threshold,
                 batch_size=args.batch_size,
             )
     return 0
