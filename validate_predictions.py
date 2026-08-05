@@ -1063,6 +1063,7 @@ def run_extraction_lightning(
     batch_size: int = 32,
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
+    kd: bool = False,
 ):
     """Extraction mode for the lightning track. Two-phase:
     Phase 1 - loop selected samples, run Hann-blended inference (raw prob
@@ -1113,8 +1114,11 @@ def run_extraction_lightning(
         print("No samples selected. Nothing to do.")
         return
 
-    print(f"\nLoading model ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned)
+    variant_label = ("finetuned" if finetuned
+                     else "KD student" if kd
+                     else "base")
+    print(f"\nLoading model ({variant_label}) ...")
+    model = load_model_artifact(model_dir, mode, source, finetuned, kd=kd)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     # Per-(sample, lead_idx, high) confusion tuples: we need them at
@@ -1214,7 +1218,12 @@ def run_extraction_lightning(
             row[f"csi_t+{m}"] = per["CSI"]
         rows.append(row)
 
-    stem = f"lightning_{year:04d}_{month:02d}"
+    # Variant suffix so base / finetuned / kd runs don't overwrite each
+    # other's outputs. Matches predict_full_domain's output_dir naming.
+    variant_suffix = ("_finetuned" if finetuned
+                      else "_kd" if kd
+                      else "")
+    stem = f"lightning_{year:04d}_{month:02d}{variant_suffix}"
     _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
                           step_minutes)
     _write_json_lightning(
@@ -1241,6 +1250,7 @@ def run_visualization_lightning(
     stride: int = DEFAULT_STRIDE,
     low_threshold: float = LIGHTNING_LOW_THRESHOLD,
     batch_size: int = 32,
+    kd: bool = False,
 ):
     """One figure per selected reference on the given date. Layout:
       Row 1 (columns = t+15/+30/+45): GT lightning occurrence
@@ -1249,9 +1259,14 @@ def run_visualization_lightning(
 
     The per-lead high threshold is read from
     post_processing.high_threshold_per_lead in the summary JSON produced
-    by run_extraction_lightning."""
+    by run_extraction_lightning. The stem is the SAME as extraction wrote
+    (base / _finetuned / _kd suffix chosen by the corresponding flag) so
+    visualisation reads the same JSON its own extraction produced."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"lightning_{year:04d}_{month:02d}"
+    variant_suffix = ("_finetuned" if finetuned
+                      else "_kd" if kd
+                      else "")
+    stem = f"lightning_{year:04d}_{month:02d}{variant_suffix}"
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "post_processing" not in summary:
         raise SystemExit(
@@ -1293,8 +1308,11 @@ def run_visualization_lightning(
     if not refs:
         raise SystemExit(f"Selection has no references for {date_str}.")
 
-    print(f"Loading model ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned)
+    variant_label = ("finetuned" if finetuned
+                     else "KD student" if kd
+                     else "base")
+    print(f"Loading model ({variant_label}) ...")
+    model = load_model_artifact(model_dir, mode, source, finetuned, kd=kd)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
@@ -2025,7 +2043,18 @@ def main() -> int:
                              "OPERA multiclass input stack.")
     parser.add_argument("--source", type=str, default="dbscan",
                         choices=["dbscan", "lightning"])
-    parser.add_argument("--finetuned", action="store_true")
+    parser.add_argument("--finetuned", action="store_true",
+                        help="Load coalition_<mode>_<source>_finetuned.keras "
+                             "(rebuilt + load_weights via train_models."
+                             "build_finetune_model). Mutually exclusive with "
+                             "--kd.")
+    parser.add_argument("--kd", action="store_true",
+                        help="Load coalition_<mode>_<source>_kd.keras - the "
+                             "knowledge-distillation student produced by "
+                             "train_lightning_kd.py. Only meaningful for "
+                             "--track lightning (evaluates the student "
+                             "standalone) and --mode mtg_opera_occurrence. "
+                             "Mutually exclusive with --finetuned.")
     parser.add_argument("--data_root", type=str, default="./our_data")
     parser.add_argument("--model_dir", type=str, default="./models")
     parser.add_argument("--output_dir", type=str, default="./validation")
@@ -2077,6 +2106,10 @@ def main() -> int:
                              "the KD-trained student produced by train_lightning_kd.py.")
     args = parser.parse_args()
 
+    if args.kd and args.finetuned:
+        parser.error("--kd and --finetuned are mutually exclusive "
+                     "(the KD student is trained fresh, no swin head).")
+
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
@@ -2118,6 +2151,7 @@ def main() -> int:
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
+                kd=args.kd,
             )
         else:
             run_visualization_lightning(
@@ -2127,6 +2161,7 @@ def main() -> int:
                 stride=args.stride,
                 low_threshold=args.low_threshold,
                 batch_size=args.batch_size,
+                kd=args.kd,
             )
     else:  # kd
         if args.date is None:
