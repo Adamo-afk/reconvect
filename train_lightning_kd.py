@@ -196,6 +196,17 @@ class KDModel(tf.keras.Model):
         return self.student(self._student_inputs(inputs), training=training)
 
     def train_step(self, data):
+        # Mixed-precision handling: when the global policy is
+        # mixed_float16, Keras auto-wraps model.compile's optimizer in a
+        # LossScaleOptimizer that requires get_scaled_loss +
+        # get_unscaled_gradients around the tape/apply so gradients don't
+        # underflow to zero in float16. Model.fit's default train_step
+        # does this transparently; a custom train_step has to opt in
+        # explicitly, otherwise TF emits the "You forgot to call ..."
+        # warning and quality quietly degrades.
+        is_lso = isinstance(
+            self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer,
+        )
         inputs, y_true = data
         student_inputs = self._student_inputs(inputs)
         teacher_probs = self._teacher(inputs, training=False)
@@ -205,7 +216,13 @@ class KDModel(tf.keras.Model):
                 teacher_probs, student_probs, y_true,
                 self.alpha, self.temperature, self.hard_loss_fn,
             )
-        grads = tape.gradient(total, self.student.trainable_variables)
+            loss_for_grad = (self.optimizer.get_scaled_loss(total)
+                             if is_lso else total)
+        raw_grads = tape.gradient(
+            loss_for_grad, self.student.trainable_variables,
+        )
+        grads = (self.optimizer.get_unscaled_gradients(raw_grads)
+                 if is_lso else raw_grads)
         self.optimizer.apply_gradients(
             zip(grads, self.student.trainable_variables)
         )
