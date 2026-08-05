@@ -119,6 +119,64 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
 
 
 # =============================================================================
+# Run-tag naming for saved model artefacts
+# =============================================================================
+# Rainfall modes have no track marker in their mode name (e.g.
+# `mtg_lightning_opera` outputs OPERA rainfall multiclass but reads as
+# a "lightning + opera" mode from the filename alone). Occurrence modes
+# already carry "occurrence" in the mode name. To make saved artefacts
+# self-describing we insert "rainfall" between mode and source when the
+# label_type is radar or radar_continuous:
+#
+#     mtg_lightning_opera_occurrence + dbscan
+#         -> coalition_mtg_lightning_opera_occurrence_dbscan.keras
+#            (unchanged; "occurrence" already in the mode name)
+#     mtg_lightning_opera             + dbscan
+#         -> coalition_mtg_lightning_opera_rainfall_dbscan.keras
+#            (was ..._dbscan.keras; NEW naming inserts "rainfall")
+#
+# Loaders (visualize_gt_vs_pred.load_model_artifact,
+# train_lightning_kd.load_teacher) fall back to the legacy filename
+# when the new-name file is missing on disk, so previously-trained
+# checkpoints keep loading without a rename step.
+
+# Every mode whose label_type is radar or radar_continuous in
+# create_datasets.get_mode_config. Kept as a hardcoded set (rather than
+# a runtime lookup) so this helper has zero import-order dependency on
+# create_datasets and can be called from any module.
+_RAINFALL_MODES: frozenset[str] = frozenset({
+    "mtg_radar",
+    "mtg_radar_continuous",
+    "mtg_opera_radar_only",
+    "mtg_opera_mtgmr",
+    "mtg_lightning_opera",
+    "mtg_opera_nwcsaf",
+    "mtg_opera_full",
+})
+
+
+def _is_rainfall_mode(mode: str) -> bool:
+    """True when the mode outputs precipitation predictions (radar or
+    radar_continuous label_type). See _RAINFALL_MODES for the canonical
+    list; add new radar-headed modes there when introducing them."""
+    return mode in _RAINFALL_MODES
+
+
+def build_run_tag(mode: str, source: str) -> str:
+    """Return the filename tag used for saved model artefacts. Inserts
+    "rainfall" for radar-labelled modes; leaves lightning modes alone."""
+    if _is_rainfall_mode(mode):
+        return f"{mode}_rainfall_{source}"
+    return f"{mode}_{source}"
+
+
+def legacy_run_tag(mode: str, source: str) -> str:
+    """The old naming scheme (no 'rainfall' insertion). Kept as a
+    fallback for loaders so pre-migration checkpoints still work."""
+    return f"{mode}_{source}"
+
+
+# =============================================================================
 # Config loader (INI via configparser)
 # =============================================================================
 
@@ -1516,15 +1574,28 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Mode + source together are the unique experiment identifier - used
-    # everywhere we'd previously used just `mode` so the DBSCAN-driven
-    # and lightning-driven runs can coexist on disk.
-    run_tag = f"{mode}_{source}"
+    # Mode + source together are the unique experiment identifier. The
+    # tag inserts "rainfall" for radar-labelled modes so saved artefacts
+    # (weights + history + checkpoints) AND dataset directories are all
+    # self-describing. See build_run_tag / legacy_run_tag at the top of
+    # this module.
+    run_tag = build_run_tag(mode, source)
 
     if dataset_dir is not None:
         dataset_dir = Path(dataset_dir)
     else:
         dataset_dir = data_root / "datasets" / run_tag
+        # Backwards compatibility: pre-migration datasets were saved as
+        # `datasets/{mode}_{source}` without the rainfall insertion. If
+        # the new-name directory isn't on disk but the legacy one is,
+        # use the legacy path (and print a rename hint).
+        if not dataset_dir.exists():
+            legacy_dir = data_root / "datasets" / legacy_run_tag(mode, source)
+            if legacy_dir.exists():
+                print(f"NOTE: using legacy dataset dir {legacy_dir.name}. "
+                      f"Rename to {dataset_dir.name} to adopt the new "
+                      f"naming (backwards-compat fallback active).")
+                dataset_dir = legacy_dir
 
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
@@ -1778,9 +1849,15 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_tag = f"{mode}_{source}"
+    run_tag = build_run_tag(mode, source)
 
     dataset_dir = data_root / "datasets" / run_tag
+    if not dataset_dir.exists():
+        legacy_dir = data_root / "datasets" / legacy_run_tag(mode, source)
+        if legacy_dir.exists():
+            print(f"NOTE: using legacy dataset dir {legacy_dir.name}. "
+                  f"Rename to {dataset_dir.name} to adopt the new naming.")
+            dataset_dir = legacy_dir
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
     for d in [train_dir, val_dir]:

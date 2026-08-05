@@ -1143,7 +1143,14 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
     # Suffix the dataset dir with the source so radar- and lightning-
     # driven runs don't clobber each other (the domain-adaptation
     # pipeline trains both and uses them as separate feature extractors).
-    save_dir = output_root / f"{mode}_{source}"
+    # Additional insertion of "rainfall" for radar-labelled modes so
+    # `datasets/mtg_lightning_opera_rainfall_dbscan/` is self-describing
+    # (mtg_lightning_opera used to hide the fact that it outputs rainfall
+    # multiclass); occurrence modes carry "occurrence" in the mode name
+    # already so nothing gets inserted for them. See
+    # train_models.build_run_tag for the single source of truth.
+    from train_models import build_run_tag
+    save_dir = output_root / build_run_tag(mode, source)
 
     # Print configuration summary
     print("=" * 70)

@@ -1029,14 +1029,35 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
             "'finetuned KD' variant does not exist. Pass one or neither."
         )
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
-    run_tag = f"{mode}_{source}"
-    base_path = model_dir / f"coalition_{run_tag}.keras"
+    # Central naming helper (inserts "rainfall" for radar-labelled modes).
+    # For backwards compatibility with pre-migration checkpoints saved as
+    # coalition_{mode}_{source}.keras (no rainfall insertion), we compute
+    # both tags and fall back to the legacy one whenever the new-name
+    # file is missing on disk. Deferred import so this module doesn't
+    # depend on train_models at import time.
+    from train_models import build_run_tag, legacy_run_tag
+    run_tag = build_run_tag(mode, source)
+    legacy_tag = legacy_run_tag(mode, source)
+
+    def _resolve(kind_suffix: str) -> Path:
+        """Return the (new-naming) path, falling back to the legacy path
+        if the new-name file isn't on disk. `kind_suffix` is "" for base,
+        "_finetuned", "_kd", etc."""
+        new_path = model_dir / f"coalition_{run_tag}{kind_suffix}.keras"
+        legacy_path = model_dir / f"coalition_{legacy_tag}{kind_suffix}.keras"
+        if not new_path.is_file() and legacy_path.is_file():
+            print(f"NOTE: loading legacy-named checkpoint {legacy_path.name}. "
+                  f"Rename to {new_path.name} to adopt the new naming.")
+            return legacy_path
+        return new_path
+
+    base_path = _resolve("")
 
     if kd:
         # KD student is saved via .save() so a straight load_model works;
         # the custom_objects list handles ResBlock / ResGRU / ConvBlock /
         # WeightedFocalLoss registration same as the base path.
-        kd_path = model_dir / f"coalition_{run_tag}_kd.keras"
+        kd_path = _resolve("_kd")
         if not kd_path.is_file():
             raise FileNotFoundError(
                 f"KD-student checkpoint not found: {kd_path}. "
@@ -1053,8 +1074,12 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
             str(base_path), custom_objects=_custom_objects(),
         )
 
-    ft_path = model_dir / f"coalition_{run_tag}_finetuned.keras"
-    history_path = model_dir / f"history_{run_tag}_finetuned.json"
+    ft_path = _resolve("_finetuned")
+    # History JSON follows the same tag as the finetuned checkpoint.
+    hist_new = model_dir / f"history_{run_tag}_finetuned.json"
+    hist_legacy = model_dir / f"history_{legacy_tag}_finetuned.json"
+    history_path = (hist_new if hist_new.is_file() or not hist_legacy.is_file()
+                    else hist_legacy)
     if not ft_path.is_file():
         raise FileNotFoundError(f"Fine-tuned model not found: {ft_path}")
     if not base_path.is_file():
