@@ -623,6 +623,434 @@ def _find_highest_activity_patch(gt_cls: np.ndarray) -> int:
     return best_patch
 
 
+DEFAULT_GT_MIN_CELL_PIXELS = 10
+
+
+def _postproc_gt_class_canvas(gt_cls: np.ndarray,
+                              min_cell_pixels: int = DEFAULT_GT_MIN_CELL_PIXELS
+                              ) -> np.ndarray:
+    """Return a copy of gt_cls with class-active (>=1) 8-connected components
+    smaller than min_cell_pixels demoted to class 0 (dry).
+
+    Removes single-pixel and sub-scale GT specks so pixel-wise hit counts
+    aren't inflated by noise that no spatially-smooth prediction can be
+    expected to match. Matches the coupled-cell filtering already used in
+    generate_report.py (MIN_CELL_SIZE_PIXELS = 10). -1 sentinels stay -1.
+    """
+    if min_cell_pixels <= 1:
+        return gt_cls.copy()
+    active = (gt_cls >= 1) & (gt_cls != -1)
+    if not active.any():
+        return gt_cls.copy()
+    from scipy.ndimage import label as _cc_label
+    labeled, n_cc = _cc_label(active, structure=np.ones((3, 3), dtype=bool))
+    if n_cc == 0:
+        return gt_cls.copy()
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0
+    small_ids = np.where(sizes < min_cell_pixels)[0]
+    if small_ids.size == 0:
+        return gt_cls.copy()
+    small_mask = np.isin(labeled, small_ids) & active
+    out = gt_cls.copy()
+    out[small_mask] = 0
+    return out
+
+
+def _plot_class_overlap_axis(ax, gt_cls: np.ndarray, pred_cls: np.ndarray,
+                             *,
+                             min_cell_pixels: int = DEFAULT_GT_MIN_CELL_PIXELS,
+                             gt_postproc: bool = True,
+                             ) -> dict:
+    """Class-aware overlap map on the full canvas.
+
+    Per pixel:
+      - hit  (pred_class == gt_class, gt >= 1): viridis-coloured by class
+        (same 5-class palette as the pred-only plot, so hit clusters
+        read at the same intensity a viewer already associates with the
+        rain-rate band).
+      - miss (gt >= 1 but pred != gt / pred == 0):        light blue
+      - false alarm (gt == 0 but pred >= 1):              orange
+      - correct dry (both == 0):                          white
+      - out of domain (gt == -1):                         light gray
+
+    When gt_postproc is True (default), GT is first passed through
+    _postproc_gt_class_canvas to strip sub-scale connected components.
+    That prevents lone GT pixels from swamping the overall matched-%
+    denominator.
+
+    Returns a dict with per-class counts and the overall matched-%,
+    which the caller can drop into the subtitle:
+        {"matched_pct": float, "hits": int, "misses": int,
+         "false_alarms": int, "n_gt_active": int,
+         "per_class": {1: {"hits": ..., "n_gt": ...}, ...}}
+    """
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+
+    gt_eff = (_postproc_gt_class_canvas(gt_cls, min_cell_pixels)
+              if gt_postproc else gt_cls)
+
+    valid = gt_eff != -1
+    gt_pos = (gt_eff >= 1) & valid
+    pr_pos = (pred_cls >= 1) & valid
+    hits = gt_pos & (pred_cls == gt_eff)
+    misses = gt_pos & ~hits
+    fas = pr_pos & ~gt_pos
+
+    H, W = gt_eff.shape
+    viridis_5 = plt.get_cmap("viridis", 5)
+    # Base: viridis GT class canvas across the whole valid area (class 0
+    # dry pixels included — they render as the darkest viridis, same as
+    # the pred-only plot). Out-of-domain patches stay as light gray so
+    # they don't read as "predicted dry".
+    rgba = np.ones((H, W, 4), dtype=np.float32)
+    rgba[~valid] = (0.90, 0.90, 0.90, 1.0)
+    for k in range(0, 5):
+        mask = valid & (gt_eff == k)
+        if mask.any():
+            rgba[mask] = viridis_5(k / 4.0)
+    # Misses painted first: light blue over the viridis base.
+    rgba[misses] = (0.20, 0.45, 0.85, 1.0)
+    # False alarms painted in RED (was orange in the pre-viridis-base
+    # design) for better contrast against the viridis backdrop.
+    rgba[fas] = (0.84, 0.15, 0.16, 1.0)
+    # Hits: intentionally NOT overpainted — the viridis base already
+    # colours them by their (true == predicted) class, and the absence
+    # of a miss/FA overlay tells the reader "this pixel matched".
+
+    ax.imshow(rgba, aspect="equal", interpolation="nearest")
+
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        ax.add_patch(Rectangle(
+            (c0, r0), PATCH_SIZE, PATCH_SIZE,
+            linewidth=0.7, edgecolor="black",
+            linestyle=(0, (1, 3)), facecolor="none", zorder=3,
+        ))
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(c_lo, c_hi)
+    ax.set_ylim(r_hi, r_lo)
+    ax.set_aspect("equal")
+
+    n_gt = int(gt_pos.sum())
+    n_hits = int(hits.sum())
+    per_class = {}
+    for k in range(1, 5):
+        gt_k = (gt_eff == k) & valid
+        n_gt_k = int(gt_k.sum())
+        n_hit_k = int((gt_k & hits).sum())
+        per_class[k] = {"hits": n_hit_k, "n_gt": n_gt_k}
+    return {
+        "matched_pct": (n_hits / n_gt * 100.0) if n_gt > 0 else 0.0,
+        "hits": n_hits,
+        "misses": int(misses.sum()),
+        "false_alarms": int(fas.sum()),
+        "n_gt_active": n_gt,
+        "per_class": per_class,
+    }
+
+
+_ZONE_ORANGE = (1.00, 0.55, 0.10, 1.0)   # hit  (GT-active + correctly predicted)
+_ZONE_BLUE   = (0.20, 0.45, 0.85, 1.0)   # miss (GT-active but not detected)
+_ZONE_RED    = (0.84, 0.15, 0.16, 1.0)   # false alarm (predicted, no GT)
+_ZONE_WHITE  = (1.00, 1.00, 1.00, 1.0)   # correct dry
+_ZONE_GRAY   = (0.90, 0.90, 0.90, 1.0)   # out-of-domain
+
+
+def _plot_zone_overlap_axis(ax, gt_cls: np.ndarray, pred_cls: np.ndarray,
+                            *,
+                            min_cell_pixels: int = DEFAULT_GT_MIN_CELL_PIXELS,
+                            gt_postproc: bool = True,
+                            ) -> dict:
+    """Zone-overlap map — treats GT and pred as BINARY masks (any class
+    >= 1 counts as "active"), so a predicted blob never mixes hits and
+    misses on the same continuous region. This is the "detection" view:
+    did we or did we not fire in the right place, regardless of the
+    specific rain-rate class we picked.
+
+    Semantics:
+      hit         = GT-active AND pred-active    (any class match)
+      miss        = GT-active AND pred-dry
+      false alarm = pred-active AND GT-dry
+      correct dry = both dry
+      out of domain = gt == -1
+
+    Palette (only three colours have meaning; the other two are neutral
+    canvas / masking):
+      orange = hit         (GT-active, correctly predicted)
+      blue   = miss        (GT-active, not detected)
+      red    = false alarm (predicted, no GT)
+      white  = correct dry (base canvas)
+      gray   = out of domain
+    """
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+
+    gt_eff = (_postproc_gt_class_canvas(gt_cls, min_cell_pixels)
+              if gt_postproc else gt_cls)
+
+    valid = gt_eff != -1
+    gt_pos = (gt_eff >= 1) & valid
+    pr_pos = (pred_cls >= 1) & valid
+    # BINARY semantic: hits = both active (any class). Every pixel inside
+    # a pred blob is either a hit (GT also active) or a false alarm (GT
+    # dry). No "miss inside a pred blob" contradiction.
+    hits = gt_pos & pr_pos
+    misses = gt_pos & ~pr_pos
+    fas = pr_pos & ~gt_pos
+
+    H, W = gt_eff.shape
+    rgba = np.ones((H, W, 4), dtype=np.float32)  # base = white (correct dry)
+    rgba[~valid] = _ZONE_GRAY
+    rgba[gt_pos] = _ZONE_ORANGE             # GT-active: hits + misses base
+    rgba[misses] = _ZONE_BLUE                # miss overlay covers orange
+    rgba[fas] = _ZONE_RED                    # FA overlay covers white
+    # Hits: intentionally NO overlay — orange base showing through says
+    # "GT-active pixel, correctly detected".
+
+    ax.imshow(rgba, aspect="equal", interpolation="nearest")
+
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        ax.add_patch(Rectangle(
+            (c0, r0), PATCH_SIZE, PATCH_SIZE,
+            linewidth=0.7, edgecolor="black",
+            linestyle=(0, (1, 3)), facecolor="none", zorder=3,
+        ))
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(c_lo, c_hi)
+    ax.set_ylim(r_hi, r_lo)
+    ax.set_aspect("equal")
+
+    return {
+        "hits": int(hits.sum()),
+        "misses": int(misses.sum()),
+        "false_alarms": int(fas.sum()),
+    }
+
+
+def _add_zone_color_legend(fig, *, y: float = -0.02,
+                           fontsize: int = 10) -> None:
+    """Add the 3-swatch zone-overlap colour legend BELOW the plot grid.
+
+    Only the three meaningful categories are listed — correct-dry
+    (white) and out-of-domain (gray) are just neutral canvas / masking
+    colours, not semantic outcomes worth explaining.
+
+    Anchored at `y=-0.02` in figure coords via `loc="upper center"`,
+    so the TOP of the legend sits just below the plot area. Pair with
+    `_add_hmf_legend(fig, y=-0.14)` (or similar) to stack the formula
+    footer further down; both are captured by `bbox_inches="tight"` at
+    savefig time.
+    """
+    from matplotlib.patches import Patch
+    handles = [
+        Patch(facecolor=_ZONE_ORANGE[:3], edgecolor="#666", linewidth=0.5,
+              label="hit"),
+        Patch(facecolor=_ZONE_BLUE[:3], edgecolor="#666", linewidth=0.5,
+              label="miss"),
+        Patch(facecolor=_ZONE_RED[:3], edgecolor="#666", linewidth=0.5,
+              label="false alarm"),
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center", bbox_to_anchor=(0.5, y),
+        ncol=3, fontsize=fontsize, frameon=True,
+        framealpha=0.90, edgecolor="#bbb",
+    )
+
+
+def _plot_red_hits_axis(ax, gt_cls: np.ndarray, pred_cls: np.ndarray,
+                        *,
+                        min_cell_pixels: int = DEFAULT_GT_MIN_CELL_PIXELS,
+                        gt_postproc: bool = True,
+                        ) -> dict:
+    """Per-class hits map — surfaces ONLY the correctly-classified rainfall
+    pixels, coloured by their (matching pred == GT) class.
+
+    Every non-hit pixel is transparent, so the panel highlights the
+    subset of the domain the model got right at the class level. Misses,
+    false alarms and correct-dry pixels are intentionally omitted from
+    the visual — the per-class hit-rate breakdown in the subtitle
+    (produced from the returned dict) covers the "how much did we
+    catch" side, and the zone-overlap sibling file covers the "where
+    did we miss / over-predict" side.
+
+        C1: X.X%  C2: Y.Y%  C3: Z.Z%  C4: W.W%
+
+    where each `Ck: p%` is `#hits_k / #gt_active_k * 100`, so classes
+    with no GT pixels for that lead print as `n/a`.
+
+    Returns:
+        {"per_class_pct": {1: float|None, 2: ..., 3: ..., 4: ...},
+         "per_class_counts": {k: {"hits": int, "n_gt": int}},
+         "total_matched_pct": float,
+         "total_hits": int, "total_gt_active": int}
+    """
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+
+    gt_eff = (_postproc_gt_class_canvas(gt_cls, min_cell_pixels)
+              if gt_postproc else gt_cls)
+
+    valid = gt_eff != -1
+    gt_pos = (gt_eff >= 1) & valid
+    hits = gt_pos & (pred_cls == gt_eff)
+
+    # Base: fill the WHOLE valid domain with class 0 (darkest viridis =
+    # "R<10"), matching the background rectangle that Rows 1 and 2 show
+    # when a pixel is dry / out-of-domain. Out-of-domain patches stay
+    # NaN so they render transparent (same behaviour as Rows 1 and 2's
+    # nan-masked fallback).
+    viridis_kwargs = dict(cmap=plt.get_cmap("viridis", 5),
+                          vmin=0, vmax=4,
+                          aspect="equal", interpolation="nearest")
+    base_display = np.where(valid, 0.0, np.nan)
+    ax.imshow(base_display, **viridis_kwargs)
+
+    # Overlay: hit pixels painted in their (matching) viridis class
+    # colour — same exact colours the pred / GT rows use, so a class-3
+    # hit here reads as the same yellow-green as a class-3 GT pixel in
+    # Row 1. Misses / false alarms sit under the dark-viridis background
+    # (visually indistinguishable from correct-dry); the per-class
+    # hit-rate in the subtitle covers how much of each class was caught.
+    hit_class_display = np.where(hits, gt_eff.astype(float), np.nan)
+    ax.imshow(hit_class_display, **viridis_kwargs)
+
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        ax.add_patch(Rectangle(
+            (c0, r0), PATCH_SIZE, PATCH_SIZE,
+            linewidth=0.7, edgecolor="black",
+            linestyle=(0, (1, 3)), facecolor="none", zorder=3,
+        ))
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(c_lo, c_hi)
+    ax.set_ylim(r_hi, r_lo)
+    ax.set_aspect("equal")
+
+    per_class_pct: dict[int, float | None] = {}
+    per_class_counts: dict[int, dict] = {}
+    for k in range(1, 5):
+        gt_k = (gt_eff == k) & valid
+        n_gt_k = int(gt_k.sum())
+        n_hit_k = int((gt_k & hits).sum())
+        per_class_counts[k] = {"hits": n_hit_k, "n_gt": n_gt_k}
+        per_class_pct[k] = ((n_hit_k / n_gt_k * 100.0)
+                            if n_gt_k > 0 else None)
+
+    n_gt_total = int(gt_pos.sum())
+    n_hit_total = int(hits.sum())
+    return {
+        "per_class_pct": per_class_pct,
+        "per_class_counts": per_class_counts,
+        "total_matched_pct": ((n_hit_total / n_gt_total * 100.0)
+                              if n_gt_total > 0 else 0.0),
+        "total_hits": n_hit_total,
+        "total_gt_active": n_gt_total,
+    }
+
+
+def _format_per_class_pct(per_class_pct: dict[int, float | None]) -> str:
+    """Two-line rendering of {1..4: pct} for a subtitle.
+
+    Each class label carries the actual rain-rate range (from
+    visualize_gt_vs_pred.RADAR_CLASS_NAMES) so a viewer knows which mm/h
+    band a `C1` / `C2` / ... number refers to without opening the code.
+    The full C1..C4 line was overflowing between adjacent panels of the
+    3x3 rainfall figure and the 1x4 validation row, so we split it
+    across two rows — C1/C2 above, C3/C4 below — which fits per-panel
+    at fontsize=10 without touching neighbouring subtitles:
+
+        C1 [10≤R<20 mm/h]: X.X%   C2 [20≤R<30 mm/h]: Y.Y%
+        C3 [30≤R<40 mm/h]: Z.Z%   C4 [R≥40 mm/h]: W.W%
+
+    Classes with zero GT-active pixels for the lead print `n/a`.
+    """
+    def _one(k: int) -> str:
+        label = RADAR_CLASS_NAMES[k]  # e.g. "10≤R<20"
+        v = per_class_pct.get(k)
+        val = "n/a" if v is None else f"{v:.1f}%"
+        return f"C{k} [{label} mm/h]: {val}"
+
+    row1 = "   ".join(_one(k) for k in (1, 2))
+    row2 = "   ".join(_one(k) for k in (3, 4))
+    return f"{row1}\n{row2}"
+
+
+def _hmf_legend_text() -> str:
+    """One-block plain-language explanation of how the hits / misses /
+    false-alarms percentages are computed. Rendered as a small footer
+    on every figure that uses `_format_hmf_pct` so a reader can decode
+    the numbers without opening the code.
+    """
+    return (
+        "How the percentages are computed:\n"
+        "  hits %          = hits / (hits + misses)                 "
+        "→ fraction of GT-active pixels the model correctly detected\n"
+        "  misses %        = misses / (hits + misses)               "
+        "→ fraction of GT-active pixels the model missed\n"
+        "  false alarms %  = false alarms / (hits + false alarms)   "
+        "→ fraction of predicted-active pixels that were wrong"
+    )
+
+
+def _add_hmf_legend(fig, *, y: float = 0.0, fontsize: int = 8) -> None:
+    """Anchor `_hmf_legend_text()` below the plot grid.
+
+    `y` is the figure-coord y for the TOP of the text block (va="top"),
+    so `y=0.0` puts it flush against the plot bottom, and negative
+    values push it further down. Zone-overlap figures use `y=-0.14`
+    to leave room for the zone colour legend at y=-0.02 above it.
+    Both are captured by `bbox_inches="tight"` at savefig time.
+    """
+    fig.text(
+        0.5, y, _hmf_legend_text(),
+        ha="center", va="top",
+        fontsize=fontsize, color="#333",
+        family="monospace",
+        bbox=dict(boxstyle="round,pad=0.4",
+                  facecolor="#f5f5f5", edgecolor="#cccccc",
+                  linewidth=0.5),
+    )
+
+
+def _format_hmf_pct(hits: int, misses: int, false_alarms: int) -> str:
+    """Render (hits, misses, false alarms) as percentages of their natural
+    denominators — the format every rainfall/lightning overlap subtitle
+    uses so raw pixel counts don't have to be mentally normalised.
+
+    Denominators:
+      - hits, misses:   GT-active total (hits + misses)   [recall / miss-rate]
+      - false alarms:   pred-active total (hits + FA)     [1 - precision / FAR]
+
+    Undefined denominators (no GT active or no pred active) print `n/a`
+    so an accidental "0.0%" isn't misread as a genuine perfect result.
+    """
+    gt_active = hits + misses
+    pred_active = hits + false_alarms
+    hits_pct = (hits / gt_active * 100.0) if gt_active > 0 else None
+    miss_pct = (misses / gt_active * 100.0) if gt_active > 0 else None
+    fa_pct = (false_alarms / pred_active * 100.0) if pred_active > 0 else None
+    def _p(v): return "n/a" if v is None else f"{v:.1f}%"
+    return (f"hits = {_p(hits_pct)}   "
+            f"misses = {_p(miss_pct)}   "
+            f"false alarms = {_p(fa_pct)}")
+
+
 def _plot_structure_axis(ax, hit_mask: np.ndarray, gt_cls: np.ndarray):
     """Left panel: white background, red pixels where hit_mask is True."""
     _ensure_view_cached()
@@ -748,9 +1176,6 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
             gt_canvas = _paste_gt_class_canvas(gt_field, valid_patches)
             pred_canvas = pred_canvases[i]
 
-            hit_mask, pct = _hit_canvas_and_pct(gt_canvas, pred_canvas)
-            zoom_patch = _find_highest_activity_patch(gt_canvas)
-
             # Colour picker: green if this lead time cleared 90%, orange if
             # only in selection. Same date can be green on one lead and
             # orange on another.
@@ -761,26 +1186,79 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
                       _date_is_in(date_str, high_cov_cwt)
             title_color = _colour_for_title(True, in_high)
 
-            fig, axes = plt.subplots(1, 2, figsize=(20, 8),
-                                     constrained_layout=True)
-            _plot_structure_axis(axes[0], hit_mask, gt_canvas)
-            axes[0].set_title(
-                f"Structure overlay - matched pixels: {pct:.1f}%",
-                fontsize=11,
+            # 1x3 layout per lead (main file):
+            #   [GT class | Pred class (+hit/miss/FA %) | Per-class red hits (per-class %)]
+            # + shared viridis-5 rain-rate colourbar on the right. Mirrors
+            # predict_full_domain's 3x3 inference figure column-for-column,
+            # just laid out horizontally because validation writes one PNG
+            # per lead. The zone-overlap view lives in a sibling
+            # `<stem>_..._zone.png` file (orange/blue/red palette, its own
+            # legend) so the two colour schemes don't compete.
+            import matplotlib.cm as mcm
+            import matplotlib.colors as mcolors
+            from visualize_gt_vs_pred import (
+                _render_gt_axes, _render_pred_axes,
+                _gt_kwargs_for, _pred_kwargs_for, RADAR_CLASS_NAMES,
             )
-            _plot_zoom_axis(axes[1], gt_canvas, pred_canvas, zoom_patch)
-            axes[1].set_title(
-                f"Zoom on highest-activity patch (#{zoom_patch})",
-                fontsize=11,
-            )
-
             wall = _resolve_gt(ref_utc, label_offsets_min[i], date_str)[0]
             wall_hm = f"{wall[:2]}:{wall[2:]}"
+
+            fig, axes = plt.subplots(1, 3, figsize=(26, 8),
+                                     constrained_layout=True)
+            _render_gt_axes(
+                axes[0], gt_canvas, "radar",
+                lead_title=lt, lead_hhmm=wall_hm,
+                gt_kwargs=_gt_kwargs_for("radar"),
+                valid_patches=valid_patches,
+            )
+            _render_pred_axes(
+                axes[1], pred_canvas, valid_patches, "radar",
+                threshold=None,
+                lead_title=lt, lead_hhmm=wall_hm,
+                pred_kwargs=_pred_kwargs_for("radar", None),
+            )
+            # Aggregate hit/miss/FA (class-strict, post-processed GT) —
+            # same numbers the sibling `_zone.png` reports.
+            gt_pp = _postproc_gt_class_canvas(gt_canvas)
+            valid_pp = gt_pp != -1
+            gt_pp_pos = (gt_pp >= 1) & valid_pp
+            pr_pp_pos = (pred_canvas >= 1) & valid_pp
+            hits_agg = int(((pred_canvas == gt_pp) & gt_pp_pos).sum())
+            misses_agg = int((gt_pp_pos & ~((pred_canvas == gt_pp) & gt_pp_pos)).sum())
+            fas_agg = int((pr_pp_pos & ~gt_pp_pos).sum())
+            axes[1].set_title(
+                f"Pred - {lt} ({wall_hm} UTC)\n"
+                f"{_format_hmf_pct(hits_agg, misses_agg, fas_agg)}",
+                fontsize=10,
+            )
+            red_stats = _plot_red_hits_axis(
+                axes[2], gt_canvas, pred_canvas,
+            )
+            axes[2].set_title(
+                f"Per-class hits  |  "
+                f"{_format_per_class_pct(red_stats['per_class_pct'])}",
+                fontsize=10,
+            )
+
+            sm = mcm.ScalarMappable(
+                cmap=plt.get_cmap("viridis", 5),
+                norm=mcolors.Normalize(vmin=0, vmax=4),
+            )
+            sm.set_array([])
+            cbar = fig.colorbar(
+                sm, ax=axes.tolist(),
+                ticks=[0, 1, 2, 3, 4],
+                shrink=0.7, pad=0.01, location="right",
+            )
+            cbar.set_ticklabels(RADAR_CLASS_NAMES)
+            cbar.set_label("Rain-rate class")
+
             fig.suptitle(
                 f"Validation ({track})  |  {date_str}  ref={ref_utc}  "
                 f"|  {lt} ({wall_hm} UTC)",
                 fontsize=14, fontweight="bold", color=title_color,
             )
+            _add_hmf_legend(fig)
 
             safe_ref = ref_utc.replace(":", "")
             out_png = output_dir / (
@@ -788,6 +1266,35 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
             )
             fig.savefig(out_png, dpi=130, bbox_inches="tight")
             plt.close(fig)
+
+            # Sibling zone-overlap file per lead: orange = hit,
+            # blue = miss, red = FA, white = correct dry, gray = out-of-
+            # domain. Same class-strict hit/miss/FA numbers as the Pred
+            # column above, presented under the detection palette with
+            # an explicit colour legend at the top.
+            zone_fig, zone_ax = plt.subplots(
+                1, 1, figsize=(14, 8), constrained_layout=True,
+            )
+            zone_stats = _plot_zone_overlap_axis(
+                zone_ax, gt_canvas, pred_canvas,
+            )
+            zone_ax.set_title(
+                f"Zone overlap - {lt} ({wall_hm} UTC)\n"
+                f"{_format_hmf_pct(zone_stats['hits'], zone_stats['misses'], zone_stats['false_alarms'])}",
+                fontsize=11,
+            )
+            zone_fig.suptitle(
+                f"Validation ({track}) - Zone overlap  |  "
+                f"{date_str}  ref={ref_utc}  |  {lt} ({wall_hm} UTC)",
+                fontsize=13, fontweight="bold", color=title_color,
+            )
+            _add_zone_color_legend(zone_fig)
+            _add_hmf_legend(zone_fig, y=-0.14)
+            zone_png = output_dir / (
+                f"{stem}_{date_str}_{safe_ref}_{lt.replace('+', 'p')}_zone.png"
+            )
+            zone_fig.savefig(zone_png, dpi=130, bbox_inches="tight")
+            plt.close(zone_fig)
             print(f"  Saved {lt} -> {out_png.name}")
 
 
@@ -1659,9 +2166,7 @@ def _plot_kd_3x3(
         try: overlay_borders(ax_gt)
         except Exception: pass
         _apply_frame(ax_gt)
-        gt_px = int((gt > 0).sum()) if gt is not None else 0
-        ax_gt.set_title(f"GT - t+{lead_min} min  |  active px = {gt_px}",
-                        fontsize=11)
+        ax_gt.set_title(f"GT - t+{lead_min} min", fontsize=11)
 
         for row_idx, (bin_can, colour) in enumerate(
             ((teacher_bin[i], "#d62728"),
@@ -1680,25 +2185,23 @@ def _plot_kd_3x3(
             try: overlay_borders(ax)
             except Exception: pass
             _apply_frame(ax)
-            n_pred = int((bin_can > 0).sum())
             if gt is not None:
                 gt_pos = gt > 0
                 pr_pos = bin_can > 0
                 hits = int((gt_pos & pr_pos).sum())
                 misses = int((gt_pos & ~pr_pos).sum())
                 fa = int((~gt_pos & pr_pos).sum())
-                subtitle = (f"{row_labels[row_idx]}  t+{lead_min}  |  "
-                            f"hits={hits} miss={misses} FA={fa}  "
-                            f"pred px={n_pred}")
+                subtitle = (f"{row_labels[row_idx]}  t+{lead_min}\n"
+                            f"{_format_hmf_pct(hits, misses, fa)}")
             else:
-                subtitle = (f"{row_labels[row_idx]}  t+{lead_min}  |  "
-                            f"pred px={n_pred}")
+                subtitle = f"{row_labels[row_idx]}  t+{lead_min}"
             ax.set_title(subtitle, fontsize=10)
 
     fig.suptitle(
         f"KD comparison  |  {date_str}  ref={ref_utc}",
         fontsize=14, fontweight="bold", color=suptitle_color,
     )
+    _add_hmf_legend(fig)
     fig.savefig(output_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
@@ -2062,7 +2565,7 @@ def main() -> int:
     parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
                         help="Overlap stride for Hann inference (lightning). "
                              f"Default {DEFAULT_STRIDE} = 50%% overlap.")
-    parser.add_argument("--low_threshold", type=float,
+    parser.add_argument("--lightning_low_threshold", type=float,
                         default=LIGHTNING_LOW_THRESHOLD,
                         help="Hysteresis LOW threshold (lightning). "
                              f"Default {LIGHTNING_LOW_THRESHOLD}.")
@@ -2147,7 +2650,7 @@ def main() -> int:
                 args.mode, args.source, args.finetuned,
                 data_root, model_dir, output_dir,
                 stride=args.stride,
-                low_threshold=args.low_threshold,
+                low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
@@ -2159,7 +2662,7 @@ def main() -> int:
                 args.mode, args.source, args.finetuned,
                 data_root, model_dir, output_dir,
                 stride=args.stride,
-                low_threshold=args.low_threshold,
+                low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
                 kd=args.kd,
             )
@@ -2172,7 +2675,7 @@ def main() -> int:
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,
                 output_dir=output_dir,
-                stride=args.stride, low_threshold=args.low_threshold,
+                stride=args.stride, low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
@@ -2185,7 +2688,7 @@ def main() -> int:
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,
                 output_dir=output_dir,
-                stride=args.stride, low_threshold=args.low_threshold,
+                stride=args.stride, low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
             )
     return 0

@@ -465,6 +465,11 @@ NWCSAF_CONFIG = {
 def get_mode_config(mode):
     """Return input group configurations and label config for a given mode.
 
+    Accepts both the canonical mode name (`mtg_lightning_opera`) and its
+    `_rainfall`-suffixed alias (`mtg_lightning_opera_rainfall`) — the
+    alias is normalised via train_models.normalize_mode so the two are
+    fully interchangeable at every callsite.
+
     Returns:
         dict with keys for each input tensor group:
             "past_hr":  (var_config_dict, resolution, suffix)
@@ -475,6 +480,12 @@ def get_mode_config(mode):
             "label_transform": callable
             "label_suffix": str — HR or LR
     """
+    # Local import: train_models pulls TF, but get_mode_config is called
+    # from lightweight paths (e.g. CLI arg parsing). Deferring the import
+    # keeps those paths cheap when TF isn't otherwise needed.
+    from train_models import normalize_mode
+    mode = normalize_mode(mode)
+
     # Common: radar + lightning at HR
     hr_base = {**HR_RADAR_CONFIG, **HR_LIGHTNING_CONFIG}
 

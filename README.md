@@ -1118,9 +1118,12 @@ python our_data/lightning_data/read_kml_version2.py --force
 Two entry points, chosen by what data you have on disk:
 
 - **[`predict_full_domain.py`](predict_full_domain.py)** — standalone inference on any date. Reads the reprojected full-domain fields directly (`reproject.py` output), slices all 18 patches on the fly at inference time, runs one batched `model.predict(...)`, and pastes the results onto a 768×1536 Romania canvas. **Does not** touch `patch_index.csv`, the per-source split CSVs, or the pre-extracted `.npy` patch tiles. Use this for operational inference on a date the training pipeline has never seen.
-- **[`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py)** — training-scope visualiser. Reads a per-source split CSV, ranks reference timesteps by qualifying-patch count, and renders GT vs Pred plus a zoom-in on the highest-activity patch. Use it for post-hoc sanity checks against the test split.
+- **[`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py)** — training-scope visualiser. Reads a per-source split CSV, ranks reference timesteps by qualifying-patch count, and renders per top-N reference:
+  - **3-row full-domain figure** — Row 1 GT, Row 2 raw Pred, Row 3 post-processing zone overlap (hit / miss / false alarm) using Hann + hysteresis for lightning or `p(argmax)` hysteresis for rainfall. Green/red patch numbering shows which patches DBSCAN selected vs padded.
+  - **3-row zoom figure** — same layout cropped to the qualifying patch with the most GT activity. Row 3 stats are recomputed for the patch window only so the reported hit / miss / false-alarm percentages describe the zoom, not the whole domain.
+  - **Rainfall-only aggregate graphs** (skipped for lightning): `aggregate_pc_hist_raw.png` + `aggregate_pc_hist_hyst.png` (per-class p(c) histograms across all top-N samples, bin counts annotated), `aggregate_class_count_distribution.png` (per-class whole-domain box plots GT/raw/hyst), and an `aggregate_pc_hist_3d/` folder of **10 interactive plotly HTMLs** (5 classes × raw/hyst) — rotatable 3D bar charts where X = softmax bin, Y = patch #, Z = % of that patch's class-c pixels. Open in a browser to inspect. Skip with `--no_aggregate_graphs`.
 
-Both scripts share the same rendering code (`plot_full_domain_predictions_only` lives in `visualize_gt_vs_pred.py` and is imported by `predict_full_domain.py`), so the prediction panels are pixel-identical between the two.
+  The hysteresis knobs (`--lightning_low_threshold` / `--lightning_high_threshold` / `--validation_summary` for lightning; `--rainfall_low_threshold` / `--rainfall_high_threshold` for rainfall) mirror `predict_full_domain.py` so both scripts render the same post-processed output on the same data. Use it for post-hoc sanity checks against the test split.
 
 ### End-to-end recipe for a new date
 
@@ -1179,15 +1182,42 @@ python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
 python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
     --source dbscan --date 2026-06-30 \
     --start-time 12:00 --end-time 15:45 --finetuned
+
+# Lightning: override the default hysteresis LOW/HIGH thresholds
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30 --time 14:30 \
+    --lightning_low_threshold 0.90 --lightning_high_threshold 0.95
+
+# Lightning: pull the per-lead tuned HIGH thresholds from a validation summary
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
+    --source dbscan --date 2026-06-30 \
+    --validation_summary ./validation/lightning_2025_05_summary.json
+
+# Rainfall: override the hysteresis thresholds on p(argmax when rainy)
+python predict_full_domain.py --mode mtg_lightning_opera_rainfall \
+    --source dbscan --date 2026-06-30 --time 14:30 \
+    --rainfall_low_threshold 0.35 --rainfall_high_threshold 0.55
 ```
 
 ### Output
 
-`inference/predict_<mode>_<source>[_finetuned]/predict_<date>_<HHMM>.png` per reference timestep, showing the three lead-time predictions (t+15, t+30, t+45) on the same Romania-centred canvas with neighbour-country borders.
+Written under `inference/predict_<run_tag>[_finetuned|_kd]/` (rainfall-track modes carry an implicit `_rainfall` insertion in the run tag).
 
-- `--save-npy` also dumps the raw `(3, 768, 1536)` prediction canvases as `.npy` next to each PNG.
+Lightning modes produce **two** PNGs per reference timestep:
+
+- **`predict_<date>_<HHMM>.png`** — 2×3 figure. **Row 1** GT lightning occurrence (`gt_red` gradient, pink base removed). **Row 2** post-processed hit / miss / false-alarm overlap of the Hann-blended + hysteresis-thresholded prediction against GT (orange = hit, blue = miss, red = false alarm on a white base). Zone colour legend + h/m/FA formula footer bracket the plots.
+- **`predict_<date>_<HHMM>_hits.png`** — companion 1×3 figure: for each lead, only the correctly-detected pixels rendered in the orange "hit" colour on a white base. Subtitle carries `hits = N (X.X% of GT-active)` per panel.
+
+Rainfall modes produce **two** PNGs per reference timestep whenever OPERA GT is on disk (falls back to a pred-only 1×3 heatmap when it isn't):
+
+- **`predict_<date>_<HHMM>.png`** — 3×3 figure. **Row 1** GT class canvas (viridis-5). **Row 2** zone overlap of the raw argmax pred vs GT (pre post-processing). **Row 3** same zone overlap but computed against the hysteresis-cleaned pred (`--rainfall_low_threshold` / `--rainfall_high_threshold`). Row 1 has its own viridis-5 colour bar; Rows 2 and 3 share the zone colour legend + h/m/FA formula footer.
+- **`predict_<date>_<HHMM>_perclass_hits.png`** — companion 2×3 figure. **Row 1** per-class hits using the raw argmax pred; **Row 2** per-class hits using the hysteresis-cleaned pred. Each subtitle carries the per-class hit-rate breakdown `C1:X% C2:Y% C3:Z% C4:W%`.
+
+Optional artefacts:
+
+- `--save-npy` dumps the raw `(3, 768, 1536)` prediction canvases as `.npy` next to each PNG. For rainfall, it also writes `<stem>_hyst.npy` — the hysteresis-cleaned int32 class canvases stacked along the lead axis.
 - `--no-plot` skips the PNGs when you only want the raw arrays.
-- `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid.
+- `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid (radar/rainfall only; the lightning path always covers the full canvas via Hann overlap).
 
 ## Validation
 
@@ -1234,9 +1264,9 @@ Output: `validation/<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` per (refere
 
 Structural clone of the rainfall extractor with three lightning-specific twists:
 
-- **Sample selection**: keeps LINET occurrence samples with `≥ --min_active_pixels` active pixels (default 1).
-- **Inference**: Hann-blended overlapping-patch inference at `--stride` (default 128 → 55 patches per reference, 3× the non-overlapping cost, kills the 256-pixel tiling seams). Post-processing is hysteresis thresholding with a fixed low = 0.90 and a **per-lead high threshold tuned inside the extraction run** by sweeping a 0.91..0.99 grid and picking the value that maximises aggregate CSI at that lead. The tuning table + chosen thresholds are persisted in `summary.json → post_processing`.
-- **Visualisation**: one 2×3 figure per selected reference (rows = pipeline stage, cols = lead times) — row 1 is the GT lightning occurrence, row 2 is the same GT with the post-processed positive pixels overlaid in red. All three lead times on a single figure, matching the spec.
+- **Sample selection**: **OPERA-driven for parity with the rainfall track** — a reference is kept when the OPERA `rainfall_rate` canvas has any pixel ≥ `--rainfall_threshold_mmh` (default 10 mm/h). The legacy LINET-driven cut (`≥ 1 active pixel`) still lives in `select_samples_lightning` but is opt-in via Python and unreachable from the CLI.
+- **Inference**: Hann-blended overlapping-patch inference at `--stride` (default 128 → 55 patches per reference, 3× the non-overlapping cost, kills the 256-pixel tiling seams). Post-processing is hysteresis thresholding with a fixed `--lightning_low_threshold` = 0.90 and a **per-lead high threshold tuned inside the extraction run** by sweeping a 0.91..0.99 grid and picking the value that maximises aggregate CSI at that lead. The tuning table + chosen thresholds are persisted in `summary.json → post_processing`.
+- **Visualisation**: one 2×3 figure per selected reference (rows = pipeline stage, cols = lead times) — row 1 is the GT lightning occurrence, row 2 is the post-processed hit / miss / false-alarm overlap against GT (orange / blue / red palette). All three lead times on a single figure, matching the spec.
 
 ```bash
 # Extraction (tunes per-lead high threshold)
@@ -1339,7 +1369,7 @@ If `kd_YYYY_MM_summary.json` exists in `--validation_dir` when [`generate_report
 
 ## Automated Report Generation
 
-[`generate_report.py`](generate_report.py) turns the outputs of `validate_predictions.py` into a standalone Romanian PDF for meteorologists who have never seen the internal model. It runs a local Ollama-hosted LLM (default `gemma4:12b`) for data-first commentary, then translates each paragraph to Romanian in a second Gemma call with a meteorological glossary in the system prompt. All prompts are **text-only** — the coupling-mask PNG is rendered for the human reader but never sent to the model; Gemma reads pre-computed per-coupled-cell metadata instead. Everything is deterministic given the same validation outputs, model tag, `temperature=0`, and seed.
+[`generate_report.py`](generate_report.py) turns the outputs of `validate_predictions.py` into a standalone PDF for meteorologists who have never seen the internal model. It runs a local Ollama-hosted LLM (default `gemma3:27b-it-q4_K_M`) for data-first commentary in English, then — unless `--language en` is passed — translates each paragraph to Romanian in a second Gemma call with a meteorological glossary in the system prompt. All prompts are **text-only** — the coupling-mask PNG is rendered for the human reader but never sent to the model; Gemma reads pre-computed per-coupled-cell metadata instead. Everything is deterministic given the same validation outputs, model tag, `temperature` (defaults to `0.1` — Gemma collapses to empty completions at exactly `0.0`), and seed.
 
 **Sample-selection parity**: both tracks use the SAME OPERA-driven selection criterion (`RAINFALL_THRESHOLD_MMH = 10.0 mm/h` anywhere on the canvas at the reference timestep — see the [Thresholds Reference](#thresholds-reference)). This means `initial_selection` in each track's `summary.json` holds the same list of references, so the report's reference count equals whichever track you loaded (union = intersection under parity).
 
@@ -1347,47 +1377,65 @@ If `kd_YYYY_MM_summary.json` exists in `--validation_dir` when [`generate_report
 
 ```powershell
 # 1. Install pip deps into the tfenv (or your project env)
-& "C:\path\to\tfenv\python.exe" -m pip install fpdf2 ollama Pillow
+& "C:\path\to\tfenv\python.exe" -m pip install fpdf2 ollama Pillow tzdata
 
 # 2. Ollama server running on http://localhost:11434 and the target model pulled
-ollama pull gemma4:12b
+ollama pull gemma3:27b-it-q4_K_M
 ```
+
+`tzdata` is only needed on Windows Python installs that don't ship system timezone data — the report renders the cover-page timestamp in Europe/Bucharest local time (EET/EEST) so the "Generated:" line matches wall-clock time for a Romanian reader. Missing `tzdata` triggers a hand-rolled EU DST fallback that computes EET/EEST from the last Sunday of March / October, so this is a nice-to-have rather than a hard requirement.
 
 ### What the report contains
 
 One PDF per (year, month). Structure:
 
-1. **Cover** — header banner from [`assets/`](assets/), title, period, tracks included, generation timestamp.
-2. **Executive summary** — one Gemma paragraph naming the period, shared selection criterion, and the per-lead FAR/POD/CSI evolution across t+15/+30/+45 for each track.
-3. **Per-lead metrics sections** — one per (track × lead time), with the aggregate `metrics.png` embedded and a Romanian paragraph interpreting that lead's performance vs the other two.
-4. **Per-reference event sections** — for every selected reference, a **coupling-mask figure** (blue = rainfall ≥ 10 mm/h only, orange = active lightning only, red = coupled cells) embedded in the PDF as decoration, plus a caption produced from per-coupled-cell metadata: bounding box + 8-way cardinal centroid + peak mm/h + lightning-active count per cell (cells smaller than `MIN_CELL_SIZE_PIXELS = 10` are dropped as noise). When any cell is present, the caption uses *"precipitation of X mm/h paired with Y% of the lightning strokes inside the same convective cell, in the &lt;cardinal&gt; of Romania"*; when the list is empty, it describes rainfall and lightning as separate observations.
-5. **Data appendix** — min / mean / max IoU per lead per track from `samples.csv`.
+1. **Cover** — header banner from [`assets/`](assets/), title, period (`Raport de validare — august 2026` in RO, `Validation report — August 2026` in EN — month is spelled out, not `2025-05` numeric), tracks with descriptive names (`clasificarea cantităților de precipitații instantanee (OPERA)` / `instantaneous rainfall intensity classification (OPERA)`), generation timestamp in Europe/Bucharest local time (`EET`/`EEST`), and localized labels (`Perioada:` / `Period:` etc — nothing hardcoded in Romanian in an English run).
+2. **Table of contents (page 2)** — one line per section with the actual page number, each entry a **clickable link** that jumps to that section in the PDF viewer.
+3. **Executive summary** — one Gemma paragraph naming the period, shared selection criterion, and the per-lead FAR/POD/CSI evolution across t+15/+30/+45 for each track.
+4. **Per-lead metrics sections** — one per (track × lead time), with the aggregate `metrics.png` embedded and a paragraph interpreting that lead's performance vs the other two.
+5. **Per-reference event sections** — for every selected reference, a **coupling-mask figure** (blue = rainfall ≥ 10 mm/h only, orange = active lightning only, red = coupled cells) embedded in the PDF as decoration, plus a caption produced from per-coupled-cell metadata: bounding box + 8-way cardinal centroid + peak mm/h + lightning-active count per cell (cells smaller than `MIN_CELL_SIZE_PIXELS = 10` are dropped as noise). When any cell is present, the caption uses *"precipitation of X mm/h paired with Y% of the lightning strokes inside the same convective cell, in the &lt;cardinal&gt; of Romania"*; when the list is empty, it describes rainfall and lightning as separate observations.
+6. **Data appendix** — min / mean / max IoU per lead per track from `samples.csv`.
 
-Every numeric claim comes from a pre-computed FACTS block. Gemma paraphrases the facts, never invents them; no vision calls at any stage.
+Every page (page 2 onward — cover is intentionally unnumbered) carries a small grey page number at the bottom-right corner. Every numeric claim comes from a pre-computed FACTS block. Gemma paraphrases the facts, never invents them; no vision calls at any stage.
+
+Empty Gemma responses are auto-retried up to 3× with a small temperature nudge (`+0.05` per attempt, floored at `0.05`) and the retry loop prints the `done_reason` so a stuck run is diagnosable at a glance; if all retries still return empty text, `generate_report.py` fails loudly with the last response metadata rather than silently producing a report with blank paragraphs.
 
 ### Usage
 
 ```bash
-# Combined rainfall + lightning report (requires both tracks' extraction outputs)
+# Combined rainfall + lightning report (requires both tracks' extraction outputs).
+# Default --language ro produces a Romanian PDF; --language en skips the
+# translation phase entirely and renders the raw English text (halves the
+# Gemma calls).
 python generate_report.py --year 2025 --month 5
+
+# English-only report — skip the RO translation phase
+python generate_report.py --year 2025 --month 5 --language en
 
 # Single track
 python generate_report.py --year 2025 --month 5 --track rainfall
 
 # Non-default model / paths, bilingual PDF (Romanian + English)
 python generate_report.py --year 2025 --month 5 \
-    --model gemma4:12b \
+    --model gemma3:27b-it-q4_K_M \
     --validation_dir ./validation \
     --output ./validation/report_2025_05.pdf \
     --bilingual
 
 # Iterate on prompts / facts extractor without spending Gemma calls
 python generate_report.py --year 2025 --month 5 --skip_pdf
+
+# Use / refresh the on-disk translation cache
+python generate_report.py --year 2025 --month 5              # read + write cache
+python generate_report.py --year 2025 --month 5 --refresh_cache  # ignore cached, rewrite
+python generate_report.py --year 2025 --month 5 --no_cache       # bypass entirely
 ```
 
 ### Cost
 
-Per report with N selected references and both tracks: `2 × (7 + N)` Gemma calls (English generation + Romanian translation). For N = 10 that's ~34 calls, ~3-5 minutes on CPU with `gemma4:12b` — **all text-only** since prompt C now reads per-cell metadata (see [Thresholds Reference](#thresholds-reference) → `MIN_CELL_SIZE_PIXELS`) rather than the coupling PNG. The coupling PNG is still rendered and embedded in the PDF for the human reader, just not sent to the model.
+Per report with N selected references and both tracks: `2 × (7 + N)` Gemma calls in the default (Romanian) mode — English generation + Romanian translation. `--language en` halves that to `(7 + N)` since the translation phase is skipped. For N = 10 in RO mode that's ~34 calls, ~3-5 minutes on CPU with `gemma3:27b-it-q4_K_M` — **all text-only** since prompt C now reads per-cell metadata (see [Thresholds Reference](#thresholds-reference) → `MIN_CELL_SIZE_PIXELS`) rather than the coupling PNG. The coupling PNG is still rendered and embedded in the PDF for the human reader, just not sent to the model.
+
+Total wall time is printed at the end of every run (`Total report-generation wall time: X.Xs (Y.Y min)`) so successive runs can be compared without external timing.
 
 ## Thresholds Reference
 
@@ -1399,7 +1447,7 @@ Every knob in the codebase that decides "what counts" — sample selection, even
 |---|---|---|---|---|---|
 | `RAINFALL_THRESHOLD_MMH` | $\color{red}{10.0}$ mm/h | [validate_predictions.py:132](validate_predictions.py#L132) & [generate_report.py:267](generate_report.py#L267) | `--rainfall_threshold_mmh` (validate_predictions.py) — **selection scope only**; the binary event for FAR/POD/CSI/IoU stays anchored to class ≥ 1 (10 mm/h) since that's the trained model's decision boundary. | Sample selection cut for the rainfall track (and lightning under parity), plus the `>= X mm/h` label on the metrics figure. In `generate_report.py` also defines coupled-cell membership. | Lowering → more samples selected, smaller cells in coupled_cells. Raising → only intense convection, fewer references per report. |
 | `HIGH_COVERAGE_PCT` | $\color{red}{90.0}$ % | [validate_predictions.py:144](validate_predictions.py#L144) | `--high_coverage_pct` (validate_predictions.py) — takes effect at extraction time; visualisation mode reads whatever the JSON was written with. | Threshold above which a sample counts as "high coverage" per lead time. Populates `samples_above_threshold_per_lead`, `difference_pct_per_lead`, `high_coverage_samples_per_lead` in the summary JSON. Drives the green/orange suptitle colour in visualisation mode. | Lowering (e.g. 80) → more samples flagged "good", green titles more common. Raising (95+) → stricter grading, orange dominates. |
-| `LIGHTNING_LOW_THRESHOLD` | $\color{red}{0.90}$ | [validate_predictions.py:777](validate_predictions.py#L777) & [lightning_postproc.py:55](lightning_postproc.py#L55) | `--low_threshold` (validate_predictions.py) & `--low_threshold` (predict_full_domain.py) | Hysteresis LOW threshold applied to the Hann-blended probability canvas. A pixel is positive iff `p ≥ low` AND its 8-connected component contains a `p ≥ high` seed. | Lowering → wider spread of positives per convective cell (more permissive edges). Raising → tighter cells, fewer marginal detections. |
+| `LIGHTNING_LOW_THRESHOLD` | $\color{red}{0.90}$ | [validate_predictions.py:777](validate_predictions.py#L777) & [lightning_postproc.py:55](lightning_postproc.py#L55) | `--lightning_low_threshold` (validate_predictions.py, predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis LOW threshold applied to the Hann-blended probability canvas. A pixel is positive iff `p ≥ low` AND its 8-connected component contains a `p ≥ high` seed. | Lowering → wider spread of positives per convective cell (more permissive edges). Raising → tighter cells, fewer marginal detections. |
 | `LIGHTNING_HIGH_GRID` | $\color{red}{0.91, 0.92, …, 0.99}$ (step 0.01) | [validate_predictions.py:778](validate_predictions.py#L778) | n/a (source edit) | Sweep grid for the hysteresis HIGH threshold tuned per lead by maximising aggregate CSI. Persisted in `summary.json → post_processing.tuning_scores`. | Narrowing/coarsening the grid → faster tuning but fewer candidate operating points. Extending below 0.91 or above 0.99 → explore more/less conservative seeds. |
 | `MIN_CELL_SIZE_PIXELS` | $\color{red}{10}$ pixels | [generate_report.py:268](generate_report.py#L268) | n/a (source edit) | Minimum connected-component size (8-conn) for a coupled cell to be reported in the FACTS block for prompt C. Specks below this are treated as noise and never surface to Gemma. | Lowering → more cells reported, longer FACTS block per reference, Gemma may over-describe minor overlaps. Raising → only large convective systems get the coupled phrasing. |
 
@@ -1408,7 +1456,9 @@ Every knob in the codebase that decides "what counts" — sample selection, even
 | Constant | Default | Location | CLI override | Purpose | Impact if changed |
 |---|---|---|---|---|---|
 | `DEFAULT_STRIDE` | $\color{red}{128}$ px | [lightning_postproc.py:54](lightning_postproc.py#L54) | `--stride` (validate_predictions.py & predict_full_domain.py) | Overlap stride for Hann-blended inference. Default = 50% overlap → 55 patches per reference on the 768×1536 canvas. | Halving to 64 → 75% overlap, smoother blending but ~4× inference cost. Raising to 256 → no overlap (baseline), visible tiling seams every 256 px. |
-| `DEFAULT_HIGH_THRESHOLD` | $\color{red}{0.95}$ | [lightning_postproc.py:56](lightning_postproc.py#L56) | `--high_threshold` (predict_full_domain.py) — falls back to this when `--validation_summary` isn't given. | Fallback hysteresis HIGH used by `predict_full_domain.py --high_threshold` when no tuned value is supplied via `--validation_summary`. | Only affects operational inference without a validation summary. Tune per lead by running `validate_predictions.py --track lightning` and pointing predict at the resulting JSON. |
+| `DEFAULT_HIGH_THRESHOLD` | $\color{red}{0.95}$ | [lightning_postproc.py:56](lightning_postproc.py#L56) | `--lightning_high_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) — falls back to this when `--validation_summary` isn't given. | Fallback hysteresis HIGH used by `predict_full_domain.py --lightning_high_threshold` when no tuned value is supplied via `--validation_summary`. | Only affects operational inference without a validation summary. Tune per lead by running `validate_predictions.py --track lightning` and pointing predict at the resulting JSON. |
+| `DEFAULT_RAIN_LOW` | $\color{red}{0.35}$ | [visualize_gt_vs_pred.py](visualize_gt_vs_pred.py) | `--rainfall_low_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis LOW threshold applied to `p(argmax)` on the rainfall softmax when the argmax is a rainy class (1..4). Lower than the lightning threshold because probability is split across 5 classes. Selected pixels keep their argmax class; rejected pixels drop to class 0 (dry). | Lowering → more marginal rainy pixels survive the cleanup. Raising → tighter blobs, more of the model's uncertain rainy predictions get discarded. |
+| `DEFAULT_RAIN_HIGH` | $\color{red}{0.55}$ | [visualize_gt_vs_pred.py](visualize_gt_vs_pred.py) | `--rainfall_high_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis HIGH seed threshold for the same rainfall post-processing (a component from the LOW mask survives only if it contains at least one pixel `p(argmax) ≥ HIGH`). | Lowering → more components qualify as seeds, larger cleaned blobs. Raising → stricter seeds, only the model's most confident rainy pixels anchor a component. |
 | `LIGHTNING_MIN_ACTIVE_PIXELS` | $\color{red}{1}$ pixel | [validate_predictions.py:780](validate_predictions.py#L780) | n/a (no CLI - opt-in via Python) | Legacy — only used if you call `select_samples_lightning` directly from Python (opt-in LINET-driven cut). The default lightning validation path uses OPERA-driven selection instead, so this constant is unreachable via the CLI. | No effect on the CLI. Change only if scripting a custom LINET-only selection. |
 
 ### Data pipeline thresholds (DBSCAN + lightning periods)
@@ -1440,8 +1490,10 @@ Every knob in the codebase that decides "what counts" — sample selection, even
 
 | Constant | Default | Location | CLI override | Purpose | Impact if changed |
 |---|---|---|---|---|---|
-| `DEFAULT_OLLAMA_SEED` | $\color{red}{42}$ | [generate_report.py:49](generate_report.py#L49) | `--seed` (generate_report.py) | Seed passed to Ollama for reproducible generation. Same seed + same prompt + `temperature=0` → identical output across runs. | Any change breaks output determinism across runs but doesn't change quality; useful if you deliberately want variation. |
-| `DEFAULT_OLLAMA_TEMPERATURE` | $\color{red}{0.0}$ | [generate_report.py:50](generate_report.py#L50) | `--temperature` (generate_report.py) | Sampling temperature for Gemma. Zero = deterministic argmax decoding. | Raising above zero introduces randomness; report is no longer reproducible run-to-run. |
+| `DEFAULT_MODEL_TAG` | $\color{red}{\text{gemma3:27b-it-q4\_K\_M}}$ | [generate_report.py:46](generate_report.py#L46) | `--model` (generate_report.py) | Ollama model tag used for every English generation + Romanian translation call. Must be pulled locally (`ollama pull …`). | Smaller quants trade quality for RAM footprint; a different family may need prompt-template tweaks. |
+| `DEFAULT_OLLAMA_SEED` | $\color{red}{42}$ | [generate_report.py](generate_report.py) | `--seed` (generate_report.py) | Seed passed to Ollama for reproducible generation. Same seed + same prompt + fixed temperature → identical output across runs. | Any change breaks output determinism across runs but doesn't change quality; useful if you deliberately want variation. |
+| `DEFAULT_OLLAMA_TEMPERATURE` | $\color{red}{0.1}$ | [generate_report.py](generate_report.py) | `--temperature` (generate_report.py) | Sampling temperature for Gemma. Paired with the fixed seed this is still effectively deterministic while avoiding Gemma's `temperature=0.0` empty-completion collapse. The retry loop nudges by `+0.05` per attempt (floored at `0.05`) if a call still returns empty. | Raising further introduces more variation. Lowering to exactly `0.0` re-exposes the empty-output failure mode Gemma has at that boundary. |
+| `DEFAULT_OLLAMA_MAX_TOKENS` | $\color{red}{2000}$ | [generate_report.py](generate_report.py) | `--max_tokens` (generate_report.py) | Hard cap on Ollama's `num_predict` per call. Guards against runaway repetition loops wedging the whole run. | Lowering → shorter paragraphs (safer for CPU-bound runs). Raising → longer answers, higher per-call latency. |
 
 ## Architecture Summary
 

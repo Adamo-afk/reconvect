@@ -43,11 +43,24 @@ from pathlib import Path
 # ============================================================================
 # Configuration
 # ============================================================================
-DEFAULT_MODEL_TAG = "gemma4:12b"
+DEFAULT_MODEL_TAG = "gemma3:27b-it-q4_K_M"
+
+# Hard upper bound on tokens Gemma is allowed to emit for a single call.
+# Ollama's default `num_predict` can be -1 (unbounded) on some models —
+# combined with a bad decode state or a repetition loop, that can hang
+# the whole report on a single paragraph. 2000 tokens is generous for
+# every prompt we send (executive summary, per-lead metrics, KD, per-
+# reference caption, period conclusion) while still tripping fast if
+# Gemma stalls. Override via `--max_tokens` on the CLI.
+DEFAULT_OLLAMA_MAX_TOKENS = 2000
 DEFAULT_VALIDATION_DIR = Path("./validation")
 DEFAULT_ASSETS_DIR = Path("./assets")
 DEFAULT_OLLAMA_SEED = 42
-DEFAULT_OLLAMA_TEMPERATURE = 0.0
+DEFAULT_OLLAMA_TEMPERATURE = 0.1   # 0.0 makes Gemma collapse to empty
+                                   # completions; 0.1 is low enough to
+                                   # stay near-deterministic (paired
+                                   # with the fixed seed) without
+                                   # triggering the empty-output path.
 
 # Rainfall / lightning artefact filename patterns that validate_predictions.py
 # emits. Kept as module-level constants so the loaders in the next step have a
@@ -699,26 +712,45 @@ def render_coupling_mask_figure(
         stats: list[str] = []
         if mask_rain is not None and mask_light is not None:
             rain_only = mask_rain & ~mask_light
-            light_only = mask_light & ~mask_rain
+            lightning_only = mask_light & ~mask_rain
             coupled = mask_rain & mask_light
             display[rain_only] = COUPLING_COLOR_RAIN_ONLY
-            display[light_only] = COUPLING_COLOR_LIGHT_ONLY
+            display[lightning_only] = COUPLING_COLOR_LIGHT_ONLY
             display[coupled] = COUPLING_COLOR_COUPLED
+            # Percentages relative to each batch's own reference set:
+            #  - rain-only        = fraction of rain-active pixels that
+            #                        DIDN'T co-occur with lightning
+            #  - lightning-only   = fraction of lightning-active pixels
+            #                        that DIDN'T co-occur with rain
+            #  - coupled          = fraction of ANY-active pixels that
+            #                        had BOTH rain and lightning
+            # Each ratio is a "did the other quantity accompany me here?"
+            # question, which is what the reader is actually trying to
+            # judge from this panel — raw counts made you mentally
+            # normalise against the visible blob sizes.
+            n_rain = int(mask_rain.sum())
+            n_light = int(mask_light.sum())
+            n_union = int((mask_rain | mask_light).sum())
+            pct_rain_only = (int(rain_only.sum()) / n_rain * 100.0
+                             if n_rain > 0 else None)
+            pct_light_only = (int(lightning_only.sum()) / n_light * 100.0
+                              if n_light > 0 else None)
+            pct_coupled = (int(coupled.sum()) / n_union * 100.0
+                           if n_union > 0 else None)
+            def _p(v): return "n/a" if v is None else f"{v:.1f}%"
             stats = [
-                f"rain-only={int(rain_only.sum())}",
-                f"light-only={int(light_only.sum())}",
-                f"coupled={int(coupled.sum())}",
+                f"rain-only={_p(pct_rain_only)}",
+                f"lightning-only={_p(pct_light_only)}",
+                f"coupled={_p(pct_coupled)}",
             ]
             any_rendered = True
         elif mask_rain is not None:
             display[mask_rain] = COUPLING_COLOR_RAIN_ONLY
-            stats = [f"rain-only={int(mask_rain.sum())}",
-                     "light GT unavailable"]
+            stats = ["rain-only=100.0% (no lightning GT for this lead)"]
             any_rendered = True
         elif mask_light is not None:
             display[mask_light] = COUPLING_COLOR_LIGHT_ONLY
-            stats = [f"light-only={int(mask_light.sum())}",
-                     "rain GT unavailable"]
+            stats = ["lightning-only=100.0% (no rain GT for this lead)"]
             any_rendered = True
         else:
             stats = ["no GT for this lead"]
@@ -758,13 +790,391 @@ def render_coupling_mask_figure(
     return output_path
 
 
+# ============================================================================
+# Predicted-coupling figure (Row 1 GT + Row 2 pred-area + Row 3 pred-class)
+# ============================================================================
+# Optional 3x3 companion to render_coupling_mask_figure that adds the
+# MODEL's take on the same lead times so the reader can compare observed
+# vs predicted coupling side by side. Renders only when the caller
+# supplies both a rainfall-multiclass model and a lightning-occurrence
+# model checkpoint on disk; the coupling numeric-facts pipeline above
+# already operates on GT only, so this figure sits alongside the GT
+# figure as a separate PNG.
+#
+# Row 1: GT — reuses the same rain-only / lightning-only / coupled
+#        palette as render_coupling_mask_figure (blue / orange / red).
+# Row 2: pred-area  — pred rain class >= 1 (binary "any rain") vs
+#        post-processed pred lightning (Hann + hysteresis binary),
+#        painted in the same 3-color palette as Row 1.
+# Row 3: pred-class — pred rain class canvas rendered in viridis-5,
+#        BUT only where pred lightning is also active (i.e. the coupled
+#        subset), so the reader sees WHICH rain intensity the model
+#        thinks fell in the coupled region.
+def render_pred_coupling_figure(
+    date_str: str,
+    ref_utc: str,
+    lead_minutes: list[int],
+    data_root: Path,
+    output_path: Path,
+    *,
+    model_dir: Path,
+    rainfall_mode: str,
+    rainfall_source: str,
+    rainfall_finetuned: bool,
+    lightning_mode: str,
+    lightning_source: str,
+    lightning_finetuned: bool,
+    lightning_kd: bool,
+    lightning_low_threshold: float,
+    lightning_high_per_lead: dict[int, float] | None,
+    rainfall_available: bool,
+    lightning_available: bool,
+) -> Path | None:
+    """Render the 3x3 GT-vs-predicted coupling figure. Returns the saved
+    path, or None if inputs / models are unavailable at this reference.
+
+    The rainfall model is expected to be a 5-class rainfall-rate head
+    (mode registered in create_datasets.get_mode_config; e.g.
+    `mtg_lightning_opera`). The lightning model is the occurrence head
+    (`mtg_lightning_opera_occurrence`) or the KD student
+    (`mtg_opera_occurrence`) — post-processing is Hann-blended overlap
+    inference + per-lead hysteresis (see lightning_postproc.py). Per-
+    lead high thresholds come from the caller (typically the tuned
+    values in `lightning_{yyyy}_{mm}_summary.json`); when absent, the
+    lightning_postproc.DEFAULT_HIGH_THRESHOLD (0.95) is used.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    import numpy as np
+    from predict_full_domain import (
+        build_inputs_for_reference,
+        paste_predictions_to_canvas,
+        LEAD_STEP_OFFSETS,
+    )
+    from visualize_gt_vs_pred import (
+        H_FULL, W_FULL, overlay_borders, _ensure_view_cached,
+        load_model_artifact,
+    )
+    import visualize_gt_vs_pred as _vf
+    from create_datasets import (
+        get_mode_config, init_sequence_config, set_normalization_stats_path,
+    )
+    from lightning_postproc import (
+        run_hann_overlapped_inference, hysteresis_binary,
+        DEFAULT_HIGH_THRESHOLD, DEFAULT_STRIDE,
+    )
+    from validate_predictions import _load_step_minutes
+
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+
+    # Init sequence config + normalization stats before any transform runs.
+    init_sequence_config(str(data_root), rainfall_source)
+    set_normalization_stats_path(
+        data_root / f"normalization_stats_{rainfall_source}.json"
+    )
+    step_minutes = _load_step_minutes(data_root)
+    lead_minutes_list = list(lead_minutes)
+
+    # ---- Load both models (once per reference; cost is dominated by
+    # the two model.predict calls below).
+    rainfall_model = load_model_artifact(
+        model_dir, rainfall_mode, rainfall_source,
+        finetuned=rainfall_finetuned,
+    )
+    lightning_model = load_model_artifact(
+        model_dir, lightning_mode, lightning_source,
+        finetuned=lightning_finetuned, kd=lightning_kd,
+    )
+
+    # ---- Rainfall inference: mode_config drives input build; output is
+    # per-lead (H, W) int32 class canvases (0..4, or -1 for out-of-domain).
+    rainfall_config = get_mode_config(rainfall_mode)
+    rain_inputs, rain_valid_patches = build_inputs_for_reference(
+        data_root, rainfall_config, date_str, ref_utc, step_minutes,
+    )
+    if not rain_valid_patches:
+        return None
+    rain_preds = rainfall_model.predict(rain_inputs, batch_size=18, verbose=0)
+    rain_class_canvases = paste_predictions_to_canvas(
+        rain_preds, rain_valid_patches, "radar",
+    )
+
+    # ---- Lightning inference: Hann-overlap + hysteresis produces per-lead
+    # (H, W) int8 binary canvases matching the operational path.
+    lightning_config = get_mode_config(lightning_mode)
+    prob_canvases = run_hann_overlapped_inference(
+        lightning_model, data_root, lightning_config,
+        date_str, ref_utc, step_minutes,
+        stride=DEFAULT_STRIDE, batch_size=32,
+    )
+    if prob_canvases is None:
+        return None
+    high_per_lead = lightning_high_per_lead or {}
+    lightning_bin_canvases = []
+    for k, offset in enumerate(LEAD_STEP_OFFSETS):
+        h = high_per_lead.get(offset, DEFAULT_HIGH_THRESHOLD)
+        lightning_bin_canvases.append(
+            hysteresis_binary(prob_canvases[k],
+                              low=lightning_low_threshold, high=h)
+        )
+
+    # ---- Figure setup.
+    fig, axes = plt.subplots(3, len(lead_minutes_list),
+                             figsize=(5.6 * len(lead_minutes_list), 12),
+                             constrained_layout=True)
+    if len(lead_minutes_list) == 1:
+        axes = axes.reshape(3, 1)
+
+    def _frame(ax):
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c_lo, c_hi); ax.set_ylim(r_hi, r_lo)
+        ax.set_aspect("equal")
+        try:
+            overlay_borders(ax)
+        except Exception:
+            pass
+
+    any_rendered = False
+    for i, lead_min in enumerate(lead_minutes_list):
+        gt_hhmm, gt_day = _resolve_lead(ref_utc, lead_min, date_str)
+        lead_wall = f"{gt_hhmm[:2]}:{gt_hhmm[2:]}"
+
+        # ---- Row 1: GT coupling (rain-only / lightning-only / coupled),
+        # same palette as render_coupling_mask_figure.
+        rain_field = (_load_rainfall_field(data_root, gt_day, gt_hhmm)
+                      if rainfall_available else None)
+        light_field = (_load_lightning_field(data_root, gt_day, gt_hhmm)
+                       if lightning_available else None)
+        ax_r1 = axes[0, i]
+        r1_display = np.full((H_FULL, W_FULL, 3),
+                             COUPLING_COLOR_BASE, dtype=np.float32)
+        if rain_field is not None and light_field is not None:
+            mr = rain_field >= RAINFALL_THRESHOLD_MMH
+            ml = light_field > 0
+            r1_display[mr & ~ml] = COUPLING_COLOR_RAIN_ONLY
+            r1_display[~mr & ml] = COUPLING_COLOR_LIGHT_ONLY
+            r1_display[mr & ml] = COUPLING_COLOR_COUPLED
+            any_rendered = True
+        ax_r1.imshow(r1_display, aspect="equal", interpolation="nearest")
+        _frame(ax_r1)
+        ax_r1.set_title(f"GT - t+{lead_min} ({lead_wall} UTC)", fontsize=10)
+
+        # ---- Row 2: pred-area (pred rain binary) intersected with
+        # post-processed pred lightning binary. Same palette as Row 1.
+        pred_rain = rain_class_canvases[i]
+        pred_light = lightning_bin_canvases[i]
+        pr_rain_bin = (pred_rain >= 1)   # any rain class
+        pr_light_bin = (pred_light > 0)
+        ax_r2 = axes[1, i]
+        r2_display = np.full((H_FULL, W_FULL, 3),
+                             COUPLING_COLOR_BASE, dtype=np.float32)
+        r2_display[pr_rain_bin & ~pr_light_bin] = COUPLING_COLOR_RAIN_ONLY
+        r2_display[~pr_rain_bin & pr_light_bin] = COUPLING_COLOR_LIGHT_ONLY
+        r2_display[pr_rain_bin & pr_light_bin] = COUPLING_COLOR_COUPLED
+        ax_r2.imshow(r2_display, aspect="equal", interpolation="nearest")
+        _frame(ax_r2)
+        ax_r2.set_title(f"Pred (per-area) - t+{lead_min}", fontsize=10)
+
+        # ---- Row 3: pred-class rainfall coloured by class, restricted
+        # to pixels where lightning was also predicted (the coupled
+        # subset). Non-coupled pixels transparent.
+        ax_r3 = axes[2, i]
+        coupled_mask = pr_rain_bin & pr_light_bin
+        cls_display = np.where(coupled_mask, pred_rain.astype(float), np.nan)
+        ax_r3.imshow(cls_display, cmap=plt.get_cmap("viridis", 5),
+                     vmin=0, vmax=4,
+                     aspect="equal", interpolation="nearest")
+        _frame(ax_r3)
+        ax_r3.set_title(f"Pred (per-class, coupled only) - t+{lead_min}",
+                        fontsize=10)
+
+    if not any_rendered:
+        plt.close(fig)
+        return None
+
+    # Legend for the top two rows (Row 3 uses the class colourbar).
+    legend_handles = [
+        Patch(color=COUPLING_COLOR_RAIN_ONLY, label="Rainfall only"),
+        Patch(color=COUPLING_COLOR_LIGHT_ONLY, label="Lightning only"),
+        Patch(color=COUPLING_COLOR_COUPLED, label="Coupled (both)"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=3,
+               fontsize=10, bbox_to_anchor=(0.5, -0.03))
+    fig.suptitle(
+        f"Coupling: GT vs predicted  |  {date_str} ref={ref_utc}",
+        fontsize=13, fontweight="bold",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+# ============================================================================
+# Coupling aggregation helpers (peak-activity picker + period-wide stats)
+# ============================================================================
+# The report used to emit ONE coupling PNG per reference; that scales to
+# hundreds of figures on a full-month run. The new layout keeps a single
+# hero image (the peak-activity reference) in `rainfall_lightning_coupling/`
+# and folds the rest of the period into an aggregate conclusion paragraph
+# (hour-of-day distribution + rainfall-band -> lightning-coupling
+# probability cross-tab).
+
+# Bins for the rainfall-band cross-tab. Same class edges as the model's
+# 5-class rainfall head so a reader lining up the report with the pred
+# plots recognises the labels immediately.
+_RAINFALL_BAND_EDGES = [10.0, 20.0, 30.0, 40.0, float("inf")]
+_RAINFALL_BAND_LABELS = ["10-20 mm/h", "20-30 mm/h", "30-40 mm/h", ">=40 mm/h"]
+
+
+def _reference_coupling_activity(ref_data: dict) -> int:
+    """Total coupled pixels for a reference, summed across all leads.
+
+    Zero when no lead has any coupling metadata (no GT on disk, or GT
+    on disk but no coupled cell survived the 10-pixel minimum size).
+    Used as the ranker for the peak-activity image and as the aggregate
+    input for the period-wide summary.
+    """
+    total = 0
+    for slot in ref_data.get("per_lead", {}).values():
+        coupling = slot.get("coupling") if slot else None
+        if coupling is not None:
+            total += int(coupling.get("n_pixels_coupled", 0) or 0)
+    return total
+
+
+def _find_most_active_coupling_ref(
+    facts_per_ref: dict,
+) -> tuple[str, str] | None:
+    """Pick the (date, ref_utc) with the most total coupled pixels
+    across its three leads. Returns None when no reference has any
+    coupling — the caller then skips the hero image entirely.
+    """
+    best_ref: tuple[str, str] | None = None
+    best_score = 0
+    for ref_key, ref_data in facts_per_ref.items():
+        score = _reference_coupling_activity(ref_data)
+        if score > best_score:
+            best_score = score
+            best_ref = ref_key
+    return best_ref
+
+
+def _compute_period_coupling_summary(
+    facts_per_ref: dict,
+    most_active_ref: tuple[str, str] | None,
+) -> dict:
+    """Aggregate coupling activity across every reference in the month
+    into a text-friendly summary the conclusion paragraph reads from.
+
+    Fields:
+      n_refs_scanned         - how many references had any GT loaded
+      n_refs_with_coupling   - how many had at least one coupled pixel
+      total_coupled_pixels   - sum across all references and leads
+      per_hour               - {hour_utc: total_coupled_pixels} (only
+                                hours with non-zero activity)
+      peak_hour_utc          - argmax of per_hour; None if all zero
+      peak_hour_pixels       - the value at that hour
+      rainfall_band_stats    - list of dicts, one per band, giving the
+                                # of coupled cells whose peak_mmh fell
+                                in that band + the sum of coupled pixels
+                                in cells peaking in that band
+      most_likely_band_label - band label with the highest coupled-pixel
+                                total (proxy for "at which rainfall
+                                intensity is lightning coupling most
+                                likely"); None if no coupling occurred
+      most_active_ref        - echoed back from the caller for prose
+                                anchoring
+    """
+    n_refs_scanned = len(facts_per_ref)
+    n_refs_with_coupling = 0
+    total_coupled_pixels = 0
+    per_hour: dict[int, int] = {}
+    band_counts = [0] * len(_RAINFALL_BAND_LABELS)
+    band_pixel_sums = [0] * len(_RAINFALL_BAND_LABELS)
+
+    for ref_key, ref_data in facts_per_ref.items():
+        ref_utc = ref_key[1]
+        score = _reference_coupling_activity(ref_data)
+        if score == 0:
+            continue
+        n_refs_with_coupling += 1
+        total_coupled_pixels += score
+
+        # Hour bucket from the reference HH:MM.
+        try:
+            hour = int(ref_utc.split(":")[0])
+        except (ValueError, IndexError):
+            hour = -1
+        if hour >= 0:
+            per_hour[hour] = per_hour.get(hour, 0) + score
+
+        # Rainfall-band tally: iterate every coupled cell across every
+        # lead and drop it into the band its peak_mmh falls into.
+        for slot in ref_data.get("per_lead", {}).values():
+            coupling = slot.get("coupling") if slot else None
+            if coupling is None:
+                continue
+            for cell in coupling.get("coupled_cells", []) or []:
+                peak = float(cell.get("peak_mmh_inside", 0.0) or 0.0)
+                if peak < _RAINFALL_BAND_EDGES[0]:
+                    continue
+                for i, edge in enumerate(_RAINFALL_BAND_EDGES[1:], start=0):
+                    if peak < edge:
+                        band_counts[i] += 1
+                        band_pixel_sums[i] += int(cell.get("n_pixels", 0) or 0)
+                        break
+
+    peak_hour_utc = None
+    peak_hour_pixels = 0
+    if per_hour:
+        peak_hour_utc = max(per_hour, key=per_hour.get)
+        peak_hour_pixels = per_hour[peak_hour_utc]
+
+    rainfall_band_stats = [
+        {
+            "band": _RAINFALL_BAND_LABELS[i],
+            "n_cells": band_counts[i],
+            "coupled_pixels": band_pixel_sums[i],
+        }
+        for i in range(len(_RAINFALL_BAND_LABELS))
+    ]
+    most_likely_band_label: str | None = None
+    if any(s > 0 for s in band_pixel_sums):
+        most_likely_band_label = _RAINFALL_BAND_LABELS[
+            max(range(len(band_pixel_sums)), key=lambda i: band_pixel_sums[i])
+        ]
+
+    return {
+        "n_refs_scanned":         n_refs_scanned,
+        "n_refs_with_coupling":   n_refs_with_coupling,
+        "total_coupled_pixels":   total_coupled_pixels,
+        "per_hour":               dict(sorted(per_hour.items())),
+        "peak_hour_utc":          peak_hour_utc,
+        "peak_hour_pixels":       peak_hour_pixels,
+        "rainfall_band_stats":    rainfall_band_stats,
+        "most_likely_band_label": most_likely_band_label,
+        "most_active_ref":        most_active_ref,
+    }
+
+
 def build_facts_index(
     per_track_loaded: dict, data_root: Path, step_minutes: int,
     coupling_output_dir: Path,
+    *,
+    pred_coupling: bool = False,
+    model_dir: Path | None = None,
+    pred_lightning_high_per_lead: dict[int, float] | None = None,
 ) -> dict:
     """For every (date, reference) that appears in EITHER track's initial
-    selection, compute the per-lead facts dict AND render the coupling-
-    mask figure that Gemma reads to detect coupling visually.
+    selection, compute the per-lead facts dict. Renders the coupling-
+    mask hero figure ONLY for the peak-activity reference (into
+    `coupling_output_dir/`), and computes a period-wide coupling
+    summary (hour-of-day + rainfall-band cross-tab) for the conclusion
+    paragraph. All other references keep `coupling_figure_path=None`;
+    the prompt layer emits a single figure caption for the hero + one
+    aggregate conclusion, no per-ref image spam.
 
     Returns:
         {
@@ -777,11 +1187,10 @@ def build_facts_index(
              },
              ...
           },
+          "most_active_ref": ("2025-05-14", "12:30") | None,
+          "period_coupling_summary": {...},   # from
+                                              # _compute_period_coupling_summary
         }
-
-    The coupling figure is skipped (path = None) when neither track has
-    GT for any lead of that reference. The prompt-construction layer
-    degrades to text-only for those references.
     """
     from c4dl.projection import GridProjection, romania_grid_area
     gp = GridProjection(romania_grid_area)
@@ -806,33 +1215,98 @@ def build_facts_index(
             ref_set.add((date_str, hhmm))
     ref_list = sorted(ref_set)
 
+    # Pass 1: numeric facts for every reference (no image rendering).
     facts_per_ref: dict[tuple[str, str], dict] = {}
-    coupling_output_dir.mkdir(parents=True, exist_ok=True)
     for date_str, ref_utc in ref_list:
         per_lead = compute_facts_for_reference(
             date_str, ref_utc, lead_minutes, data_root, gp, centre,
             rainfall_available=rainfall_available,
             lightning_available=lightning_available,
         )
-        # Render the coupling mask (Gemma's visual anchor). One figure per
-        # reference, all leads on the same image, so the LLM sees the
-        # evolution at a glance in a single vision call.
-        safe_ref = ref_utc.replace(":", "")
-        coupling_path = coupling_output_dir / f"coupling_{date_str}_{safe_ref}.png"
-        rendered = render_coupling_mask_figure(
-            date_str, ref_utc, lead_minutes, data_root, coupling_path,
-            rainfall_available=rainfall_available,
-            lightning_available=lightning_available,
-        )
         facts_per_ref[(date_str, ref_utc)] = {
-            "coupling_figure_path": rendered,
+            "coupling_figure_path": None,
             "per_lead": per_lead,
         }
+
+    # Pass 2: pick the peak-activity reference and render ONE coupling
+    # PNG for it. When --pred_coupling is set, the 3x3 GT-vs-predicted
+    # figure IS that image (its Row 1 already contains the GT view, so
+    # a separate GT-only file would just duplicate content). Otherwise
+    # we fall back to the 1x3 GT-only render.
+    most_active_ref = _find_most_active_coupling_ref(facts_per_ref)
+    coupling_output_dir.mkdir(parents=True, exist_ok=True)
+    if most_active_ref is not None:
+        date_str, ref_utc = most_active_ref
+        safe_ref = ref_utc.replace(":", "")
+
+        pred_rendered = None
+        if pred_coupling:
+            if model_dir is None:
+                print("  pred_coupling: skipped (no --model_dir set)")
+            else:
+                pred_coupling_path = (
+                    coupling_output_dir
+                    / f"coupling_pred_{date_str}_{safe_ref}.png"
+                )
+                # Operational defaults for the model config — matches what
+                # predict_full_domain / validate_predictions use by default.
+                # No user knobs on these because the report always wants
+                # the base operational models; a variant comparison
+                # (finetuned / KD student) belongs to the per-track
+                # validation figures, not the coupling image.
+                try:
+                    pred_rendered = render_pred_coupling_figure(
+                        date_str, ref_utc, lead_minutes,
+                        data_root, pred_coupling_path,
+                        model_dir=model_dir,
+                        rainfall_mode="mtg_lightning_opera_rainfall",
+                        rainfall_source="dbscan",
+                        rainfall_finetuned=False,
+                        lightning_mode="mtg_lightning_opera_occurrence",
+                        lightning_source="dbscan",
+                        lightning_finetuned=False,
+                        lightning_kd=False,
+                        lightning_low_threshold=0.90,
+                        lightning_high_per_lead=pred_lightning_high_per_lead,
+                        rainfall_available=rainfall_available,
+                        lightning_available=lightning_available,
+                    )
+                    if pred_rendered is not None:
+                        print(f"  pred_coupling: {pred_rendered.name}")
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+                    print(f"  pred_coupling: failed "
+                          f"({type(e).__name__}: {e}); "
+                          f"falling back to GT-only figure.")
+                    traceback.print_exc()
+                    pred_rendered = None
+
+        if pred_rendered is not None:
+            # Pred figure contains GT as Row 1 — use it as the single
+            # coupling image, no separate GT render.
+            facts_per_ref[most_active_ref]["coupling_figure_path"] = pred_rendered
+        else:
+            # Fallback / --pred_coupling not set: GT-only 1x3 render.
+            coupling_path = (
+                coupling_output_dir / f"coupling_{date_str}_{safe_ref}.png"
+            )
+            rendered = render_coupling_mask_figure(
+                date_str, ref_utc, lead_minutes, data_root, coupling_path,
+                rainfall_available=rainfall_available,
+                lightning_available=lightning_available,
+            )
+            facts_per_ref[most_active_ref]["coupling_figure_path"] = rendered
+
+    period_coupling_summary = _compute_period_coupling_summary(
+        facts_per_ref, most_active_ref,
+    )
 
     return {
         "grid_centre_lat_lon": centre,
         "lead_minutes": lead_minutes,
         "references": facts_per_ref,
+        "most_active_ref": most_active_ref,
+        "period_coupling_summary": period_coupling_summary,
     }
 
 
@@ -885,26 +1359,82 @@ def verify_ollama_model_available(model: str, timeout: float = 3.0) -> None:
 
 def _ollama_chat_with_retries(messages: list, *, model: str, seed: int,
                               temperature: float, max_retries: int = 3,
-                              retry_backoff_sec: float = 2.0) -> str:
+                              retry_backoff_sec: float = 2.0,
+                              max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS
+                              ) -> str:
     """Shared retry wrapper around ollama.chat. Returns the assistant's
-    message text."""
+    message text.
+
+    `max_tokens` maps to Ollama's `num_predict` option — a hard cap on
+    the number of tokens the model may emit. Prevents a single Gemma
+    call from wedging the whole report if it enters a repetition /
+    hallucination loop. On truncation the returned string is silently
+    cut mid-sentence, which is fine for our downstream (fpdf2 wraps
+    whatever text it gets) and infinitely preferable to a stall.
+
+    Empty-response handling: Ollama occasionally returns an empty
+    message with a non-"stop" `done_reason` — most commonly on the
+    first call after loading (`done_reason == "load"`), and sometimes
+    with Gemma at `temperature=0.0`. We detect that, log the metadata
+    for diagnosis, and retry with a tiny temperature bump (0.05 floor)
+    on the next attempt so the model has a non-degenerate path forward.
+    Never merges silently: if all retries produce empty text, we raise
+    SystemExit with the last response metadata attached so the caller
+    knows why the run failed.
+    """
     import time
     import ollama
 
     last_exc: Exception | None = None
+    last_resp: dict | None = None
+    effective_temp = temperature
     for attempt in range(max_retries):
         try:
             resp = ollama.chat(
                 model=model,
                 messages=messages,
                 options={
-                    "temperature": temperature,
+                    "temperature": effective_temp,
                     "seed": seed,
+                    "num_predict": int(max_tokens),
                     # keep_alive defaults are fine; long-running batch of
                     # calls will re-use the loaded model.
                 },
             )
-            return resp["message"]["content"]
+            # ollama.chat may return either a plain dict or a typed
+            # ChatResponse; both expose ["message"]["content"] and
+            # a top-level "done_reason".
+            try:
+                content = resp["message"]["content"]
+            except (TypeError, KeyError):
+                content = getattr(resp.message, "content", "")  # type: ignore[union-attr]
+            content = content or ""
+            if content.strip():
+                return content
+            # Empty response — dig out enough metadata to explain why
+            # and try again with a nudge on temperature.
+            try:
+                done_reason = resp.get("done_reason")
+            except AttributeError:
+                done_reason = getattr(resp, "done_reason", None)
+            last_resp = {
+                "done_reason": done_reason,
+                "attempt": attempt + 1,
+                "temperature": effective_temp,
+                "seed": seed,
+            }
+            print(
+                f"    [warn] Ollama returned an empty message on "
+                f"attempt {attempt + 1}/{max_retries} "
+                f"(done_reason={done_reason!r}, temp={effective_temp}). "
+                f"Retrying with a small temperature nudge.",
+                flush=True,
+            )
+            # Nudge temperature so Gemma has a non-degenerate sampling
+            # distribution on the retry. 0.05 is enough to break the
+            # deterministic empty-output path without materially
+            # changing the tone of the answer.
+            effective_temp = max(effective_temp + 0.05, 0.05)
         except ollama.ResponseError as e:
             msg = str(e).lower()
             if "not found" in msg or "no such model" in msg:
@@ -918,9 +1448,21 @@ def _ollama_chat_with_retries(messages: list, *, model: str, seed: int,
         # Exponential-ish backoff between attempts (2s, 4s, 8s ...).
         if attempt < max_retries - 1:
             time.sleep(retry_backoff_sec * (2 ** attempt))
+    if last_exc is not None:
+        raise SystemExit(
+            f"Ollama request failed after {max_retries} attempts: "
+            f"{type(last_exc).__name__}: {last_exc}"
+        )
     raise SystemExit(
-        f"Ollama request failed after {max_retries} attempts: "
-        f"{type(last_exc).__name__}: {last_exc}"
+        f"Ollama returned an empty message on all "
+        f"{max_retries} attempts.  Last response metadata: {last_resp}\n"
+        f"Common causes:\n"
+        f"  - Cold-start ('load') on the first call: run the request "
+        f"once manually to warm the model, or restart Ollama.\n"
+        f"  - Gemma + temperature=0.0 sampling collapse: pass "
+        f"--temperature 0.05 (or higher) on the report CLI.\n"
+        f"  - System prompt not accepted by this Gemma build: try a "
+        f"different --model (e.g. gemma3:12b)."
     )
 
 
@@ -929,9 +1471,11 @@ def ollama_generate_text(
     seed: int = DEFAULT_OLLAMA_SEED,
     temperature: float = DEFAULT_OLLAMA_TEMPERATURE,
     max_retries: int = 3,
+    max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS,
 ) -> str:
     """Text-only chat completion. `system` is optional; when set it goes
-    into a system-role message ahead of the user prompt."""
+    into a system-role message ahead of the user prompt. `max_tokens`
+    caps the response length so runaway generations can't stall a run."""
     verify_ollama_model_available(model)
     messages: list[dict] = []
     if system:
@@ -939,7 +1483,7 @@ def ollama_generate_text(
     messages.append({"role": "user", "content": prompt})
     return _ollama_chat_with_retries(
         messages, model=model, seed=seed, temperature=temperature,
-        max_retries=max_retries,
+        max_retries=max_retries, max_tokens=max_tokens,
     )
 
 
@@ -949,10 +1493,12 @@ def ollama_generate_vision(
     seed: int = DEFAULT_OLLAMA_SEED,
     temperature: float = DEFAULT_OLLAMA_TEMPERATURE,
     max_retries: int = 3,
+    max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS,
 ) -> str:
     """Vision chat: prompt + one PNG. The Ollama Python client accepts
     either a file path or bytes for `images`; we pass the path so it
-    handles the read + base64 encoding for us."""
+    handles the read + base64 encoding for us. `max_tokens` caps the
+    response length so a runaway vision decode can't stall a run."""
     verify_ollama_model_available(model)
     if not Path(image_path).is_file():
         raise FileNotFoundError(f"vision image not found: {image_path}")
@@ -965,7 +1511,7 @@ def ollama_generate_vision(
     })
     return _ollama_chat_with_retries(
         messages, model=model, seed=seed, temperature=temperature,
-        max_retries=max_retries,
+        max_retries=max_retries, max_tokens=max_tokens,
     )
 
 
@@ -1086,48 +1632,68 @@ Requirements:
 # text is deterministic, cheaper, and lets us apply a hard minimum-cell-
 # size cut so single-pixel specks don't drive prose.
 PROMPT_FIGURE_CAPTION_EN = """\
-Write a meteorological caption (4-6 sentences) for date {date_str}, \
-reference time {ref_utc} UTC, describing the convective event across \
-the three lead times (t+15, t+30, t+45 minutes).
+Write a SHORT meteorological caption (2-3 sentences, no more) for date \
+{date_str}, reference time {ref_utc} UTC, describing the peak-activity \
+coupled convective event across the three lead times (t+15, t+30, t+45).
 
 FACTS (source of truth for every number you cite):
 {facts_block}
 
-Coupling rule (this is important - it lives in FACTS, not an image):
-- Each lead's coupling.coupled_cells list contains ONE ENTRY PER \
-  coupled convective cell (rainfall >=10 mm/h AND active lightning \
-  inside the same 8-connected component, minimum 10 pixels per cell). \
-  If the list is non-empty for that lead, describe the biggest cell \
-  first using the paired phrasing: "precipitation of X mm/h paired \
-  with Y% of the lightning strokes inside the same convective cell, \
-  in the <cardinal> of Romania". Fill X from that cell's \
-  peak_mmh_inside; Y from lightning_pct_in_coupled (percentage of \
-  ALL active lightning in the whole canvas that fell inside the \
-  coupled region for that lead); <cardinal> from that cell's \
-  centroid_cardinal. When multiple cells are listed, briefly note \
-  their count and cardinal spread.
-- If coupled_cells is EMPTY for a lead but rainfall or lightning has \
-  activity, describe them as SEPARATE observations for that lead \
-  (rainfall's own peak_mmh + cardinal + n_pixels_ge10, lightning's \
-  own n_active_pixels + cardinal). Never fabricate a coupling that \
-  isn't in FACTS.
-- If a lead's rainfall AND lightning are both null, note that GT is \
-  unavailable at that lead and skip numeric claims for it.
+Sentence 1 - one line naming the event and its location: cite the biggest \
+coupled cell at the lead with the strongest coupling using the phrasing \
+"precipitation of X mm/h paired with Y% of the lightning strokes inside \
+the same convective cell, in the <cardinal> of Romania". Fill X from \
+that cell's peak_mmh_inside, Y from lightning_pct_in_coupled, <cardinal> \
+from centroid_cardinal.
 
-Structure:
-1. One opening sentence naming the event, the dominant cardinal zone \
-   at the earliest lead with activity, and whether the FACTS coupled_cells \
-   list indicates a coupled convective system at that lead.
-2. Two to three sentences tracking the evolution across t+15 -> t+45: \
-   name the start value, the end value, and the extremum (min or max) \
-   across the interval for whichever quantity matters most \
-   (peak_mmh_inside for coupled cells, or peak_mmh / n_active_pixels for \
-   the separate-observations case).
-3. One closing sentence noting whether the coupling pattern strengthens, \
-   holds, or weakens across the three lead times (compare coupled_cells \
-   sizes / counts across leads), and roughly where in Romania the \
-   coupled cells sit (cardinals from FACTS).
+Sentence 2 (and optional sentence 3) - track how the coupling evolves \
+across t+15 -> t+45: does the coupled cell strengthen, hold, or weaken \
+(compare peak_mmh_inside and coupled_cells count across leads).
+
+Hard limits:
+- 2-3 sentences total. No opening filler, no closing filler.
+- Never cite a number that isn't in FACTS.
+- If a lead has no coupled_cells, just say "no coupling at t+N" in a \
+  clause; don't spend a whole sentence on it.
 """
+
+
+# ============================================================================
+# Prompt C2 - period-wide rainfall-lightning coupling conclusion (TEXT-ONLY)
+# ============================================================================
+# The hero image (Prompt C above) is one snapshot. This prompt writes the
+# closing paragraph that contextualises it against the rest of the month:
+# when in the day did coupling peak, and at what rainfall intensity was
+# lightning most likely to fire alongside the rain. Reader flow: skim the
+# per-track metrics, look at the hero coupling PNG, then read THIS
+# paragraph to know how representative the hero image is of the period.
+PROMPT_PERIOD_COUPLING_EN = """\
+Write a VERY SHORT summary paragraph (2-3 sentences, no more) placing \
+the report's single coupling image in the context of the whole period \
+{year:04d}-{month:02d}.
+
+FACTS (source of truth for every number you cite):
+{facts_block}
+
+Sentence 1 - the diurnal + intensity pattern: cite peak_hour_utc (the \
+UTC hour with the most aggregate coupling) and \
+most_likely_rainfall_band_for_coupling (the rainfall intensity band with \
+the most coupled pixels across the period).
+
+Sentence 2 (and optional sentence 3) - the hero image's context: does \
+hero_reference land inside the peak_hour_utc window and the \
+most_likely_rainfall_band_for_coupling? If yes, call it "representative \
+of the period's dominant regime"; if no, call it a "high-magnitude \
+outlier vs. the typical period pattern".
+
+Hard limits:
+- 2-3 sentences total. No filler.
+- Never invent hours, bands, or counts.
+- If peak_hour_utc, most_likely_rainfall_band_for_coupling, or \
+  hero_reference is n/a, output ONE sentence: "the period lacked \
+  measurable rainfall-lightning coupling."
+"""
+
 
 # ============================================================================
 # Prompt D - Romanian translation (text-only, one call per English paragraph)
@@ -1189,6 +1755,82 @@ and date character-for-character. Output ONLY the translation.
 {english_text}
 ---
 """
+
+
+# ============================================================================
+# Gemma output cache — persistent JSON keyed by section id + language
+# ============================================================================
+# Every Gemma call (English generation AND Romanian translation) is
+# checked against this cache first; on a hit the LLM is skipped
+# entirely, which lets the user iterate on the PDF layout / prompts /
+# prose without paying the LLM cost on every run. On a miss the call
+# runs normally and the response is written back to the cache.
+#
+# Layout on disk: `validation/report_gemma_cache_{yyyy}_{mm}.json`
+#     {
+#       "english:exec_summary":                 "...",
+#       "english:lead_metrics_rainfall_t+15":   "...",
+#       "romanian:exec_summary":                "...",
+#       "romanian:lead_metrics_rainfall_t+15":  "...",
+#       ...
+#     }
+#
+# CLI:
+#     --refresh_cache          -- discard every entry before running
+#                                  (equivalent to deleting the JSON)
+#     --no_cache               -- skip the cache entirely (don't read,
+#                                  don't write)
+#
+# `text` in the cache is stored EXACTLY as Gemma returned it (no
+# `.strip()`) so the cache is a faithful record of what the model
+# said. Callers still strip on consumption if they want to.
+class GemmaCache:
+    """Thin JSON-backed cache. Keys are `"{lang}:{section_id}"`; values
+    are the raw Gemma response strings."""
+
+    def __init__(self, path: Path, *, enabled: bool = True):
+        self.path = path
+        self.enabled = enabled
+        self.data: dict[str, str] = {}
+        self.hits = 0
+        self.misses = 0
+        if enabled and path.is_file():
+            try:
+                with open(path, encoding="utf-8") as f:
+                    self.data = json.load(f)
+                print(f"  Gemma cache: loaded {len(self.data)} entries "
+                      f"from {path.name}")
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"  Gemma cache: could not read {path.name} "
+                      f"({type(e).__name__}: {e}); starting fresh.")
+                self.data = {}
+
+    @staticmethod
+    def _key(lang: str, section_id: str) -> str:
+        return f"{lang}:{section_id}"
+
+    def get(self, lang: str, section_id: str) -> str | None:
+        if not self.enabled:
+            return None
+        val = self.data.get(self._key(lang, section_id))
+        if val is not None:
+            self.hits += 1
+        return val
+
+    def put(self, lang: str, section_id: str, value: str) -> None:
+        if not self.enabled:
+            return
+        self.data[self._key(lang, section_id)] = value
+        self.misses += 1
+
+    def save(self) -> None:
+        if not self.enabled:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, indent=2, ensure_ascii=False)
+        print(f"  Gemma cache: wrote {len(self.data)} entries "
+              f"({self.hits} hits, {self.misses} new) -> {self.path.name}")
 
 
 # ----- Prompt E - KD teacher-vs-student comparison (text-only, 1 call) ------
@@ -1257,7 +1899,7 @@ def _print_facts(facts_index: dict) -> None:
             else:
                 parts.append(
                     f"cp(rain-only={cp['n_pixels_rain_only']}, "
-                    f"light-only={cp['n_pixels_lightning_only']}, "
+                    f"lightning-only={cp['n_pixels_lightning_only']}, "
                     f"coupled={cp['n_pixels_coupled']}, "
                     f"pk_in_coupled={cp['peak_mmh_in_coupled_cells']:.1f}mm/h, "
                     f"at={cp['coupled_centroid_cardinal'] or 'n/a'})"
@@ -1423,6 +2065,67 @@ def _facts_block_figure_caption(ref_data: dict, lead_minutes: list[int]
     return "\n".join(lines)
 
 
+def _facts_block_period_coupling(period_summary: dict,
+                                  year: int, month: int) -> str:
+    """FACTS block for Prompt C2 (period-wide coupling conclusion).
+
+    Text-only render of the aggregated stats produced by
+    `_compute_period_coupling_summary`: overall counts, hour-of-day
+    activity distribution, rainfall-band -> lightning-coupling cross-tab,
+    and a pointer to the hero-image reference. Gemma reads these numbers
+    to write the closing paragraph — no images involved.
+    """
+    lines: list[str] = [
+        f"period:                 {year:04d}-{month:02d}",
+        f"references_scanned:     {period_summary.get('n_refs_scanned', 0)}",
+        f"references_with_coupling: {period_summary.get('n_refs_with_coupling', 0)}",
+        f"total_coupled_pixels:   {period_summary.get('total_coupled_pixels', 0)}",
+        "",
+    ]
+
+    peak_hour = period_summary.get("peak_hour_utc")
+    peak_pixels = period_summary.get("peak_hour_pixels", 0)
+    if peak_hour is not None:
+        lines.append(
+            f"peak_hour_utc:          {peak_hour:02d}:00 UTC  "
+            f"({peak_pixels} coupled pixels aggregated at this hour)"
+        )
+    else:
+        lines.append("peak_hour_utc:          n/a (no coupling in the period)")
+
+    per_hour = period_summary.get("per_hour") or {}
+    if per_hour:
+        lines.append("per_hour_utc  (hour -> total coupled pixels):")
+        for h, px in sorted(per_hour.items()):
+            lines.append(f"  {h:02d}:00 UTC -> {px}")
+    else:
+        lines.append("per_hour_utc: (empty)")
+    lines.append("")
+
+    most_likely = period_summary.get("most_likely_band_label")
+    lines.append(
+        f"most_likely_rainfall_band_for_coupling: {most_likely or 'n/a'}  "
+        f"(band with the most coupled pixels across the period)"
+    )
+    lines.append("rainfall_band_stats  (peak intensity of each coupled cell -> tally):")
+    for entry in period_summary.get("rainfall_band_stats", []):
+        lines.append(
+            f"  {entry['band']:<12}  n_cells={entry['n_cells']}  "
+            f"coupled_pixels={entry['coupled_pixels']}"
+        )
+    lines.append("")
+
+    hero = period_summary.get("most_active_ref")
+    if hero is not None:
+        d, r = hero
+        lines.append(f"hero_reference: {d} {r} UTC "
+                     "(the ONE coupling image included in the report)")
+    else:
+        lines.append("hero_reference: n/a")
+
+    return "\n".join(lines)
+
+
 # ============================================================================
 # Orchestrators: run every prompt through Gemma and translate the output
 # ============================================================================
@@ -1431,11 +2134,59 @@ def _facts_block_figure_caption(ref_data: dict, lead_minutes: list[int]
 # (section_id, english, romanian) tuples so the PDF layout can iterate in
 # order without knowing what generated them.
 
+def _strip_leading_markdown_heading(text: str) -> str:
+    """Drop a leading `# … / ## … / ### …` line if Gemma prefixed the
+    body with its own section title (already redundant with the PDF
+    section heading rendered above it). Also eats one blank line right
+    after the heading so the visible body doesn't start with an
+    empty paragraph."""
+    import re
+    stripped = text.lstrip()
+    lines = stripped.split("\n")
+    if lines and re.match(r"^\s*#{1,6}\s+", lines[0]):
+        i = 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        return "\n".join(lines[i:])
+    return stripped
+
+
+def _english_call(cache: "GemmaCache | None", section_id: str, prompt: str,
+                  *, model: str, seed: int, temperature: float,
+                  max_tokens: int) -> str:
+    """Cache-checked English generation. Prints response length either
+    way so an empty/short Gemma reply is immediately obvious in the log
+    (was the root cause of a run where PDF bodies came out blank).
+
+    Post-processes with `_strip_leading_markdown_heading` — Gemma
+    sometimes prefixes the body with its own '## …' title even when the
+    prompt asks for paragraphs; that duplicates the section header the
+    PDF renders above the body and reads badly."""
+    if cache is not None and (cached := cache.get("english", section_id)) is not None:
+        preview = cached[:80].replace("\n", " ")
+        print(f"    [cache HIT english:{section_id}] len={len(cached)} "
+              f"preview={preview!r}", flush=True)
+        return cached
+    text = ollama_generate_text(
+        prompt, model=model, system=PROMPT_SYSTEM_EN,
+        seed=seed, temperature=temperature, max_tokens=max_tokens,
+    )
+    text = _strip_leading_markdown_heading(text)
+    preview = text[:80].replace("\n", " ")
+    print(f"    [english:{section_id}] len={len(text)} "
+          f"preview={preview!r}", flush=True)
+    if cache is not None:
+        cache.put("english", section_id, text)
+    return text
+
+
 def generate_english_paragraphs(
     per_track_loaded: dict, facts_index: dict, *,
     year: int, month: int, step_minutes: int,
     model: str, seed: int, temperature: float,
+    max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS,
     kd_artefacts: dict | None = None,
+    cache: "GemmaCache | None" = None,
 ) -> list[dict]:
     """Run prompts A, B (per track x per lead), C (per reference) through
     Gemma and return a list of section dicts:
@@ -1458,10 +2209,11 @@ def generate_english_paragraphs(
     # ---- Prompt A: executive summary ----------------------------------
     print(f"  [A] executive summary ...", flush=True)
     facts = _facts_block_exec_summary(per_track_loaded, year, month)
-    english = ollama_generate_text(
+    english = _english_call(
+        cache, "exec_summary",
         PROMPT_EXEC_SUMMARY_EN.format(facts_block=facts),
-        model=model, system=PROMPT_SYSTEM_EN,
-        seed=seed, temperature=temperature,
+        model=model, seed=seed, temperature=temperature,
+        max_tokens=max_tokens,
     )
     sections.append({
         "id": "exec_summary",
@@ -1477,17 +2229,19 @@ def generate_english_paragraphs(
             continue
         for offset in (1, 2, 3):
             lead_min = offset * step_minutes
+            section_id = f"lead_metrics_{track}_t+{lead_min}"
             print(f"  [B] {track} metrics at t+{lead_min} ...", flush=True)
             facts = _facts_block_lead_metrics(loaded, lead_min, step_minutes)
-            english = ollama_generate_text(
+            english = _english_call(
+                cache, section_id,
                 PROMPT_LEAD_METRICS_EN.format(
                     lead_min=lead_min, track=track, facts_block=facts,
                 ),
-                model=model, system=PROMPT_SYSTEM_EN,
-                seed=seed, temperature=temperature,
+                model=model, seed=seed, temperature=temperature,
+                max_tokens=max_tokens,
             )
             sections.append({
-                "id": f"lead_metrics_{track}_t+{lead_min}",
+                "id": section_id,
                 "kind": "lead_metrics",
                 "title": f"{track.capitalize()} - t+{lead_min} minutes",
                 "english": english.strip(),
@@ -1495,40 +2249,74 @@ def generate_english_paragraphs(
                 "lead_min": lead_min,
             })
 
-    # ---- Prompt C: per-reference event caption (TEXT-ONLY) ------------
-    # Gemma no longer sees the coupling-mask PNG; it reads the per-cell
-    # metadata from the FACTS block. The PNG is still rendered upstream
-    # (build_facts_index) and gets embedded in the PDF for the human.
+    # ---- Prompt C: HERO coupling caption (only the peak-activity ref) --
+    # Prior versions of the report emitted one figure_caption section per
+    # reference (hundreds of Gemma calls per month). We now render + caption
+    # only the PEAK reference and fold everything else into a period-wide
+    # conclusion (Prompt C2) so the reader gets ONE hero image contextualised
+    # against the whole month rather than a wall of near-empty panels.
     lead_minutes = facts_index["lead_minutes"]
-    for (date_str, ref_utc), ref_data in facts_index["references"].items():
-        # Only emit a caption when at least one lead has coupling metadata
-        # (i.e. both GTs were on disk for at least one lead). Same guard
-        # as before, just phrased in terms of facts rather than PNG.
-        has_any_data = any(
-            slot["rainfall"] is not None or slot["lightning"] is not None
-            for slot in ref_data["per_lead"].values()
-        )
-        if not has_any_data:
-            continue
-        print(f"  [C] event caption {date_str} {ref_utc} ...", flush=True)
+    hero_ref = facts_index.get("most_active_ref")
+    if hero_ref is not None:
+        date_str, ref_utc = hero_ref
+        ref_data = facts_index["references"][hero_ref]
+        section_id = f"figure_caption_{date_str}_{ref_utc.replace(':', '')}"
+        print(f"  [C] hero coupling caption "
+              f"{date_str} {ref_utc} (peak-activity) ...", flush=True)
         facts = _facts_block_figure_caption(ref_data, lead_minutes)
-        english = ollama_generate_text(
+        english = _english_call(
+            cache, section_id,
             PROMPT_FIGURE_CAPTION_EN.format(
                 date_str=date_str, ref_utc=ref_utc, facts_block=facts,
             ),
-            model=model, system=PROMPT_SYSTEM_EN,
-            seed=seed, temperature=temperature,
+            model=model, seed=seed, temperature=temperature,
+            max_tokens=max_tokens,
         )
         sections.append({
-            "id": f"figure_caption_{date_str}_{ref_utc.replace(':', '')}",
+            "id": section_id,
             "kind": "figure_caption",
-            "title": f"{date_str} - reference {ref_utc} UTC",
+            "title": f"Peak coupling event - {date_str} "
+                     f"reference {ref_utc} UTC",
             "english": english.strip(),
             "date": date_str,
             "ref_utc": ref_utc,
-            # figure_path kept so the PDF layout still embeds the coupling PNG
-            # as decoration below the caption; it just isn't sent to Gemma.
+            # figure_path is the ONLY coupling PNG that build_facts_index
+            # rendered; every other reference's path is None so the PDF
+            # layer implicitly skips them (belt-and-braces: the Prompt C
+            # loop above never emits sections for them either).
+            # Single coupling image. When --pred_coupling is set this
+            # is the 3x3 GT-vs-predicted figure (its Row 1 IS the GT
+            # view); otherwise it's the 1x3 GT-only figure. Either way
+            # the PDF layout embeds exactly one image for this section.
             "figure_path": ref_data.get("coupling_figure_path"),
+        })
+
+    # ---- Prompt C2: period-wide coupling conclusion (TEXT-ONLY) --------
+    # Aggregates hour-of-day activity + rainfall-band -> lightning-coupling
+    # cross-tab across the whole month. Answers "when in the day were storms
+    # most active" and "at what rainfall intensity was lightning coupling
+    # most likely" — the reader can then re-contextualise the hero image
+    # against the period as a whole without needing per-reference captions.
+    # Skipped when there was no coupling anywhere in the month (the
+    # aggregate has nothing to say).
+    period_summary = facts_index.get("period_coupling_summary") or {}
+    if period_summary.get("n_refs_with_coupling", 0) > 0:
+        print(f"  [C2] period-wide coupling conclusion ...", flush=True)
+        facts = _facts_block_period_coupling(period_summary, year, month)
+        english = _english_call(
+            cache, "coupling_period_conclusion",
+            PROMPT_PERIOD_COUPLING_EN.format(
+                year=year, month=month, facts_block=facts,
+            ),
+            model=model, seed=seed, temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        sections.append({
+            "id": "coupling_period_conclusion",
+            "kind": "coupling_period_conclusion",
+            "title": f"Rainfall-lightning coupling - period summary "
+                     f"({year:04d}-{month:02d})",
+            "english": english.strip(),
         })
 
     # ---- Prompt E: KD teacher-vs-student comparison (auto-detected) ---
@@ -1541,10 +2329,11 @@ def generate_english_paragraphs(
         with open(kd_artefacts["summary_json"]) as f:
             kd_summary = json.load(f)
         facts = _facts_block_kd_summary(kd_summary)
-        english = ollama_generate_text(
+        english = _english_call(
+            cache, "kd_summary",
             PROMPT_KD_SUMMARY_EN.format(facts_block=facts),
-            model=model, system=PROMPT_SYSTEM_EN,
-            seed=seed, temperature=temperature,
+            model=model, seed=seed, temperature=temperature,
+            max_tokens=max_tokens,
         )
         sections.append({
             "id": "kd_summary",
@@ -1562,17 +2351,33 @@ def generate_english_paragraphs(
 def translate_paragraphs_to_romanian(
     sections: list[dict], *,
     model: str, seed: int, temperature: float,
+    max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS,
+    cache: "GemmaCache | None" = None,
 ) -> list[dict]:
     """For each section, call prompt D once and store the Romanian text
-    under 'romanian'. Returns the SAME list (mutated in place)."""
+    under 'romanian'. Returns the SAME list (mutated in place). Cache-
+    checked per section id so a re-run reuses prior translations."""
     for i, sec in enumerate(sections, 1):
-        print(f"  [D] translating {i}/{len(sections)}: {sec['id']} ...",
+        sid = sec["id"]
+        print(f"  [D] translating {i}/{len(sections)}: {sid} ...",
               flush=True)
-        ro = ollama_generate_text(
-            PROMPT_USER_RO_TRANSLATE.format(english_text=sec["english"]),
-            model=model, system=PROMPT_SYSTEM_RO_TRANSLATE,
-            seed=seed, temperature=temperature,
-        )
+        cached = cache.get("romanian", sid) if cache is not None else None
+        if cached is not None:
+            preview = cached[:80].replace("\n", " ")
+            print(f"    [cache HIT romanian:{sid}] len={len(cached)} "
+                  f"preview={preview!r}", flush=True)
+            ro = cached
+        else:
+            ro = ollama_generate_text(
+                PROMPT_USER_RO_TRANSLATE.format(english_text=sec["english"]),
+                model=model, system=PROMPT_SYSTEM_RO_TRANSLATE,
+                seed=seed, temperature=temperature, max_tokens=max_tokens,
+            )
+            preview = ro[:80].replace("\n", " ")
+            print(f"    [romanian:{sid}] len={len(ro)} "
+                  f"preview={preview!r}", flush=True)
+            if cache is not None:
+                cache.put("romanian", sid, ro)
         sec["romanian"] = ro.strip()
     return sections
 
@@ -1635,20 +2440,44 @@ class _ReportPDF:
     rendering can share the pdf state without threading it through
     argument lists."""
 
-    def __init__(self, output_path: Path):
+    def __init__(self, output_path: Path, *, toc_title: str = "Cuprins"):
         from fpdf import FPDF
         reg, bold = _find_unicode_fonts()
-        self.pdf = FPDF(orientation="P", unit="mm", format="A4")
+
+        # FPDF subclass that renders a bottom-right page number on
+        # every non-cover page. `footer()` is called automatically
+        # after each `add_page()` and each auto-page-break.
+        class _NumberedFPDF(FPDF):
+            def footer(inner_self):   # noqa: N805 — fpdf2 convention
+                # Skip the cover page (page 1) — convention is to number
+                # from page 2 (TOC) onward.
+                if inner_self.page_no() <= 1:
+                    return
+                inner_self.set_y(-15)  # 15mm from the bottom edge
+                try:
+                    inner_self.set_font("DejaVu", "", 9)
+                except Exception:
+                    inner_self.set_font("Helvetica", "", 9)
+                inner_self.set_text_color(120, 120, 120)
+                inner_self.cell(0, 8, str(inner_self.page_no()),
+                                align="R")
+                inner_self.set_text_color(0, 0, 0)
+
+        self.pdf = _NumberedFPDF(orientation="P", unit="mm", format="A4")
         self.pdf.set_auto_page_break(auto=True, margin=25)
         self.pdf.set_margins(left=20, top=20, right=20)
         self.pdf.add_font("DejaVu", "", str(reg))
         self.pdf.add_font("DejaVu", "B", str(bold))
         self.pdf.set_font("DejaVu", "", 11)
         self.output_path = output_path
+        self._toc_title = toc_title
         # Page width available for content after margins (A4 = 210mm).
         self.content_width_mm = 210 - 20 - 20
         # TOC accumulates (title, page_number) pairs as sections render.
         self._toc_entries: list[tuple[str, int]] = []
+        # Placeholder page number reserved for the TOC (populated by
+        # `reserve_toc_page`, filled by `_write_toc_content` at save).
+        self._toc_page_no: int | None = None
 
     # ---- primitives ----------------------------------------------------
     def new_page(self):
@@ -1713,7 +2542,15 @@ class _ReportPDF:
     # ---- specific sections --------------------------------------------
     def cover(self, header_png: Path | None, title_ro: str, title_en: str,
               period: str, tracks: list[str], generation_ts: str,
-              bilingual: bool = False):
+              bilingual: bool = False,
+              *,
+              period_label: str = "Perioada",
+              tracks_label: str = "Fluxuri incluse",
+              generated_label: str = "Generat"):
+        """Cover page. Labels default to Romanian but are overridden
+        by `render_pdf_report` from the active language pack so an
+        English run reads 'Period / Streams included / Generated'
+        instead of the Romanian originals."""
         self.new_page()
         if header_png is not None and header_png.is_file():
             self.image_full_width(header_png, max_height_mm=45)
@@ -1728,12 +2565,12 @@ class _ReportPDF:
             self.pdf.set_text_color(0, 0, 0)
         self.pdf.ln(25)
         self.pdf.set_font("DejaVu", "", 14)
-        self._mc(7, f"Perioada: {period}", align="C")
-        self._mc(7, f"Fluxuri incluse: {', '.join(tracks)}", align="C")
+        self._mc(7, f"{period_label}: {period}", align="C")
+        self._mc(7, f"{tracks_label}: {', '.join(tracks)}", align="C")
         self.pdf.ln(3)
         self.pdf.set_font("DejaVu", "", 10)
         self.pdf.set_text_color(110, 110, 110)
-        self._mc(5, f"Generat: {generation_ts}", align="C")
+        self._mc(5, f"{generated_label}: {generation_ts}", align="C")
         self.pdf.set_text_color(0, 0, 0)
 
     def _record_toc(self, title: str):
@@ -1775,12 +2612,19 @@ class _ReportPDF:
     def reference_section(self, ref_title_ro: str, figure_path: Path | None,
                           romanian: str, english: str | None = None,
                           bilingual: bool = False):
-        """One section per (date, ref): coupling figure + caption."""
+        """One section per (date, ref): coupling figure + caption. The
+        figure is either the 1x3 GT-only render or the 3x3 GT-vs-
+        predicted render (whichever `build_facts_index` produced); the
+        layout is the same either way — one image, then the caption."""
         self.new_page()
         self._record_toc(ref_title_ro)
         self.title(ref_title_ro, size=14)
         if figure_path is not None and figure_path.is_file():
-            self.image_full_width(figure_path, max_height_mm=95)
+            # 3x3 pred-coupling image is taller than the 1x3 GT-only
+            # figure, so we give it more vertical room; the aspect-
+            # preserving scaler inside image_full_width falls back to
+            # width-capped for the shorter 1x3 image automatically.
+            self.image_full_width(figure_path, max_height_mm=170)
         self.body(romanian, size=11)
         if bilingual and english:
             self.body(english, size=9, italic=True)
@@ -1830,20 +2674,28 @@ class _ReportPDF:
             self._mc(6, f"Comparație KD - {caption}")
             self.image_full_width(p, max_height_mm=200)
 
-    def data_appendix(self, per_track_loaded: dict, step_minutes: int):
-        """Per-track table: min / mean / max coverage per lead time."""
+    def data_appendix(self, per_track_loaded: dict, step_minutes: int,
+                       *, appendix_title: str = "Anexa - statistici pe eșantion",
+                       appendix_toc: str = "Anexa - date sumar",
+                       samples_word: str = "eșantioane",
+                       header_labels: tuple[str, str, str, str] = (
+                           "Orizont", "min", "mediu", "max"),
+                       ):
+        """Per-track table: min / mean / max coverage per lead time.
+        Localisable — pass the label kwargs to switch to English."""
         import numpy as np
         self.new_page()
-        self._record_toc("Anexa - date sumar")
-        self.title("Anexa - statistici pe eșantion", size=16)
+        self._record_toc(appendix_toc)
+        self.title(appendix_title, size=16)
         for track, loaded in per_track_loaded.items():
             self.pdf.set_font("DejaVu", "B", 12)
             self._mc(6, f"{track.capitalize()} - "
-                        f"{len(loaded['samples'])} eșantioane")
+                        f"{len(loaded['samples'])} {samples_word}")
             self.pdf.ln(1)
             # Choose the "primary" per-lead metric per track.
             primary_key = "iou_mask" if track == "rainfall" else "iou"
-            header = f"{'Orizont':<12}{'min':>8}{'mediu':>10}{'max':>8}"
+            h0, h1, h2, h3 = header_labels
+            header = f"{h0:<12}{h1:>8}{h2:>10}{h3:>8}"
             self.pdf.set_font("DejaVu", "", 10)
             self._mc(5, header)
             for offset in (1, 2, 3):
@@ -1861,34 +2713,174 @@ class _ReportPDF:
                 self._mc(5, line)
             self.pdf.ln(3)
 
-    def emit_toc_at_start(self):
-        """Rebuild the final PDF so the TOC lands as page 2 with the
-        collected page numbers filled in. fpdf2 doesn't have a first-pass
-        placeholder, so we render everything into a temp buffer once,
-        collect page numbers as sections are added, and then rewrite a
-        TOC page. Simpler: skip a rewrite and print the TOC BEFORE section
-        rendering with 'see following pages' if page numbers aren't known
-        yet - but users usually want the exact pages. Compromise below:
-        insert the TOC as page 2 by inserting into the internal pages
-        list after the fact."""
-        # fpdf2 stores pages as bytes in self.pdf.pages (a dict-like from
-        # 2.7+). Rewriting the sequence is fragile; instead we output the
-        # TOC as the last page and note it. For a first cut this keeps the
-        # code simple; the audience is not chapter-hopping, so TOC at end
-        # is acceptable.
+    def reserve_toc_page(self) -> None:
+        """Reserve page 2 for the table of contents. Adds an empty page
+        immediately so subsequent sections start on page 3+; the actual
+        TOC content is written by `_write_toc_content` right before
+        `save()` so the entries reflect every section's final page
+        number.
+
+        Manual navigation (`pdf.page = self._toc_page_no`) is used
+        instead of fpdf2's `insert_toc_placeholder(callback, pages=1)`
+        — the callback was silently producing an empty page 2 in this
+        codebase; manual navigation is bulletproof.
+        """
         self.new_page()
-        self.pdf.set_font("DejaVu", "B", 16)
-        self._mc(8, "Cuprins")
-        self.pdf.ln(2)
-        self.pdf.set_font("DejaVu", "", 11)
-        for title, page in self._toc_entries:
-            dots = "." * max(3, 60 - len(title))
-            line = f"{title} {dots} p.{page}"
-            self._mc(5.5, line)
+        self._toc_page_no = self.pdf.page_no()
+
+    def _write_toc_content(self) -> None:
+        """Navigate back to the reserved TOC page and render the TOC
+        entries there. Called once, right before `save()`.
+
+        Setting `self.pdf.page = N` is the low-level fpdf2 mechanism for
+        switching the active page buffer — every `multi_cell` / `set_xy`
+        that follows writes into page N. We restore the previous page
+        afterwards so downstream save state stays sane.
+
+        Each entry is a fpdf2 internal link (`add_link` + `set_link`)
+        stamped over the whole 'title … p.NN' line via `multi_cell(
+        link=…)`, so the reader can click the entry in the PDF viewer
+        to jump straight to that section's first page.
+        """
+        if self._toc_page_no is None:
+            return
+        saved_page = self.pdf.page
+        try:
+            self.pdf.page = self._toc_page_no
+            # Reset the cursor to the top of the page — pdf.page = N
+            # doesn't reset x/y, and by the time we get here the
+            # cursor might be halfway down the last-rendered page.
+            self.pdf.set_xy(20, 20)
+            self.pdf.set_font("DejaVu", "B", 16)
+            self.pdf.set_x(20)
+            self.pdf.multi_cell(0, 8, self._toc_title)
+            self.pdf.ln(2)
+            self.pdf.set_font("DejaVu", "", 11)
+            for title, page in self._toc_entries:
+                dots = "." * max(3, 60 - len(title))
+                line = f"{title} {dots} p.{page}"
+                link_id = self.pdf.add_link()
+                self.pdf.set_link(link_id, page=page)
+                self.pdf.set_x(20)
+                self.pdf.multi_cell(0, 5.5, line, link=link_id)
+        finally:
+            self.pdf.page = saved_page
 
     def save(self):
+        # Fill the reserved TOC page (if any) with entries collected
+        # while sections rendered.
+        self._write_toc_content()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.pdf.output(str(self.output_path))
+
+
+# ---------------------------------------------------------------------------
+# Localised month names + local-time helpers used by the cover page.
+# Locale-agnostic (Windows Python ships without proper locale data by
+# default, so `%B` isn't reliable) — we hard-code the two supported
+# languages.
+# ---------------------------------------------------------------------------
+_MONTH_NAMES = {
+    "ro": ["", "ianuarie", "februarie", "martie", "aprilie", "mai",
+           "iunie", "iulie", "august", "septembrie", "octombrie",
+           "noiembrie", "decembrie"],
+    "en": ["", "January", "February", "March", "April", "May",
+           "June", "July", "August", "September", "October",
+           "November", "December"],
+}
+
+
+def _format_period_month_year(year: int, month: int, language: str) -> str:
+    """`(2026, 8, 'ro') → 'august 2026'`, `(2026, 8, 'en') → 'August 2026'`."""
+    names = _MONTH_NAMES.get(language, _MONTH_NAMES["en"])
+    if not (1 <= month <= 12):
+        return f"{year:04d}-{month:02d}"
+    return f"{names[month]} {year}"
+
+
+def _romanian_local_now_str() -> str:
+    """Current wall time in Europe/Bucharest, formatted
+    `'YYYY-MM-DD HH:MM EET'` or `'... EEST'` depending on DST.
+
+    Uses `zoneinfo` when available (Python 3.9+ with the `tzdata`
+    package on Windows). Falls back to a hand-rolled EU DST rule
+    (last Sunday of March 01:00 UTC → last Sunday of October 01:00 UTC
+    = EEST +03:00, otherwise EET +02:00) so the report still generates
+    on stock Windows Python installs that don't ship system tzdata.
+    """
+    from datetime import datetime, timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Europe/Bucharest")
+        local = now_utc.astimezone(tz)
+        return local.strftime("%Y-%m-%d %H:%M %Z")
+    except Exception:
+        # Manual DST fallback.
+        from calendar import monthrange
+
+        def _last_sunday(y: int, m: int) -> datetime:
+            last_day = monthrange(y, m)[1]
+            d = datetime(y, m, last_day)
+            while d.weekday() != 6:   # 6 == Sunday for weekday()
+                d = d.replace(day=d.day - 1)
+            return d
+
+        y = now_utc.year
+        dst_start = _last_sunday(y, 3).replace(
+            hour=1, tzinfo=timezone.utc,
+        )
+        dst_end = _last_sunday(y, 10).replace(
+            hour=1, tzinfo=timezone.utc,
+        )
+        if dst_start <= now_utc < dst_end:
+            offset = timedelta(hours=3)
+            tzname = "EEST"
+        else:
+            offset = timedelta(hours=2)
+            tzname = "EET"
+        local = now_utc.astimezone(timezone(offset))
+        return local.strftime("%Y-%m-%d %H:%M ") + tzname
+
+
+_REPORT_LABELS = {
+    "ro": {
+        "cover_title":         "Raport de validare — {period}",
+        "toc_title":           "Cuprins",
+        "exec_summary":        "Rezumat executiv",
+        "track_metrics_pref":  "Performanță pe orizont — ",
+        "rainfall":            "clasificarea cantităților de precipitații instantanee (OPERA)",
+        "lightning":           "detecția descărcărilor electrice (LINET)",
+        "lead_prefix":         "Orizontul t+",
+        "lead_suffix":         " minute",
+        "peak_coupling":       "Eveniment de vârf al cuplării — {date} referință {ref} UTC",
+        "kd_title":            "Distilare cunoștințe — profesor vs. student",
+        "period_coupling":     "Cuplare precipitații-fulgere — sinteza perioadei",
+        "appendix_title":      "Anexa - statistici pe eșantion",
+        "appendix_toc":        "Anexa - date sumar",
+        "cover_period":        "Perioada",
+        "cover_tracks":        "Fluxuri incluse",
+        "cover_generated":     "Generat",
+    },
+    "en": {
+        "cover_title":         "Validation report — {period}",
+        "toc_title":           "Table of contents",
+        "exec_summary":        "Executive summary",
+        "track_metrics_pref":  "Per-lead performance — ",
+        "rainfall":            "instantaneous rainfall intensity classification (OPERA)",
+        "lightning":           "electrical discharge detection (LINET)",
+        "lead_prefix":         "Lead time t+",
+        "lead_suffix":         " minutes",
+        "peak_coupling":       "Peak coupling event — {date} reference {ref} UTC",
+        "kd_title":            "Knowledge distillation — teacher vs student",
+        "period_coupling":     "Rainfall-lightning coupling — period summary",
+        "appendix_title":      "Appendix - per-sample statistics",
+        "appendix_toc":        "Appendix - summary data",
+        "cover_period":        "Period",
+        "cover_tracks":        "Streams included",
+        "cover_generated":     "Generated",
+    },
+}
 
 
 def render_pdf_report(
@@ -1899,25 +2891,45 @@ def render_pdf_report(
     output_path: Path,
     year: int, month: int, step_minutes: int,
     bilingual: bool = False,
+    language: str = "ro",
 ) -> None:
-    """Compose the standalone PDF from generated (English + Romanian)
-    section paragraphs, plus the metrics.png and per-reference coupling
-    figures that already sit on disk in the validation directory."""
-    from datetime import datetime, timezone
-    tracks_ro = {"rainfall": "precipitații (OPERA)",
-                 "lightning": "descărcări electrice (LINET)"}
-    tracks_included = [tracks_ro.get(t, t) for t in per_track_loaded]
+    """Compose the standalone PDF from generated section paragraphs,
+    plus the metrics.png and per-reference coupling figures that already
+    sit on disk in the validation directory.
 
-    doc = _ReportPDF(output_path)
+    `language` picks the label set (Romanian or English) for every
+    hardcoded string in the layout (cover title, section headers, TOC
+    title, appendix). Body prose is always read from `sec["romanian"]`
+    — when `--language en` the orchestrator copies the raw English into
+    that slot so the layout code stays language-agnostic.
+    """
+    L = _REPORT_LABELS.get(language, _REPORT_LABELS["ro"])
+    track_names = {"rainfall": L["rainfall"], "lightning": L["lightning"]}
+    tracks_included = [track_names.get(t, t) for t in per_track_loaded]
+
+    period_primary = _format_period_month_year(year, month, language)
+    period_secondary = _format_period_month_year(
+        year, month, "en" if language != "en" else "ro",
+    )
+
+    doc = _ReportPDF(output_path, toc_title=L["toc_title"])
     doc.cover(
         header_png=header_png,
-        title_ro=f"Raport de validare — {year:04d}-{month:02d}",
-        title_en=f"Validation report — {year:04d}-{month:02d}",
-        period=f"{year:04d}-{month:02d}",
+        title_ro=L["cover_title"].format(period=period_primary),
+        title_en=(_REPORT_LABELS["en"]["cover_title"]
+                  .format(period=period_secondary)),
+        period=period_primary,
         tracks=tracks_included,
-        generation_ts=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        generation_ts=_romanian_local_now_str(),
         bilingual=bilingual,
+        period_label=L["cover_period"],
+        tracks_label=L["cover_tracks"],
+        generated_label=L["cover_generated"],
     )
+    # Reserve page 2 for the TOC. We write the actual TOC content
+    # right before `doc.save()` via manual page-2 navigation, so the
+    # entries reflect every section's true page number.
+    doc.reserve_toc_page()
 
     # Index sections by kind for structured layout.
     by_kind: dict[str, list[dict]] = defaultdict(list)
@@ -1927,21 +2939,26 @@ def render_pdf_report(
     # -------- Executive summary
     for sec in by_kind.get("exec_summary", []):
         doc.section(
-            title="Rezumat executiv",
+            title=L["exec_summary"],
             romanian=sec["romanian"],
             english=sec.get("english"),
             bilingual=bilingual,
         )
 
+    # -------- Executive summary label swap (uses LABELS)
+    # (The exec_summary loop above hardcoded the Romanian title; patched
+    # in-place below to reuse the LABELS dict picked at the top of this
+    # function.)
+
     # -------- Per-track metrics sections
     for track, loaded in per_track_loaded.items():
-        track_title = f"Performanță pe orizont — {tracks_ro.get(track, track)}"
+        track_title = f"{L['track_metrics_pref']}{track_names.get(track, track)}"
         # Group prompt-B sections for this track by lead order.
         lead_secs = [s for s in by_kind.get("lead_metrics", [])
                      if s.get("track") == track]
         lead_secs.sort(key=lambda s: s["lead_min"])
         subsections = [
-            (f"Orizontul t+{s['lead_min']} minute",
+            (f"{L['lead_prefix']}{s['lead_min']}{L['lead_suffix']}",
              s["romanian"], s.get("english"))
             for s in lead_secs
         ]
@@ -1952,10 +2969,15 @@ def render_pdf_report(
             bilingual=bilingual,
         )
 
-    # -------- Per-reference figure captions
+    # -------- Peak coupling event: ONE hero image + its Gemma caption.
+    # `generate_english_paragraphs` only emits a figure_caption section
+    # for the peak-activity reference (build_facts_index also only
+    # renders that one PNG). The loop keeps the same shape as before
+    # but iterates over exactly one element under the new design.
     for sec in by_kind.get("figure_caption", []):
-        ref_title = (f"Eveniment {sec['date']} — "
-                     f"referință {sec['ref_utc']} UTC")
+        ref_title = L["peak_coupling"].format(
+            date=sec['date'], ref=sec['ref_utc'],
+        )
         doc.reference_section(
             ref_title_ro=ref_title,
             figure_path=sec.get("figure_path"),
@@ -1967,7 +2989,7 @@ def render_pdf_report(
     # -------- KD comparison (auto-detected; may be absent for pure rain/light runs)
     for sec in by_kind.get("kd_summary", []):
         doc.kd_section(
-            title_ro="Distilare cunoștințe — profesor vs. student",
+            title_ro=L["kd_title"],
             romanian=sec["romanian"],
             metric_pngs=sec.get("kd_metric_pngs", {}),
             per_ref_pngs=sec.get("kd_per_ref_pngs", []),
@@ -1975,12 +2997,36 @@ def render_pdf_report(
             bilingual=bilingual,
         )
 
+    # -------- Period-wide coupling conclusion: LAST narrative section.
+    # Text-only, no image. Contextualises the hero image against the
+    # whole month (hour-of-day pattern, rainfall-band -> lightning-
+    # coupling rate). Placed last so the reader closes with the
+    # period-scale takeaway; rendered via reference_section with
+    # figure_path=None so the same method handles both the hero + this
+    # conclusion consistently.
+    for sec in by_kind.get("coupling_period_conclusion", []):
+        doc.reference_section(
+            ref_title_ro=L["period_coupling"],
+            figure_path=None,
+            romanian=sec["romanian"],
+            english=sec.get("english"),
+            bilingual=bilingual,
+        )
+
     # -------- Data appendix
-    doc.data_appendix(per_track_loaded, step_minutes)
+    doc.data_appendix(
+        per_track_loaded, step_minutes,
+        appendix_title=L["appendix_title"],
+        appendix_toc=L["appendix_toc"],
+        samples_word=("samples" if language == "en" else "eșantioane"),
+        header_labels=(
+            ("Lead", "min", "mean", "max") if language == "en"
+            else ("Orizont", "min", "mediu", "max")
+        ),
+    )
 
-    # -------- TOC (last page for now - fpdf2 doesn't allow easy insertion)
-    doc.emit_toc_at_start()
-
+    # TOC page 2 is filled in automatically during `doc.save()` via the
+    # placeholder callback (`_render_toc_at_placeholder`).
     doc.save()
 
 
@@ -2029,13 +3075,69 @@ def main() -> int:
     parser.add_argument("--temperature", type=float,
                         default=DEFAULT_OLLAMA_TEMPERATURE,
                         help="Sampling temperature. Keep at 0 for reproducibility.")
+    parser.add_argument("--max_tokens", type=int,
+                        default=DEFAULT_OLLAMA_MAX_TOKENS,
+                        help=f"Hard cap on tokens per Gemma response "
+                             f"(Ollama num_predict). Default "
+                             f"{DEFAULT_OLLAMA_MAX_TOKENS}. Prevents a "
+                             f"single paragraph from wedging the whole "
+                             f"run if the model enters a repetition / "
+                             f"hallucination loop; the response is cut "
+                             f"mid-sentence when the ceiling is hit.")
+    parser.add_argument("--refresh_cache", action="store_true",
+                        help="Discard the persisted Gemma cache (JSON) "
+                             "before running, forcing every English + "
+                             "Romanian paragraph to be regenerated from "
+                             "scratch. Use when a prompt has changed or "
+                             "the previous run's outputs look off.")
+    parser.add_argument("--no_cache", action="store_true",
+                        help="Do not read from OR write to the Gemma "
+                             "cache. Every call hits the LLM and the "
+                             "on-disk cache is left untouched.")
+    parser.add_argument("--language", type=str, default="ro",
+                        choices=["ro", "en"],
+                        help="Body language for the report. 'ro' "
+                             "(default) generates English via Gemma "
+                             "AND translates every paragraph to "
+                             "Romanian (two Gemma calls per section). "
+                             "'en' skips the translation phase — the "
+                             "raw English paragraph is what lands in "
+                             "the PDF. Roughly halves generation time "
+                             "and doubles as a debug switch: if the "
+                             "English-only PDF renders correctly then "
+                             "any body-text bug lives in the "
+                             "translation stage.")
     parser.add_argument("--bilingual", action="store_true",
                         help="Include the English source paragraph below each "
                              "Romanian body in the PDF. Default: Romanian only.")
     parser.add_argument("--skip_pdf", action="store_true",
                         help="Skip the PDF render step (useful when iterating "
                              "on prompts / facts extraction).")
+
+    # --- Predicted-coupling companion figure -----------------------------
+    # Two flags only. Everything else about the pred-coupling figure
+    # (rainfall/lightning modes, sources, threshold) is hardcoded to the
+    # operational defaults: base checkpoints, `mtg_lightning_opera_rainfall`
+    # (rainfall) and `mtg_lightning_opera_occurrence` (lightning teacher),
+    # dbscan source, hysteresis low=0.90. Per-lead high thresholds are
+    # auto-read from `lightning_{yyyy}_{mm}_summary.json` when present.
+    parser.add_argument("--pred_coupling", action="store_true",
+                        help="Replace the GT-only coupling image with the "
+                             "3x3 GT-vs-predicted coupling figure (Row 1: "
+                             "GT, Row 2: pred per-area, Row 3: pred per-"
+                             "class). Loads the operational rainfall + "
+                             "lightning checkpoints from --model_dir. "
+                             "Adds ~10-30s to the run.")
+    parser.add_argument("--model_dir", type=str, default="./models",
+                        help="Directory with the model checkpoints "
+                             "(only used when --pred_coupling is set).")
+
     args = parser.parse_args()
+
+    # Overall wall-clock so the final line can report end-to-end runtime
+    # (facts extraction + Gemma calls + Romanian translation + PDF layout).
+    import time as _time
+    _t_start = _time.time()
 
     if not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
@@ -2115,11 +3217,36 @@ def main() -> int:
     # ---------------------------------------------------------------------
     print("Computing per-reference cardinal + numeric facts from GT canvases "
           "and rendering the coupling-mask figures ...")
+
+    # If pred-coupling is requested, dig the tuned per-lead high-threshold
+    # values out of the lightning summary (mirrors the operational path in
+    # predict_full_domain --validation_summary). Falls back to
+    # lightning_postproc.DEFAULT_HIGH_THRESHOLD (0.95) per lead when the
+    # summary is absent or missing the block.
+    pred_lightning_high_per_lead: dict[int, float] | None = None
+    if args.pred_coupling:
+        light = per_track_loaded.get("lightning")
+        if light is not None:
+            pp = light["summary"].get("post_processing") or {}
+            named = pp.get("high_threshold_per_lead") or {}
+            resolved: dict[int, float] = {}
+            for offset in (1, 2, 3):
+                key = f"t+{offset * step_minutes}"
+                if key in named:
+                    resolved[offset] = float(named[key])
+            if resolved:
+                pred_lightning_high_per_lead = resolved
+                print(f"  pred_coupling: per-lead high thresholds from "
+                      f"lightning summary: {resolved}")
+
     facts_index: dict | None = None
     try:
         facts_index = build_facts_index(
             per_track_loaded, Path(args.data_root), step_minutes,
-            coupling_output_dir=validation_dir,
+            coupling_output_dir=validation_dir / "rainfall_lightning_coupling",
+            pred_coupling=args.pred_coupling,
+            model_dir=Path(args.model_dir) if args.pred_coupling else None,
+            pred_lightning_high_per_lead=pred_lightning_high_per_lead,
         )
     except Exception as e:
         # GT canvases are typically missing until the user has run reproject
@@ -2169,31 +3296,66 @@ def main() -> int:
     else:
         print("  No KD outputs present; skipping KD comparison section.")
 
+    # Gemma output cache. Persists English + Romanian per section id in
+    # `validation/report_gemma_cache_{yyyy}_{mm}.json`, so a re-run with
+    # the same prompts / facts skips the LLM entirely and reuses the
+    # prior outputs. `--refresh_cache` discards the file before running;
+    # `--no_cache` disables both read and write.
+    cache_path = (validation_dir /
+                  f"report_gemma_cache_{args.year:04d}_{args.month:02d}.json")
+    if args.refresh_cache and cache_path.is_file():
+        print(f"--refresh_cache: removing {cache_path.name}")
+        try:
+            cache_path.unlink()
+        except OSError as e:
+            print(f"  WARN: could not remove {cache_path.name}: {e}")
+    cache = GemmaCache(cache_path, enabled=(not args.no_cache))
+
     print()
     print("Generating English paragraphs via Gemma ...")
     sections = generate_english_paragraphs(
         per_track_loaded, facts_index,
         year=args.year, month=args.month, step_minutes=step_minutes,
         model=args.model, seed=args.seed, temperature=args.temperature,
+        max_tokens=args.max_tokens,
         kd_artefacts=kd_artefacts if kd_artefacts["summary_json"] else None,
+        cache=cache,
     )
     print(f"  {len(sections)} sections generated in English.")
 
-    print()
-    print("Translating each section to Romanian via Gemma ...")
-    translate_paragraphs_to_romanian(
-        sections,
-        model=args.model, seed=args.seed, temperature=args.temperature,
-    )
-    print(f"  {len(sections)} sections translated.")
+    if args.language == "en":
+        # English-only path: skip the translation phase entirely, copy
+        # the raw English body into the layout slot (`sec["romanian"]`
+        # is the layout's language-agnostic body slot — repurposed here
+        # so the PDF code stays untouched).
+        print()
+        print("--language en: skipping Romanian translation phase.")
+        for sec in sections:
+            sec["romanian"] = sec.get("english", "")
+    else:
+        print()
+        print("Translating each section to Romanian via Gemma ...")
+        translate_paragraphs_to_romanian(
+            sections,
+            model=args.model, seed=args.seed, temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            cache=cache,
+        )
+        print(f"  {len(sections)} sections translated.")
+    cache.save()
 
-    # Preview: first 200 chars of each section's Romanian body.
+    # Preview: first 200 chars of each section's rendered body. When
+    # --language en the "romanian" slot actually carries the English
+    # text (we copied it in above so the PDF layout stays language-
+    # agnostic), so label the preview accordingly.
+    preview_label = "EN" if args.language == "en" else "RO"
     print()
     print(f"--- Section preview ({len(sections)} sections) ---")
     for sec in sections:
-        preview = (sec["romanian"][:200] + "...") if len(sec["romanian"]) > 200 else sec["romanian"]
+        body = sec["romanian"]
+        preview = (body[:200] + "...") if len(body) > 200 else body
         print(f"  [{sec['kind']}] {sec['title']}")
-        print(f"    RO: {preview}")
+        print(f"    {preview_label}: {preview}")
         print()
 
     # ---------------------------------------------------------------------
@@ -2201,6 +3363,9 @@ def main() -> int:
     # ---------------------------------------------------------------------
     if args.skip_pdf:
         print("--skip_pdf set; not rendering the PDF.")
+        _elapsed = _time.time() - _t_start
+        print(f"Total report-generation wall time: "
+              f"{_elapsed:.1f}s ({_elapsed / 60.0:.1f} min)")
         return 0
 
     output_pdf = Path(
@@ -2215,8 +3380,12 @@ def main() -> int:
         output_path=output_pdf,
         year=args.year, month=args.month, step_minutes=step_minutes,
         bilingual=args.bilingual,
+        language=args.language,
     )
     print(f"  Wrote {output_pdf} ({output_pdf.stat().st_size / 1024:.1f} KB)")
+    _elapsed = _time.time() - _t_start
+    print(f"Total report-generation wall time: "
+          f"{_elapsed:.1f}s ({_elapsed / 60.0:.1f} min)")
     return 0
 
 

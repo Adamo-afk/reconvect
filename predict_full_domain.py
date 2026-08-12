@@ -82,10 +82,18 @@ from visualize_gt_vs_pred import (
     _load_country_borders_pixels,
     _gt_kwargs_for,
     load_model_artifact,
-    resolve_threshold,
     plot_full_domain_predictions_only,
 )
 import visualize_gt_vs_pred as _vf
+from train_models import build_run_tag, all_mode_choices, normalize_mode
+
+_MODE_CHOICES = all_mode_choices([
+    "mtg_lightning", "mtg_radar", "mtg_radar_continuous",
+    "mtg_opera_radar_only", "mtg_opera_mtgmr",
+    "mtg_lightning_opera",
+    "mtg_lightning_opera_occurrence",
+    "mtg_opera_occurrence",
+])
 
 
 # ============================================================================
@@ -368,6 +376,56 @@ def paste_predictions_to_canvas(predictions: np.ndarray,
 # ============================================================================
 # Lightning post-processing helpers (Hann overlap + hysteresis + GT/overlay plot)
 # ============================================================================
+def _load_gt_rainfall_canvas(data_root: Path, date_str: str,
+                             hhmm: str) -> np.ndarray | None:
+    """Load the OPERA rainfall_rate reprojected field for one (date, HHMM).
+    Returns raw mm/h array (768, 1536) float32, or None when missing. NaNs
+    are turned into 0.0 so the caller can classify without extra masking.
+
+    Duplicated (not imported) from validate_predictions to keep the two
+    modules import-cycle-free — validate_predictions already imports from
+    this file, so we cannot import from it at module scope.
+    """
+    from extract_patches import find_reprojected_file, load_reprojected
+    path = find_reprojected_file(
+        str(data_root), "opera_rainfall_rate", "opera", date_str, hhmm,
+    )
+    if path is None:
+        return None
+    field = load_reprojected(path)
+    if field.ndim == 3:
+        field = np.squeeze(field, axis=0)
+    return np.where(np.isnan(field), 0.0, field).astype(np.float32)
+
+
+def _print_prob_stats(prob_canvases: list[np.ndarray],
+                      step_minutes: int,
+                      low: float,
+                      high_per_lead: dict[int, float]) -> None:
+    """Emit per-lead raw-probability summary stats to stdout.
+
+    Purpose: when the post-processed binary canvas comes out empty
+    (`pred px=0` in the 2x3 subtitles), the reader has no way to tell
+    from the plot whether the raw model output was uniformly near zero
+    or was hovering just below the hysteresis LOW threshold. Printing
+    max / mean / percentiles and the count of pixels crossing LOW gives
+    that visibility without opening the .npy artefacts.
+    """
+    print("  Raw-prob stats per lead (before Hann-blend + hysteresis):")
+    for k, offset in enumerate(LEAD_STEP_OFFSETS):
+        p = prob_canvases[k]
+        lead_min = offset * step_minutes
+        p_max = float(p.max()); p_mean = float(p.mean())
+        p_p99 = float(np.percentile(p, 99.0))
+        p_p999 = float(np.percentile(p, 99.9))
+        above_low = int((p >= low).sum())
+        above_high = int((p >= high_per_lead[offset]).sum())
+        print(f"    t+{lead_min:>3d}: max={p_max:.3f} mean={p_mean:.4f} "
+              f"p99={p_p99:.3f} p99.9={p_p999:.3f} "
+              f"px>={low:.2f}: {above_low}  px>={high_per_lead[offset]:.2f}: "
+              f"{above_high}")
+
+
 def _load_gt_lightning_canvas(data_root: Path, date_str: str,
                               hhmm: str) -> np.ndarray | None:
     """Load the LINET binary occurrence canvas for one (date, HHMM). Returns
@@ -403,7 +461,7 @@ def _resolve_high_threshold_per_lead(
          from the JSON produced by validate_predictions.py --track lightning.
          Values are indexed by "t+<minutes>" strings; we map them back to
          step-offsets via LEAD_STEP_OFFSETS + step_minutes.
-      2. --high_threshold <x> -> same x used for every lead.
+      2. --lightning_high_threshold <x> -> same x used for every lead.
       3. Fallback: 0.95 for every lead (lightning_postproc.DEFAULT_HIGH_THRESHOLD).
     """
     from lightning_postproc import DEFAULT_HIGH_THRESHOLD  # local import: keep top clean
@@ -427,8 +485,8 @@ def _resolve_high_threshold_per_lead(
                 )
             result[offset] = float(per_lead_named[key])
         return result
-    if args.high_threshold is not None:
-        return {offset: float(args.high_threshold)
+    if args.lightning_high_threshold is not None:
+        return {offset: float(args.lightning_high_threshold)
                 for offset in LEAD_STEP_OFFSETS}
     return {offset: DEFAULT_HIGH_THRESHOLD for offset in LEAD_STEP_OFFSETS}
 
@@ -460,6 +518,7 @@ def _plot_lightning_2x3(
     """
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    from visualize_gt_vs_pred import _plot_patch_grid
 
     _ensure_view_cached()
     c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
@@ -491,6 +550,7 @@ def _plot_lightning_2x3(
                        fontsize=13, color="#555")
         else:
             ax_gt.imshow(gt.astype(np.float32), **gt_kwargs)
+        _plot_patch_grid(ax_gt)
         try:
             overlay_borders(ax_gt)
         except Exception:
@@ -498,54 +558,405 @@ def _plot_lightning_2x3(
         _apply_frame(ax_gt)
         gt_pixels = int((gt > 0).sum()) if gt is not None else 0
         ax_gt.set_title(
-            f"GT lightning occurrence - t+{lead_min} ({lead_wall} UTC)"
-            + (f"  |  active px = {gt_pixels}" if gt is not None else ""),
+            f"GT lightning occurrence - t+{lead_min} ({lead_wall} UTC)",
             fontsize=11,
         )
 
-        # ------------------------------ Row 2: GT underneath + post-proc overlay
-        ax_ov = axes[1, i]
-        if gt is not None:
-            ax_ov.imshow(gt.astype(np.float32), **gt_kwargs)
-        else:
-            ax_ov.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
-                         cmap="gray", vmin=0.0, vmax=1.0,
-                         aspect="equal", interpolation="nearest")
-        # Post-processed positives as opaque red on top.
-        pp_display = np.where(bin_canvases[i] > 0, 1.0, np.nan)
-        ax_ov.imshow(
-            pp_display,
-            cmap=mcolors.ListedColormap(["#d62728"]),
-            vmin=0.5, vmax=1.5, aspect="equal", interpolation="nearest",
+        # ------------------------------ Row 2: hits / misses / false-alarm
+        # 3-colour palette on a plain white base (the gt_red cmap's
+        # white low end, matching Row 1). Hits=orange, misses=blue,
+        # false alarms=red; correct-dry pixels stay white.
+        from validate_predictions import (
+            _ZONE_ORANGE, _ZONE_BLUE, _ZONE_RED, _format_hmf_pct,
         )
+        _GT_RED_LOW = (1.0, 1.0, 1.0, 1.0)   # white (was #fff5f0)
+        ax_ov = axes[1, i]
+        H, W = (gt.shape if gt is not None else (H_FULL, W_FULL))
+        rgba = np.empty((H, W, 4), dtype=np.float32)
+        rgba[:] = _GT_RED_LOW
+        if gt is not None:
+            gt_pos = gt > 0
+            pr_pos = bin_canvases[i] > 0
+            rgba[gt_pos & pr_pos] = _ZONE_ORANGE     # hit
+            rgba[gt_pos & ~pr_pos] = _ZONE_BLUE      # miss
+            rgba[~gt_pos & pr_pos] = _ZONE_RED       # false alarm
+            hits = int((gt_pos & pr_pos).sum())
+            misses = int((gt_pos & ~pr_pos).sum())
+            false_alarms = int((~gt_pos & pr_pos).sum())
+        else:
+            # No GT: every post-processed positive counts as an FA-like
+            # marker (no way to distinguish hit vs FA without truth).
+            pr_pos = bin_canvases[i] > 0
+            rgba[pr_pos] = _ZONE_RED
+            hits = misses = false_alarms = 0
+        ax_ov.imshow(rgba, aspect="equal", interpolation="nearest")
+        _plot_patch_grid(ax_ov)
         try:
             overlay_borders(ax_ov)
         except Exception:
             pass
         _apply_frame(ax_ov)
-        n_pred = int((bin_canvases[i] > 0).sum())
-        # If GT is present, break the count out into hit/miss/false-alarm.
         if gt is not None:
-            gt_pos = gt > 0
-            pr_pos = bin_canvases[i] > 0
-            hits = int((gt_pos & pr_pos).sum())
-            misses = int((gt_pos & ~pr_pos).sum())
-            false_alarms = int((~gt_pos & pr_pos).sum())
             subtitle = (
-                f"post-proc (low={low:.2f}, high={high_per_lead[offset]:.2f}) "
-                f"|  hits={hits}  miss={misses}  FA={false_alarms}  "
-                f"pred px={n_pred}"
+                f"Occurrence overlap  (low={low:.2f}, high={high_per_lead[offset]:.2f})\n"
+                f"{_format_hmf_pct(hits, misses, false_alarms)}"
             )
         else:
             subtitle = (
-                f"post-proc (low={low:.2f}, high={high_per_lead[offset]:.2f}) "
-                f"|  pred px={n_pred}"
+                f"Occurrence overlap  (low={low:.2f}, high={high_per_lead[offset]:.2f})"
             )
         ax_ov.set_title(subtitle, fontsize=11)
 
     fig.suptitle(
         f"{suptitle_prefix}  |  {date_str}  ref={ref_utc}",
         fontsize=14, fontweight="bold", color=suptitle_color,
+    )
+    # 3-swatch colour legend (hit / miss / false alarm) + plain-language
+    # percentage-formula footer, stacked below the plots.
+    from validate_predictions import _add_hmf_legend, _add_zone_color_legend
+    _add_zone_color_legend(fig)
+    _add_hmf_legend(fig, y=-0.14)
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_lightning_hits_1x3(
+    bin_canvases: list[np.ndarray],
+    gt_canvases: list[np.ndarray | None],
+    *,
+    date_str: str,
+    ref_utc: str,
+    step_minutes: int,
+    output_path: Path,
+) -> None:
+    """Companion lightning-hits figure (1 row × 3 leads).
+
+    Mirrors the rainfall `_plot_rainfall_perclass_hits_2x3` companion but
+    for the binary lightning track — a single "did we detect it here?"
+    view per lead. Only the pixels where BOTH GT and post-processed pred
+    are active render (in the orange 'hit' colour from the zone palette);
+    everything else stays white. Subtitle carries the hit count and the
+    hit rate (hits / GT-active).
+
+    Panels with no GT on disk render a placeholder — no hit computation
+    possible without truth.
+    """
+    import matplotlib.pyplot as plt
+    from validate_predictions import _ZONE_ORANGE
+    from visualize_gt_vs_pred import _plot_patch_grid
+
+    _ensure_view_cached()
+    c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+
+    fig, axes = plt.subplots(1, 3, figsize=(21, 5.5),
+                             constrained_layout=True)
+
+    def _apply_frame(ax):
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(c_lo, c_hi)
+        ax.set_ylim(r_hi, r_lo)
+        ax.set_aspect("equal")
+
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        lead_min = offset * step_minutes
+        lead_hhmm, _ = _ref_to_hhmm(ref_utc, lead_min, date_str)
+        lead_wall = f"{lead_hhmm[:2]}:{lead_hhmm[2:]}"
+        ax = axes[i]
+        gt = gt_canvases[i]
+        if gt is None:
+            ax.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                      cmap="gray", vmin=0.0, vmax=1.0,
+                      aspect="equal", interpolation="nearest")
+            ax.text(0.5, 0.5, "GT unavailable\n(no LINET file for this lead)",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=12, color="#555")
+            _plot_patch_grid(ax)
+            _apply_frame(ax)
+            ax.set_title(f"Hits - t+{lead_min} ({lead_wall} UTC)",
+                         fontsize=11)
+            continue
+        H, W = gt.shape
+        rgba = np.ones((H, W, 4), dtype=np.float32)   # white base
+        gt_pos = gt > 0
+        pr_pos = bin_canvases[i] > 0
+        hits_mask = gt_pos & pr_pos
+        rgba[hits_mask] = _ZONE_ORANGE
+        ax.imshow(rgba, aspect="equal", interpolation="nearest")
+        _plot_patch_grid(ax)
+        try:
+            overlay_borders(ax)
+        except Exception:
+            pass
+        _apply_frame(ax)
+        n_hits = int(hits_mask.sum())
+        n_gt = int(gt_pos.sum())
+        hit_rate = (100.0 * n_hits / n_gt) if n_gt > 0 else 0.0
+        ax.set_title(
+            f"Hits - t+{lead_min} ({lead_wall} UTC)\n"
+            f"hits = {n_hits}  ({hit_rate:.1f}% of GT-active)",
+            fontsize=11,
+        )
+
+    fig.suptitle(
+        f"Lightning inference — hits only  |  {date_str}  ref={ref_utc}",
+        fontsize=14, fontweight="bold",
+    )
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _build_rainfall_gt_class_canvas(
+    gt_mmh: np.ndarray,
+    valid_patches: list[int],
+) -> np.ndarray:
+    """Turn a raw OPERA mm/h canvas into a class canvas (-1 for
+    out-of-domain slots) restricted to `valid_patches`. Shared by
+    every rainfall-inference plotter in this module."""
+    from validate_predictions import _mmh_to_class
+    gt_full_cls = _mmh_to_class(gt_mmh).astype(np.int32)
+    gt_canvas = np.full((H_FULL, W_FULL), -1, dtype=np.int32)
+    for p in valid_patches:
+        r0, r1, c0, c1 = get_patch_bounds(p)
+        gt_canvas[r0:r1, c0:c1] = gt_full_cls[r0:r1, c0:c1]
+    return gt_canvas
+
+
+def _plot_rainfall_zone_prepost_3x3(
+    pred_canvases: list[np.ndarray],
+    hyst_canvases: list[np.ndarray],
+    gt_rainfall_canvases: list[np.ndarray | None],
+    valid_patches: list[int],
+    *,
+    date_str: str,
+    ref_utc: str,
+    step_minutes: int,
+    output_path: Path,
+    rainfall_low: float,
+    rainfall_high: float,
+) -> None:
+    """Rainfall inference main figure (3 rows × 3 leads).
+
+    Row 1 — GT class canvas (viridis-5) restricted to the valid patches.
+    Row 2 — Zone overlap of the RAW argmax pred against GT (pre post-
+            processing). Orange = hit, blue = miss, red = false alarm.
+    Row 3 — Same zone overlap but computed against the HYSTERESIS-
+            cleaned pred (`rainfall_hysteresis` with the caller-supplied
+            low/high thresholds), so the reader can compare 'raw' vs
+            'blob-cleaned' at a glance.
+
+    A single viridis-5 colourbar labels Row 1's class palette on the
+    right; Rows 2 and 3 share the standard zone colour legend +
+    hit/miss/FA formula footer at the bottom of the figure. Panels
+    without GT (missing OPERA file) render placeholders in every row.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as mcm
+    import matplotlib.colors as mcolors
+    # Lazy imports keep the module cycle-free.
+    from validate_predictions import (
+        _plot_zone_overlap_axis, _add_zone_color_legend,
+        _add_hmf_legend, _format_hmf_pct,
+    )
+    from visualize_gt_vs_pred import (
+        _gt_kwargs_for, _plot_patch_grid, RADAR_CLASS_NAMES,
+    )
+
+    fig, axes = plt.subplots(3, 3, figsize=(21, 15),
+                             constrained_layout=True)
+    gt_kwargs = _gt_kwargs_for("radar")  # viridis-5, vmin=0, vmax=4
+
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        lead_min = offset * step_minutes
+        lead_hhmm, _ = _ref_to_hhmm(ref_utc, lead_min, date_str)
+        lead_wall = f"{lead_hhmm[:2]}:{lead_hhmm[2:]}"
+        pred_canvas = pred_canvases[i]
+        hyst_canvas = hyst_canvases[i]
+        gt_mmh = gt_rainfall_canvases[i]
+
+        ax_r1 = axes[0, i]
+        ax_r2 = axes[1, i]
+        ax_r3 = axes[2, i]
+
+        if gt_mmh is None:
+            for ax in (ax_r1, ax_r2, ax_r3):
+                ax.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                          cmap="gray", vmin=0.0, vmax=1.0,
+                          aspect="equal", interpolation="nearest")
+                ax.text(0.5, 0.5, "GT unavailable\n(no OPERA file for this lead)",
+                        transform=ax.transAxes, ha="center", va="center",
+                        fontsize=12, color="#555")
+                ax.set_xticks([]); ax.set_yticks([])
+            ax_r1.set_title(f"GT class - t+{lead_min} ({lead_wall} UTC)",
+                            fontsize=11)
+            ax_r2.set_title(f"Zone overlap (pre) - t+{lead_min}",
+                            fontsize=11)
+            ax_r3.set_title(f"Zone overlap (post) - t+{lead_min}",
+                            fontsize=11)
+            continue
+
+        gt_canvas = _build_rainfall_gt_class_canvas(gt_mmh, valid_patches)
+
+        # --- Row 1: GT class canvas (viridis-5, NaN for out-of-domain).
+        gt_display = np.where(gt_canvas < 0, np.nan, gt_canvas.astype(float))
+        ax_r1.imshow(gt_display, **gt_kwargs)
+        _plot_patch_grid(ax_r1)
+        try:
+            overlay_borders(ax_r1)
+        except Exception:
+            pass
+        _ensure_view_cached()
+        c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
+        ax_r1.set_xticks([]); ax_r1.set_yticks([])
+        ax_r1.set_xlim(c_lo, c_hi); ax_r1.set_ylim(r_hi, r_lo)
+        ax_r1.set_aspect("equal")
+        ax_r1.set_title(
+            f"GT class - t+{lead_min} ({lead_wall} UTC)",
+            fontsize=11,
+        )
+
+        # --- Row 2: zone overlap (raw pred, pre post-processing).
+        stats_pre = _plot_zone_overlap_axis(ax_r2, gt_canvas, pred_canvas)
+        _plot_patch_grid(ax_r2)
+        ax_r2.set_title(
+            f"Zone overlap (pre post-proc) - t+{lead_min} "
+            f"({lead_wall} UTC)\n"
+            f"{_format_hmf_pct(stats_pre['hits'], stats_pre['misses'], stats_pre['false_alarms'])}",
+            fontsize=10,
+        )
+
+        # --- Row 3: zone overlap after rainfall hysteresis.
+        stats_post = _plot_zone_overlap_axis(ax_r3, gt_canvas, hyst_canvas)
+        _plot_patch_grid(ax_r3)
+        ax_r3.set_title(
+            f"Post-processing (hysteresis) zone-overlap  "
+            f"(low={rainfall_low:.2f}, high={rainfall_high:.2f}) - "
+            f"t+{lead_min}\n"
+            f"{_format_hmf_pct(stats_post['hits'], stats_post['misses'], stats_post['false_alarms'])}",
+            fontsize=10,
+        )
+
+    # Row 1 gets its own viridis colourbar; Rows 2 and 3 share the
+    # zone colour legend + hmf formula footer (no scalar colourbar,
+    # the palette is categorical).
+    sm = mcm.ScalarMappable(
+        cmap=plt.get_cmap("viridis", 5),
+        norm=mcolors.Normalize(vmin=0, vmax=4),
+    )
+    sm.set_array([])
+    cbar = fig.colorbar(
+        sm, ax=axes[0, :].ravel().tolist(),
+        ticks=[0, 1, 2, 3, 4],
+        shrink=0.75, pad=0.02, location="right",
+    )
+    cbar.set_ticklabels(RADAR_CLASS_NAMES)
+    cbar.set_label("Rain-rate class (Row 1)")
+    # Keep Rows 2 and 3 the same width as Row 1 under constrained_layout
+    # by attaching same-shape invisible colourbars to them.
+    for row in (1, 2):
+        spacer = fig.colorbar(
+            sm, ax=axes[row, :].ravel().tolist(),
+            shrink=0.75, pad=0.02, location="right",
+        )
+        spacer.ax.set_visible(False)
+
+    _add_zone_color_legend(fig)
+    _add_hmf_legend(fig, y=-0.09)
+    fig.suptitle(
+        f"Rainfall inference — GT + zone overlap pre/post hysteresis  |  "
+        f"{date_str}  ref={ref_utc}",
+        fontsize=14, fontweight="bold",
+    )
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_rainfall_perclass_hits_2x3(
+    pred_canvases: list[np.ndarray],
+    hyst_canvases: list[np.ndarray],
+    gt_rainfall_canvases: list[np.ndarray | None],
+    valid_patches: list[int],
+    *,
+    date_str: str,
+    ref_utc: str,
+    step_minutes: int,
+    output_path: Path,
+    rainfall_low: float,
+    rainfall_high: float,
+) -> None:
+    """Per-class hits companion figure (2 rows × 3 leads).
+
+    Row 1 — Per-class hits using the RAW argmax pred (pre post-proc).
+    Row 2 — Per-class hits using the hysteresis-cleaned pred.
+
+    Each panel is `_plot_red_hits_axis`: post-processed GT rendered
+    with a viridis-5 base and the pixels where pred_class == gt_class
+    highlighted in their matching viridis colour. The per-class hit
+    rate `C1:X% C2:Y% C3:Z% C4:W%` sits in the subtitle so the reader
+    can see which rain-rate bands each variant recovered.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.cm as mcm
+    import matplotlib.colors as mcolors
+    from validate_predictions import (
+        _plot_red_hits_axis, _format_per_class_pct,
+    )
+    from visualize_gt_vs_pred import RADAR_CLASS_NAMES
+
+    fig, axes = plt.subplots(2, 3, figsize=(21, 10),
+                             constrained_layout=True)
+
+    row_labels = [
+        ("Per-class hits (pre post-proc)", pred_canvases, ""),
+        ("Per-class hits (post-processing / hysteresis)", hyst_canvases,
+         f"  (low={rainfall_low:.2f}, high={rainfall_high:.2f})"),
+    ]
+
+    for row_idx, (row_title, canvases_for_row, extra) in enumerate(row_labels):
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            lead_min = offset * step_minutes
+            lead_hhmm, _ = _ref_to_hhmm(ref_utc, lead_min, date_str)
+            lead_wall = f"{lead_hhmm[:2]}:{lead_hhmm[2:]}"
+            gt_mmh = gt_rainfall_canvases[i]
+            ax = axes[row_idx, i]
+            if gt_mmh is None:
+                ax.imshow(np.zeros((H_FULL, W_FULL), dtype=np.float32),
+                          cmap="gray", vmin=0.0, vmax=1.0,
+                          aspect="equal", interpolation="nearest")
+                ax.text(0.5, 0.5,
+                        "GT unavailable\n(no OPERA file for this lead)",
+                        transform=ax.transAxes, ha="center", va="center",
+                        fontsize=12, color="#555")
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.set_title(f"{row_title} - t+{lead_min}", fontsize=10)
+                continue
+            gt_canvas = _build_rainfall_gt_class_canvas(gt_mmh, valid_patches)
+            red_stats = _plot_red_hits_axis(
+                ax, gt_canvas, canvases_for_row[i],
+            )
+            ax.set_title(
+                f"{row_title}{extra} - t+{lead_min} ({lead_wall} UTC)\n"
+                f"{_format_per_class_pct(red_stats['per_class_pct'])}",
+                fontsize=9,
+            )
+
+    # Shared viridis-5 colourbar (both rows use the same palette).
+    sm = mcm.ScalarMappable(
+        cmap=plt.get_cmap("viridis", 5),
+        norm=mcolors.Normalize(vmin=0, vmax=4),
+    )
+    sm.set_array([])
+    cbar = fig.colorbar(
+        sm, ax=axes.ravel().tolist(),
+        ticks=[0, 1, 2, 3, 4],
+        shrink=0.7, pad=0.02, location="right",
+    )
+    cbar.set_ticklabels(RADAR_CLASS_NAMES)
+    cbar.set_label("Rain-rate class")
+
+    fig.suptitle(
+        f"Rainfall inference — per-class hits pre vs post hysteresis  |  "
+        f"{date_str}  ref={ref_utc}",
+        fontsize=14, fontweight="bold",
     )
     fig.savefig(output_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -561,12 +972,12 @@ def main() -> int:
                     "without touching training-pipeline artefacts.",
     )
     parser.add_argument("--mode", required=True, type=str,
-                        choices=["mtg_lightning", "mtg_radar",
-                                 "mtg_radar_continuous",
-                                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                                 "mtg_lightning_opera",
-                                 "mtg_lightning_opera_occurrence",
-                                 "mtg_opera_occurrence"])
+                        choices=_MODE_CHOICES,
+                        help="Model variant. Rainfall-track modes accept "
+                             "an optional `_rainfall` suffix (e.g. "
+                             "`mtg_lightning_opera_rainfall`) that mirrors "
+                             "the on-disk run-tag naming; the canonical "
+                             "short form (`mtg_lightning_opera`) works too.")
     parser.add_argument("--source", type=str, default="dbscan",
                         choices=["dbscan", "lightning"],
                         help="Selects normalization_stats_<source>.json and "
@@ -606,7 +1017,8 @@ def main() -> int:
                              "evaluation_results.json is not present). "
                              "Ignored for lightning modes when the Hann-"
                              "overlap + hysteresis path is used (see "
-                             "--low_threshold / --high_threshold / "
+                             "--lightning_low_threshold / "
+                             "--lightning_high_threshold / "
                              "--validation_summary).")
     parser.add_argument("--batch_size", type=int, default=18,
                         help="Per-reference-time batch size passed to "
@@ -632,10 +1044,10 @@ def main() -> int:
                              "path (lightning only). Default 128 = 50%% "
                              "overlap, giving 55 patches on a 768x1536 "
                              "canvas.")
-    parser.add_argument("--low_threshold", type=float, default=None,
+    parser.add_argument("--lightning_low_threshold", type=float, default=None,
                         help="Hysteresis LOW threshold for lightning post-"
                              "processing. Default 0.90 (operational).")
-    parser.add_argument("--high_threshold", type=float, default=None,
+    parser.add_argument("--lightning_high_threshold", type=float, default=None,
                         help="Hysteresis HIGH threshold applied to every "
                              "lead time (lightning only). Superseded by "
                              "--validation_summary if that flag is also "
@@ -645,7 +1057,20 @@ def main() -> int:
                              "produced by validate_predictions.py --track "
                              "lightning. When present, the per-lead tuned "
                              "high-threshold values are read from it and "
-                             "override --high_threshold.")
+                             "override --lightning_high_threshold.")
+    # --- Rainfall post-processing controls (ignored for lightning) ---
+    # Defaults imported lazily below to avoid loading visualize_gt_vs_pred
+    # at argparse-build time.
+    parser.add_argument("--rainfall_low_threshold", type=float,
+                        default=None,
+                        help="Rainfall hysteresis LOW threshold on p(argmax) "
+                             "when argmax is a rainy class. Default 0.35 — "
+                             "lower than lightning because probability is "
+                             "split across 5 classes.")
+    parser.add_argument("--rainfall_high_threshold", type=float,
+                        default=None,
+                        help="Rainfall hysteresis HIGH threshold. "
+                             "Default 0.55.")
     args = parser.parse_args()
 
     if args.kd and args.finetuned:
@@ -657,8 +1082,9 @@ def main() -> int:
     variant_suffix = ("_finetuned" if args.finetuned
                       else "_kd" if args.kd
                       else "")
+    run_tag = build_run_tag(args.mode, args.source)
     output_dir = Path(args.output_dir) / (
-        f"predict_{args.mode}_{args.source}{variant_suffix}"
+        f"predict_{run_tag}{variant_suffix}"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -696,11 +1122,14 @@ def main() -> int:
     _load_country_borders_pixels()  # populate cache eagerly
     _ensure_view_cached()
 
-    # 2. Threshold + model
-    threshold = resolve_threshold(
-        label_type, args.mode, args.source, args.finetuned,
-        args.threshold, None,
-    )
+    # 2. Model
+    # NOTE: we no longer call resolve_threshold() here. The legacy 0.5-
+    # style sigmoid threshold has no consumer in this script: lightning
+    # goes through Hann-blend + hysteresis (driven by
+    # --lightning_low_threshold / --lightning_high_threshold /
+    # --validation_summary) and rainfall uses the argmax over 5 classes.
+    # --threshold survives only as an optional override for the raw-
+    # probability heatmap's colormap centering.
     print("\nLoading model...")
     model = load_model_artifact(
         model_dir, args.mode, args.source, args.finetuned, kd=args.kd,
@@ -711,7 +1140,8 @@ def main() -> int:
     # Prepare lightning post-processing state once (no cost when unused).
     is_lightning = (label_type == "lightning")
     stride = args.stride if args.stride is not None else 128
-    low_threshold = (args.low_threshold if args.low_threshold is not None
+    low_threshold = (args.lightning_low_threshold
+                     if args.lightning_low_threshold is not None
                      else 0.90)
     if is_lightning:
         high_per_lead = _resolve_high_threshold_per_lead(args, step_minutes)
@@ -757,6 +1187,8 @@ def main() -> int:
                   f"canvas shape {prob_canvases[0].shape}; "
                   f"GT panels available: "
                   f"{sum(1 for g in gt_canvases if g is not None)}/{len(gt_canvases)}")
+            _print_prob_stats(prob_canvases, step_minutes,
+                              low_threshold, high_per_lead)
 
             safe_ref = ref_utc.replace(":", "")
             out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
@@ -770,6 +1202,19 @@ def main() -> int:
                     suptitle_prefix="Lightning inference (Hann + hysteresis)",
                 )
                 print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
+                # Companion hits-only figure (single row × 3 leads,
+                # only pixels where GT and post-processed pred both
+                # fire — mirrors the rainfall per-class hits sibling).
+                hits_out = out_stem.parent / (
+                    out_stem.name + "_hits.png"
+                )
+                _plot_lightning_hits_1x3(
+                    bin_canvases, gt_canvases,
+                    date_str=args.date, ref_utc=ref_utc,
+                    step_minutes=step_minutes,
+                    output_path=hits_out,
+                )
+                print(f"  Saved hits -> {hits_out.name}")
             if args.save_npy:
                 # Per-lead per-artefact filenames so downstream tooling can
                 # pick either one without re-splitting a stacked array.
@@ -802,25 +1247,108 @@ def main() -> int:
         print(f"  Predicted {len(valid_patches)} patch(es); "
               f"canvases {canvases[0].shape}")
 
+        # Rainfall-only: build the (H, W, 5) soft canvases + apply the
+        # class-argmax hysteresis so both pre- and post-processing views
+        # can be drawn side by side. Defaults for the two knobs live in
+        # visualize_gt_vs_pred so the two scripts share the same
+        # operational thresholds.
+        hyst_canvases: list[np.ndarray] | None = None
+        rainfall_low_used = rainfall_high_used = None
+        if label_type == "radar":
+            from visualize_gt_vs_pred import (
+                build_full_soft_pred, rainfall_hysteresis,
+                DEFAULT_RAIN_LOW, DEFAULT_RAIN_HIGH,
+            )
+            rainfall_low_used = (args.rainfall_low_threshold
+                                 if args.rainfall_low_threshold is not None
+                                 else DEFAULT_RAIN_LOW)
+            rainfall_high_used = (args.rainfall_high_threshold
+                                  if args.rainfall_high_threshold is not None
+                                  else DEFAULT_RAIN_HIGH)
+            soft_canvases = build_full_soft_pred(
+                preds, valid_patches, n_classes=preds.shape[-1],
+            )
+            hyst_canvases = [
+                rainfall_hysteresis(
+                    soft_canvases[k],
+                    low=rainfall_low_used,
+                    high=rainfall_high_used,
+                )
+                for k in range(len(soft_canvases))
+            ]
+            print(f"  Rainfall hysteresis "
+                  f"(low={rainfall_low_used:.2f}, "
+                  f"high={rainfall_high_used:.2f}): "
+                  f"selected px per lead = "
+                  f"{[int(np.sum(c > 0)) for c in hyst_canvases]}")
+
+        # Attempt to load OPERA GT for each lead time so the operator sees
+        # the same "overlapping" structure/zoom figures validate_predictions
+        # produces per lead. When GT is missing (typical for new-date
+        # inference), fall back to the pred-only 1x3 heatmap.
+        gt_class_canvases: list[np.ndarray | None] = []
+        for offset in LEAD_STEP_OFFSETS:
+            gt_hhmm, gt_day = _ref_to_hhmm(
+                ref_utc, offset * step_minutes, args.date,
+            )
+            gt_class_canvases.append(
+                _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm)
+            )
+        n_gt_avail = sum(1 for g in gt_class_canvases if g is not None)
+        print(f"  OPERA GT panels available: {n_gt_avail}/{len(gt_class_canvases)}")
+
         safe_ref = ref_utc.replace(":", "")
         out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
         if not args.no_plot:
-            # Shared renderer from visualize_gt_vs_pred so the pred
-            # panels are pixel-identical to the bottom row of the 2x3
-            # figure the training-scope script produces.
-            plot_full_domain_predictions_only(
-                canvases, valid_patches, label_type,
-                date_str=args.date, ref_utc=ref_utc,
-                step_minutes=step_minutes,
-                threshold=threshold,
-                output_path=out_stem.with_suffix(".png"),
-                suptitle_prefix="Inference",
-            )
-            print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
+            if label_type == "radar" and n_gt_avail > 0:
+                # Main 3x3 figure: GT / zone overlap (raw pred) /
+                # zone overlap (hysteresis-cleaned pred). Companion
+                # 2x3 figure: per-class hits pre + post-processing.
+                _plot_rainfall_zone_prepost_3x3(
+                    canvases, hyst_canvases, gt_class_canvases,
+                    valid_patches,
+                    date_str=args.date, ref_utc=ref_utc,
+                    step_minutes=step_minutes,
+                    output_path=out_stem.with_suffix(".png"),
+                    rainfall_low=rainfall_low_used,
+                    rainfall_high=rainfall_high_used,
+                )
+                print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
+                hits_out = out_stem.parent / (
+                    out_stem.name + "_perclass_hits.png"
+                )
+                _plot_rainfall_perclass_hits_2x3(
+                    canvases, hyst_canvases, gt_class_canvases,
+                    valid_patches,
+                    date_str=args.date, ref_utc=ref_utc,
+                    step_minutes=step_minutes,
+                    output_path=hits_out,
+                    rainfall_low=rainfall_low_used,
+                    rainfall_high=rainfall_high_used,
+                )
+                print(f"  Saved per-class hits -> {hits_out.name}")
+            else:
+                # No OPERA GT on disk (typical for a genuinely new date):
+                # fall back to the pred-only 1x3 heatmap as the sole
+                # output. No GT means no Row 2/Row 3/Zone content to
+                # render anyway.
+                plot_full_domain_predictions_only(
+                    canvases, valid_patches, label_type,
+                    date_str=args.date, ref_utc=ref_utc,
+                    step_minutes=step_minutes,
+                    threshold=args.threshold,
+                    output_path=out_stem.with_suffix(".png"),
+                    suptitle_prefix="Inference",
+                )
+                print(f"  Saved plot -> {out_stem.with_suffix('.png').name}")
         if args.save_npy:
             npy_path = out_stem.with_suffix(".npy")
             np.save(npy_path, np.stack(canvases, axis=0))
             print(f"  Saved canvases -> {npy_path.name}")
+            if hyst_canvases is not None:
+                hyst_npy = out_stem.parent / (out_stem.name + "_hyst.npy")
+                np.save(hyst_npy, np.stack(hyst_canvases, axis=0))
+                print(f"  Saved hyst canvases -> {hyst_npy.name}")
 
     print(f"\nDone. Wrote {len(ref_times)} reference time(s) to {output_dir}.")
     return 0

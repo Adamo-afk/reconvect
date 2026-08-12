@@ -444,17 +444,44 @@ def build_full_gt(row, patches_dir: str, mode_config: dict,
                   label_type: str, step_minutes: int) -> list[np.ndarray]:
     """Return a list of 3 full-domain GT canvases (one per lead time).
 
+    Active patches (those in `row['patch_numbers']`) are populated from
+    the pre-extracted per-patch .npy tiles in `patches_dir` — the exact
+    bytes the model was trained on. Inactive patches (the ones DBSCAN
+    selection dropped) are filled from the reprojected full-domain
+    canvas on disk so all 18 tiles carry real observational data
+    instead of a placeholder, keeping the plot consistent between the
+    two tracks (rainfall inactive shows class 0 dark viridis; lightning
+    inactive shows any real occurrence that happened there, which is
+    usually near-white "no lightning" but occasionally sparse strikes).
+
+    If the full-canvas loader can't find a file for the label HHMM,
+    the inactive tiles fall back to their pre-fix defaults (float32
+    zeros for lightning, -1 sentinels for radar).
+
     Lightning: float32 in [0, 1], shape (H_FULL, W_FULL).
-    Radar:     int32 class index in {0..4}; -1 marks "no qualifying patch".
+    Radar:     int32 class index in {0..4}; -1 marks "no reprojected
+               data on disk for this lead" (rare fallback).
     """
+    # Lazy imports: predict_full_domain and validate_predictions both
+    # pull TF at module load. Deferring keeps this function callable
+    # in TF-less contexts (tests, type checks) as long as it isn't hit.
+    from predict_full_domain import (
+        _load_gt_lightning_canvas, _load_gt_rainfall_canvas,
+        _ref_to_hhmm as _pf_ref_to_hhmm,  # handles day rollover
+    )
+    from validate_predictions import _mmh_to_class
+
     date_str = row["date"]
     ref_utc = row["reference_utc"].strip()
     patches = ast.literal_eval(row["patch_numbers"])
+    active_set = set(patches)
 
     label_var = mode_config["label_var"]
     label_transform = mode_config["label_transform"]
     label_suffix = mode_config["label_suffix"]
     n_label_ch = LABEL_CHANNELS[label_type]
+
+    data_root = Path(patches_dir).parent  # patches_dir = data_root/patches
 
     canvases: list[np.ndarray] = []
     for t, col in enumerate(LABEL_TIME_COLS):
@@ -466,6 +493,7 @@ def build_full_gt(row, patches_dir: str, mode_config: dict,
         else:
             canvas = np.full((H_FULL, W_FULL), -1, dtype=np.int32)
 
+        # --- Active patches from pre-extracted .npy tiles.
         for p_pos, patch_num in enumerate(patches):
             r0, r1, c0, c1 = get_patch_bounds(patch_num)
             npy_idx = label_idxs[p_pos]
@@ -478,6 +506,36 @@ def build_full_gt(row, patches_dir: str, mode_config: dict,
                 canvas[r0:r1, c0:c1] = gt_patch[..., 0]
             else:
                 canvas[r0:r1, c0:c1] = np.argmax(gt_patch, axis=-1)
+
+        # --- Inactive patches from the reprojected full canvas so the
+        # plot shows real observed data everywhere (not a placeholder).
+        # Uses predict_full_domain._ref_to_hhmm for day rollover on
+        # labels that cross midnight.
+        inactive_patches = [p for p in range(1, N_PATCHES + 1)
+                            if p not in active_set]
+        if inactive_patches:
+            gt_hhmm, gt_day = _pf_ref_to_hhmm(
+                ref_utc, LABEL_STEP_OFFSETS[t] * step_minutes, date_str,
+            )
+            if label_type == "lightning":
+                full_canvas = _load_gt_lightning_canvas(
+                    data_root, gt_day, gt_hhmm,
+                )
+                if full_canvas is not None:
+                    for p in inactive_patches:
+                        r0, r1, c0, c1 = get_patch_bounds(p)
+                        canvas[r0:r1, c0:c1] = full_canvas[r0:r1, c0:c1] \
+                            .astype(np.float32)
+            else:  # radar
+                mmh = _load_gt_rainfall_canvas(
+                    data_root, gt_day, gt_hhmm,
+                )
+                if mmh is not None:
+                    full_cls = _mmh_to_class(mmh).astype(np.int32)
+                    for p in inactive_patches:
+                        r0, r1, c0, c1 = get_patch_bounds(p)
+                        canvas[r0:r1, c0:c1] = full_cls[r0:r1, c0:c1]
+
         canvases.append(canvas)
     return canvases
 
@@ -509,14 +567,103 @@ def build_full_pred(predictions: np.ndarray, valid_patches: list[int],
     return canvases
 
 
+def build_full_soft_pred(predictions: np.ndarray,
+                         valid_patches: list[int],
+                         n_classes: int) -> list[np.ndarray]:
+    """Radar-only companion to `build_full_pred` that keeps the raw
+    softmax probabilities per class, so downstream code can run the
+    rainfall hysteresis post-processing (which needs `p(argmax)` per
+    pixel, not just the argmax label).
+
+    Returns one (H_FULL, W_FULL, n_classes) float32 canvas per lead
+    time. Non-qualifying patch slots stay zeroed — no valid probability
+    distribution exists there, and 0 across every class is a natural
+    'no prediction' marker (subsequent `argmax` still returns 0/dry so
+    the pixel drops out of the hysteresis selection anyway).
+    """
+    T_future = predictions.shape[1]
+    canvases: list[np.ndarray] = []
+    for t in range(T_future):
+        canvas = np.zeros((H_FULL, W_FULL, n_classes), dtype=np.float32)
+        for p_pos, patch_num in enumerate(valid_patches):
+            r0, r1, c0, c1 = get_patch_bounds(patch_num)
+            canvas[r0:r1, c0:c1, :] = predictions[p_pos, t].astype(np.float32)
+        canvases.append(canvas)
+    return canvases
+
+
+# ============================================================================
+# Rainfall post-processing (hysteresis on p(argmax) when argmax is rainy)
+# ============================================================================
+DEFAULT_RAIN_LOW = 0.35
+DEFAULT_RAIN_HIGH = 0.55
+
+
+def rainfall_hysteresis(
+    soft_canvas: np.ndarray,
+    *,
+    low: float = DEFAULT_RAIN_LOW,
+    high: float = DEFAULT_RAIN_HIGH,
+) -> np.ndarray:
+    """Apply hysteresis thresholding to a rainfall softmax canvas.
+
+    Rule: for every pixel, take the argmax over the 5-class softmax. If
+    argmax == 0 (dry / R<10) the pixel is not a rain candidate. Otherwise
+    the pixel's score for the hysteresis test is `p(argmax)` — the
+    confidence with which the model picked that specific rainy class.
+    We then apply the same connected-component hysteresis
+    (`lightning_postproc.hysteresis_binary`) with the caller-supplied
+    (low, high) thresholds and keep only the pixels selected by that
+    mask. Selected pixels retain their argmax class label (1..4),
+    everything else is written to 0 (dry).
+
+    The default thresholds (low=0.35, high=0.55) are lower than the
+    lightning ones because probability mass is split across 5 classes
+    and a confident rainy prediction rarely exceeds 0.6 for any single
+    class.
+
+    Args:
+        soft_canvas: (H, W, 5) softmax probabilities.
+        low:  hysteresis lower threshold on p(argmax).
+        high: hysteresis upper threshold on p(argmax).
+
+    Returns:
+        (H, W) int32 class canvas in {0..4}. All rejected pixels are 0.
+    """
+    from lightning_postproc import hysteresis_binary
+    argmax = np.argmax(soft_canvas, axis=-1).astype(np.int32)
+    p_argmax = np.take_along_axis(
+        soft_canvas, argmax[..., None], axis=-1
+    ).squeeze(-1)
+    # Only rainy-class argmax pixels are eligible for the hysteresis
+    # selection; dry-class argmax pixels start at score 0 so they never
+    # cross even the low threshold.
+    score = np.where(argmax > 0, p_argmax, 0.0).astype(np.float32)
+    keep = hysteresis_binary(score, low=low, high=high).astype(bool)
+    out = np.where(keep, argmax, 0).astype(np.int32)
+    return out
+
+
 # ============================================================================
 # Plotting
 # ============================================================================
 def _plot_patch_grid(ax, *, color="black", linewidth=0.7,
-                     linestyle=(0, (1, 3))):
+                     linestyle=(0, (1, 3)),
+                     valid_patches: list[int] | None = None,
+                     number_active_color: str = "#1b7a1b",
+                     number_inactive_color: str = "#c11515"):
     """Outline every 256x256 patch slot with a dashed/dotted rectangle so
     the viewer can read the 6x3 tile structure of the Romania canvas.
-    Default linestyle is loosely-dotted (`(0, (1, 3))` = 1px on, 3px off)."""
+    Default linestyle is loosely-dotted (`(0, (1, 3))` = 1px on, 3px off).
+
+    When `valid_patches` is supplied, each patch is additionally labelled
+    with its 1-indexed number (1..18, row-major from upper-left) in
+    green for active patches (present in `valid_patches`) and red for
+    inactive ones. Replaces the older `_plot_radar_inactive_mask` hatch
+    overlay — the numbers make it obvious which patches contributed to
+    the prediction without hiding the underlying pixels.
+    """
+    valid_set = set(valid_patches) if valid_patches is not None else None
     for p in range(1, N_PATCHES + 1):
         r0, _, c0, _ = get_patch_bounds(p)
         rect = Rectangle(
@@ -526,15 +673,26 @@ def _plot_patch_grid(ax, *, color="black", linewidth=0.7,
             zorder=3,
         )
         ax.add_patch(rect)
+        if valid_set is not None:
+            txt_color = (number_active_color if p in valid_set
+                         else number_inactive_color)
+            ax.text(
+                c0 + 3, r0 + 3, str(p),
+                color=txt_color, fontsize=6, fontweight="bold",
+                ha="left", va="top", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.08",
+                          facecolor="white", alpha=0.75,
+                          edgecolor="none"),
+            )
 
 
 def _plot_radar_inactive_mask(ax, valid_patches: list[int]):
-    """Hatch-shade non-qualifying patches in the RADAR case only. For the
-    5-class radar head, value 0 = class "R<10" (low rain), which is NOT
-    the same as "no model output here"; we need the explicit hatching to
-    distinguish. The lightning case doesn't need this because the
-    canvas's natural 0 == "no lightning here" reads correctly under the
-    probability colormap."""
+    """DEPRECATED: no longer called from the main plotters. Kept as a
+    utility for callers that still want the classic hatch overlay on
+    non-qualifying patches. The new-style patch numbering via
+    `_plot_patch_grid(valid_patches=...)` (green/red per-patch labels)
+    now conveys the same information without hiding the underlying
+    pixel values."""
     valid_set = set(valid_patches)
     for p in range(1, N_PATCHES + 1):
         if p in valid_set:
@@ -553,8 +711,11 @@ def _gt_kwargs_for(label_type: str) -> dict:
     between plot_full_domain (2x3 GT vs Pred) and any other renderer
     that wants the same GT styling."""
     if label_type == "lightning":
+        # Ramp starts at pure white so the domain rectangle reads as
+        # 'no reading' rather than a subtle pink cast (user request:
+        # drop the pink background from every lightning plot).
         gt_cmap = mcolors.LinearSegmentedColormap.from_list(
-            "gt_red", ["#fff5f0", "#67000d"]
+            "gt_red", ["#ffffff", "#67000d"]
         )
         return dict(cmap=gt_cmap, vmin=0.0, vmax=1.0,
                     aspect="equal", interpolation="nearest")
@@ -590,68 +751,212 @@ def _apply_view_and_frame(ax):
 
 def _render_gt_axes(ax, canvas: np.ndarray, label_type: str,
                     *, lead_title: str, lead_hhmm: str,
-                    gt_kwargs: dict):
+                    gt_kwargs: dict,
+                    valid_patches: list[int] | None = None,
+                    show_patch_numbers: bool = False):
     """Render a single GT panel onto `ax`. Returns the imshow handle so
-    the caller can wire a colorbar."""
+    the caller can wire a colorbar.
+
+    When `show_patch_numbers=True` AND `valid_patches` is supplied, the
+    patch grid is annotated with green (active) / red (inactive) 1..18
+    numbers. This is the training-scope 2x3 use case
+    (plot_full_domain / finetuned): the CSV drives a partial set of
+    qualifying patches, so numbering makes the coverage explicit.
+    Inference callers reconstruct the whole grid — all 18 patches are
+    always active — so they should leave the default False and skip
+    the redundant numbering.
+    """
     if label_type == "radar":
-        display = np.where(canvas < 0, np.nan, canvas.astype(float))
+        # Fill non-qualifying slots (canvas == -1) with class 0 (darkest
+        # viridis / "R<10") so all 18 patches paint in the viridis-5
+        # palette rather than showing as blank pixels. The green/red
+        # numbering from _plot_patch_grid then tells the reader which
+        # tiles were actually processed vs. filled in as dark background.
+        display = np.where(canvas < 0, 0.0, canvas.astype(float))
         im = ax.imshow(display, **gt_kwargs)
-        # Radar GT: non-qualifying slots are NaN -> transparent; the
-        # dashed grid alone makes the structure readable.
     else:
         im = ax.imshow(canvas, **gt_kwargs)
-    _plot_patch_grid(ax)
+    _plot_patch_grid(
+        ax,
+        valid_patches=(valid_patches if show_patch_numbers else None),
+    )
     try:
         overlay_borders(ax)
     except Exception:
         pass
-    active_px = (int(np.sum(canvas > 0)) if label_type == "lightning"
-                 else int(np.sum((canvas != 0) & (canvas != -1))))
-    ax.text(
-        8, H_FULL - 12, f"pixels={active_px}",
-        color="white", fontsize=10,
-        bbox=dict(boxstyle="round,pad=0.25",
-                  facecolor="black", alpha=0.55, edgecolor="none"),
-        va="bottom", ha="left", zorder=6,
-    )
     ax.set_title(f"GT — {lead_title} ({lead_hhmm} UTC)", fontsize=11)
     _apply_view_and_frame(ax)
     return im
 
 
+def _render_pred_lightning_zone_axes(
+    ax,
+    gt_canvas: np.ndarray,
+    bin_canvas: np.ndarray,
+    *,
+    lead_title: str,
+    lead_hhmm: str,
+    extent: tuple[float, float, float, float] | None = None,
+    valid_patches: list[int] | None = None,
+    show_patch_numbers: bool = False,
+) -> dict:
+    """Row 3 renderer for lightning: post-processed hit/miss/FA overlay.
+
+    Palette matches `predict_full_domain._plot_lightning_2x3`:
+      orange   = hit  (GT-active + post-proc positive)
+      blue     = miss (GT-active + post-proc negative)
+      red      = false alarm  (GT-inactive + post-proc positive)
+      white    = correct dry  (matches Row 1's gt_red cmap low end)
+
+    When `extent` is set the RGBA image is placed in those data coords —
+    used by `plot_zoom_patch` so every panel draws in the full-canvas
+    coordinate system but is cropped to a single patch via xlim/ylim.
+
+    Returns {"hits", "misses", "false_alarms"} px counts so callers can
+    re-use them (e.g. for aggregate tallies).
+    """
+    from validate_predictions import (
+        _ZONE_ORANGE, _ZONE_BLUE, _ZONE_RED, _format_hmf_pct,
+    )
+    _GT_RED_LOW = (1.0, 1.0, 1.0, 1.0)   # white (was #fff5f0)
+    gt_pos = gt_canvas > 0
+    pr_pos = bin_canvas > 0
+    H, W = gt_canvas.shape
+    rgba = np.empty((H, W, 4), dtype=np.float32)
+    rgba[:] = _GT_RED_LOW
+    rgba[gt_pos & pr_pos] = _ZONE_ORANGE
+    rgba[gt_pos & ~pr_pos] = _ZONE_BLUE
+    rgba[~gt_pos & pr_pos] = _ZONE_RED
+    hits = int((gt_pos & pr_pos).sum())
+    misses = int((gt_pos & ~pr_pos).sum())
+    false_alarms = int((~gt_pos & pr_pos).sum())
+    imshow_kwargs = dict(aspect="equal", interpolation="nearest")
+    if extent is not None:
+        imshow_kwargs["extent"] = extent
+    ax.imshow(rgba, **imshow_kwargs)
+    _plot_patch_grid(
+        ax,
+        valid_patches=(valid_patches if show_patch_numbers else None),
+    )
+    try:
+        overlay_borders(ax)
+    except Exception:
+        pass
+    ax.set_title(
+        f"Post-processing (hysteresis) overlap — {lead_title} "
+        f"({lead_hhmm} UTC)\n"
+        f"{_format_hmf_pct(hits, misses, false_alarms)}",
+        fontsize=10,
+    )
+    return {"hits": hits, "misses": misses, "false_alarms": false_alarms}
+
+
+def _render_pred_rainfall_hyst_axes(
+    ax,
+    gt_class_canvas: np.ndarray,
+    hyst_class_canvas: np.ndarray,
+    *,
+    lead_title: str,
+    lead_hhmm: str,
+    low: float,
+    high: float,
+    extent: tuple[float, float, float, float] | None = None,
+    valid_patches: list[int] | None = None,
+    show_patch_numbers: bool = False,
+    stats_crop: tuple[int, int, int, int] | None = None,
+) -> dict:
+    """Row 3 renderer for rainfall: zone overlap between the
+    hysteresis-cleaned pred and GT.
+
+    Reuses `validate_predictions._plot_zone_overlap_axis` so the palette
+    (orange = hit, blue = miss, red = false alarm, white = correct dry)
+    and the figure-level colour + formula legends stay identical to
+    the lightning Row 3 and the predict_full_domain rainfall figure.
+
+    Patch numbering (green = active, red = inactive) is opt-in via
+    `show_patch_numbers=True` — the training-scope caller keeps it on
+    so the reader still sees which patches DBSCAN selected.
+
+    `stats_crop=(r0, r1, c0, c1)` restricts the hits/misses/false-alarms
+    numbers in the subtitle to that pixel window WITHOUT changing what
+    gets rendered (the full canvas is still drawn — the zoom caller
+    then crops the view via xlim/ylim). Used by `plot_zoom_patch` so
+    the reported percentages describe the zoomed patch alone.
+
+    Returns the zone stats dict — either whole-canvas or crop-restricted
+    depending on `stats_crop`.
+    """
+    from validate_predictions import (
+        _plot_zone_overlap_axis, _format_hmf_pct,
+        _postproc_gt_class_canvas,
+    )
+    # NOTE: _plot_zone_overlap_axis draws the RGBA canvas itself and
+    # doesn't honour an `extent` kwarg (zoom callers work by cropping
+    # gt_canvas and hyst_canvas before calling — see plot_zoom_patch).
+    stats = _plot_zone_overlap_axis(ax, gt_class_canvas, hyst_class_canvas)
+    _plot_patch_grid(
+        ax,
+        valid_patches=(valid_patches if show_patch_numbers else None),
+    )
+    if stats_crop is not None:
+        # Recompute hits/misses/false-alarms restricted to the zoom
+        # window, mirroring _plot_zone_overlap_axis's logic exactly
+        # (GT is post-processed on the FULL canvas first — small-blob
+        # rejection has to see the whole neighbourhood before we crop —
+        # then we slice both the post-processed GT and the pred).
+        r0, r1, c0, c1 = stats_crop
+        gt_eff_full = _postproc_gt_class_canvas(gt_class_canvas)
+        gt_eff = gt_eff_full[r0:r1, c0:c1]
+        pred_crop = hyst_class_canvas[r0:r1, c0:c1]
+        valid = gt_eff != -1
+        gt_pos = (gt_eff >= 1) & valid
+        pr_pos = (pred_crop >= 1) & valid
+        stats = {
+            "hits": int((gt_pos & pr_pos).sum()),
+            "misses": int((gt_pos & ~pr_pos).sum()),
+            "false_alarms": int((pr_pos & ~gt_pos).sum()),
+        }
+    ax.set_title(
+        f"Post-processing (hysteresis) zone-overlap\n"
+        f"(low={low:.2f}, high={high:.2f}) — {lead_title} "
+        f"({lead_hhmm} UTC)\n"
+        f"{_format_hmf_pct(stats['hits'], stats['misses'], stats['false_alarms'])}",
+        fontsize=10,
+    )
+    return stats
+
+
 def _render_pred_axes(ax, canvas: np.ndarray, valid_patches: list[int],
                      label_type: str, threshold: float | None,
                      *, lead_title: str, lead_hhmm: str,
-                     pred_kwargs: dict):
-    """Render a single Pred panel onto `ax`. Returns the imshow handle."""
+                     pred_kwargs: dict,
+                     show_patch_numbers: bool = False):
+    """Render a single Pred panel onto `ax`. Returns the imshow handle.
+
+    Patch grid numbering (green = active, red = inactive) is opt-in via
+    `show_patch_numbers=True`. Turn it on for the training-scope 2x3
+    plot_full_domain figure (both base and finetuned) where the CSV
+    drives a partial patch set; leave it off for inference/validation
+    where the whole 18-patch grid is always in play and the numbers
+    would just be noise.
+    """
     if label_type == "radar":
-        display = np.where(canvas < 0, np.nan, canvas.astype(float))
+        # Same "fill inactive with class 0 dark viridis" treatment as
+        # _render_gt_axes so all 18 tiles read as filled.
+        display = np.where(canvas < 0, 0.0, canvas.astype(float))
         im = ax.imshow(display, **pred_kwargs)
-        # Radar: class 0 means "R<10", NOT "no data". Keep the explicit
-        # no-data hatching so the viewer cannot mistake an empty patch
-        # slot for a "no rain" prediction.
-        _plot_radar_inactive_mask(ax, valid_patches)
     else:
-        # Lightning: non-qualifying patches stay at canvas[..] = 0,
-        # which the diverging colormap paints as deep blue (well below
-        # threshold). Reads visually as "no activity here".
         im = ax.imshow(canvas, **pred_kwargs)
-    _plot_patch_grid(ax)
+    _plot_patch_grid(
+        ax,
+        valid_patches=(valid_patches if show_patch_numbers else None),
+    )
     try:
         overlay_borders(ax)
     except Exception:
         pass
     if label_type == "lightning":
         thr_for_count = threshold if threshold is not None else 0.5
-        above = int(np.sum(canvas >= thr_for_count))
-        ax.text(
-            8, H_FULL - 12,
-            f"pixels≥{thr_for_count:.2f}={above}  max={canvas.max():.3f}",
-            color="white", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.25",
-                      facecolor="black", alpha=0.55, edgecolor="none"),
-            va="bottom", ha="left", zorder=6,
-        )
         title_suffix = f"(≥{thr_for_count:.2f})"
     else:
         title_suffix = ""
@@ -672,12 +977,42 @@ def plot_full_domain(
     threshold: float | None,
     output_path: Path,
     step_minutes: int,
+    row3_canvases: list[np.ndarray] | None = None,
+    postproc_low: float | None = None,
+    postproc_high_per_lead: dict[int, float] | None = None,
+    postproc_high: float | None = None,
 ):
-    """Draw the GT-over-Pred 2x3 figure for one reference timestep."""
+    """Draw the GT / Pred / Post-proc 3x3 figure for one reference timestep.
+
+    Row 1 (GT), Row 2 (Pred, raw) — unchanged from the historical 2x3
+    layout. Row 3 shows the post-processed output:
+      lightning: Hann-blended + hysteresis binary rendered as a
+                 hit / miss / false-alarm overlay on the same
+                 gt_red-low white base Row 1 uses.
+      rainfall:  hysteresis-cleaned argmax (rainfall_hysteresis), same
+                 viridis-5 palette as Rows 1/2 but dry pixels rendered
+                 in light grey so 'not selected' reads distinctly from
+                 the darkest viridis end.
+
+    `row3_canvases` is either:
+      - a list of 3 int8 binary canvases (lightning), or
+      - a list of 3 int32 class canvases (rainfall), or
+      - None, in which case the figure falls back to the historical
+        2-row layout (used only when the caller can't provide post-
+        processed output for the given label_type).
+
+    `postproc_low` + `postproc_high_per_lead` (lightning) or
+    `postproc_low` + `postproc_high` (rainfall) drive the Row 3 subtitle
+    annotations.
+    """
     lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
     label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
 
-    fig, axes = plt.subplots(2, 3, figsize=(20, 10), constrained_layout=True)
+    has_row3 = row3_canvases is not None
+    n_rows = 3 if has_row3 else 2
+    fig_height = 14 if has_row3 else 10
+    fig, axes = plt.subplots(n_rows, 3, figsize=(20, fig_height),
+                             constrained_layout=True)
 
     gt_kwargs = _gt_kwargs_for(label_type)
     pred_kwargs = _pred_kwargs_for(label_type, threshold)
@@ -689,27 +1024,100 @@ def plot_full_domain(
             axes[0, t], gt_canvases[t], label_type,
             lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
             gt_kwargs=gt_kwargs,
+            valid_patches=valid_patches,
+            show_patch_numbers=True,
         )
         im_pred = _render_pred_axes(
             axes[1, t], pred_canvases[t], valid_patches, label_type,
             threshold, lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
             pred_kwargs=pred_kwargs,
+            show_patch_numbers=True,
         )
+        if has_row3:
+            ax_r3 = axes[2, t]
+            if label_type == "lightning":
+                _render_pred_lightning_zone_axes(
+                    ax_r3, gt_canvases[t], row3_canvases[t],
+                    lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+                    valid_patches=valid_patches,
+                    show_patch_numbers=True,
+                )
+                _apply_view_and_frame(ax_r3)
+            else:  # rainfall
+                # Per-lead high threshold isn't a concept for rainfall
+                # (single --rainfall_high_threshold across leads), so
+                # fall back to the scalar value when the dict form isn't
+                # provided.
+                hi = (postproc_high if postproc_high is not None
+                      else (postproc_high_per_lead or {}).get(
+                          LABEL_STEP_OFFSETS[t], 0.0))
+                _render_pred_rainfall_hyst_axes(
+                    ax_r3, gt_canvases[t], row3_canvases[t],
+                    lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+                    low=(postproc_low if postproc_low is not None else 0.0),
+                    high=hi,
+                    valid_patches=valid_patches,
+                    show_patch_numbers=True,
+                )
+                _apply_view_and_frame(ax_r3)
 
-    # Colorbars (one per row).
+    # Colorbars (one per row, but Row 3 shares Row 2's colorbar where
+    # the palette matches).
     if label_type == "lightning":
-        cax_gt = fig.colorbar(im_gt, ax=axes[0, :].ravel().tolist(),
-                              shrink=0.7, pad=0.01, location="right")
-        cax_gt.set_label("Occurrence")
+        # GT is a binary 0/1 canvas — the gt_red gradient colourbar
+        # was redundant, so we drop it. To keep all three rows the same
+        # width under constrained_layout, we attach an INVISIBLE
+        # colourbar of the same shape as Row 2's; matplotlib reserves
+        # the width but renders nothing.
+        cax_gt_spacer = fig.colorbar(
+            im_gt, ax=axes[0, :].ravel().tolist(),
+            shrink=0.7, pad=0.01, location="right",
+        )
+        cax_gt_spacer.ax.set_visible(False)
         cax_pred = fig.colorbar(im_pred, ax=axes[1, :].ravel().tolist(),
                                 shrink=0.7, pad=0.01, location="right")
         cax_pred.set_label("Probability")
+        if has_row3:
+            # Row 3 uses the orange / blue / red zone palette — no
+            # scalar colourbar. Add the standard hit/miss/FA legend +
+            # formula footer instead.
+            from validate_predictions import (
+                _add_zone_color_legend, _add_hmf_legend,
+            )
+            _add_zone_color_legend(fig)
+            _add_hmf_legend(fig, y=-0.10)
+            # Row 3 also needs a same-width invisible colourbar slot
+            # so it stays aligned with Rows 1 and 2.
+            cax_spacer = fig.colorbar(
+                im_pred, ax=axes[2, :].ravel().tolist(),
+                shrink=0.7, pad=0.01, location="right",
+            )
+            cax_spacer.ax.set_visible(False)
     else:
-        cax = fig.colorbar(im_gt, ax=axes.ravel().tolist(),
+        # Rainfall: Rows 1 and 2 read against the same viridis-5 class
+        # palette, so they share ONE colourbar. Row 3 now uses the
+        # zone-overlap palette (orange/blue/red) — no scalar colourbar
+        # for it; instead we attach a same-shape invisible spacer so
+        # its panels align with Rows 1/2, and place the standard zone
+        # colour legend + HMF formula footer below the figure.
+        upper_axes = (axes[0:2, :].ravel().tolist()
+                      if has_row3 else axes.ravel().tolist())
+        cax = fig.colorbar(im_gt, ax=upper_axes,
                            ticks=[0, 1, 2, 3, 4],
                            shrink=0.7, pad=0.01, location="right")
         cax.set_ticklabels(RADAR_CLASS_NAMES)
         cax.set_label("Rain-rate class")
+        if has_row3:
+            spacer = fig.colorbar(
+                im_gt, ax=axes[2, :].ravel().tolist(),
+                shrink=0.7, pad=0.01, location="right",
+            )
+            spacer.ax.set_visible(False)
+            from validate_predictions import (
+                _add_zone_color_legend, _add_hmf_legend,
+            )
+            _add_zone_color_legend(fig)
+            _add_hmf_legend(fig, y=-0.10)
 
     fig.suptitle(
         f"{'Lightning' if label_type == 'lightning' else 'OPERA 5-class'} "
@@ -848,27 +1256,39 @@ def plot_zoom_patch(
     threshold: float | None,
     output_path: Path,
     step_minutes: int,
+    row3_canvases: list[np.ndarray] | None = None,
+    postproc_low: float | None = None,
+    postproc_high_per_lead: dict[int, float] | None = None,
+    postproc_high: float | None = None,
 ):
-    """Save a zoomed 2x3 figure for one specific 256x256 patch.
+    """Save a zoomed 3-row figure for one specific 256x256 patch.
 
-    Same GT-over-Pred 3-leadtime layout as plot_full_domain but cropped
-    to the chosen patch. Country borders that intersect the patch are
-    drawn inside the cropped frame so the location stays identifiable;
-    the patch's lat/lon centre is reported in the figure suptitle so the
-    operator can match it to a real-world region.
+    Same GT / Pred / Post-proc 3-leadtime layout as plot_full_domain but
+    cropped to the chosen patch. Country borders that intersect the
+    patch are drawn inside the cropped frame so the location stays
+    identifiable; the patch's lat/lon centre is reported in the figure
+    suptitle so the operator can match it to a real-world region.
+
+    Passing `row3_canvases=None` falls back to the historical 2-row
+    layout (no post-processing available for the label_type).
     """
     r0, r1, c0, c1 = get_patch_bounds(patch_num)
     lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
     label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 9.5),
+    has_row3 = row3_canvases is not None
+    n_rows = 3 if has_row3 else 2
+    fig_height = 13 if has_row3 else 9.5
+    fig, axes = plt.subplots(n_rows, 3, figsize=(15, fig_height),
                              constrained_layout=True)
 
     # GT styling identical to plot_full_domain so the zoom reads as a
     # consistent panel of the same figure.
     if label_type == "lightning":
+        # White low end (was #fff5f0) — pink background removed from
+        # every lightning figure per user request.
         gt_cmap = mcolors.LinearSegmentedColormap.from_list(
-            "gt_red", ["#fff5f0", "#67000d"]
+            "gt_red", ["#ffffff", "#67000d"]
         )
         gt_kwargs = dict(cmap=gt_cmap, vmin=0.0, vmax=1.0,
                          aspect="equal", interpolation="nearest",
@@ -893,15 +1313,6 @@ def plot_zoom_patch(
             overlay_borders(ax)
         except Exception:
             pass
-        active_px = int(np.sum(tile > 0)) if label_type == "lightning" \
-            else int(np.sum((tile > 0) & (tile != -1)))
-        ax.text(
-            c0 + 4, r1 - 6, f"pixels={active_px}",
-            color="white", fontsize=10,
-            bbox=dict(boxstyle="round,pad=0.25",
-                      facecolor="black", alpha=0.55, edgecolor="none"),
-            va="bottom", ha="left", zorder=7,
-        )
         ax.set_title(f"GT — {lead_titles[t]} "
                      f"({_ref_to_hhmm(ref_utc, label_offsets_min[t])} UTC)",
                      fontsize=11)
@@ -955,20 +1366,87 @@ def plot_zoom_patch(
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_xlim(c0, c1); ax.set_ylim(r1, r0)
 
-    # Colorbars (one per row, same as plot_full_domain).
+    # Row 3 (post-processed) — cropped to the patch via extent + xlim.
+    if has_row3:
+        for t in range(3):
+            ax = axes[2, t]
+            lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
+            row3_tile = row3_canvases[t][r0:r1, c0:c1]
+            if label_type == "lightning":
+                gt_tile = gt_canvases[t][r0:r1, c0:c1]
+                _render_pred_lightning_zone_axes(
+                    ax, gt_tile, row3_tile,
+                    lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+                    extent=(c0, c1, r1, r0),
+                )
+            else:
+                hi = (postproc_high if postproc_high is not None
+                      else (postproc_high_per_lead or {}).get(
+                          LABEL_STEP_OFFSETS[t], 0.0))
+                # Pass FULL canvases (not the cropped tile) — the
+                # underlying `_plot_zone_overlap_axis` draws the RGBA
+                # at natural (0..W, 0..H) coords and doesn't honour
+                # extent. The post-render xlim/ylim below then zooms
+                # into the patch window. `stats_crop` restricts the
+                # subtitle numbers to that same window so the reported
+                # hits/misses/false-alarms match the zoomed view.
+                _render_pred_rainfall_hyst_axes(
+                    ax, gt_canvases[t], row3_canvases[t],
+                    lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
+                    low=(postproc_low if postproc_low is not None else 0.0),
+                    high=hi,
+                    stats_crop=(r0, r1, c0, c1),
+                )
+            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xlim(c0, c1); ax.set_ylim(r1, r0)
+
+    # Colorbars (one per row for lightning; single shared for rainfall).
     if label_type == "lightning":
-        cax_gt = fig.colorbar(im_gt, ax=axes[0, :].ravel().tolist(),
-                              shrink=0.85, pad=0.01, location="right")
-        cax_gt.set_label("Occurrence")
+        # GT colourbar dropped (binary canvas — the gradient bar was
+        # noise); an invisible spacer of the same size keeps Row 1
+        # aligned with Rows 2/3 under constrained_layout.
+        cax_gt_spacer = fig.colorbar(
+            im_gt, ax=axes[0, :].ravel().tolist(),
+            shrink=0.85, pad=0.01, location="right",
+        )
+        cax_gt_spacer.ax.set_visible(False)
         cax_pred = fig.colorbar(im_pred, ax=axes[1, :].ravel().tolist(),
                                 shrink=0.85, pad=0.01, location="right")
         cax_pred.set_label("Probability")
+        if has_row3:
+            from validate_predictions import (
+                _add_zone_color_legend, _add_hmf_legend,
+            )
+            _add_zone_color_legend(fig)
+            _add_hmf_legend(fig, y=-0.10)
+            cax_spacer = fig.colorbar(
+                im_pred, ax=axes[2, :].ravel().tolist(),
+                shrink=0.85, pad=0.01, location="right",
+            )
+            cax_spacer.ax.set_visible(False)
     else:
-        cax = fig.colorbar(im_gt, ax=axes.ravel().tolist(),
+        # Rainfall Row 3 now renders the zone palette (orange/blue/red),
+        # not viridis — so the shared viridis colourbar only makes
+        # sense for Rows 1 and 2. Row 3 gets an invisible spacer and
+        # the standard zone legend + HMF footer instead.
+        upper_axes = (axes[0:2, :].ravel().tolist()
+                      if has_row3 else axes.ravel().tolist())
+        cax = fig.colorbar(im_gt, ax=upper_axes,
                            ticks=[0, 1, 2, 3, 4],
                            shrink=0.85, pad=0.01, location="right")
         cax.set_ticklabels(RADAR_CLASS_NAMES)
         cax.set_label("Rain-rate class")
+        if has_row3:
+            spacer = fig.colorbar(
+                im_gt, ax=axes[2, :].ravel().tolist(),
+                shrink=0.85, pad=0.01, location="right",
+            )
+            spacer.ax.set_visible(False)
+            from validate_predictions import (
+                _add_zone_color_legend, _add_hmf_legend,
+            )
+            _add_zone_color_legend(fig)
+            _add_hmf_legend(fig, y=-0.10)
 
     centre_latlon = _format_pixel_to_latlon((c0 + c1) / 2, (r0 + r1) / 2)
     fig.suptitle(
@@ -980,6 +1458,494 @@ def plot_zoom_patch(
     )
 
     fig.savefig(output_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ============================================================================
+# Aggregate rainfall comparison graphs (top-N timesteps × 3 leads)
+# ============================================================================
+def _per_patch_class_counts(canvas: np.ndarray, n_classes: int = 5) -> np.ndarray:
+    """Return an (N_PATCHES, n_classes) int64 count matrix. Slots that
+    are out-of-domain (canvas < 0) contribute to no class — the row sum
+    can therefore be smaller than PATCH_SIZE ** 2."""
+    counts = np.zeros((N_PATCHES, n_classes), dtype=np.int64)
+    for pi, p in enumerate(range(1, N_PATCHES + 1)):
+        r0, r1, c0, c1 = get_patch_bounds(p)
+        tile = canvas[r0:r1, c0:c1]
+        for c in range(n_classes):
+            counts[pi, c] = int(np.sum(tile == c))
+    return counts
+
+
+def _per_patch_class_pct(canvas: np.ndarray, n_classes: int = 5) -> np.ndarray:
+    """Return an (N_PATCHES, n_classes) float64 percentage matrix. Zero
+    out-of-domain contributions still divide by the full patch area
+    (PATCH_SIZE ** 2), keeping the % scale interpretable when
+    non-qualifying slots are present."""
+    denom = float(PATCH_SIZE * PATCH_SIZE)
+    counts = _per_patch_class_counts(canvas, n_classes)
+    return 100.0 * counts.astype(np.float64) / denom
+
+
+def _total_class_counts(canvas: np.ndarray, n_classes: int = 5) -> np.ndarray:
+    counts = np.zeros(n_classes, dtype=np.int64)
+    for c in range(n_classes):
+        counts[c] = int(np.sum(canvas == c))
+    return counts
+
+
+def _total_class_pct(canvas: np.ndarray, n_classes: int = 5) -> np.ndarray:
+    denom = float(H_FULL * W_FULL)
+    counts = _total_class_counts(canvas, n_classes)
+    return 100.0 * counts.astype(np.float64) / denom
+
+
+# ---- p(class) histogram helpers ------------------------------------------
+# Bin edges shared by every rainfall p(c) aggregate graph (2D + 3D). 10
+# equal 10-percentage-point bins over the [0, 1] softmax range.
+PMAX_BIN_EDGES = np.linspace(0.0, 1.0, 11)         # 0.0, 0.1, …, 1.0
+PMAX_BIN_LABELS = [f"{int(100*PMAX_BIN_EDGES[i])}-"
+                   f"{int(100*PMAX_BIN_EDGES[i+1])}%"
+                   for i in range(len(PMAX_BIN_EDGES) - 1)]
+PMAX_N_BINS = len(PMAX_BIN_LABELS)                 # 10
+
+
+def _per_class_pc_hist_aggregate(
+    raw_soft_samples: list[np.ndarray],
+    raw_class_samples: list[np.ndarray],
+    hyst_class_samples: list[np.ndarray],
+) -> dict:
+    """Aggregate counts + per-class denominators for the rainfall p(c)
+    histogram graphs (2D + 3D).
+
+    The denominator is per-CLASS (not per-domain): for row c, we look
+    ONLY at pixels the model predicted as class c
+      raw:  pixels where argmax(soft) == c   (from `raw_class_samples`)
+      hyst: pixels where hyst_class     == c (from `hyst_class_samples`)
+    and count how many have `soft[..., c]` in each softmax bin. The
+    resulting histogram row therefore describes the distribution of
+    confidence WITHIN class c — normalising by the row's own total
+    (which the caller shows on the plot as a bonus annotation).
+
+    Returned dict keys:
+      raw_counts_pp   (n_classes, N_PATCHES, PMAX_N_BINS) int64
+      hyst_counts_pp  (n_classes, N_PATCHES, PMAX_N_BINS) int64
+      raw_denom_pp    (n_classes, N_PATCHES)              int64
+      hyst_denom_pp   (n_classes, N_PATCHES)              int64
+
+    Whole-domain (global) tallies for the 2D graph are just row-sums
+    over the patch axis — the caller reduces as needed.
+    """
+    if not raw_soft_samples:
+        empty_hist = np.zeros((5, N_PATCHES, PMAX_N_BINS), dtype=np.int64)
+        empty_denom = np.zeros((5, N_PATCHES), dtype=np.int64)
+        return dict(
+            raw_counts_pp=empty_hist, hyst_counts_pp=empty_hist.copy(),
+            raw_denom_pp=empty_denom, hyst_denom_pp=empty_denom.copy(),
+        )
+    n_classes = raw_soft_samples[0].shape[-1]
+    raw_counts = np.zeros((n_classes, N_PATCHES, PMAX_N_BINS),
+                          dtype=np.int64)
+    hyst_counts = np.zeros_like(raw_counts)
+    raw_denom = np.zeros((n_classes, N_PATCHES), dtype=np.int64)
+    hyst_denom = np.zeros_like(raw_denom)
+
+    for soft, raw_cls, hyst_cls in zip(
+        raw_soft_samples, raw_class_samples, hyst_class_samples,
+    ):
+        for pi, p in enumerate(range(1, N_PATCHES + 1)):
+            r0, r1, c0, c1 = get_patch_bounds(p)
+            raw_tile = raw_cls[r0:r1, c0:c1]
+            hyst_tile = hyst_cls[r0:r1, c0:c1]
+            soft_tile = soft[r0:r1, c0:c1, :]
+            for c in range(n_classes):
+                p_c = soft_tile[..., c]
+                r_mask = (raw_tile == c)
+                r_n = int(r_mask.sum())
+                if r_n > 0:
+                    raw_denom[c, pi] += r_n
+                    hist, _ = np.histogram(p_c[r_mask].ravel(),
+                                           bins=PMAX_BIN_EDGES)
+                    raw_counts[c, pi] += hist
+                h_mask = (hyst_tile == c)
+                h_n = int(h_mask.sum())
+                if h_n > 0:
+                    hyst_denom[c, pi] += h_n
+                    hist, _ = np.histogram(p_c[h_mask].ravel(),
+                                           bins=PMAX_BIN_EDGES)
+                    hyst_counts[c, pi] += hist
+    return dict(
+        raw_counts_pp=raw_counts, hyst_counts_pp=hyst_counts,
+        raw_denom_pp=raw_denom, hyst_denom_pp=hyst_denom,
+    )
+
+
+def _plotly_bar3d_mesh(x_pos, y_pos, z_top, *,
+                       dx: float = 0.7, dy: float = 0.7,
+                       colorscale: str = "Blues",
+                       colorbar_title: str = "% pixels"):
+    """Build a single plotly Mesh3d trace representing N 3D bars.
+
+    Each bar is a rectangular prism from (x-dx/2, y-dy/2, 0) to
+    (x+dx/2, y+dy/2, z_top[i]). 8 vertices × N bars, 12 triangles ×
+    N bars combined into one Mesh3d — faster than N separate traces.
+
+    Vertex intensity = the bar's height, colour-mapped through
+    `colorscale`, so taller bars pop against shorter ones on the same
+    axes. The colourbar shows the raw % value (not a normalised
+    quantity) — plotly rescales automatically.
+    """
+    import plotly.graph_objects as go
+    x_pos = np.asarray(x_pos, dtype=np.float64)
+    y_pos = np.asarray(y_pos, dtype=np.float64)
+    z_top = np.asarray(z_top, dtype=np.float64)
+    n = len(x_pos)
+    all_x = np.empty(8 * n, dtype=np.float64)
+    all_y = np.empty(8 * n, dtype=np.float64)
+    all_z = np.empty(8 * n, dtype=np.float64)
+    all_intensity = np.empty(8 * n, dtype=np.float64)
+
+    face_offsets = np.array([
+        (0, 1, 2), (0, 2, 3),   # bottom
+        (4, 5, 6), (4, 6, 7),   # top
+        (0, 1, 5), (0, 5, 4),   # front  (y=y0)
+        (1, 2, 6), (1, 6, 5),   # right  (x=x1)
+        (2, 3, 7), (2, 7, 6),   # back   (y=y1)
+        (3, 0, 4), (3, 4, 7),   # left   (x=x0)
+    ], dtype=np.int64)
+
+    all_i = np.empty(12 * n, dtype=np.int64)
+    all_j = np.empty(12 * n, dtype=np.int64)
+    all_k = np.empty(12 * n, dtype=np.int64)
+
+    for b in range(n):
+        x0 = x_pos[b] - dx / 2
+        x1 = x_pos[b] + dx / 2
+        y0 = y_pos[b] - dy / 2
+        y1 = y_pos[b] + dy / 2
+        z0 = 0.0
+        z1 = float(z_top[b])
+        base = b * 8
+        # Local corner order:
+        #   0 (x0,y0,z0)  1 (x1,y0,z0)  2 (x1,y1,z0)  3 (x0,y1,z0)
+        #   4 (x0,y0,z1)  5 (x1,y0,z1)  6 (x1,y1,z1)  7 (x0,y1,z1)
+        all_x[base:base + 8] = [x0, x1, x1, x0, x0, x1, x1, x0]
+        all_y[base:base + 8] = [y0, y0, y1, y1, y0, y0, y1, y1]
+        all_z[base:base + 8] = [z0, z0, z0, z0, z1, z1, z1, z1]
+        # Uniform per-bar colour intensity (all 8 vertices share the value).
+        all_intensity[base:base + 8] = z1
+        tri_base = b * 12
+        all_i[tri_base:tri_base + 12] = face_offsets[:, 0] + base
+        all_j[tri_base:tri_base + 12] = face_offsets[:, 1] + base
+        all_k[tri_base:tri_base + 12] = face_offsets[:, 2] + base
+
+    z_max = float(max(z_top.max(), 1e-6))
+    return go.Mesh3d(
+        x=all_x, y=all_y, z=all_z,
+        i=all_i, j=all_j, k=all_k,
+        intensity=all_intensity,
+        colorscale=colorscale,
+        cmin=0.0, cmax=z_max,
+        showscale=True,
+        colorbar=dict(title=colorbar_title),
+        flatshading=True,
+        opacity=1.0,
+    )
+
+
+def plot_rainfall_pc_hist(
+    raw_soft_samples: list[np.ndarray],
+    raw_class_samples: list[np.ndarray],
+    hyst_class_samples: list[np.ndarray],
+    *,
+    output_dir: Path,
+    top_n: int,
+) -> list[Path]:
+    """Aggregate rainfall p(c) histogram — TWO separate PNGs (raw / hyst).
+
+    Each PNG has 5 rows (one per class). Per row (class c):
+      X-axis      10 bins of p(c) in 10% ranges (0-10% .. 90-100%).
+                  p(c) is the softmax value for class c, BEFORE argmax.
+      Y-axis      % of PIXELS-PREDICTED-AS-CLASS-C whose p(c) fell in
+                  that bin (denominator is class-c pixels only — the
+                  distribution INSIDE the class, not against the whole
+                  domain).
+      Bar label   raw pixel count in that bin (bonus annotation on top
+                  of each bar).
+      Row title   total number of class-c pixels considered.
+
+    Denominator per row:
+      raw  → pixels where argmax(soft) == c   (from `raw_class_samples`)
+      hyst → pixels where hyst_class     == c (from `hyst_class_samples`)
+
+    Returns paths to the two files written.
+    """
+    if (not raw_soft_samples or not raw_class_samples
+            or not hyst_class_samples):
+        print(f"  Skipping p(class) hist graph — no samples collected.")
+        return []
+    agg = _per_class_pc_hist_aggregate(
+        raw_soft_samples, raw_class_samples, hyst_class_samples,
+    )
+    # Sum patch axis → global counts + denoms.
+    raw_counts = agg["raw_counts_pp"].sum(axis=1)    # (n_classes, bins)
+    hyst_counts = agg["hyst_counts_pp"].sum(axis=1)
+    raw_denom = agg["raw_denom_pp"].sum(axis=1)      # (n_classes,)
+    hyst_denom = agg["hyst_denom_pp"].sum(axis=1)
+    n_classes = raw_counts.shape[0]
+    n_samples = len(raw_soft_samples)
+
+    def _annotate_bars(ax, x, counts, y_max):
+        """Print the raw pixel count centred over each bar in
+        thousands-separated form."""
+        for xi, cnt in zip(x, counts):
+            if cnt <= 0:
+                continue
+            ax.text(
+                xi, y_max * 0.02 + (100.0 * cnt / max(counts.sum(), 1)),
+                f"{int(cnt):,}",
+                ha="center", va="bottom", fontsize=7,
+                color="#222",
+            )
+
+    written: list[Path] = []
+    for source_name, counts_by_class, denom_by_class, color in [
+        ("raw", raw_counts, raw_denom, "steelblue"),
+        ("hyst", hyst_counts, hyst_denom, "darkorange"),
+    ]:
+        fig, axes = plt.subplots(
+            n_classes, 1, figsize=(13, 2.8 * n_classes),
+            sharex=True, constrained_layout=True,
+        )
+        x = np.arange(PMAX_N_BINS)
+        for c in range(n_classes):
+            ax = axes[c]
+            denom = int(denom_by_class[c])
+            pct = (100.0 * counts_by_class[c] / denom
+                   if denom > 0
+                   else np.zeros(PMAX_N_BINS, dtype=np.float64))
+            ax.bar(x, pct, width=0.8, color=color, alpha=0.9,
+                   edgecolor=color)
+            ax.set_ylabel(
+                f"class {c} — {RADAR_CLASS_NAMES[c]}\n"
+                f"(% of class-{c} pixels)",
+                fontsize=10,
+            )
+            ax.set_title(
+                f"class {c} — {RADAR_CLASS_NAMES[c]}  |  "
+                f"total pixels considered: {denom:,}",
+                fontsize=11, loc="left",
+            )
+            ax.grid(True, alpha=0.3, axis="y")
+            # Bonus: annotate each bar with the raw pixel count that
+            # produced it (integer, thousands-separated).
+            y_max = max(float(pct.max()), 1.0)
+            for xi, cnt, pc in zip(x, counts_by_class[c], pct):
+                if int(cnt) <= 0:
+                    continue
+                ax.text(
+                    xi, pc + 0.02 * y_max,
+                    f"{int(cnt):,}",
+                    ha="center", va="bottom", fontsize=7, color="#222",
+                )
+        axes[-1].set_xticks(x)
+        axes[-1].set_xticklabels(PMAX_BIN_LABELS, rotation=0, fontsize=9)
+        axes[-1].set_xlabel(
+            "p(class) bin  (softmax value for that class, before argmax)"
+        )
+        fig.suptitle(
+            f"Rainfall — per-class p(c) histogram ({source_name} pred)  "
+            f"|  top-{top_n} timesteps × 3 leads = {n_samples} samples",
+            fontsize=14, fontweight="bold",
+        )
+        out_path = output_dir / f"aggregate_pc_hist_{source_name}.png"
+        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        written.append(out_path)
+    return written
+
+
+def plot_rainfall_pc_hist_3d(
+    raw_soft_samples: list[np.ndarray],
+    raw_class_samples: list[np.ndarray],
+    hyst_class_samples: list[np.ndarray],
+    *,
+    output_dir: Path,
+    top_n: int,
+    filename_prefix: str = "aggregate_pc_hist_3d",
+) -> list[Path]:
+    """Interactive 3D companion to `plot_rainfall_pc_hist`.
+
+    Writes ONE plotly HTML per (class, source) pair — 5 classes ×
+    (raw, hyst) = 10 files. Each figure is a rotatable 3D BAR chart
+    (built from a single plotly Mesh3d trace):
+      X  p(c) bin (0..9 → 0-10% .. 90-100%)
+      Y  Patch #  (1..18)
+      Z  % of that patch's class-c pixels whose p(c) fell in the bin
+         — per-patch denominator is 'pixels in the patch predicted as
+         class c across all samples'. Each patch's bars therefore sum
+         to 100% independently (when the patch has any class-c pixels).
+
+    Title carries the total class-c denominator across the whole
+    domain so the reader knows how many pixels the row summarises.
+
+    Returns the list of written file paths.
+    """
+    if (not raw_soft_samples or not raw_class_samples
+            or not hyst_class_samples):
+        print(f"  Skipping p(class) 3D hist graphs — no samples collected.")
+        return []
+    import plotly.graph_objects as go
+    agg = _per_class_pc_hist_aggregate(
+        raw_soft_samples, raw_class_samples, hyst_class_samples,
+    )
+    raw_counts_pp = agg["raw_counts_pp"]     # (n_classes, N_PATCHES, bins)
+    hyst_counts_pp = agg["hyst_counts_pp"]
+    raw_denom_pp = agg["raw_denom_pp"]       # (n_classes, N_PATCHES)
+    hyst_denom_pp = agg["hyst_denom_pp"]
+    n_classes = raw_counts_pp.shape[0]
+    n_samples = len(raw_soft_samples)
+    written: list[Path] = []
+
+    # Per-(class, patch) percentage matrices. Skip divisions by zero
+    # cleanly with np.divide's `where`.
+    def _pct(counts, denom):
+        pct = np.zeros_like(counts, dtype=np.float64)
+        for c in range(counts.shape[0]):
+            for pi in range(counts.shape[1]):
+                d = int(denom[c, pi])
+                if d > 0:
+                    pct[c, pi] = 100.0 * counts[c, pi] / d
+        return pct
+
+    raw_pct_pp = _pct(raw_counts_pp, raw_denom_pp)
+    hyst_pct_pp = _pct(hyst_counts_pp, hyst_denom_pp)
+    raw_denom_total = raw_denom_pp.sum(axis=1)    # (n_classes,)
+    hyst_denom_total = hyst_denom_pp.sum(axis=1)
+
+    x_ticks = list(range(PMAX_N_BINS))
+    y_ticks = list(range(1, N_PATCHES + 1))
+
+    for c in range(n_classes):
+        for source_name, pct_pp, denom_total, colorscale in [
+            ("raw",  raw_pct_pp[c],  int(raw_denom_total[c]),  "Blues"),
+            ("hyst", hyst_pct_pp[c], int(hyst_denom_total[c]), "Oranges"),
+        ]:
+            # Flatten (N_PATCHES, PMAX_N_BINS) → per-bar positions.
+            xx, yy = np.meshgrid(
+                np.arange(PMAX_N_BINS),
+                np.arange(1, N_PATCHES + 1),
+                indexing="xy",
+            )
+            x_flat = xx.ravel().astype(np.float64)
+            y_flat = yy.ravel().astype(np.float64)
+            z_flat = pct_pp.ravel().astype(np.float64)
+
+            trace = _plotly_bar3d_mesh(
+                x_flat, y_flat, z_flat,
+                dx=0.7, dy=0.7,
+                colorscale=colorscale,
+                colorbar_title="% of class pixels",
+            )
+            fig = go.Figure(data=[trace])
+            fig.update_layout(
+                title=(
+                    f"Rainfall — p(class {c} - {RADAR_CLASS_NAMES[c]}) "
+                    f"histogram per patch — {source_name} pred  |  "
+                    f"total class-{c} pixels: {denom_total:,}  |  "
+                    f"top-{top_n} timesteps × 3 leads = {n_samples} "
+                    f"samples"
+                ),
+                scene=dict(
+                    xaxis=dict(
+                        title="p(class) bin",
+                        tickmode="array",
+                        tickvals=x_ticks,
+                        ticktext=PMAX_BIN_LABELS,
+                    ),
+                    yaxis=dict(
+                        title="Patch #",
+                        tickmode="array",
+                        tickvals=y_ticks,
+                    ),
+                    zaxis=dict(title="% of class pixels (per patch)"),
+                    aspectratio=dict(x=1.4, y=1.6, z=1.0),
+                ),
+                margin=dict(l=0, r=0, b=0, t=80),
+            )
+            out_path = (output_dir
+                        / f"{filename_prefix}_class{c}_{source_name}.html")
+            fig.write_html(str(out_path), include_plotlyjs="cdn")
+            written.append(out_path)
+    return written
+
+
+def plot_rainfall_class_count_distribution(
+    gt_samples: list[np.ndarray],
+    raw_samples: list[np.ndarray],
+    hyst_samples: list[np.ndarray],
+    *,
+    output_path: Path,
+    top_n: int,
+):
+    """Aggregate rainfall graph: whole-domain class-count distribution
+    (TOTAL column only) across top-N × 3 leads.
+
+    Sources: GT, raw pred, hyst pred → 3 boxes per class subplot. One
+    subplot per class (5 total), each subplot shows the distribution of
+    whole-domain pixel counts for that class across every sample. The
+    per-patch column series has been dropped — reader wanted the
+    right-of-panel TOTAL summary only.
+    """
+    if not raw_samples or not hyst_samples or not gt_samples:
+        print(f"  Skipping class-count distribution graph — "
+              f"no samples collected.")
+        return
+    gt_tot = np.stack([_total_class_counts(c) for c in gt_samples])
+    raw_tot = np.stack([_total_class_counts(c) for c in raw_samples])
+    hyst_tot = np.stack([_total_class_counts(c) for c in hyst_samples])
+
+    colors = {"gt": "#2ca02c", "raw": "steelblue", "hyst": "darkorange"}
+    labels = {"gt": "GT", "raw": "raw pred", "hyst": "hyst pred"}
+    positions = [0, 1, 2]
+
+    fig, axes = plt.subplots(1, 5, figsize=(20, 6),
+                             constrained_layout=True)
+    for c in range(5):
+        ax = axes[c]
+        data = [gt_tot[:, c], raw_tot[:, c], hyst_tot[:, c]]
+        bp = ax.boxplot(
+            data,
+            positions=positions,
+            widths=0.55,
+            patch_artist=True,
+            showfliers=False,
+            medianprops=dict(color="black"),
+        )
+        for box, key in zip(bp["boxes"], ("gt", "raw", "hyst")):
+            box.set_facecolor(colors[key])
+            box.set_alpha(0.7)
+            box.set_edgecolor(colors[key])
+        ax.set_xticks(positions)
+        ax.set_xticklabels(["GT", "raw", "hyst"], fontsize=10)
+        ax.set_title(f"class {c} — {RADAR_CLASS_NAMES[c]}",
+                     fontsize=11)
+        if c == 0:
+            ax.set_ylabel("pixel count (whole domain)", fontsize=10)
+        ax.grid(True, alpha=0.3, axis="y")
+        legend_handles = [
+            Rectangle((0, 0), 1, 1, facecolor=colors[k],
+                      alpha=0.7, edgecolor=colors[k], label=labels[k])
+            for k in ("gt", "raw", "hyst")
+        ]
+        ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+    fig.suptitle(
+        f"Rainfall — whole-domain class-count distribution  |  "
+        f"top-{top_n} timesteps × 3 leads = "
+        f"{len(raw_samples)} samples",
+        fontsize=14, fontweight="bold",
+    )
+    fig.savefig(output_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1124,15 +2090,24 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
 
 def resolve_threshold(label_type: str, mode: str, source: str,
                       finetuned: bool, override: float | None,
-                      eval_results_path: Path | None) -> float | None:
+                      eval_results_path: Path | None,
+                      kd: bool = False) -> float | None:
     """Pick the operative threshold for the lightning prediction map.
 
     Order:
       1. --threshold (manual override) if set.
       2. --eval_results JSON if explicitly passed.
-      3. evaluation/eval_<run_tag>[_finetuned]/evaluation_results.json
+      3. evaluation/eval_<run_tag>[_finetuned|_kd]/evaluation_results.json
          (the path evaluate_coalition.py writes by default).
+         Falls back to the legacy pre-rename dir if the new-name dir is
+         absent, so historical evaluation runs still resolve.
       4. 0.5 fallback with a warning.
+
+    Note: this legacy threshold is only meaningful for the direct sigmoid-
+    threshold path. The Hann-blend + hysteresis lightning inference in
+    predict_full_domain.py drives binarisation from
+    --lightning_low_threshold / --lightning_high_threshold instead, so
+    predict_full_domain no longer calls this function.
     """
     if label_type != "lightning":
         return None
@@ -1140,12 +2115,30 @@ def resolve_threshold(label_type: str, mode: str, source: str,
         print(f"  Using manual threshold = {override:.3f}")
         return float(override)
 
+    from train_models import build_run_tag  # local import: keep viz-only path clean
     if eval_results_path is None:
-        run_tag = f"{mode}_{source}"
+        run_tag = build_run_tag(mode, source)
         if finetuned:
             run_tag = f"{run_tag}_finetuned"
-        eval_results_path = Path("evaluation") / f"eval_{run_tag}" \
-                            / "evaluation_results.json"
+        elif kd:
+            run_tag = f"{run_tag}_kd"
+        new_path = Path("evaluation") / f"eval_{run_tag}" / "evaluation_results.json"
+        # Legacy-name fallback (dir created before build_run_tag inserted
+        # "rainfall" for rainfall-track modes). Only used when the new
+        # dir is not on disk.
+        legacy_run_tag = f"{mode}_{source}"
+        if finetuned:
+            legacy_run_tag = f"{legacy_run_tag}_finetuned"
+        elif kd:
+            legacy_run_tag = f"{legacy_run_tag}_kd"
+        legacy_path = (Path("evaluation") / f"eval_{legacy_run_tag}"
+                       / "evaluation_results.json")
+        if new_path.is_file() or not legacy_path.is_file():
+            eval_results_path = new_path
+        else:
+            print(f"  Note: using legacy eval dir {legacy_path.parent}. "
+                  f"Rename to {new_path.parent.name} to match the new run-tag.")
+            eval_results_path = legacy_path
 
     if eval_results_path.is_file():
         with open(eval_results_path) as f:
@@ -1173,12 +2166,19 @@ def main() -> int:
     parser.add_argument("--csv", required=True, type=str,
                         help="Path to a per-source split CSV "
                              "(train/validation/test_data_<source>.csv).")
+    from train_models import all_mode_choices
     parser.add_argument("--mode", required=True, type=str,
-                        choices=["mtg_lightning", "mtg_radar",
-                                 "mtg_radar_continuous",
-                                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                                 "mtg_lightning_opera",
-                                 "mtg_lightning_opera_occurrence"])
+                        choices=all_mode_choices([
+                            "mtg_lightning", "mtg_radar",
+                            "mtg_radar_continuous",
+                            "mtg_opera_radar_only", "mtg_opera_mtgmr",
+                            "mtg_lightning_opera",
+                            "mtg_lightning_opera_occurrence",
+                            "mtg_opera_occurrence",
+                        ]),
+                        help="Model variant. Rainfall-track modes accept "
+                             "an optional `_rainfall` suffix that mirrors "
+                             "the on-disk run-tag naming.")
     parser.add_argument("--source", type=str, default="dbscan",
                         choices=["dbscan", "lightning"])
     parser.add_argument("--top_n", type=int, default=5,
@@ -1190,11 +2190,21 @@ def main() -> int:
     parser.add_argument("--finetuned", action="store_true",
                         help="Use coalition_<run_tag>_finetuned.keras "
                              "(rebuilt + load_weights, same trick as "
-                             "evaluate_coalition).")
+                             "evaluate_coalition). Mutually exclusive "
+                             "with --kd.")
+    parser.add_argument("--kd", action="store_true",
+                        help="Use coalition_<run_tag>_kd.keras — the "
+                             "knowledge-distillation student saved by "
+                             "train_lightning_kd.py. Only meaningful for "
+                             "the student mode `mtg_opera_occurrence`; "
+                             "the student's mode config (satellite-only "
+                             "past_hr) drives input construction so no "
+                             "extra slicing step is needed. Mutually "
+                             "exclusive with --finetuned.")
     parser.add_argument("--eval_results", type=str, default=None,
                         help="Path to an evaluation_results.json to read "
                              "optimal_threshold from. Default is "
-                             "evaluation/eval_<run_tag>[_finetuned]/"
+                             "evaluation/eval_<run_tag>[_finetuned|_kd]/"
                              "evaluation_results.json.")
     parser.add_argument("--threshold", type=float, default=None,
                         help="Manual probability threshold for the lightning "
@@ -1206,7 +2216,50 @@ def main() -> int:
                              "patch with the highest GT activity. Default "
                              "is to save BOTH the full-domain figure and "
                              "the zoom figure side by side.")
+    # ---- Lightning post-processing (Row 3, lightning modes only) ----
+    parser.add_argument("--stride", type=int, default=128,
+                        help="Hann-overlap stride for the lightning "
+                             "post-processing path used to build Row 3. "
+                             "Default 128 = 50%% overlap (55 patches on "
+                             "the 768x1536 canvas).")
+    parser.add_argument("--lightning_low_threshold", type=float, default=0.90,
+                        help="Hysteresis LOW threshold for lightning "
+                             "Row 3. Default 0.90 (operational).")
+    parser.add_argument("--lightning_high_threshold", type=float,
+                        default=None,
+                        help="Hysteresis HIGH threshold applied to every "
+                             "lead time for lightning Row 3. Superseded by "
+                             "--validation_summary. Default falls back to "
+                             "lightning_postproc.DEFAULT_HIGH_THRESHOLD.")
+    parser.add_argument("--validation_summary", type=str, default=None,
+                        help="Path to a {track}_{yyyy}_{mm}_summary.json "
+                             "produced by validate_predictions.py --track "
+                             "lightning. When present, the per-lead tuned "
+                             "high-threshold values are read from it and "
+                             "override --lightning_high_threshold.")
+    # ---- Rainfall post-processing (Row 3, rainfall/radar modes only) ----
+    parser.add_argument("--rainfall_low_threshold", type=float,
+                        default=DEFAULT_RAIN_LOW,
+                        help=f"Hysteresis LOW threshold for rainfall Row 3 "
+                             f"(applied to p(argmax) when argmax is a rainy "
+                             f"class). Default {DEFAULT_RAIN_LOW} — lower "
+                             f"than the lightning threshold because "
+                             f"probability is split across 5 classes.")
+    parser.add_argument("--rainfall_high_threshold", type=float,
+                        default=DEFAULT_RAIN_HIGH,
+                        help=f"Hysteresis HIGH threshold for rainfall Row 3. "
+                             f"Default {DEFAULT_RAIN_HIGH}.")
+    parser.add_argument("--no_aggregate_graphs", action="store_true",
+                        help="Skip the rainfall aggregate comparison "
+                             "graphs (avg per-patch class % and per-patch "
+                             "class-count distribution). Only meaningful "
+                             "for rainfall/radar modes; ignored otherwise.")
     args = parser.parse_args()
+
+    if args.kd and args.finetuned:
+        parser.error("--kd and --finetuned are mutually exclusive "
+                     "(the KD student is trained fresh from scratch, "
+                     "no swin head).")
 
     csv_path = Path(args.csv)
     if not csv_path.is_file():
@@ -1233,18 +2286,24 @@ def main() -> int:
     label_type = mode_config["label_type"]
     step_minutes = _load_step_minutes(data_root)
 
-    run_tag = f"{args.mode}_{args.source}"
-    artifact_tag = f"{run_tag}_finetuned" if args.finetuned else run_tag
+    from train_models import build_run_tag  # local import: keep TF-heavy load lazy
+    run_tag = build_run_tag(args.mode, args.source)
+    variant_suffix = ("_finetuned" if args.finetuned
+                      else "_kd" if args.kd
+                      else "")
+    artifact_tag = f"{run_tag}{variant_suffix}"
     output_dir = Path(args.output_dir) / f"full_domain_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    variant_label = ("finetuned" if args.finetuned
+                     else "KD student" if args.kd
+                     else "base")
     print("=" * 70)
     print("Full-domain top-N visualisation")
     print("=" * 70)
     print(f"  CSV:         {csv_path}")
     print(f"  Mode:        {args.mode}  (label_type={label_type})")
-    print(f"  Source:      {args.source}  "
-          f"{'(finetuned)' if args.finetuned else '(base)'}")
+    print(f"  Source:      {args.source}  ({variant_label})")
     print(f"  Top N:       {args.top_n}")
     print(f"  Step (min):  {step_minutes}")
     print(f"  Output dir:  {output_dir}")
@@ -1253,11 +2312,13 @@ def main() -> int:
         label_type, args.mode, args.source, args.finetuned,
         args.threshold,
         Path(args.eval_results) if args.eval_results else None,
+        kd=args.kd,
     )
 
     print(f"\nLoading model...")
     model = load_model_artifact(
         Path(args.model_dir), args.mode, args.source, args.finetuned,
+        kd=args.kd,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
@@ -1274,45 +2335,173 @@ def main() -> int:
     df_top = load_top_n_rows(csv_path, args.top_n)
     print(df_top[["date", "reference_utc", "n_patches"]].to_string(index=False))
 
+    # Lazy import: predict_full_domain pulls TF, but we're already past
+    # the model load so the cost is paid. Use its full-canvas input
+    # builder + paste helper to run the model on ALL 18 patches (from
+    # the reprojected data on disk), so pred canvases carry real model
+    # output on inactive patches too — not a placeholder. The CSV's
+    # active-patch list is kept only to drive the green/red numbering
+    # (which patches DBSCAN actually selected).
+    from predict_full_domain import (
+        build_inputs_for_reference,
+        paste_predictions_to_canvas,
+        LEAD_STEP_OFFSETS as _PF_LEAD_STEP_OFFSETS,
+    )
+
+    # ---- Lightning post-processing setup (Row 3, lightning modes) ----
+    is_lightning = (label_type == "lightning")
+    is_rainfall = (label_type == "radar")
+    run_hann_overlapped_inference = hysteresis_binary = None
+    high_per_lead: dict[int, float] | None = None
+    if is_lightning:
+        from lightning_postproc import (
+            run_hann_overlapped_inference,
+            hysteresis_binary,
+            DEFAULT_HIGH_THRESHOLD,
+        )
+        # Reuse the same resolver predict_full_domain uses so a shared
+        # validation-summary file drives both scripts identically.
+        from predict_full_domain import _resolve_high_threshold_per_lead
+        import argparse as _argparse
+        _resolver_args = _argparse.Namespace(
+            validation_summary=args.validation_summary,
+            lightning_high_threshold=args.lightning_high_threshold,
+        )
+        high_per_lead = _resolve_high_threshold_per_lead(
+            _resolver_args, step_minutes,
+        )
+        print(f"  Lightning post-proc: stride={args.stride}  "
+              f"low={args.lightning_low_threshold:.2f}  "
+              f"high per lead={{{', '.join(f't+{o*step_minutes}={h:.2f}' for o, h in high_per_lead.items())}}}")
+
+    # ---- Aggregate accumulators (rainfall only; per-sample canvases) ----
+    # agg_raw_soft carries the raw (H, W, 5) softmax canvases needed by
+    # the p(argmax) histogram graphs; the *_class arrays are int32
+    # argmax / hysteresis-cleaned canvases used by the count-based graph.
+    agg_gt: list[np.ndarray] = []
+    agg_raw: list[np.ndarray] = []
+    agg_hyst: list[np.ndarray] = []
+    agg_raw_soft: list[np.ndarray] = []
+
     for rank, (_, row) in enumerate(df_top.iterrows(), start=1):
         date_str = row["date"]
         ref_utc = row["reference_utc"].strip()
         print(f"\n[{rank}/{len(df_top)}] {date_str} {ref_utc} UTC  "
               f"({row['n_patches']} qualifying patches)")
 
-        inputs, valid_patches = build_batch_inputs(
-            row, str(patches_dir), mode_config, step_minutes,
-        )
-        if not valid_patches:
-            print(f"  No usable patches (all input timesteps were missing). "
-                  f"Skipping.")
-            continue
-        n_valid = len(valid_patches)
-        print(f"  Built input tensors for {n_valid} patches "
-              f"({', '.join(str(p) for p in valid_patches)})")
-
-        preds = model.predict(inputs, batch_size=args.batch_size, verbose=0)
-        print(f"  Model output shape: {preds.shape}")
+        # DBSCAN-selected patches from the CSV — drives green/red
+        # numbering only; every patch still gets a model prediction.
+        csv_active = ast.literal_eval(row["patch_numbers"])
 
         gt_canvases = build_full_gt(
             row, str(patches_dir), mode_config, label_type, step_minutes,
         )
-        pred_canvases = build_full_pred(preds, valid_patches, label_type)
+
+        # -------------------- Model inference + Row 3 canvases --------------------
+        pred_canvases: list[np.ndarray]
+        row3_canvases: list[np.ndarray] | None = None
+        raw_class_canvases: list[np.ndarray] | None = None
+        if is_lightning:
+            # Hann-overlap raw probability canvas → Row 2, then hysteresis
+            # binary → Row 3. Matches predict_full_domain._plot_lightning_2x3
+            # semantics so the visualiser and the operational inference
+            # script show the same post-processed output on the same data.
+            prob_canvases = run_hann_overlapped_inference(
+                model, data_root, mode_config, date_str, ref_utc,
+                step_minutes, stride=args.stride,
+                batch_size=args.batch_size,
+            )
+            if prob_canvases is None:
+                print(f"  No data available for the Hann-overlap input "
+                      f"window. Skipping.")
+                continue
+            pred_canvases = prob_canvases
+            row3_canvases = [
+                hysteresis_binary(
+                    prob_canvases[k], low=args.lightning_low_threshold,
+                    high=high_per_lead[_PF_LEAD_STEP_OFFSETS[k]],
+                )
+                for k in range(len(prob_canvases))
+            ]
+            print(f"  Hann-overlap produced {len(prob_canvases)} lead(s); "
+                  f"canvas shape {prob_canvases[0].shape}")
+        else:
+            inputs, all_patches = build_inputs_for_reference(
+                data_root, mode_config, date_str, ref_utc, step_minutes,
+            )
+            if not all_patches:
+                print(f"  No reprojected data available for the input "
+                      f"window. Skipping.")
+                continue
+            print(f"  Built inputs for {len(all_patches)} / {N_PATCHES} "
+                  f"patches (from reprojected data)  |  "
+                  f"DBSCAN-selected: {len(csv_active)}")
+            preds = model.predict(inputs, batch_size=args.batch_size,
+                                  verbose=0)
+            print(f"  Model output shape: {preds.shape}")
+            pred_canvases = paste_predictions_to_canvas(
+                preds, all_patches, label_type,
+            )
+            if is_rainfall:
+                # Soft canvases → rainfall_hysteresis → Row 3 class map.
+                # We reuse the model output rather than re-running the
+                # 5-class softmax path.
+                soft_canvases = build_full_soft_pred(
+                    preds, all_patches, n_classes=preds.shape[-1],
+                )
+                row3_canvases = [
+                    rainfall_hysteresis(
+                        soft_canvases[k],
+                        low=args.rainfall_low_threshold,
+                        high=args.rainfall_high_threshold,
+                    )
+                    for k in range(len(soft_canvases))
+                ]
+                raw_class_canvases = pred_canvases   # int32 argmax
+                raw_soft_canvases = soft_canvases    # (H, W, 5) softmax
+                print(f"  Rainfall hysteresis "
+                      f"(low={args.rainfall_low_threshold:.2f}, "
+                      f"high={args.rainfall_high_threshold:.2f}): "
+                      f"selected px per lead = "
+                      f"{[int(np.sum((c > 0))) for c in row3_canvases]}")
+
+        # -------------------- Aggregate collection (rainfall) --------------------
+        # Each (timestep, lead) is one sample. GT tiles come from
+        # build_full_gt (int32 class canvas with -1 for missing lead
+        # data — clip to 0 for the aggregate so out-of-domain reads as
+        # dry rather than an invalid class).
+        if (is_rainfall and row3_canvases is not None
+                and raw_class_canvases is not None):
+            for t in range(len(gt_canvases)):
+                gt_clean = np.where(gt_canvases[t] < 0, 0,
+                                    gt_canvases[t]).astype(np.int32)
+                raw_clean = np.where(raw_class_canvases[t] < 0, 0,
+                                     raw_class_canvases[t]).astype(np.int32)
+                agg_gt.append(gt_clean)
+                agg_raw.append(raw_clean)
+                agg_hyst.append(row3_canvases[t].astype(np.int32))
+                agg_raw_soft.append(raw_soft_canvases[t])
 
         safe_ref = ref_utc.replace(":", "")
         out_png = output_dir / f"ts{rank:02d}_{date_str}_{safe_ref}.png"
         plot_full_domain(
-            gt_canvases, pred_canvases, valid_patches, label_type,
+            gt_canvases, pred_canvases, csv_active, label_type,
             date_str=date_str, ref_utc=ref_utc,
             threshold=threshold, output_path=out_png,
             step_minutes=step_minutes,
+            row3_canvases=row3_canvases,
+            postproc_low=(args.lightning_low_threshold if is_lightning
+                          else args.rainfall_low_threshold),
+            postproc_high_per_lead=(high_per_lead if is_lightning else None),
+            postproc_high=(args.rainfall_high_threshold
+                           if is_rainfall else None),
         )
         print(f"  Saved -> {out_png}")
 
         # Zoom plot: the qualifying patch with the most GT activity.
         if not args.no_zoom:
             best_patch, best_score = find_highest_activity_patch(
-                gt_canvases, valid_patches, label_type,
+                gt_canvases, csv_active, label_type,
             )
             zoom_png = (
                 output_dir
@@ -1323,9 +2512,43 @@ def main() -> int:
                 label_type, date_str=date_str, ref_utc=ref_utc,
                 threshold=threshold, output_path=zoom_png,
                 step_minutes=step_minutes,
+                row3_canvases=row3_canvases,
+                postproc_low=(args.lightning_low_threshold if is_lightning
+                              else args.rainfall_low_threshold),
+                postproc_high_per_lead=(high_per_lead if is_lightning
+                                        else None),
+                postproc_high=(args.rainfall_high_threshold
+                               if is_rainfall else None),
             )
             print(f"  Zoom  -> {zoom_png}  "
                   f"(patch #{best_patch}, GT activity={best_score} px)")
+
+    # -------------------- Aggregate rainfall comparison graphs --------------------
+    if is_rainfall and not args.no_aggregate_graphs and agg_raw:
+        n_samples = len(agg_raw)
+        print(f"\nBuilding aggregate rainfall graphs over {n_samples} samples "
+              f"({args.top_n} timesteps × 3 leads)...")
+        pc_paths = plot_rainfall_pc_hist(
+            agg_raw_soft, agg_raw, agg_hyst,
+            output_dir=output_dir, top_n=args.top_n,
+        )
+        for p in pc_paths:
+            print(f"  Saved -> {p}")
+        html_dir = output_dir / "aggregate_pc_hist_3d"
+        html_dir.mkdir(exist_ok=True)
+        written = plot_rainfall_pc_hist_3d(
+            agg_raw_soft, agg_raw, agg_hyst,
+            output_dir=html_dir, top_n=args.top_n,
+        )
+        if written:
+            print(f"  Saved {len(written)} interactive 3D HTML(s) "
+                  f"-> {html_dir}")
+        dist_png = output_dir / "aggregate_class_count_distribution.png"
+        plot_rainfall_class_count_distribution(
+            agg_gt, agg_raw, agg_hyst,
+            output_path=dist_png, top_n=args.top_n,
+        )
+        print(f"  Saved -> {dist_png}")
 
     print(f"\nDone. {len(df_top)} figure(s) written under {output_dir}")
     return 0
