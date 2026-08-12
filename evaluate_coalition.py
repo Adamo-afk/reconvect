@@ -1421,14 +1421,21 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
 # ============================================================================
 
 def plot_training_history(history_path, output_dir):
-    """Load and plot training history from JSON."""
+    """Load and plot training history from JSON.
+
+    Supports both the base/finetuned schema (mode/wall_times/total_wall_time)
+    and the KD-student schema written by train_lightning_kd.py
+    (student_mode/epoch_wall_times/wall_time_sec) — the plotter itself
+    doesn't need to know which one; it just picks up whatever keys are
+    present so both curve families come out looking the same.
+    """
     with open(history_path) as f:
         data = json.load(f)
 
     history = data["history"]
-    mode = data["mode"]
-    wall_times = data.get("wall_times", [])
-    total_wall = data.get("total_wall_time", 0)
+    mode = data.get("mode") or data.get("student_mode", "?")
+    wall_times = data.get("wall_times") or data.get("epoch_wall_times", [])
+    total_wall = data.get("total_wall_time") or data.get("wall_time_sec", 0)
 
     # Determine which metrics to plot
     loss_keys = [k for k in history if "loss" in k]
@@ -1515,12 +1522,15 @@ def plot_training_history(history_path, output_dir):
 def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
              threshold=None, plot_threshold=0.5,
              plot_date=None, plot_hour=None, split="test",
-             source="dbscan", finetuned=False):
+             source="dbscan", finetuned=False, kd=False):
     """Run full evaluation pipeline.
 
     Args:
         mode: one of the entries in TRAINING_MODES (e.g.
             `mtg_lightning_opera_occurrence`, `mtg_opera_mtgmr`).
+            When kd=True, this is the STUDENT mode (e.g.
+            `mtg_opera_occurrence`); the teacher's dataset is used
+            for evaluation.
         data_root: path to our_data/ containing datasets/{mode}_{source}/
         model_dir: path to directory containing trained model and history
         output_dir: where to save evaluation results and plots
@@ -1535,19 +1545,100 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             `history_<mode>_<source>_finetuned.json`) instead of the
             base model. The dataset path is unchanged - the fine-tune
             stage trains against the same TFRecord shards.
+        kd: if True, evaluate the knowledge-distillation student saved
+            by train_lightning_kd.py (`coalition_<mode>_<source>_kd.keras`
+            / `history_<mode>_<source>_kd.json`). The student consumes
+            a subset of the teacher's inputs, so the teacher's dataset
+            dir (extracted from the KD history JSON) is loaded and
+            past_hr is sliced to STUDENT_HR_CHANNELS before batching.
+            Mutually exclusive with finetuned.
     """
+    if kd and finetuned:
+        raise ValueError(
+            "kd=True and finetuned=True are mutually exclusive: the KD "
+            "student is trained fresh (no swin head), so there is no "
+            "'finetuned KD' variant. Pass one or neither."
+        )
     data_root = Path(data_root)
     model_dir = Path(model_dir)
-    run_tag = f"{mode}_{source}"
-    artifact_tag = f"{run_tag}_finetuned" if finetuned else run_tag
+    # Central naming (inserts "rainfall" for radar-labelled modes). We
+    # also compute the legacy tag so pre-migration checkpoints, history
+    # files, and dataset dirs still resolve — matches the fallback logic
+    # in visualize_gt_vs_pred.load_model_artifact.
+    from train_models import build_run_tag, legacy_run_tag as _legacy_tag
+    run_tag = build_run_tag(mode, source)
+    legacy_tag = _legacy_tag(mode, source)
+    variant_suffix = ("_finetuned" if finetuned
+                      else "_kd" if kd
+                      else "")
+    artifact_tag = f"{run_tag}{variant_suffix}"
+    legacy_artifact_tag = f"{legacy_tag}{variant_suffix}"
     output_dir = Path(output_dir) / f"eval_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_read(dir_root: Path, kind_prefix: str, kind_suffix: str,
+                     is_dir: bool = False) -> Path:
+        """Return the new-name path if it exists, else the legacy path if
+        that exists, else the new-name path (so the caller emits the
+        canonical error message)."""
+        new = dir_root / f"{kind_prefix}{run_tag}{kind_suffix}"
+        legacy = dir_root / f"{kind_prefix}{legacy_tag}{kind_suffix}"
+        exists = (Path.is_dir if is_dir else Path.is_file)
+        if not exists(new) and exists(legacy):
+            print(f"NOTE: using legacy-named {legacy.name}. "
+                  f"Rename to {new.name} to adopt the new naming.")
+            return legacy
+        return new
+
+    # KD student was trained on the TEACHER's dataset (past_hr sliced at
+    # forward time). At eval, we need the teacher's dataset dir here too;
+    # we look up teacher_mode from the KD history JSON so this stays
+    # self-describing (train_lightning_kd writes teacher_mode into the
+    # history), avoiding a hardcoded STUDENT->TEACHER map.
+    kd_student_hr_channels: int | None = None
+    kd_teacher_run_tag: str | None = None
+    if kd:
+        kd_hist_path = model_dir / f"history_{artifact_tag}.json"
+        if not kd_hist_path.is_file():
+            legacy_hist = model_dir / f"history_{legacy_artifact_tag}.json"
+            if legacy_hist.is_file():
+                kd_hist_path = legacy_hist
+            else:
+                raise FileNotFoundError(
+                    f"KD history not found: {kd_hist_path}. Train the student "
+                    f"first via train_lightning_kd.py."
+                )
+        with open(kd_hist_path) as f:
+            kd_hist = json.load(f)
+        teacher_mode = kd_hist.get("teacher_mode")
+        if not teacher_mode:
+            raise SystemExit(
+                f"{kd_hist_path} has no `teacher_mode`. Re-train the KD "
+                f"student with the current train_lightning_kd.py, which "
+                f"writes teacher_mode into the history JSON."
+            )
+        kd_student_hr_channels = int(kd_hist.get("student_hr_channels", 1))
+        kd_teacher_run_tag = build_run_tag(teacher_mode, source)
+        kd_teacher_legacy_tag = _legacy_tag(teacher_mode, source)
+        # Datasets dir points at the TEACHER, not the student.
+        teacher_new = data_root / "datasets" / kd_teacher_run_tag
+        teacher_legacy = data_root / "datasets" / kd_teacher_legacy_tag
+        if not teacher_new.is_dir() and teacher_legacy.is_dir():
+            print(f"NOTE: using legacy teacher dataset dir "
+                  f"{teacher_legacy.name}. Rename to {teacher_new.name}.")
+            dataset_root = teacher_legacy
+        else:
+            dataset_root = teacher_new
+    else:
+        dataset_root = _resolve_read(
+            data_root / "datasets", "", "", is_dir=True,
+        )
 
     # Authoritative label_type comes from the dataset's metadata.json
     # (written by create_datasets.py). Mode-name heuristics misclassify
     # modes like `mtg_lightning_opera` which has 'lightning' in its name
     # but targets OPERA 5-class rainfall.
-    meta_path = data_root / "datasets" / run_tag / split / "metadata.json"
+    meta_path = dataset_root / split / "metadata.json"
     if meta_path.is_file():
         with open(meta_path) as f:
             label_type = json.load(f).get(
@@ -1557,14 +1648,21 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     else:
         label_type = "lightning" if "lightning" in mode else "radar"
 
+    variant_label = ("finetuned" if finetuned
+                     else "KD student" if kd
+                     else "base")
     print("=" * 70)
     print(f"COALITION-4 Evaluation - Mode: {mode}  Source: {source}  "
-          f"{'(finetuned)' if finetuned else '(base)'}")
+          f"({variant_label})")
     print("=" * 70)
     print(f"  Label type:    {label_type}")
     print(f"  Split:         {split}")
     print(f"  Threshold:     {threshold if threshold is not None else 'optimize on validation'}")
     print(f"  Plot thresh:   {plot_threshold}")
+    if kd:
+        print(f"  KD teacher:    {teacher_mode}  "
+              f"(dataset: {dataset_root.name})")
+        print(f"  KD student HR channels: {kd_student_hr_channels}")
 
     SPLIT_CSV = {
         "train":      f"train_data_{source}.csv",
@@ -1574,17 +1672,30 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     csv_name = SPLIT_CSV[split]
 
     # ---- 1. Plot training history ----
-    history_path = model_dir / f"history_{artifact_tag}.json"
+    history_new = model_dir / f"history_{artifact_tag}.json"
+    history_legacy = model_dir / f"history_{legacy_artifact_tag}.json"
+    history_path = (history_new if history_new.is_file()
+                    or not history_legacy.is_file()
+                    else history_legacy)
     if history_path.is_file():
+        if history_path == history_legacy:
+            print(f"NOTE: using legacy-named history file {history_path.name}. "
+                  f"Rename to {history_new.name} to adopt the new naming.")
         print(f"\n1. Plotting training history from {history_path}")
         plot_training_history(history_path, output_dir)
     else:
         print(f"\n1. WARNING: History file not found: {history_path}")
 
     # ---- 2. Load model (with mixed precision matching training) ----
-    model_path = model_dir / f"coalition_{artifact_tag}.keras"
+    model_new = model_dir / f"coalition_{artifact_tag}.keras"
+    model_legacy = model_dir / f"coalition_{legacy_artifact_tag}.keras"
+    model_path = (model_new if model_new.is_file() or not model_legacy.is_file()
+                  else model_legacy)
     if not model_path.is_file():
-        raise FileNotFoundError(f"Model not found: {model_path}")
+        raise FileNotFoundError(f"Model not found: {model_new}")
+    if model_path == model_legacy:
+        print(f"NOTE: loading legacy-named checkpoint {model_path.name}. "
+              f"Rename to {model_new.name} to adopt the new naming.")
 
     print(f"\n2. Loading model from {model_path}")
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
@@ -1623,7 +1734,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         # uses, then call `model.load_weights(...)` which matches by name
         # (not by index). Requires the base checkpoint path because the
         # backbone is loaded fresh from there.
-        base_ckpt = model_dir / f"coalition_{run_tag}.keras"
+        base_ckpt = _resolve_read(model_dir, "coalition_", ".keras")
         if not base_ckpt.is_file():
             raise FileNotFoundError(
                 f"Fine-tune evaluation needs the base checkpoint at "
@@ -1677,21 +1788,41 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     print(f"  Model loaded: {model.count_params():,} parameters")
 
     # ---- 3. Load datasets ----
-    eval_dir = data_root / "datasets" / run_tag / split
+    eval_dir = dataset_root / split
     if not eval_dir.exists():
         raise FileNotFoundError(f"{split.capitalize()} dataset not found: {eval_dir}")
 
+    # KD input adapter: student's forward expects the teacher-format batch
+    # projected down to STUDENT_HR_CHANNELS on past_hr (the vis_06 slice
+    # kept as the last channel by create_datasets.HR_LIGHTNING_CONFIG).
+    # past_mr passes through unchanged. Matches KDModel._student_inputs
+    # in train_lightning_kd.py — inference reproduces training-time
+    # boundary conditions exactly.
+    _kd_adapt_inputs = None
+    if kd:
+        _hr_ch = kd_student_hr_channels
+        def _kd_adapt_inputs(inputs: dict, y: tf.Tensor):
+            new_inputs = dict(inputs)
+            new_inputs["past_hr"] = inputs["past_hr"][..., -_hr_ch:]
+            return new_inputs, y
+
     print(f"\n3. Loading {split} dataset from {eval_dir}")
     eval_ds = _load_split(eval_dir)
+    if kd:
+        eval_ds = eval_ds.map(_kd_adapt_inputs,
+                              num_parallel_calls=tf.data.AUTOTUNE)
     eval_ds = eval_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     # Load validation dataset if threshold optimization needed
     val_ds = None
     if label_type == "lightning" and threshold is None:
-        val_dir = data_root / "datasets" / run_tag / "validation"
+        val_dir = dataset_root / "validation"
         if val_dir.exists():
             print(f"  Loading validation dataset for threshold optimization...")
             val_ds = _load_split(val_dir)
+            if kd:
+                val_ds = val_ds.map(_kd_adapt_inputs,
+                                    num_parallel_calls=tf.data.AUTOTUNE)
             val_ds = val_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
         else:
             print(f"  WARNING: Validation dataset not found at {val_dir}")
@@ -1710,17 +1841,27 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
 
     # ---- 5. Visualize predictions ----
     if plot_date and plot_hour is not None:
-        print(f"\n5. Visualizing predictions for {plot_date} hour {plot_hour}:00 "
-              f"(from {csv_name})...")
-        try:
-            plot_predictions_for_date_hour(model, mode, data_root,
-                                            output_dir, plot_date, plot_hour,
-                                            plot_threshold=plot_threshold,
-                                            csv_name=csv_name,
-                                            label_type=label_type,
-                                            source=source)
-        except Exception as e:
-            print(f"  Skipping visualization: {e}")
+        if kd:
+            # plot_predictions_for_date_hour loads full-domain inputs via
+            # the teacher's mode config; the student expects the sliced
+            # HR channel(s), so the shapes wouldn't line up. Skip cleanly
+            # and point the user at predict_full_domain --kd for full-
+            # canvas KD-student plots.
+            print(f"\n5. Skipping visualization for KD student "
+                  f"(input shape mismatch with teacher's plot loader). "
+                  f"Use predict_full_domain.py --kd for KD-student plots.")
+        else:
+            print(f"\n5. Visualizing predictions for {plot_date} hour {plot_hour}:00 "
+                  f"(from {csv_name})...")
+            try:
+                plot_predictions_for_date_hour(model, mode, data_root,
+                                                output_dir, plot_date, plot_hour,
+                                                plot_threshold=plot_threshold,
+                                                csv_name=csv_name,
+                                                label_type=label_type,
+                                                source=source)
+            except Exception as e:
+                print(f"  Skipping visualization: {e}")
     else:
         print(f"\n5. Skipping visualization (use --date and --hour to enable)")
 
@@ -1728,15 +1869,18 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     results["mode"] = mode
     results["source"] = source
     results["finetuned"] = finetuned
+    results["kd"] = kd
     results["label_type"] = label_type
     results["split"] = split
     results["model_params"] = model.count_params()
 
-    # Load history for wall time info
+    # Load history for wall time info. The base/finetuned schema uses
+    # `total_wall_time`; the KD schema uses `wall_time_sec` — try both.
     if history_path.is_file():
         with open(history_path) as f:
             hist_data = json.load(f)
-        results["training_wall_time"] = hist_data.get("total_wall_time")
+        results["training_wall_time"] = (hist_data.get("total_wall_time")
+                                         or hist_data.get("wall_time_sec"))
         results["epochs_completed"] = hist_data.get("epochs_completed")
 
     results_path = output_dir / f"evaluation_results.json"
@@ -1788,13 +1932,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate trained COALITION-4 model on test set."
     )
+    from train_models import all_mode_choices
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                 "mtg_lightning_opera", "mtg_lightning_opera_occurrence"],
+        choices=all_mode_choices([
+            "mtg_lightning", "mtg_radar", "mtg_radar_continuous",
+            "mtg_opera_radar_only", "mtg_opera_mtgmr",
+            "mtg_lightning_opera", "mtg_lightning_opera_occurrence",
+            "mtg_opera_occurrence",
+        ]),
         help="Model variant to evaluate. Matches the modes registered "
-             "in train_models.TRAINING_MODES and create_datasets."
+             "in train_models.TRAINING_MODES and create_datasets. For "
+             "the KD student, pass its student mode (e.g. "
+             "mtg_opera_occurrence) together with --kd. Rainfall-track "
+             "modes accept an optional `_rainfall` suffix mirroring "
+             "the on-disk run-tag naming."
     )
     parser.add_argument(
         "--source", type=str, default="dbscan",
@@ -1812,6 +1964,16 @@ def main():
              "(coalition_<mode>_<source>_finetuned.keras) instead of "
              "the base coalition_<mode>_<source>.keras. Dataset path "
              "and label_type are unchanged."
+    )
+    parser.add_argument(
+        "--kd", action="store_true",
+        help="Evaluate the knowledge-distillation student "
+             "(coalition_<mode>_<source>_kd.keras / "
+             "history_<mode>_<source>_kd.json) saved by "
+             "train_lightning_kd.py. The teacher's dataset (looked up "
+             "from teacher_mode in the KD history) is used for "
+             "evaluation, and past_hr is sliced to student_hr_channels "
+             "before batching. Mutually exclusive with --finetuned."
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
@@ -1854,6 +2016,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.kd and args.finetuned:
+        parser.error("--kd and --finetuned are mutually exclusive.")
+
     evaluate(
         mode=args.mode,
         data_root=args.data_root,
@@ -1867,6 +2032,7 @@ def main():
         split=args.split,
         source=args.source,
         finetuned=args.finetuned,
+        kd=args.kd,
     )
 
 

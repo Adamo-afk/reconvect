@@ -162,9 +162,64 @@ def _is_rainfall_mode(mode: str) -> bool:
     return mode in _RAINFALL_MODES
 
 
+_RAINFALL_ALIAS_SUFFIX = "_rainfall"
+
+
+def normalize_mode(mode: str) -> str:
+    """Resolve a `<mode>_rainfall` alias down to the canonical mode name.
+
+    Users see run-tag filenames like `mtg_lightning_opera_rainfall_dbscan`
+    on disk, so it's natural to type `--mode mtg_lightning_opera_rainfall`
+    to match. The canonical mode registry (create_datasets.get_mode_config)
+    still keys off the shorter `mtg_lightning_opera` form — this helper
+    strips the alias suffix when (and only when) the base is a
+    rainfall-track mode, so the two forms are interchangeable at every
+    entry point.
+
+    Lightning modes already carry their track descriptor in the name
+    (`_occurrence`), so nothing needs to change for them.
+    """
+    if mode.endswith(_RAINFALL_ALIAS_SUFFIX):
+        base = mode[: -len(_RAINFALL_ALIAS_SUFFIX)]
+        if _is_rainfall_mode(base):
+            return base
+    return mode
+
+
+def rainfall_mode_alias(mode: str) -> str:
+    """Return the user-facing `_rainfall`-suffixed alias for a rainfall
+    mode; the same string for lightning modes. Inverse of normalize_mode
+    on the alias half of the mapping."""
+    canonical = normalize_mode(mode)
+    if _is_rainfall_mode(canonical):
+        return f"{canonical}{_RAINFALL_ALIAS_SUFFIX}"
+    return canonical
+
+
+def all_mode_choices(base_modes) -> list[str]:
+    """Given an iterable of canonical mode names, return the list expanded
+    with the `_rainfall`-suffixed alias for each rainfall-track mode.
+    Meant to feed `argparse`'s `choices=` so both forms are accepted at
+    the CLI. Order is preserved and duplicates are stripped."""
+    out: list[str] = []
+    for m in base_modes:
+        if m not in out:
+            out.append(m)
+        alias = rainfall_mode_alias(m)
+        if alias != m and alias not in out:
+            out.append(alias)
+    return out
+
+
 def build_run_tag(mode: str, source: str) -> str:
     """Return the filename tag used for saved model artefacts. Inserts
-    "rainfall" for radar-labelled modes; leaves lightning modes alone."""
+    "rainfall" for radar-labelled modes; leaves lightning modes alone.
+
+    Idempotent w.r.t. the `_rainfall`-suffixed alias: passing
+    `mtg_lightning_opera_rainfall` produces the same tag as passing
+    `mtg_lightning_opera`, so callers don't need to normalize first.
+    """
+    mode = normalize_mode(mode)
     if _is_rainfall_mode(mode):
         return f"{mode}_rainfall_{source}"
     return f"{mode}_{source}"
@@ -173,7 +228,7 @@ def build_run_tag(mode: str, source: str) -> str:
 def legacy_run_tag(mode: str, source: str) -> str:
     """The old naming scheme (no 'rainfall' insertion). Kept as a
     fallback for loaders so pre-migration checkpoints still work."""
-    return f"{mode}_{source}"
+    return f"{normalize_mode(mode)}_{source}"
 
 
 # =============================================================================

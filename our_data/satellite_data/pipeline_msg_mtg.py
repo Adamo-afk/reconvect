@@ -923,10 +923,12 @@ if __name__ == "__main__":
     data_dir = args.output_dir or os.path.join(script_dir, 'MTG')
     os.makedirs(data_dir, exist_ok=True)
 
-    # Resolve products file
+    # Resolve products file relative to the script dir (anchoring to
+    # the caller's cwd would silently drop the default when running
+    # from anywhere other than our_data/satellite_data/).
     products_file = args.products_file
     if not os.path.isabs(products_file):
-        products_file = os.path.join(base_dir, products_file)
+        products_file = os.path.join(script_dir, products_file)
 
     # Print summary
     print(f"Date range     : {args.start} to {args.end}")

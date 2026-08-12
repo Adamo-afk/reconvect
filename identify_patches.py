@@ -575,6 +575,109 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     return save_path
 
 
+def plot_binary_mask_selection(binary_mask, active_patches,
+                               date_str, time_str, output_dir):
+    """Single-panel view of the DBSCAN binary mask + the 18-patch
+    "polygon" of candidate 256x256 tiles that feed the model.
+
+    Separate from `plot_patch_grid` on purpose: that function is the
+    2-panel operational figure (OPERA rain rate + binary mask, red-
+    highlighted selection) and stays untouched. This one focuses on
+    the SELECTION step:
+
+      - Binary mask underneath (gray / red).
+      - Orange dashed rectangles outlining EVERY one of the 18
+        256x256 candidate patches — together they form the full
+        6x3 polygon of positions the pipeline can pick from.
+      - Each patch labelled with its 1..18 number (upper-left = 1,
+        row-major) coloured green when the patch was selected by
+        DBSCAN (`in active_patches`) and red when it was rejected.
+        Matches the green/red numbering convention already used by
+        the full-domain training/inference plots so a viewer switching
+        between the two sets of figures reads them the same way.
+
+    Args:
+        binary_mask: (768, 1536) uint8 — the DBSCAN binary mask.
+        active_patches: list of 1-indexed patch numbers selected by
+            `identify_active_patches`.
+        date_str: 'YYYY-MM-DD'
+        time_str: 'HH:MM'
+        output_dir: directory to save the PNG.
+
+    Returns:
+        Absolute path to the written PNG.
+    """
+    _ensure_borders_cached()
+    c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 7), constrained_layout=True)
+
+    # Binary mask: dry = light gray so the orange grid + red mask pixels
+    # pop; DBSCAN cluster pixels stay in the operational red.
+    mask_cmap = ListedColormap(['#e6e6e6', '#d32f2f'])
+    ax.imshow(binary_mask, cmap=mask_cmap, vmin=0, vmax=1,
+              aspect='equal', interpolation='nearest')
+
+    active_set = set(active_patches)
+
+    # Orange dashed grid — one rectangle per candidate 256x256 patch.
+    # The 18 rectangles together outline the "selection polygon" the
+    # pipeline picks from.
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        ax.add_patch(Rectangle(
+            (c0, r0), PATCH_SIZE, PATCH_SIZE,
+            linewidth=1.4, edgecolor='#ff8c00',
+            linestyle=(0, (4, 3)), facecolor='none',
+            zorder=4,
+        ))
+
+    # Green (active) / red (inactive) numbering — same colour codes as
+    # visualize_gt_vs_pred._plot_patch_grid so the two figure families
+    # read identically.
+    for p in range(1, N_PATCHES + 1):
+        r0, _, c0, _ = get_patch_bounds(p)
+        is_active = p in active_set
+        ax.text(
+            c0 + 6, r0 + 6, str(p),
+            color='#1b7a1b' if is_active else '#c11515',
+            fontsize=10, fontweight='bold',
+            ha='left', va='top', zorder=6,
+            bbox=dict(boxstyle='round,pad=0.18',
+                      facecolor='white', alpha=0.85,
+                      edgecolor='#888888', linewidth=0.4),
+        )
+
+    try:
+        _overlay_borders(ax)
+    except Exception:
+        pass
+
+    ax.set_xticks([]); ax.set_yticks([])
+    ax.set_xlim(c_lo, c_hi)
+    ax.set_ylim(r_hi, r_lo)  # image y is flipped
+    ax.set_aspect('equal')
+    ax.set_title('DBSCAN binary mask + 18-patch candidate polygon',
+                 fontsize=11)
+
+    n_active = len(active_patches)
+    patches_str = ', '.join(str(p) for p in active_patches) if active_patches else 'none'
+    fig.suptitle(
+        f'Patch selection  |  {date_str}  {time_str} UTC  |  '
+        f'active: {n_active}/{N_PATCHES}  → [{patches_str}]',
+        fontsize=12, fontweight='bold',
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+    safe_time = time_str.replace(':', '')
+    filename = f"patches_{date_str}_{safe_time}_selection.png"
+    save_path = os.path.join(output_dir, filename)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+    return save_path
+
+
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                         date_str, time_str, output_dir, source,
                         data_root):
@@ -1004,6 +1107,13 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                     plot_patch_grid(
                         reprojected, binary_mask, active, d, t, plot_dir,
                         source=source,
+                    )
+                    # Sibling `_selection.png` file — binary mask +
+                    # orange 6x3 candidate polygon + green/red patch
+                    # numbering. Companion to plot_patch_grid, not a
+                    # replacement (the 2-panel figure stays untouched).
+                    plot_binary_mask_selection(
+                        binary_mask, active, d, t, plot_dir,
                     )
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
