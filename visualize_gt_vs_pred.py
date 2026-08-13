@@ -55,7 +55,7 @@ Example commands
     # OPERA 5-class on the lightning-driven split CSV
     python visualize_gt_vs_pred.py \
         --csv our_data/validation_data_lightning.csv \
-        --mode mtg_opera_mtgmr \
+        --mode mtg_opera_mtgmr_rainfall \
         --source lightning --top_n 3
 
 Outputs land under
@@ -92,6 +92,8 @@ from create_datasets import (
     set_normalization_stats_path,
     LABEL_CHANNELS,
 )
+
+from pipeline_config import SOURCE
 
 # ============================================================================
 # Geometry constants (must mirror identify_patches / extract_patches)
@@ -387,8 +389,8 @@ def build_batch_inputs(row, patches_dir: str, mode_config: dict,
     """Build a single batched inputs dict for every qualifying patch in `row`.
 
     Returns:
-        inputs_dict: keys are model input names ("past_hr", "past_mr",
-                     "past_lr"), each value an np.ndarray of shape
+        inputs_dict: keys are model input names ("past_hr", "past_mr"),
+                     each value an np.ndarray of shape
                      (N_valid, 3, H, W, C). Skipped patches (any input
                      timestep missing) are dropped from the batch.
         valid_patches: list of patch_numbers (1-indexed) actually in the
@@ -403,7 +405,7 @@ def build_batch_inputs(row, patches_dir: str, mode_config: dict,
                    for off in INPUT_STEP_OFFSETS]
 
     input_groups: dict[str, tuple] = {}
-    for key in ("past_hr", "past_mr", "past_lr"):
+    for key in ("past_hr", "past_mr"):
         cfg = mode_config.get(key)
         if cfg is not None:
             input_groups[key] = cfg
@@ -1995,27 +1997,15 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
             "'finetuned KD' variant does not exist. Pass one or neither."
         )
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
-    # Central naming helper (inserts "rainfall" for radar-labelled modes).
-    # For backwards compatibility with pre-migration checkpoints saved as
-    # coalition_{mode}_{source}.keras (no rainfall insertion), we compute
-    # both tags and fall back to the legacy one whenever the new-name
-    # file is missing on disk. Deferred import so this module doesn't
+    # Central naming helper. Deferred import so this module doesn't
     # depend on train_models at import time.
-    from train_models import build_run_tag, legacy_run_tag
+    from train_models import build_run_tag
     run_tag = build_run_tag(mode, source)
-    legacy_tag = legacy_run_tag(mode, source)
 
     def _resolve(kind_suffix: str) -> Path:
-        """Return the (new-naming) path, falling back to the legacy path
-        if the new-name file isn't on disk. `kind_suffix` is "" for base,
+        """Artefact path for this run tag. `kind_suffix` is "" for base,
         "_finetuned", "_kd", etc."""
-        new_path = model_dir / f"coalition_{run_tag}{kind_suffix}.keras"
-        legacy_path = model_dir / f"coalition_{legacy_tag}{kind_suffix}.keras"
-        if not new_path.is_file() and legacy_path.is_file():
-            print(f"NOTE: loading legacy-named checkpoint {legacy_path.name}. "
-                  f"Rename to {new_path.name} to adopt the new naming.")
-            return legacy_path
-        return new_path
+        return model_dir / f"coalition_{run_tag}{kind_suffix}.keras"
 
     base_path = _resolve("")
 
@@ -2042,10 +2032,7 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
 
     ft_path = _resolve("_finetuned")
     # History JSON follows the same tag as the finetuned checkpoint.
-    hist_new = model_dir / f"history_{run_tag}_finetuned.json"
-    hist_legacy = model_dir / f"history_{legacy_tag}_finetuned.json"
-    history_path = (hist_new if hist_new.is_file() or not hist_legacy.is_file()
-                    else hist_legacy)
+    history_path = model_dir / f"history_{run_tag}_finetuned.json"
     if not ft_path.is_file():
         raise FileNotFoundError(f"Fine-tuned model not found: {ft_path}")
     if not base_path.is_file():
@@ -2122,23 +2109,8 @@ def resolve_threshold(label_type: str, mode: str, source: str,
             run_tag = f"{run_tag}_finetuned"
         elif kd:
             run_tag = f"{run_tag}_kd"
-        new_path = Path("evaluation") / f"eval_{run_tag}" / "evaluation_results.json"
-        # Legacy-name fallback (dir created before build_run_tag inserted
-        # "rainfall" for rainfall-track modes). Only used when the new
-        # dir is not on disk.
-        legacy_run_tag = f"{mode}_{source}"
-        if finetuned:
-            legacy_run_tag = f"{legacy_run_tag}_finetuned"
-        elif kd:
-            legacy_run_tag = f"{legacy_run_tag}_kd"
-        legacy_path = (Path("evaluation") / f"eval_{legacy_run_tag}"
-                       / "evaluation_results.json")
-        if new_path.is_file() or not legacy_path.is_file():
-            eval_results_path = new_path
-        else:
-            print(f"  Note: using legacy eval dir {legacy_path.parent}. "
-                  f"Rename to {new_path.parent.name} to match the new run-tag.")
-            eval_results_path = legacy_path
+        eval_results_path = (Path("evaluation") / f"eval_{run_tag}"
+                             / "evaluation_results.json")
 
     if eval_results_path.is_file():
         with open(eval_results_path) as f:
@@ -2166,21 +2138,20 @@ def main() -> int:
     parser.add_argument("--csv", required=True, type=str,
                         help="Path to a per-source split CSV "
                              "(train/validation/test_data_<source>.csv).")
-    from train_models import all_mode_choices
     parser.add_argument("--mode", required=True, type=str,
-                        choices=all_mode_choices([
-                            "mtg_lightning", "mtg_radar",
-                            "mtg_radar_continuous",
-                            "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                            "mtg_lightning_opera",
+                        choices=[
+                            "mtg_lightning",
+                            "mtg_radar_rainfall",
+                            "mtg_radar_continuous_rainfall",
+                            "mtg_opera_radar_only_rainfall",
+                            "mtg_opera_mtgmr_rainfall",
+                            "mtg_lightning_opera_rainfall",
                             "mtg_lightning_opera_occurrence",
                             "mtg_opera_occurrence",
-                        ]),
-                        help="Model variant. Rainfall-track modes accept "
-                             "an optional `_rainfall` suffix that mirrors "
-                             "the on-disk run-tag naming.")
-    parser.add_argument("--source", type=str, default="dbscan",
-                        choices=["dbscan", "lightning"])
+                        ],
+                        help="Model variant. The name states its own track: "
+                             "`_rainfall` for the OPERA 5-class head, "
+                             "`_occurrence` for the lightning binary head.")
     parser.add_argument("--top_n", type=int, default=5,
                         help="How many of the highest-patch-count rows to "
                              "plot (default 5).")
@@ -2277,9 +2248,9 @@ def main() -> int:
     # from sequence_meta_<source>.json; set_normalization_stats_path
     # points the lazy stats loader at normalization_stats_<source>.json
     # (required - the transforms in create_datasets read those stats).
-    init_sequence_config(str(data_root), args.source)
+    init_sequence_config(str(data_root), SOURCE)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{args.source}.json"
+        data_root / f"normalization_stats_{SOURCE}.json"
     )
 
     mode_config = get_mode_config(args.mode)
@@ -2287,7 +2258,7 @@ def main() -> int:
     step_minutes = _load_step_minutes(data_root)
 
     from train_models import build_run_tag  # local import: keep TF-heavy load lazy
-    run_tag = build_run_tag(args.mode, args.source)
+    run_tag = build_run_tag(args.mode, SOURCE)
     variant_suffix = ("_finetuned" if args.finetuned
                       else "_kd" if args.kd
                       else "")
@@ -2303,13 +2274,13 @@ def main() -> int:
     print("=" * 70)
     print(f"  CSV:         {csv_path}")
     print(f"  Mode:        {args.mode}  (label_type={label_type})")
-    print(f"  Source:      {args.source}  ({variant_label})")
+    print(f"  Source:      {SOURCE}  ({variant_label})")
     print(f"  Top N:       {args.top_n}")
     print(f"  Step (min):  {step_minutes}")
     print(f"  Output dir:  {output_dir}")
 
     threshold = resolve_threshold(
-        label_type, args.mode, args.source, args.finetuned,
+        label_type, args.mode, SOURCE, args.finetuned,
         args.threshold,
         Path(args.eval_results) if args.eval_results else None,
         kd=args.kd,
@@ -2317,7 +2288,7 @@ def main() -> int:
 
     print(f"\nLoading model...")
     model = load_model_artifact(
-        Path(args.model_dir), args.mode, args.source, args.finetuned,
+        Path(args.model_dir), args.mode, SOURCE, args.finetuned,
         kd=args.kd,
     )
     print(f"  Loaded: {model.count_params():,} parameters")

@@ -126,6 +126,8 @@ from lightning_postproc import (
     hysteresis_binary,
 )
 
+from pipeline_config import SOURCE
+
 
 # Threshold above which a rainfall pixel is considered "active" convection.
 # Same value across selection, coverage IoU, and the binary FAR/POD/CSI event.
@@ -2541,11 +2543,9 @@ def main() -> int:
                              "visualization mode against the JSON "
                              "produced by an earlier extraction run.")
     parser.add_argument("--mode", type=str,
-                        default="mtg_lightning_opera",
+                        default="mtg_lightning_opera_rainfall",
                         help="Model mode name. Defaults to the heaviest "
                              "OPERA multiclass input stack.")
-    parser.add_argument("--source", type=str, default="dbscan",
-                        choices=["dbscan", "lightning"])
     parser.add_argument("--finetuned", action="store_true",
                         help="Load coalition_<mode>_<source>_finetuned.keras "
                              "(rebuilt + load_weights via train_models."
@@ -2628,7 +2628,7 @@ def main() -> int:
         if args.date is None:
             run_extraction(
                 args.track, args.year, args.month,
-                args.mode, args.source, args.finetuned,
+                args.mode, SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
@@ -2640,14 +2640,14 @@ def main() -> int:
             # is likewise a selection-time knob and has no effect here.
             run_visualization(
                 args.track, args.year, args.month, args.date,
-                args.mode, args.source, args.finetuned,
+                args.mode, SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
             )
     elif args.track == "lightning":
         if args.date is None:
             run_extraction_lightning(
                 args.year, args.month,
-                args.mode, args.source, args.finetuned,
+                args.mode, SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.lightning_low_threshold,
@@ -2659,7 +2659,7 @@ def main() -> int:
         else:
             run_visualization_lightning(
                 args.year, args.month, args.date,
-                args.mode, args.source, args.finetuned,
+                args.mode, SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.lightning_low_threshold,
@@ -2670,7 +2670,7 @@ def main() -> int:
         if args.date is None:
             run_extraction_kd(
                 args.year, args.month,
-                args.teacher_mode, args.student_mode, args.source,
+                args.teacher_mode, args.student_mode, SOURCE,
                 teacher_finetuned=args.teacher_finetuned,
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,
@@ -2683,7 +2683,7 @@ def main() -> int:
         else:
             run_visualization_kd(
                 args.year, args.month, args.date,
-                args.teacher_mode, args.student_mode, args.source,
+                args.teacher_mode, args.student_mode, SOURCE,
                 teacher_finetuned=args.teacher_finetuned,
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,

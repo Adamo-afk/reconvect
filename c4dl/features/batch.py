@@ -509,58 +509,25 @@ class PatchIndex:
             self._batch = np.zeros((n,)+self.sample_shape, self.patch_data.dtype)
         return self._batch
 
-    def __call__(self, t0_all, i0_all, j0_all, num_timesteps=None, save_diagnostics=False):
+    def __call__(self, t0_all, i0_all, j0_all, num_timesteps=None):
         n = len(t0_all)
         batch = self._alloc_batch(n)
         if num_timesteps is None:
             num_timesteps = self.box_size[0]
-        
+
         if self.static:
             t0_all = np.zeros_like(t0_all)
-        
-        # Prepare diagnostics if requested
-        if save_diagnostics:
-            from scripts.patch_stitching import StitchingDiagnostics
-            diagnostics = StitchingDiagnostics()
-        
+
         # Build at 256×256 resolution
-        if save_diagnostics:
-            # Build with diagnostics
-            found_patches, missing_patches = build_batch_with_diagnostics(
-                batch, self.patch_data,
-                self.patch_times_idx, self.patch_pixels_i, 
-                self.patch_pixels_j, self.patch_indices,
-                t0_all, num_timesteps, i0_all, j0_all,
-                self.box_size[1], self.box_size[2],
-                self.zero_value, self.missing_value, self.static
-            )
-            
-            # Save diagnostics for each sample
-            for sample_idx in range(n):
-                timestamp = self.t0 + t0_all[sample_idx] * self.dt
-                diagnostics.save_stitching_metadata(
-                    self.var_name, 
-                    int(t0_all[sample_idx]),
-                    int(i0_all[sample_idx]), 
-                    int(j0_all[sample_idx]),
-                    self.box_size,
-                    32,  # patch_size during stitching
-                    found_patches[sample_idx],
-                    missing_patches[sample_idx],
-                    batch[sample_idx, 0],  # First timestep
-                    timestamp
-                )
-        else:
-            # Build without diagnostics (faster)
-            build_batch(
-                batch, self.patch_data,
-                self.patch_times_idx, self.patch_pixels_i, 
-                self.patch_pixels_j, self.patch_indices,
-                t0_all, num_timesteps, i0_all, j0_all,
-                self.box_size[1], self.box_size[2],
-                self.zero_value, self.missing_value, self.static
-            )
-        
+        build_batch(
+            batch, self.patch_data,
+            self.patch_times_idx, self.patch_pixels_i,
+            self.patch_pixels_j, self.patch_indices,
+            t0_all, num_timesteps, i0_all, j0_all,
+            self.box_size[1], self.box_size[2],
+            self.zero_value, self.missing_value, self.static
+        )
+
         # Downscale if this was originally 8×8 data
         if self.final_output_size == 64:
             # Downscale from 256×256 to 64×64
@@ -576,120 +543,6 @@ class PatchIndex:
 IDX_ZERO = PatchIndex.IDX_ZERO
 IDX_MISSING = PatchIndex.IDX_MISSING
 GRID_SPACING = PatchIndex.GRID_SPACING
-
-@njit(parallel=False)  # Disable parallel for diagnostics to avoid race conditions
-def build_batch_with_diagnostics(
-    batch, patch_data,
-    patch_times_idx, patch_pixels_i, patch_pixels_j, patch_indices,
-    t0_all, num_timesteps, pixel_i0_all, pixel_j0_all,
-    box_size_i, box_size_j, zero_value, missing_value, static=False
-):
-    """
-    Build batch and collect diagnostic information
-    Returns: (found_patches_per_sample, missing_patches_per_sample)
-    """
-    n_samples = len(t0_all)
-    
-    # Initialize lists to collect diagnostics (one per sample)
-    # We'll use a workaround since numba doesn't support complex Python objects
-    # Return flat arrays that can be reshaped later
-    max_patches = box_size_i * box_size_j
-    
-    # Arrays to track found/missing patches
-    # Shape: (n_samples, max_patches, 4) for (i, j, patch_idx, mean_value)
-    found_info = np.zeros((n_samples, max_patches, 4), dtype=np.float32)
-    found_counts = np.zeros(n_samples, dtype=np.int32)
-    missing_info = np.zeros((n_samples, max_patches, 2), dtype=np.int32)
-    missing_counts = np.zeros(n_samples, dtype=np.int32)
-    
-    for k in range(n_samples):
-        t0 = t0_all[k]
-        t1 = t0 + num_timesteps
-        pixel_i0 = pixel_i0_all[k]
-        pixel_j0 = pixel_j0_all[k]
-        
-        found_idx = 0
-        missing_idx = 0
-        
-        for t in range(t0, t1):
-            bt = int(t-t0)
-            tt = int(t0 if static else t)
-            
-            for patch_i_idx in range(box_size_i):
-                for patch_j_idx in range(box_size_j):
-                    target_pi = pixel_i0 + patch_i_idx * GRID_SPACING
-                    target_pj = pixel_j0 + patch_j_idx * GRID_SPACING
-                    target_pi = (target_pi // GRID_SPACING) * GRID_SPACING
-                    target_pj = (target_pj // GRID_SPACING) * GRID_SPACING
-                    
-                    bi0 = patch_i_idx * 32
-                    bi1 = bi0 + 32
-                    bj0 = patch_j_idx * 32
-                    bj1 = bj0 + 32
-                    
-                    # Find patch
-                    ind = IDX_MISSING
-                    for p in range(len(patch_times_idx)):
-                        if (patch_times_idx[p] == tt and 
-                            patch_pixels_i[p] == target_pi and 
-                            patch_pixels_j[p] == target_pj):
-                            ind = patch_indices[p]
-                            break
-                    
-                    # Place and record
-                    if ind >= 0:
-                        patch = patch_data[ind]
-                        batch[k,bt,bi0:bi1,bj0:bj1] = patch
-                        
-                        # Record found patch (only for first timestep to save space)
-                        if bt == 0 and found_idx < max_patches:
-                            found_info[k, found_idx, 0] = patch_i_idx
-                            found_info[k, found_idx, 1] = patch_j_idx
-                            found_info[k, found_idx, 2] = ind
-                            found_info[k, found_idx, 3] = np.mean(patch)
-                            found_idx += 1
-                            
-                    elif ind == IDX_ZERO:
-                        batch[k,bt,bi0:bi1,bj0:bj1] = zero_value
-                    else:
-                        batch[k,bt,bi0:bi1,bj0:bj1] = missing_value
-                        
-                        # Record missing patch (only for first timestep)
-                        if bt == 0 and missing_idx < max_patches:
-                            missing_info[k, missing_idx, 0] = patch_i_idx
-                            missing_info[k, missing_idx, 1] = patch_j_idx
-                            missing_idx += 1
-        
-        found_counts[k] = found_idx
-        missing_counts[k] = missing_idx
-    
-    # Convert to Python lists for return
-    found_patches_list = []
-    missing_patches_list = []
-    
-    for k in range(n_samples):
-        # Found patches for this sample
-        found_for_sample = []
-        for i in range(found_counts[k]):
-            found_for_sample.append((
-                int(found_info[k, i, 0]),
-                int(found_info[k, i, 1]),
-                int(found_info[k, i, 2]),
-                float(found_info[k, i, 3])
-            ))
-        found_patches_list.append(found_for_sample)
-        
-        # Missing patches for this sample
-        missing_for_sample = []
-        for i in range(missing_counts[k]):
-            missing_for_sample.append((
-                int(missing_info[k, i, 0]),
-                int(missing_info[k, i, 1])
-            ))
-        missing_patches_list.append(missing_for_sample)
-    
-    return found_patches_list, missing_patches_list
-
 
 @njit(parallel=True)
 def build_batch(

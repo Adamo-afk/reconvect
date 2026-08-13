@@ -886,12 +886,29 @@ def plot_shapley_by_leadtime(shapley_lt, interval_min=5):
     return fig
 
 
-def plot_nwcsaf_impact(xi_df_with, xi_df_without):
-    """Compare Xi matrices from models with and without NWCSAF."""
-    fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=["With NWCSAF", "Without NWCSAF"])
+def plot_ablation_impact(xi_df_full, xi_df_ablated):
+    """Compare Xi matrices from a full model and an ablated one.
 
-    for col, df in enumerate([xi_df_with, xi_df_without], start=1):
+    Generic input-ablation comparison: train a second model with one
+    input group removed, then diff the two Xi matrices to see how the
+    remaining inputs take over the dropped group's role. The mode set
+    is already an ablation ladder, so e.g.
+
+        full    = mtg_opera_mtgmr_rainfall        (OPERA + MTG IR/WV)
+        ablated = mtg_opera_radar_only_rainfall   (OPERA only)
+
+    isolates MTG IR/WV, and
+
+        full    = mtg_lightning_opera_rainfall    (+ LINET)
+        ablated = mtg_opera_mtgmr_rainfall
+
+    isolates lightning. Same comparison bundle_eval_scores.py encodes as
+    its coalition letters.
+    """
+    fig = make_subplots(rows=1, cols=2,
+                        subplot_titles=["Full model", "Ablated model"])
+
+    for col, df in enumerate([xi_df_full, xi_df_ablated], start=1):
         fig.add_trace(go.Heatmap(
             z=df.values, x=list(df.columns), y=list(df.index),
             colorscale="RdYlBu", zmid=0.5, zmin=0, zmax=1,
@@ -899,13 +916,13 @@ def plot_nwcsaf_impact(xi_df_with, xi_df_without):
             textfont={"size": 8}, showscale=(col == 2),
         ), row=1, col=col)
 
-    fig.update_layout(title="NWCSAF Impact on Xi Correlations",
+    fig.update_layout(title="Input-ablation impact on Xi correlations",
                       height=600, width=1400)
     return fig
 
 
 def plot_prediction_diagnostics(model, dataset, arch, num_samples=8,
-                                label_name="BZC", interval_min=5):
+                                label_name="Rainfall", interval_min=5):
     """Generate a 4-panel evaluation diagnostic figure.
 
     Panels:
@@ -919,7 +936,7 @@ def plot_prediction_diagnostics(model, dataset, arch, num_samples=8,
         dataset: tf.data.Dataset yielding (inputs_dict, label).
         arch: Architecture dict from inspect_architecture().
         num_samples: Number of samples to evaluate.
-        label_name: Variable name for axis labels (e.g. "BZC", "Lightning").
+        label_name: Variable name for axis labels (e.g. "Rainfall", "Lightning").
         interval_min: Minutes between output timesteps.
 
     Returns:
@@ -1159,8 +1176,8 @@ def load_test_dataset(data_dir):
 
 
 def run_analysis(model_path, data_dir, output_dir, methods, num_samples=4,
-                 scores_dir=None, model_path_no_nwcsaf=None,
-                 data_dir_no_nwcsaf=None):
+                 scores_dir=None, model_path_ablated=None,
+                 data_dir_ablated=None):
     """Orchestrate the full feature-importance analysis."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1325,20 +1342,20 @@ def run_analysis(model_path, data_dir, output_dir, methods, num_samples=4,
         fig = plot_method_comparison(comp_df)
         fig.write_html(os.path.join(output_dir, "method_comparison.html"))
 
-    # ===================== NWCSAF Impact =====================
-    if model_path_no_nwcsaf and data_dir_no_nwcsaf and xi_df is not None:
-        print("\n--- NWCSAF Impact Comparison ---")
-        model_no = load_model(model_path_no_nwcsaf)
+    # ===================== Ablation impact =====================
+    if model_path_ablated and data_dir_ablated and xi_df is not None:
+        print("\n--- Input-ablation comparison ---")
+        model_no = load_model(model_path_ablated)
         arch_no = inspect_architecture(model_no)
-        ds_no, _ = load_test_dataset(data_dir_no_nwcsaf)
+        ds_no, _ = load_test_dataset(data_dir_ablated)
 
         inp_cams_no, out_cams_no, _, _ = batch_average_gradcam(
             model_no, ds_no, arch_no, num_samples=num_samples)
         xi_df_no = compute_xi_matrix(inp_cams_no, out_cams_no)
-        xi_df_no.to_csv(os.path.join(output_dir, "xi_matrix_no_nwcsaf.csv"))
+        xi_df_no.to_csv(os.path.join(output_dir, "xi_matrix_ablated.csv"))
 
-        fig = plot_nwcsaf_impact(xi_df, xi_df_no)
-        fig.write_html(os.path.join(output_dir, "nwcsaf_impact.html"))
+        fig = plot_ablation_impact(xi_df, xi_df_no)
+        fig.write_html(os.path.join(output_dir, "ablation_impact.html"))
         del model_no
         tf.keras.backend.clear_session()
 
@@ -1412,10 +1429,11 @@ def main():
                         help="Number of samples to average GradCAM over")
     parser.add_argument("--scores-dir", default=None,
                         help="Directory with eval CSVs for classical Shapley")
-    parser.add_argument("--model-no-nwcsaf", default=None,
-                        help="Path to model trained without NWCSAF (for comparison)")
-    parser.add_argument("--data-no-nwcsaf", default=None,
-                        help="Path to test dataset for model without NWCSAF")
+    parser.add_argument("--model-ablated", default=None,
+                        help="Path to a model trained with one input group "
+                             "removed, for the ablation comparison")
+    parser.add_argument("--data-ablated", default=None,
+                        help="Path to the test dataset for --model-ablated")
 
     args = parser.parse_args()
 
@@ -1426,8 +1444,8 @@ def main():
         methods=args.methods,
         num_samples=args.num_samples,
         scores_dir=args.scores_dir,
-        model_path_no_nwcsaf=args.model_no_nwcsaf,
-        data_dir_no_nwcsaf=args.data_no_nwcsaf,
+        model_path_ablated=args.model_ablated,
+        data_dir_ablated=args.data_ablated,
     )
 
 

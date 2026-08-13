@@ -1,264 +1,44 @@
-<p align="center">
-  <img src="assets/reconvect-logo.gif" alt="reconvect logo" width="480">
-</p>
+<div align="center">
+  <img src="assets/reconvect-logo.gif" width="180" alt="ReConvect"/>
+</div>
 
 # COALITION-4 Nowcasting System — Romanian Adaptation
 
-Adaptation of the [COALITION-4](https://doi.org/10.1175/MWR-D-22-0084.1) deep learning nowcasting system (Leinonen et al., 2022, MeteoSwiss) for Romanian meteorological conditions. Developed at Romania's National Meteorological Administration (ANM) as part of the EUMETSAT Training Placement Scheme.
+Recurrent-convolutional nowcasting of **rainfall intensity** and **lightning occurrence** over Romania, adapted from MeteoSwiss COALITION-4 (Leinonen et al.).
 
-The system uses a recurrent-convolutional encoder-decoder architecture operating on the EPSG:31700 Stereo70 projection of Romania to produce 45-minute precipitation and lightning nowcasts from multi-source meteorological inputs.
+An encoder-forecaster (ResBlock + ConvGRU) ingests a multi-resolution stack of MTG FCI satellite channels, OPERA composite radar, and LINET lightning, and predicts three lead times: **T+15, T+30, T+45 min**.
 
-## Project Overview
+- **Grid:** Romania, EPSG:31700 (Stereo70), **1536 × 768** @ ~1 km — a fixed 6 × 3 array of 18 patches of 256 × 256.
+- **Area extent:** `(-177324, 77148, 1331353, 723370)` metres.
+- **Cadence:** 15 min (configurable — Step 0).
+- **Sample window:** 3 past steps (t−30, t−15, t0) → 3 future steps (t+15, t+30, t+45).
 
-Three training configurations are supported. The first two compare MSG vs MTG with the legacy ANM-radar precipitation target; the third replaces the legacy radar with the pan-European **OPERA** composite.
+Precipitation is driven by the pan-European **OPERA** composite; lightning by **LINET**. Sample selection is DBSCAN over OPERA `rainfall_rate`, so every artefact is tagged `<mode>_dbscan`.
 
-- **MSG experiment**: ANM radar + LINET lightning + MSG SEVIRI (5 channels, 3 km)
-- **MTG experiment**: ANM radar + LINET lightning + MTG FCI (5 channels, 1–2 km)
-- **MTG + OPERA experiment**: **OPERA** precipitation composite (reflectivity + instantaneous rainfall rate, 2 km, 15 min) + MTG FCI. The label is `opera_rainfall_rate` multi-class (5 bins, same thresholds as the radar configuration). No lightning.
+**Contents:** [Resolution tiers](#resolution-tiers) · [Modes](#modes) · [Setup](#environment-setup) · [Table 1 — Training](#table-1--training-a-model-from-scratch) · [Table 2 — Validation & inference](#table-2--validation-inference-visualisation--analysis) · [Table 3 — Architecture defaults](#table-3--architecture--training-defaults) · [Outputs](#outputs-reference) · [Thresholds](#thresholds-reference) · [Data products](#data-products)
 
-The first two share the same radar targets and lightning labels; only the satellite input branch differs. The OPERA configuration switches the radar source: same downstream pipeline (reprojection to EPSG:31700, DBSCAN-driven patch index, sequence extraction, normalization, dataset creation, training, evaluation), but driven by OPERA's pre-reprojected HDF5 instead of the legacy ANM-radar NetCDF.
+---
 
-### Two sample-selection tracks (`--source`)
+## Resolution tiers
 
-Independently of which training mode you pick, sample selection now has two parallel tracks that can coexist on disk:
+Two input tiers. **Always read the physical resolution, not the tier name.**
 
-| Track | What drives sample selection | Per-patch index produced by | `extract_patch_seq` / `create_datasets` / `train_models` flag |
-|---|---|---|---|
-| **DBSCAN track** | DBSCAN clusters in OPERA `rainfall_rate` (or RZC) — broad convective coverage | `identify_patches.py --source {radar, opera}` | `--source dbscan` |
-| **Lightning track** | Per-map occurrence-fraction threshold (≥ 0.30 × mean over active maps) — lightning-active windows only | `identify_lightning_periods.py` | `--source lightning` |
+| Tier | Native | Patch | Pooling | Channels |
+|---|---|---|---|---|
+| `past_hr` — high resolution | 1 km | 256 × 256 | none | MTG `vis_06`; LINET `density`, `current`, `occurrence` |
+| `past_mr` — medium resolution | 2 km | 128 × 128 | 2 × 2 avg | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
 
-> Note the two `--source` vocabularies: `identify_patches.py --source {radar, opera}` picks the **sensor** whose data is clustered (both writes go to the same `patch_index.csv`); downstream `extract_patch_seq / create_datasets / train_models --source {dbscan, lightning}` picks the **index file** to consume (`patch_index.csv` vs `lightning_patches.csv`).
+> **Why "medium" when MR is the coarsest tier?** There used to be a third tier (`past_lr`, 3 km, 64 × 64, 4 × 4 pooling) carrying MSG SEVIRI and NWCSAF. Both products were retired and the tier removed, so MR only reads as "middle" relative to that old MSG stack. The name is kept because `past_mr` is baked into the input-tensor names of every trained checkpoint and every dataset's `metadata.json`.
 
-Both tracks share the same model architecture and downstream training script. Every artefact emitted by `extract_patch_seq` / `create_datasets` / `train_models` is suffixed with `_<source>` so the two tracks never overwrite each other. Run `python train_models.py --source dbscan --stage both` on one machine and `... --source lightning --stage both` on another to train them in parallel.
+> **On-disk suffix caveat:** extracted patches are named `{variable}_{HHMM}_{HR|LR}.npy` — only **two** suffixes, where `_LR` means *"was pooled"*, not a tier name. Since the LR tier is gone, **every `_LR` patch on disk is MR: 128 × 128 at 2 km.**
 
-For end-to-end commands per track, see the runbooks at the project root:
+### How multi-resolution inputs are reconciled
 
-- [`run_opera.config`](run_opera.config) — full pipeline for the OPERA-driven track (comments-only).
-- [`run_lightning.config`](run_lightning.config) — full pipeline for the lightning-driven track (comments-only).
+**1. Reproject everything to the same 1 km grid first.** `reproject.py` applies a precomputed pyresample KD-tree mapping from each product's native CRS onto the shared 1536 × 768 EPSG:31700 canvas. Afterwards every `.npy` is on the *same* grid and a given patch number maps to the same geographic tile across all products. Cross-scale alignment is paid once per cadence step, not at training time.
 
-### Optional domain-adaptation fine-tune (Swin transformer head)
+**2. Pool *down* to native resolution — never up.** `extract_patches.py` slices 256 × 256 1 km tiles, then average-pools 2 km products to 128 × 128. Upsampling would fabricate pixels: the model would see "1 km OPERA" carrying no genuine 1 km information and would overfit interpolation artefacts. Downsampling preserves the real resolution each instrument actually measured, forcing the encoder to cross scales honestly.
 
-`train_models.py --stage both` adds an optional second training stage after the base model finishes: load the saved base, **freeze the encoder-forecaster**, graft a 2-block Swin transformer head with 8×8 windowed attention on top, and fine-tune that head with AdamW. The Swin head shares features once across the 3 lead-time predictions and projects each lead-time output through an independent lightweight Conv 1×1 head. All hyperparameters live in the `[finetune]` section of [`training.config`](training.config). For a simpler first run, use `--stage base` instead — that's the standard COALITION-4 model with no transformer head.
-
-### Optional class-weighted focal loss for the radar / OPERA multiclass head
-
-The OPERA rainfall target is severely imbalanced: class 0 (`R<10` mm/h) is ~98% of pixels, class 4 (`R≥40`) is sparser by orders of magnitude. The `[radar_loss]` section of [`training.config`](training.config) lets you swap the historical `CategoricalCrossentropy(label_smoothing=0.01)` for `WeightedFocalCategoricalCrossentropy` — focal modulation `(1 − p_t)^gamma` plus per-class weights derived from the training-distribution pixel fractions (read from **_base_dir_**/opera_rainfall_fraction_<source>.json, produced by `opera_rainfall_fraction.py --source <source>`). `weighting` accepts `inverse`, `median`, or `none`; setting `weighting = none` and `gamma = 0` reproduces the plain-CCE baseline exactly. Per-source like the lightning prior, so the dbscan / lightning tracks each compute their own.
-
-## Environment Setup
-
-### Prerequisites
-
-- **Conda** (Miniconda or Anaconda)
-- **NVIDIA GPU** with CUDA support
-- **Windows** (the pipeline was developed and tested on Windows; TensorFlow GPU support on Windows requires specific version pinning)
-
-### Installation
-
-Follow the steps in this exact order. The two Windows-specific traps to know about are (a) `conda install cudatoolkit=... cudnn=...` silently downgrades Python 3.10 to 3.9 because conda-forge has no CUDA 11.2 builds for Python 3.10, and (b) pip-installing pyproj / geopandas on Windows produces mismatched PROJ database paths. Both are avoided below.
-
-1. **Install CUDA 11.2 and cuDNN 8.1 system-wide via NVIDIA installers.** DO NOT use `conda install cudatoolkit=11.2 cudnn=8.1.0` — that installs old packages that pin Python to 3.9. Use the NVIDIA installers instead:
-
-   - CUDA Toolkit 11.2 (any of 11.2.0 / 11.2.1 / 11.2.2 — they ship identical DLL names): download from https://developer.nvidia.com/cuda-11.2.2-download-archive. Run the installer with defaults. Installs to `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2\` and adds itself to Windows `PATH`.
-   - cuDNN 8.1 for CUDA 11.2: download from https://developer.nvidia.com/rdp/cudnn-archive (requires a free NVIDIA developer account). Unzip and merge `bin\`, `include\`, and `lib\x64\` into the matching subdirectories under the CUDA install root above.
-
-   After the CUDA install, make sure the `CUDA_PATH` environment variable is set — Python 3.8+ on Windows no longer honours PATH for DLL loading in C extensions, so TensorFlow finds CUDA via `CUDA_PATH` specifically. If the NVIDIA installer didn't set it (some builds miss this), do it manually and open a fresh terminal:
-
-   ```powershell
-   setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"
-   ```
-
-2. Create a conda environment with Python 3.10 (one of the last Python versions with native Windows GPU support for TensorFlow):
-
-   ```powershell
-   conda create -n tfenv python=3.10 -y
-   conda activate tfenv
-   python --version    # MUST print Python 3.10.x before continuing
-   ```
-
-3. Install the geospatial / cartography stack via **conda-forge**. This must come before the `pip install` step so `pyproj`, `proj`, `geopandas`, `pyogrio`, `shapely`, `cartopy`, `pyresample`, and `pykdtree` all share the same PROJ ABI — pip-installing them on Windows produces mismatched `proj.db` locations and every CRS lookup then fails with `Invalid projection: ... no database context specified`.
-
-   ```powershell
-   conda install -c conda-forge -y `
-       pyproj proj geopandas pyogrio shapely cartopy `
-       pyresample pykdtree `
-       netCDF4 xarray hdf5plugin h5py
-   ```
-
-   Also verify no downgrade happened:
-
-   ```powershell
-   python --version    # still Python 3.10.x
-   ```
-
-   *(Rescuing an env that previously pip-installed any of these? Wipe the leftover `site-packages\<pkg>\` directories before the conda install, otherwise conda sees the empty dirs, skips repopulating them, and the packages import as empty namespace stubs — see the [Troubleshooting](#local-package--imports) entry for the tell-tale `AttributeError: module 'pyproj' has no attribute 'CRS'` symptom.)*
-
-4. Install the remaining Python dependencies (pip picks up what conda-forge didn't cover, including TensorFlow):
-
-   ```powershell
-   pip install -r requirements.txt
-   ```
-
-5. Install the local `c4dl` package in editable mode. One-time per environment. Several scripts (`read_kml_version2.py`, `reproject.py`, `identify_patches.py`, ...) import from `c4dl.projection` and `c4dl.datasets`; without this step they fail with `ModuleNotFoundError: No module named 'c4dl'`.
-
-   ```powershell
-   pip install -e .
-   ```
-
-6. Verify PROJ and the GPU are both working:
-
-   ```powershell
-   python -c "import pyproj; print(pyproj.CRS('EPSG:4326'))"
-   python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-   ```
-
-   Both should print without warnings — the CRS as a full projection block, and the TensorFlow line as a Python list containing your GPU. If TF prints `Could not load dynamic library 'cudart64_110.dll'` and an empty list `[]`, `CUDA_PATH` is not being seen by this shell — re-open the terminal (`setx` only affects newly-launched shells) and try again.
-
-## Directory Structure
-
-```
-coalition4-rcnn/
-│
-├── c4dl/                              # Core library (projection, datasets, features)
-│   ├── projection.py                  # GridProjection, romania_grid_area (EPSG:31700)
-│   ├── datasets/                      # Data readers (mchradar, mchlightning, msgccs4, etc.)
-│   └── features/
-│       └── regions.py                 # Patch saving functions (save_patches_radar, etc.)
-│
-├── our_data/                          # All data (not tracked in git)
-│   ├── radar_data/
-│   │   ├── RZC/nc4_{date}-Romania_RZC/*.nc
-│   │   ├── BZC/nc4_{date}-Romania_BZC/*.nc
-│   │   ├── CZC/...
-│   │   ├── EZC-20/...
-│   │   ├── LZC/...
-│   │   └── CPCH/...
-│   ├── satellite_data/
-│   │   ├── MSG/
-│   │   │   ├── VIS006/nc4_{date}-Romania_VIS006/*.nc
-│   │   │   ├── IR_039/...
-│   │   │   ├── IR_108/...
-│   │   │   ├── WV_062/...
-│   │   │   └── WV_073/...
-│   │   ├── MTG/
-│   │   │   ├── mtg_constants.json     # Grid constants (geos projection + x/y scan angles)
-│   │   │   │                          #   written by pipeline_msg_mtg.py on first run
-│   │   │   ├── vis_06/nc4_{date}-Romania_vis_06/*.npy  # per-channel arrays on geos grid
-│   │   │   ├── ir_38/...
-│   │   │   ├── ir_105/...
-│   │   │   ├── wv_63/...
-│   │   │   └── wv_73/...
-│   │   ├── pipeline_msg_mtg.py        # MTG FCI L1C SFTP + Satpy processing pipeline
-│   │   ├── inspect_mtg.py             # Reconstruct .nc and plot raw / reprojected MTG data
-│   │   ├── summarize_mtg.py    # CSV report of downloaded FCI chunks per date
-│   │   ├── check_chunk_names.py       # Diagnostic: inspect FCI chunk NetCDF structure
-│   │   ├── check_chunk_contents.py    # Diagnostic: read FCI chunk radiance data
-│   │   └── _raw_chunks/               # Cache of downloaded FCI chunk files (gitignored)
-│   ├── lightning_data/
-│   │   ├── kml_data/{date}/{date}.kml
-│   │   ├── density/nc4_{date}-Romania_density/*.npy
-│   │   ├── current/nc4_{date}-Romania_current/*.npy
-│   │   ├── occurrence/nc4_{date}-Romania_occurrence/*.npy
-│   │   ├── read_kml_version2.py       # KML → per-cadence .npy lightning maps (filter-aligned, variable windows)
-│   │   ├── summarize_lightning_data.py # Scan .npy → lightning_summary.csv + lightning_active_steps.csv at project root
-│   │   └── visualize_lightning_stats.py  # Lightning activity bar plots (reads lightning_active_steps.csv, plots-only)
-│   ├── opera_data/
-│   │   ├── reflectivity/{YYYY}/{MM}/{DD}/*.h5      # OPERA max-reflectivity HDF5 (2 km, 15 min)
-│   │   ├── rainfall_rate/{YYYY}/{MM}/{DD}/*.h5     # OPERA rain-rate HDF5 (2 km, 15 min)
-│   │   ├── pipeline_opera.py          # SFTP/SCP download from EWC VM with cadence filtering
-│   │   └── summarize_opera_data.py    # CSV + missing-timesteps report
-│   ├── reprojected_data/                # Cached reprojected data (generated by reproject.py)
-│   │   ├── romania_grid_lats.npy           # Shared 768×1536 EPSG:31700 lat array
-│   │   ├── romania_grid_lons.npy           # Shared 768×1536 EPSG:31700 lon array
-│   │   ├── radar_data/{product}/nc4_{date}-Romania_{product}/*.npy
-│   │   ├── satellite_data/MSG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-│   │   ├── satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-│   │   ├── lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
-│   │   ├── opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
-│   │   └── opera_data/opera_constants.json                    # source projection (/where attrs)
-│   ├── patch_index/                   # DBSCAN patch identification output (identify_patches --source {radar, opera})
-│   │   ├── patch_index.csv
-│   │   ├── patch_index.json
-│   │   └── plots/                     # Optional diagnostic plots
-│   ├── lightning_periods/             # Occurrence-fraction filter output (--source lightning)
-│   │   ├── lightning_periods_config.json   # Parameters used + threshold metadata (reproducibility)
-│   │   └── lightning_patches.csv      # Per-map per-patch index keyed by master HHMM (schema mirrors patch_index.csv)
-│   ├── patches/                       # Extracted 256×256 patches (generated by extract_patches.py)
-│   │   └── {date}/{variable}_{HHMM}_{HR|LR}.npy
-│   ├── datasets/                      # Saved TF datasets (generated by create_datasets.py)
-│   │   └── {mode}_{source}/train|validation|test/
-│   │       └── metadata.json          # Input shapes, label type (used by train_models.py)
-│   ├── data_statistics/               # Diagnostic plots (generated by data_statistics.py)
-│   ├── timestep_config.json           # Cadence config (generated by validate_timestep.py)
-│   ├── sequence_meta_{source}.json    # Per-sample window (generated in Step 4.1, per source)
-│   ├── timestep_manifest.csv          # Surviving (date, HHMM) timesteps (generated in Step 4.2)
-│   ├── intersect_summary.png          # Per-date stacked bar of kept vs dropped (Step 4.2)
-│   ├── normalization_stats_{source}.json  # Per-variable mean/std per source (generated in Step 4.3)
-│   ├── train_data_{source}.csv        # Training sequences per source (80% per temporal block)
-│   ├── validation_data_{source}.csv   # Validation sequences per source (10% per temporal block)
-│   ├── test_data_{source}.csv         # Test sequences per source (10% per temporal block)
-│   ├── extract_patch_seq_drops_{source}.csv  # Audit: (date, HHMM) dropped by the manifest gate
-│   └── lightning_fraction_{source}.json  # Per-source training-scope non-zero pixel fraction for focal loss
-│
-├── models/                            # Saved trained models (not tracked in git)
-│   └── {mode}/
-├── evaluation/                        # Evaluation outputs (not tracked in git)
-│   └── eval_{mode}/
-│
-├── product_cadences.config              # Native cadence per data product (input to Step 0)
-├── training.config                     # train_models.py hyperparameters + [finetune] Swin head + [radar_loss] focal/class-weighted CCE config
-├── run_lightning.config                # Comments-only runbook for the lightning-driven track
-├── run_opera.config                    # Comments-only runbook for the OPERA-driven track
-│
-├── validate_timestep.py               # Step 0: Validate cadence → timestep_config.json
-├── identify_patches.py                # Step 1 (--source {radar, opera}): DBSCAN → patch_index.csv
-├── identify_lightning_periods.py      # Step 1 (--source lightning): occurrence-fraction filter → lightning_periods/lightning_patches.csv
-├── reproject.py                          # Step 2: Reproject all products to Romania grid; also aggregates per-category logs into errors.txt
-├── extract_patches.py                 # Step 3: Slice 256×256 patches from reprojected data (driven by Step 4.1's per-source split CSVs; --source dbscan / lightning)
-├── extract_patch_seq_for_datasets.py  # Step 4.1: Continuous sequences + Czibula split + manifest gate (per-source CSVs)
-├── intersect_product_coverage.py      # Step 4.2: Per-timestep manifest + plot (--summary / --missing / --active per product)
-├── compute_normalization_stats.py     # Step 4.3: Per-variable mean/std → normalization_stats_<source>.json (--source dbscan / lightning)
-├── create_datasets.py                 # Step 5: Build TF datasets + metadata.json (--source aware)
-├── train_models.py                    # Step 6: Train (--stage base / finetune / both, --source dbscan / lightning)
-├── evaluate_coalition.py              # Step 7: Evaluate, generate metrics + plots (--source / --finetuned)
-├── bundle_eval_scores.py              # Bundle per-mode eval results into Shapley-ready per-leadtime CSVs (--source / --finetuned)
-├── visualize_gt_vs_pred.py  # Training-scope viz: top-N ref timesteps from a split CSV, full-domain GT vs Pred with zoom-in
-├── predict_full_domain.py             # Inference-only: run a trained model against reprojected full-domain fields for any date, no training-pipeline artefacts needed
-│
-├── feature_importance_analysis.py     # Grad-CAM + Xi, SHAP, classical Shapley analysis
-├── lightning_fraction.py              # Per-source lightning-occurrence prior for the binary focal loss (--source dbscan / lightning)
-├── opera_rainfall_fraction.py         # Per-source OPERA 5-class pixel fractions; prior for WeightedFocalCategoricalCrossentropy
-├── data_statistics.py                 # Generate diagnostic plots from patch/sequence data
-│
-├── requirements.txt
-├── .gitignore
-└── README.md
-```
-
-## Data Products
-
-### Resolution Categories
-
-| Category | Grid Resolution | Patch Size | Pooling | Products |
-|----------|----------------|------------|---------|----------|
-| HR (1 km) | 1536×768 | 256×256 | None | Radar (RZC, BZC, CZC, EZC-20, LZC, CPCH), Lightning (density, current, occurrence), MTG vis_06, OPERA rainfall_rate (HR alias for the label head) |
-| LR (2 km) | 1536×768 | 128×128 | 2×2 avg | MTG IR/WV (ir_38, ir_105, wv_63, wv_73), OPERA (reflectivity, rainfall_rate) |
-| LR (3 km) | 1536×768 | 64×64 | 4×4 avg | MSG (VIS006, IR_039, IR_108, WV_062, WV_073) |
-
-### Handling multi-resolution inputs
-
-The pipeline mixes radar (~1 km), lightning (~1 km), MTG vis (1 km), MTG IR/WV (2 km), OPERA (2 km), and MSG (3 km). Two design choices reconcile them without lying about each product's information content:
-
-**1. Reproject every product to the same 1 km Romania grid first.** `reproject.py` runs a precomputed pyresample KD-tree mapping from each product's native CRS into the shared 1536×768 EPSG:31700 (Stereo70) canvas. After this step every `.npy` is on the *same grid* and the same patch-number maps to the same geographic tile across all products. This makes spatial alignment trivial downstream — the cost of cross-scale comparison is paid once per cadence step, not at training time.
-
-**2. Pool *down* to native resolution before the model sees the data, not up.** `extract_patches.py` slices each reprojected product into 256×256 1 km HR tiles, then average-pools to:
-- **128×128 (MR)** for products natively at ~2 km (MTG IR/WV, OPERA)
-- **64×64 (LR)** for products natively at ~3 km (MSG)
-
-The HR (1 km) products keep their 256×256 tiles unchanged.
-
-Why downsample instead of bilinearly upsampling the 2 km / 3 km inputs to 1 km? Upsampling fabricates pixels — the model would see "1 km MSG IR" with no genuine 1 km information and would inevitably overfit interpolation artifacts. Downsampling does the opposite: it preserves the *real* spatial resolution each instrument actually measured, so the encoder is forced to cross-scale honestly rather than hallucinating detail.
-
-**3. Multi-branch encoder, merges at matching scales.** [`train_models.build_coalition_model`](train_models.py) wires one input per resolution bucket (`past_hr` 256×256, `past_mr` 128×128, optionally `past_lr` 64×64) and walks each through ResBlock + ConvGRU stages of [32, 64, 128] channels. After the HR branch's first stride-2 ResBlock it lands at 128×128 and gets concatenated with the MR branch; after the second it lands at 64×64 and merges with the LR branch (if present). The decoder then upsamples a single fused state back to 256×256 over three lead times.
+**3. Multi-branch encoder, merging at matching scales.**
 
 ```
 INPUT  past_hr (256×256, 1 km) ─┐
@@ -267,1372 +47,395 @@ INPUT  past_hr (256×256, 1 km) ─┐
        past_mr (128×128, 2 km) ─┴────── concat ─────────────────[merge @128]
                                                                  │
                                                                  ▼
-                                          ResBlock + ConvGRU ─stride 2─┐
-                                                                       ▼
-       past_lr (64×64, 3 km) ────────── concat ─────────────────[merge @64]
-                                                                       │
-                                                                       ▼
-                                                                  DECODER → T+15/30/45
+                                                            DECODER → T+15/30/45
 ```
 
-**4. The model rebuilds itself from `metadata.json`.** Each dataset's `metadata.json` records the input group names + their shapes (`[T, H, W, C]`). `build_coalition_model` reads the metadata, computes each branch's downsample factor as `max_res / branch_res` (so 1 for HR, 2 for MR, 4 for LR), and wires the merges automatically. Adding a new resolution bucket needs no code change in the model — only `create_datasets.get_mode_config()` learns about it.
+**4. The model rebuilds itself from `metadata.json`.** Each dataset records its input group names and shapes `[T, H, W, C]`. The builder creates one branch per group, derives each branch's downsample factor as `max_res / branch_res` (1 for HR, 2 for MR), concatenates branches that share a resolution, and sizes the encoder-decoder accordingly. A dataset built from any subset of inputs produces a matching model with no code change; the Swin head from `--stage finetune` inherits the backbone's shape the same way.
 
-### Data Sources
+---
 
-| Source | Products | Native cadence | Native resolution | Role | Pipeline entry point |
-|---|---|---|---|---|---|
-| **ANM radar** (legacy, no longer wired up) | RZC, BZC, CZC, EZC-20, LZC, CPCH | 10 min | ~1 km | Precipitation target + features (MSG/MTG experiments) | n/a — no longer maintained |
-| **LINET lightning** | density, current, occurrence | 10 min native; filter-aligned to `products.lightning.filter` | Native KML → 1 km grid (variable-width windows that cover every minute of the day) | Lightning target + features | **_base_dir_**/lightning_data/linet_export.py, **_base_dir_**/lightning_data/read_kml_version2.py |
-| **MSG SEVIRI** *(disabled in active build)* | VIS006, IR_039, IR_108, WV_062, WV_073 | 15 min | 3 km | Satellite features (LR branch) | **_base_dir_**/satellite_data/pipeline_msg_mtg.py |
-| **MTG FCI L1C** | vis_06, ir_38, ir_105, wv_63, wv_73 | 10 min | 1 km (vis_06) / 2 km (IR/WV) | Satellite features (HR + MR branches) | **_base_dir_**/satellite_data/pipeline_msg_mtg.py |
-| **OPERA composite** | reflectivity (dBZ), rainfall_rate (mm/h) | 15 min | 2 km | Precipitation target + features for the **MTG+OPERA experiment** (replaces ANM radar) | **_base_dir_**/opera_data/pipeline_opera.py |
+## Modes
 
-### Satellite Channel Selection
+The mode name states its own track: `_rainfall` = OPERA rainfall 5-class, `_continuous` = OPERA rainfall regression, `_occurrence` = lightning binary. There are no aliases.
 
-5 channels per instrument, chosen as spectral equivalents for fair MSG vs MTG comparison:
-
-| Physical property | MSG SEVIRI | MTG FCI |
-|---|---|---|
-| Cloud optical thickness (VIS) | VIS006 (0.6 µm) | vis_06 |
-| Cloud phase discrimination (SWIR) | IR_039 (3.9 µm) | ir_38 |
-| Cloud top temperature (TIR) | IR_108 (10.8 µm) | ir_105 |
-| Upper-tropospheric moisture (WV) | WV_062 (6.2 µm) | wv_63 |
-| Mid-tropospheric moisture (WV) | WV_073 (7.3 µm) | wv_73 |
-
-### Grid Definition
-
-Romania grid on EPSG:31700 (Stereo70):
-- **Dimensions**: 1536×768 pixels (~1 km resolution)
-- **Patch layout**: 6 columns × 3 rows = 18 patches of 256×256
-- **Area extent**: (-177324, 77148, 1331353, 723370) meters
-
-## Pipeline
-
-### Pipeline steps (run in order)
-
-All scripts are run from the project root (`coalition4-rcnn/`):
-
-```bash
-cd F:\nowcasting\coalition4-rcnn
-conda activate tfenv
-```
-
-### Step 0 — Set the training cadence
-
-The pipeline supports any training step that is at least as coarse as the
-highest native data cadence. Native cadences are declared in
-[`product_cadences.config`](product_cadences.config) at the project root and
-cover every product family the pipeline knows about (radar, MTG,
-the two OPERA products, and lightning).
-
-**Lightning** is special: it has no native scan cadence — LINET strokes
-are individual observed events, not raster scans. The lightning maps that
-feed the model are produced by binning strokes into windows whose width
-mirrors whichever paired product the experiment uses:
-
-- When **radar** is in the configuration, lightning bins align to the
-  radar cadence (`step_minutes` resolved against the radar `filter` set).
-- When **OPERA** replaces radar, lightning bins align to the OPERA
-  cadence — although the OPERA experiment can be run without lightning
-  entirely if the goal is OPERA vs MTG only.
-- In any other combination the validator picks the most common cadence of
-  the active products and aligns lightning bins to it.
-
-OPERA composites are scanned with the 15-min product family (NIMBUS,
-CIRRUS, ODYSSEY) — see the *OPERA composite acquisition window* note
-just below for the exact `[NT-X, NT+Y]` data windows each composite type
-uses, and why the 10-min products are filtered to the alternating
-`{:00, :10, :30, :40}` pattern when paired with a 15-min training step.
-
-If you add a new data source or its native cadence changes, edit
-`product_cadences.config` rather than the validator script. The file is
-INI-style with a single `[cadences]` section; comments start with `#`
-or `;`, and a value of `null` or an empty value marks a continuous /
-event-based product (lightning). The validator reads the file at
-startup; it does not inspect any data folders. Override the path with
-`--cadences_file path/to/other.config`. Comment out a product line
-with a leading `#` to drop it from the active set — e.g. comment out
-OPERA's two entries to bring the validator floor back to 10 min when
-running a radar-only experiment.
-
-Run the validator once before any other pipeline step:
-
-```bash
-python validate_timestep.py --step_minutes 15        # 15-min cadence (required when OPERA is in the mix)
-python validate_timestep.py --step_minutes 10        # 10-min cadence (radar/MTG only; OPERA must be commented out)
-python validate_timestep.py --step_minutes 30        # 30-min cadence (any product set)
-python validate_timestep.py --step_minutes 5         # ERROR (below 10-min native)
-python validate_timestep.py --print                  # show current config
-```
-
-##### Why the alternating 10–20–10–20 filter for 10-min products at a 15-min step?
-
-OPERA composites are produced over fixed temporal windows centred on the
-quarter-hour. The data-time-window contract from EUMETNET differs by
-composite generation:
-
-- **NIMBUS** (15-min composites): data window is `[NT − 12 min, NT + 7 min]`
-  around each nominal time `HH:00, HH:15, HH:30, HH:45`. NIMBUS takes the
-  input scan closest to NT.
-- **CIRRUS**: temporal coverage `[NT − 10 min, NT]` where NT is the
-  composite's Nominal Time. Updated every 5 minutes (288× per day).
-- **Old ODYSSEY** (legacy): 15-min scanning interval `[NT − 10 min,
-  NT + 5 min]`.
-
-In all three cases the OPERA nominal grid is the strict `{:00, :15, :30,
-:45}` set, and the 10-minute products that feed the same training sample
-(radar, MTG) need to land within roughly ±5 min of those nominal
-times so the composite's temporal window matches the satellite/radar
-acquisition. The minute filter `{:00, :10, :30, :40}` is exactly that
-choice — at every 15-min step, it picks the 10-min slot whose acquisition
-is closest to the OPERA nominal time, giving an alternating 10–20–10–20
-spacing between consecutive samples. The `extract_patches.py` cadence
-snap (see Step 3) translates between the two grids automatically.
-
-The script writes **_base_dir_**/timestep_config.json with the chosen
-`step_minutes`, the per-product `minute_filter` (the native minutes to keep
-when arranging or downloading), the `steps_per_day`, and a
-`cadences_source` pointer back to the JSON file it loaded. All downstream
-scripts (`pipeline_msg_mtg.py`, `pipeline_opera.py`,
-`read_kml_version2.py`, `identify_patches.py`,
-`identify_lightning_periods.py`, `extract_patch_seq_for_datasets.py`,
-`create_datasets.py`) **read this file** and refuse to run if it is missing.
-
-For step=15 with 10-min radar/MTG the resulting filter is `{00, 10, 30, 40}`,
-giving an alternating 10–20–10–20 spacing between consecutive samples (no optical
-flow interpolation is used).
-
-> **MSG**: the MSG SEVIRI ingestion path is currently disabled in
-> `pipeline_msg_mtg.py` and `create_datasets.py`. Only MTG FCI L1C is supported.
-
-### Step 1 — Identify convective patches from RZC radar
-
-Runs DBSCAN on RZC rain rate data at 15-minute resolution. Produces a patch index mapping each timestamp to the active patches (1–18) on the fixed 6×3 grid.
-
-```bash
-python identify_patches.py
-python identify_patches.py --date 2025-05-15 --plot    # single date with diagnostic plots
-
-# OPERA-driven DBSCAN (uses pre-reprojected opera_rainfall_rate; same 10 mm/h threshold as RZC)
-python identify_patches.py --source opera
-python identify_patches.py --source opera --start 2026-03-13 --end 2026-05-11
-```
-
-Output: **_base_dir_**/patch_index/patch_index.csv and `patch_index.json`. The `--source opera` flag reads from `reprojected_data/opera_data/rainfall_rate/` instead of reprojection RZC on the fly; OPERA-source runs require `reproject.py --opera` to have been run first.
-
-### Step 2 — Reproject all products to the Romania grid
-
-Regrids radar, satellite (MSG/MTG), lightning, **and OPERA** to the 1536×768 grid. Uses precomputed KD-tree mappings (built once per source geometry) and parallel day-folder processing for speed.
-
-```bash
-python reproject.py --all                          # all products
-python reproject.py --radar                        # radar only
-python reproject.py --satellite MSG                # MSG channels only
-python reproject.py --satellite MTG                # MTG channels only
-python reproject.py --lightning                    # lightning (cache as .npy)
-python reproject.py --opera                        # OPERA radar (HDF5 → .npy)
-python reproject.py --all --workers 8              # 8 parallel workers
-python reproject.py --radar --date 2025-05-15      # single date
-```
-
-**Every product family writes `.npy`** under **_base_dir_**/reprojected_data/.... The shared Romania-grid lat/lon arrays are written once at **_base_dir_**/reprojected_data/romania_grid_{lats,lons}.npy, and each non-trivial source (MTG, OPERA) drops a sidecar `*_constants.json` with the source projection so an `.npy` can be re-attached to its projection at any later step (e.g. by `inspect_mtg.py --reprojected`).
-
-### Step 3 — Extract 256×256 patches
-
-> **Order of operations:** this step now runs **after Step 4.1** (`extract_patch_seq_for_datasets.py`). The split CSVs that step produces (with the manifest gate baked in) are the exact list of (date, time) pairs extract_patches needs to walk — driving off them avoids the previous patch_index + manifest filtering loop and guarantees the saved patches stay in sync with what training will load.
-
-Reads the per-source patch-activity index (`patch_index.csv` for `--source dbscan`, `lightning_patches.csv` for `--source lightning`) and the cached reprojected data, walks the **union of (date, time) tuples across `train/val/test_data_<source>.csv`**, slices the active patches at each step, applies resolution-dependent pooling (none for HR, 2×2 for MTG LR, 4×4 for MSG LR), and saves stacked `.npy` files.
-
-`timestep_config.json` is still read for the per-product cadence snap (e.g. OPERA's 15-min grid vs MTG's `:00, :10, :30, :40`). No separate manifest read is needed because the split CSVs already incorporate that gate (Step 4.1 enforces it).
-
-```bash
-python extract_patches.py --source dbscan
-python extract_patches.py --source lightning
-python extract_patches.py --source dbscan --date 2025-05-15
-python extract_patches.py --source dbscan --products satellite_MTG opera lightning
-```
-
-Output: **_base_dir_**/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy (shape `(num_active_patches, H, W)`; the per-patch order at each timestep matches whichever index file `--source` selected, so the `idx_t*` columns in the split CSVs address the right slice).
-
-### Step 4.1 — Extract temporally continuous sequences and split dataset
-
-Analyzes the patch index to find patches with uninterrupted activity over a 6-step window (2 past + current + 3 future, 90 minutes total). Produces per-timestep npy indices accounting for index shifts when the active patch set changes.
-
-Dataset splitting follows Czibula et al. (2024): each day is divided into equal temporal blocks (default 6h). Within each block, qualifying sequences are ordered chronologically — the first 10% go to test, next 10% to validation, remaining 80% to training. This ensures all three splits sample from the same diurnal distribution, avoiding hour-based bias.
-
-**Manifest gate (final cross-product filter).** Step 4.1 auto-discovers **_base_dir_**/timestep_manifest.csv (from Step 4.2 below) and intersects the patch index with it before searching for sequences. This is the final filter that decides which `(date, time)` tuples can become training samples: a slot only survives if every product in the intersect set had data there. The intersection is reported on stdout with a top-N "dates by drop count" table, and every dropped `(date, time)` is written to **_base_dir_**/extract_patch_seq_drops_<source>.csv for audit. Pass `--manifest none` to disable the gate (debug only).
-
-```bash
-python extract_patch_seq_for_datasets.py --source dbscan            # DBSCAN track (reads patch_index.csv)
-python extract_patch_seq_for_datasets.py --source lightning         # Lightning track (reads lightning_patches.csv)
-python extract_patch_seq_for_datasets.py --source dbscan --block_hours 4           # 4h blocks (finer diurnal balance)
-python extract_patch_seq_for_datasets.py --source dbscan --test_frac 0.15 --val_frac 0.15  # 15/15/70 split
-python extract_patch_seq_for_datasets.py --source dbscan --manifest none           # Skip the manifest gate
-```
-
-Outputs (suffixed by source so the two tracks coexist on disk):
-
-- **_base_dir_**/train_data_<source>.csv
-- **_base_dir_**/validation_data_<source>.csv
-- **_base_dir_**/test_data_<source>.csv
-- **_base_dir_**/sequence_meta_<source>.json — source, effective step, past/future window length
-- **_base_dir_**/extract_patch_seq_drops_<source>.csv — every (date, time) the manifest gate removed
-
-##### Lightning-source sequences
-
-For the lightning training pipeline, sample selection is driven by **lightning activity in time** rather than by radar-DBSCAN convective clusters in space. `--source lightning` reads `lightning_patches.csv` produced by [`identify_lightning_periods.py`](#lightning-periods-occurrence-fraction-filter) (see below). The CSV format, Czibula splitting, and step-column naming are identical; only the upstream activity index and the step interval change.
-
-```bash
-# 1. Run summarize → emits lightning_active_steps.csv at project root
-python our_data/lightning_data/summarize_lightning_data.py
-
-# 2. Run the occurrence-fraction filter (produces our_data/lightning_periods/)
-python identify_lightning_periods.py
-
-# 3. Build lightning-driven sequences (uses step_minutes from timestep_config.json)
-python extract_patch_seq_for_datasets.py --source lightning
-```
-
-### Lightning periods (occurrence-fraction filter)
-
-`identify_lightning_periods.py` produces the lightning-activity index that drives `extract_patch_seq_for_datasets.py --source lightning`. Lightning is much sparser than radar, so the model is trained on a separate sample list filtered to lightning-active windows only.
-
-**Two upstream files at project root**, both produced by **_base_dir_**/lightning_data/summarize_lightning_data.py:
-
-| File | Purpose |
-|---|---|
-| `lightning_summary.csv` | Per-date coverage report keyed against `products.lightning.filter` from `timestep_config.json`. Same shape as `opera_summary.csv` — consumed by `intersect_product_coverage.py` via `--summary lightning=...`. |
-| `lightning_active_steps.csv` | Per-`(date, HH:MM)` activity flags for density / current / occurrence. Consumed by both `intersect_product_coverage.py --active lightning=...` (as the cross-product gate) and `identify_lightning_periods.py` (as the candidate set for the fraction threshold). |
-
-**Filter logic.** `identify_lightning_periods.py` walks the master grid at `step_minutes`, snaps each master HHMM to the lightning filter to find the matching `.npy` file, computes the per-map occurrence-fraction `nonzero_pixels / total_pixels`, then keeps only `(date, HH:MM)` where `fraction ≥ ratio × mean(fraction over active occurrence maps)`. **No temporal aggregation** — each surviving map is one row in the output CSV. The per-patch step then marks any 256×256 patch with at least one non-zero pixel as active.
-
-| Knob | Default flag | Default value | Effect |
+| Mode | HR inputs | MR inputs | Target |
 |---|---|---|---|
-| **Fraction threshold ratio** | `--fraction_threshold_ratio` | `0.30` | Keep maps whose occurrence-fraction is at least this fraction of the mean fraction over the active set. |
-| Active CSV path | `--active_csv` | `lightning_active_steps.csv` at project root | Source of candidate `(date, HH:MM)` pairs. |
-| Lightning data root | `--lightning_dir` | **_base_dir_**/lightning_data | Where to find the `occurrence/...npy` files. |
-| Output dir | `--output_dir` | **_base_dir_**/lightning_periods | Where to write the index. |
+| `mtg_opera_radar_only_rainfall` | `vis_06` | OPERA ×2 | rainfall 5-class |
+| `mtg_opera_mtgmr_rainfall` | `vis_06` | OPERA + MTG IR/WV | rainfall 5-class |
+| `mtg_lightning_opera_rainfall` | LINET ×3 + `vis_06` | OPERA + MTG IR/WV | rainfall 5-class |
+| `mtg_opera_mtgmr_continuous` | `vis_06` | OPERA + MTG IR/WV | rainfall regression [0,1] |
+| `mtg_lightning_opera_occurrence` | LINET ×3 + `vis_06` | OPERA + MTG IR/WV | lightning binary |
+| `mtg_opera_occurrence` † | `vis_06` | OPERA + MTG IR/WV | lightning binary |
 
-```bash
-# All defaults: reads lightning_active_steps.csv, threshold = 0.30 × mean.
-python identify_lightning_periods.py
+† **KD student only.** Not buildable via `create_datasets.py` — it trains on the teacher's dataset with `past_hr` sliced.
 
-# Stricter threshold (keep only above-average maps).
-python identify_lightning_periods.py --fraction_threshold_ratio 1.0
-```
+**Rainfall classes (mm/h):** `0: R<10 · 1: 10–20 · 2: 20–30 · 3: 30–40 · 4: R≥40`. The `_continuous` head regresses the same quantity normalised by 70 mm/h, so it bins back to these 5 classes for a like-for-like SepConv comparison.
 
-Outputs in **_base_dir_**/lightning_periods/:
+`mtg_lightning_opera_rainfall` and `mtg_lightning_opera_occurrence` share an identical input stack and differ only in the label head — the natural dual-target pair to train side by side.
 
-| File | Purpose |
-|---|---|
-| `lightning_periods_config.json` | All CLI parameters used + computed mean / threshold / per-stage counts (reproducibility) |
-| `lightning_patches.csv` | Per-map per-patch index keyed by **master HHMM** so it lines up with the same grid every other product walks. Schema mirrors `patch_index.csv` — `extract_patch_seq_for_datasets.py --source lightning` consumes it directly. |
+---
 
-##### Diagnostics
+## Environment Setup
 
-```bash
-# Per-day + per-timestep bar charts (reads lightning_active_steps.csv)
-python our_data/lightning_data/visualize_lightning_stats.py \
-    --output_dir our_data/lightning_data
+Requires **Conda**, an **NVIDIA GPU**, and **Windows**. Follow this order exactly; it sidesteps the two Windows traps.
 
-# Per-source training-scope non-zero pixel fraction. Reads
-# train_data_<source>.csv and writes lightning_fraction_<source>.json,
-# which train_models.py loads for the focal-loss prior on any mode with
-# label_type='lightning' (mtg_lightning, mtg_lightning_opera_occurrence).
-python lightning_fraction.py --source dbscan
-python lightning_fraction.py --source lightning
-# Broader scope (skip the train-split filter):
-python lightning_fraction.py --source dbscan --scope_csv lightning_active_steps.csv
-```
+1. **Install CUDA 11.2 + cuDNN 8.1 via the NVIDIA installers** — *not* `conda install cudatoolkit=11.2 cudnn=8.1.0`, which silently downgrades Python 3.10 → 3.9 (conda-forge has no CUDA 11.2 builds for 3.10). Then confirm `CUDA_PATH` is set — Python 3.8+ on Windows no longer honours `PATH` for DLL loading in C extensions, so TensorFlow finds CUDA through `CUDA_PATH` specifically:
+   ```powershell
+   setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"
+   ```
+   `setx` only affects newly-launched shells — open a fresh terminal afterwards.
+2. **Create the env** (3.10 is the last Python with native Windows TF GPU support):
+   ```powershell
+   conda create -n tfenv python=3.10 -y; conda activate tfenv
+   python --version    # MUST still print 3.10.x at every step below
+   ```
+3. **Geospatial stack via conda-forge first**, so `pyproj` / `proj` / `geopandas` / `cartopy` / `pyresample` share one PROJ ABI. Pip-installing these on Windows yields mismatched `proj.db` paths and every CRS lookup then fails with `Invalid projection: … no database context specified`:
+   ```powershell
+   conda install -c conda-forge -y pyproj proj geopandas pyogrio shapely cartopy pyresample pykdtree netCDF4 xarray hdf5plugin h5py
+   ```
+4. **Remaining deps, then the local package** (`c4dl.projection` is imported by several scripts):
+   ```powershell
+   pip install -r requirements.txt; pip install -e .
+   ```
+5. **Verify both PROJ and the GPU:**
+   ```powershell
+   python -c "import pyproj; print(pyproj.CRS('EPSG:4326'))"
+   python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+   ```
+   An empty `[]` plus `Could not load dynamic library 'cudart64_110.dll'` means this shell can't see `CUDA_PATH` — reopen the terminal.
 
-### Step 4.2 — Intersect per-product timestep coverage
+---
 
-`intersect_product_coverage.py` computes the per-timestep intersection of available data across the chosen product set and writes a manifest that Step 4.1 (`extract_patch_seq_for_datasets.py`, the final filter) consumes directly. `extract_patches.py` does **not** read the manifest itself any more — it walks the train/val/test CSVs produced by Step 4.1, which already incorporate the manifest gate.
+## Table 1 — Training a model from scratch
 
-- **Active products** are determined by which `--summary KEY=PATH` flags you pass. Lightning is included only when `--summary lightning=...` is supplied.
-- **Per-timestep availability** is sourced from one of two gates per product:
-    - **Missing-JSON gate** (default for MTG / OPERA): each summarizer's companion `<key>_missing_timesteps.json` (auto-discovered next to the summary CSV; overridable per product with `--missing KEY=PATH`). A slot survives iff its snapped HHMM is **not** in the missing set.
-    - **Active-CSV gate** (opt-in via `--active KEY=PATH`): used for **lightning** — `lightning_active_steps.csv` carries per-`(date, HH:MM)` activity flags. A slot survives iff its snapped HHMM **is** in the active set (any of the flag columns == 1). When `--active` is given for a product, the missing-JSON gate is skipped for that product entirely.
-- **Per-product cadences** come from `timestep_config.json` (Step 0). For each master-grid HHMM the script snaps to the nearest minute in each product's filter, then checks the per-product gate.
-- **Error logs** (`--errors_log PATH`, repeatable): consumed in the same format whether you pass the per-category `reproject_<category>.log` files or the single aggregated `errors.txt` (which `reproject.py` now writes automatically at the end of every category run).
-- Train / val / test CSVs are **not** touched — they keep whatever `extract_patch_seq_for_datasets.py` wrote.
+Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optional.
 
-```bash
-# OPERA / radar track (no lightning gating):
-python intersect_product_coverage.py \
-    --summary mtg=mtg_summary.csv \
-    --summary opera=opera_summary.csv \
-    --errors_log our_data/reprojected_data/errors.txt
-
-# Lightning track (lightning as the activity gate):
-python intersect_product_coverage.py \
-    --summary  mtg=mtg_summary.csv \
-    --summary  opera=opera_summary.csv \
-    --summary  lightning=lightning_summary.csv \
-    --active   lightning=lightning_active_steps.csv \
-    --errors_log our_data/reprojected_data/errors.txt
-```
-
-| Flag | Purpose |
-|---|---|
-| `--summary KEY=PATH` (repeatable, **required**) | One per active product. `KEY ∈ {radar, mtg, opera, lightning}`. `PATH` is the per-product summary CSV; the script reads its date list. |
-| `--missing KEY=PATH` (repeatable, optional) | Override the auto-discovered missing-timesteps JSON. Mutually exclusive with `--active` for the same product. |
-| `--active KEY=PATH` (repeatable, optional) | Replace the missing-JSON gate with an active-steps CSV (`date,time_utc,<flag1>,<flag2>,...`). Slot survives iff snapped HHMM is in the active set. |
-| `--errors_log PATH` (repeatable, optional) | A `reproject_<category>.log` or the aggregated `errors.txt` from `reproject.py`. Any `(date, HHMM)` parsed from these logs is removed from the kept set. |
-| `--timestep_config PATH` | Override the location of `timestep_config.json`. |
-| `--output_csv`, `--output_plot` | Override the default output paths. |
-
-**Outputs (only two):**
-
-| File | Purpose |
-|---|---|
-| **_base_dir_**/timestep_manifest.csv | One row per surviving `(date, HHMM)`; columns also include the per-product snapped HHMM each product loaded so the manifest doubles as an audit trail. Consumed by `extract_patch_seq_for_datasets.py` (Step 4.1) as the final cross-product gate before the split CSVs are written. |
-| **_base_dir_**/intersect_summary.png | Per-date stacked bar: kept timesteps + drops attributed to each product / error log. Shows the quantitative impact of the intersection. |
-
-> **Why this comes before Step 4.3**: the normalization stats are computed on the surviving timesteps, so they never see slots that would later be discarded for missing inputs — fewer file reads and stats that match the eventual training distribution.
-
-### Step 4.3 — Compute normalization statistics
-
-`compute_normalization_stats.py` derives per-variable mean / std from the reprojected data so the model trains on values centred for the **Romanian** distribution, not the Swiss one. This step is **mandatory** before Step 5: `create_datasets.py` no longer falls back to the Leinonen Table A1 constants — if `normalization_stats_<source>.json` is missing, the run fails with an explicit pointer back to this script.
-
-Stats are now **per-source**. The DBSCAN-driven and lightning-driven tracks have different training distributions (different sets of `(date, time)` survive each filter chain), so each writes its own `normalization_stats_<source>.json` and `create_datasets.py --source <source>` reads the matching one. The inputs (`train_data_<source>.csv`, `sequence_meta_<source>.json`) are also auto-resolved from `--source`.
-
-```bash
-# DBSCAN track (reads train_data_dbscan.csv + sequence_meta_dbscan.json,
-# writes normalization_stats_dbscan.json)
-python compute_normalization_stats.py --source dbscan
-
-# Lightning track (reads train_data_lightning.csv + sequence_meta_lightning.json,
-# writes normalization_stats_lightning.json)
-python compute_normalization_stats.py --source lightning
-
-# Subset of variables (faster iteration while tuning)
-python compute_normalization_stats.py --source dbscan --variables RZC ir_105
-
-# Also surface p01 / p50 / p99 + MAD via reservoir sampling
-python compute_normalization_stats.py --source dbscan --with_percentiles
-
-# Disable training-window filter (DIAGNOSTIC ONLY — leaks val/test data)
-python compute_normalization_stats.py --source dbscan --no_split_filter
-```
-
-**Policy decisions** (recorded inside the JSON for traceability):
-
-| Decision | Choice | Why |
-|---|---|---|
-| Sample scope | training-set only, expanded across each row's past + current + future window | Stats from val / test would leak distributional info into the model |
-| Spatial scope | single scalar mean / std per variable | Per-pixel climatology would overfit to training-domain geography (e.g. permanent radar beam blockage) |
-| Source data | **_base_dir_**/reprojected_data/ (full 1536 × 768 grids) | The pre-built patches in **_base_dir_**/patches/ are filtered by RZC / lightning activity — computing stats on them would bias every variable's distribution toward convective scenes |
-| Missing values | NaN and per-variable "missing sentinel" pixels are **dropped** from the Welford accumulator | Replacing them with `fill` (as the inference-time transforms still do) would silently drag the mean toward the fill value |
-| Pre-norm for heavy-tailed | `log10` after clipping to a positive floor | RZC, LZC, lightning density / current, `cmic_cot`, `opera_rainfall_rate` are zero-inflated with long right tails — z-scoring them directly would compress the bulk into a tiny range |
-| Near-constant flag | `std < 1e-3 · |mean|` → flagged in JSON | Standardising near-constant variables amplifies noise in the rare non-zero pixels; the consumer should consider clipping / robust scaling |
-
-**Per-product normalization table** (also encoded in `NORMALIZATION_SPEC` inside `compute_normalization_stats.py`):
-
-| Product / Variable | Source dir | Transform | Why |
-|---|---|---|---|
-| **Radar — RZC** (rain rate, mm/h) | `radar_data/` | clip 0.01 → `log10` → z-score | Zero-inflated, log-normal-like in the tail. The `0.01 mm/h` floor avoids `log10(0)` and matches the gauge detection limit. |
-| **Radar — LZC** (liquid water content) | `radar_data/` | clip 0.5 → `log10` → z-score | Same family as RZC; the higher floor reflects the noise level of the radar-derived LWC product. |
-| **Radar — CZC** (composite reflectivity, dBZ) | `radar_data/` | linear z-score | dBZ is already a logarithmic scale; the distribution is roughly Gaussian when signal is present. |
-| **Radar — BZC** (base reflectivity, dBZ) | `radar_data/` | hardcoded `x / 100` | Stored as integer-encoded `dBZ * 100`; this divides back to physical units. No statistical centring needed. |
-| **Radar — EZC-20** (echo top height) | `radar_data/` | hardcoded `x / 1.97` | Empirically chosen unit conversion (height/km divided by 1.97 maps to a [0, 1]-ish range). |
-| **Radar — CPCH** (1 h precipitation) | `radar_data/` | pure `log10`, no z-score | Used as a sub-threshold mask (values < 0.1 mm/h are set to the fill). Already on a log scale; further centring would obscure the threshold semantics. |
-| **MTG — `ir_38`** (3.8 µm, K) | `satellite_data/MTG/` | linear z-score | Brightness temperatures are approximately Gaussian; centring stabilises gradient magnitudes across channels. |
-| **MTG — `ir_105`** (10.5 µm, K) | `satellite_data/MTG/` | linear z-score | Same reasoning as `ir_38`. |
-| **MTG — `wv_63`** (6.3 µm water vapour, K) | `satellite_data/MTG/` | linear z-score | Water-vapour channels have narrower dynamic ranges than thermal IR; per-channel stats matter. |
-| **MTG — `wv_73`** (7.3 µm water vapour, K) | `satellite_data/MTG/` | linear z-score | As above. |
-| **MTG — `vis_06`** (0.6 µm reflectance, %) | `satellite_data/MTG/` | hardcoded `x / 100` | Source stores integer `reflectance × 100`; `/100` recovers `[0, 1]` already on a natural scale. No z-score. |
-| **Lightning — density** (strokes/km²) | `lightning_data/` | clip 1e-4 → `log10` → z-score | Extremely heavy-tailed (most pixels zero, rare pixels with thousands). The 1e-4 floor preserves zero-class handling while allowing log. |
-| **Lightning — current** (kA-weighted) | `lightning_data/` | clip 1e-8 → `log10` → z-score | Same as density, with a smaller floor matching the smallest measurable current. |
-| **Lightning — occurrence** (binary) | `lightning_data/` | clip to {0, 1} only | Already on its natural scale; z-scoring would destroy the binary interpretation. |
-| **OPERA — `opera_reflectivity`** (max reflectivity, dBZ) | `opera_data/` | linear z-score | Like CZC: dBZ is already logarithmic, Gaussian-ish where signal is present. |
-| **OPERA — `opera_rainfall_rate`** (mm/h) | `opera_data/` | clip 0.01 → `log10` → z-score | Like RZC: heavy-tailed, zero-inflated. Same floor and transform family for consistency across both rain-rate sources. |
-
-When `--with_percentiles` is passed, each variable block additionally carries `p01`, `p50`, `p99`, and `mad` (median absolute deviation) — useful for sanity-checking against the mean/std, and as robust alternatives if a variable is flagged `near_constant: true`.
-
-### Step 5 — Build TF datasets
-
-Transforms patches using the **data-driven** mean / std from
-**_base_dir_**/normalization_stats_<source>.json (Step 4.3, matching the chosen `--source`) and saves as TFRecord shards for each `(mode, source)` pair. Each dataset split also saves a `metadata.json` containing `input_shapes`, `label_type`, `past_timesteps`, and `future_timesteps` — this metadata drives dynamic model construction in Step 6.
-
-Active modes: `mtg_lightning`, `mtg_radar`, `mtg_radar_continuous`, the OPERA-driven `mtg_opera_radar_only` / `mtg_opera_mtgmr`, and the dual-target full-input pair `mtg_lightning_opera` (OPERA rainfall label) / `mtg_lightning_opera_occurrence` (lightning binary label). The MSG modes (`msg_lightning`, `msg_radar`, `msg_radar_continuous`) are commented out in `get_mode_config()` — re-enable in source if you need them.
-
-The new `--source {dbscan, lightning}` flag selects which `sequence_meta_<source>.json` + `{train,validation,test}_data_<source>.csv` triplet to read and lands the output dataset at **_base_dir_**/datasets/<mode>_<source>/. Mode and source are independent: a single mode can be built once per source so the lightning- and DBSCAN-driven tracks have separate dataset directories.
-
-```bash
-# DBSCAN-driven sample selection (uses patch_index.csv produced by
-# identify_patches.py, whether that script was run with --source radar
-# or --source opera).
-python create_datasets.py --mode mtg_lightning        --source dbscan
-python create_datasets.py --mode mtg_radar            --source dbscan
-python create_datasets.py --mode mtg_radar_continuous --source dbscan
-
-# OPERA-driven precipitation modes
-python create_datasets.py --mode mtg_opera_radar_only --source dbscan
-python create_datasets.py --mode mtg_opera_mtgmr      --source dbscan
-
-# Lightning-driven sample selection (same modes can be rebuilt here)
-python create_datasets.py --mode mtg_lightning        --source lightning
-python create_datasets.py --mode mtg_opera_mtgmr      --source lightning
-```
-
-The OPERA modes replace radar (RZC and friends) with OPERA `opera_reflectivity` + `opera_rainfall_rate` in the MR branch (2 km, `pool=2`) and use `opera_rainfall_rate_hr` (HR alias of the same reprojected file) as the 5-class multi-class label (same bin edges as RZC: `<10`, `10–20`, `20–30`, `30–40`, `≥40 mm/h`):
-
-| Mode | HR | MR | LR | Label |
+| # | Script | Arguments | What the step does | Commands |
 |---|---|---|---|---|
-| `mtg_opera_radar_only` | MTG `vis_06` | OPERA | — | OPERA rainfall 5-class |
-| `mtg_opera_mtgmr` | MTG `vis_06` | OPERA + MTG IR/WV | — | OPERA rainfall 5-class |
-| `mtg_lightning_opera` | lightning + MTG `vis_06` | OPERA + MTG IR/WV | — | OPERA rainfall 5-class |
-| `mtg_lightning_opera_occurrence` | lightning + MTG `vis_06` | OPERA + MTG IR/WV | — | lightning binary occurrence |
-
-`mtg_lightning_opera` and `mtg_lightning_opera_occurrence` share the **same input stack** but differ on the label head — same OPERA-driven sample selection (`--source dbscan`), same channels in HR and MR, but one predicts OPERA rainfall while the other predicts whether lightning will fire. They're the natural dual-target pair to train side-by-side and feed into the domain-adaptation Swin head.
-
-Custom modes can be defined by adding a new configuration in `create_datasets.py`. The training script requires no code changes — it reads whatever inputs are in the dataset.
-
-Output: **_base_dir_**/datasets/{mode}_{source}/train|validation|test/ (each with `metadata.json`)
-
-##### When `--mode` is required vs. optional
-
-The `--mode` argument behaves differently in each of the three pipeline scripts. **Only `train_models.py` is truly dynamic** — the dataset name there is just a label. The other two need a name that matches a hardcoded recipe.
-
-| Script | `--mode` | Resolved as | If you want a new input combination |
-|---|---|---|---|
-| `create_datasets.py` | **required**, restricted to the names in `get_mode_config()` | Picks the HR / MR / LR variable recipe + label transform | Add a branch in `get_mode_config()` — there is no CLI alternative (the per-variable transforms exist as a registry, but the group composition is hardcoded) |
-| `train_models.py` | **required**, but a free-form string | Used only for the saved-model folder name and the default dataset path `{data_root}/datasets/{mode}` | Pass any string. Combine with `--dataset_dir` to point at a dataset that doesn't follow the `{mode}` naming convention |
-| `evaluate_coalition.py` | **required**, restricted to a `choices=[...]` list | Used for the eval output folder name and the dataset path | Add the new name to the `choices=[...]` list in `main()` |
-
-So **the only "skippable" use** of `--mode` is on `train_models.py` when paired with `--dataset_dir`:
-
-```bash
-# Re-train any saved dataset under whatever model label you want
-python train_models.py --mode my_label \
-    --dataset_dir our_data/datasets/mtg_opera_full
-```
-
-For `create_datasets.py` and `evaluate_coalition.py`, the mode name **must** exist in code — adding a new product combination still requires a one-line edit in each. `train_models.py` is unaffected: it reads `metadata.json` and adapts to whatever inputs the dataset declares.
-
-### Step 6 — Train
-
-Builds the COALITION recurrent-convolutional architecture (ResBlock + ConvGRU encoder-decoder) dynamically from the dataset's `metadata.json`. The model architecture adapts automatically to whatever inputs are present — number of input groups, channel counts, and resolutions are all read from metadata rather than hardcoded. This means training with different input configurations (MSG vs MTG, different precipitation targets) requires no code changes; only the dataset needs to change.
-
-Hyperparameters live in [`training.config`](training.config) (epochs, batch size, dropout, cosine-warmup LR schedule, early stopping, checkpointing, the `[finetune]` section for the Swin head, and the `[radar_loss]` section for the OPERA multiclass focal/class-weighted loss). Per-mode overrides go under `[mode.<name>]`.
-
-##### `--stage` — base training vs. domain-adaptation fine-tune
-
-`train_models.py` runs in one of three stages, selected by `--stage`:
-
-| Stage | What it does | Optimizer | Saves |
-|---|---|---|---|
-| `base` (default) | Standard COALITION-4 training from scratch. | Adam (LR from `[lr_schedule]`) | `coalition_<mode>_<source>.keras` |
-| `finetune` | Loads `--base_checkpoint`, freezes the encoder-forecaster, grafts a 2-block Swin transformer head with 8×8 windowed attention + 3 per-lead-time projection heads, fine-tunes only the head. | AdamW (LR + weight_decay from `[finetune]`) | `coalition_<mode>_<source>_finetuned.keras` |
-| `both` | Runs `base` then `finetune` back-to-back in the same Python process. The just-saved base model is used as the frozen backbone — no separate `--base_checkpoint` flag needed. | base uses Adam, finetune uses AdamW | both `.keras` files above |
-
-The Swin head sits on the named `backbone_output` layer (the decoder's final feature tensor, shape `(B, F=3, H, W, C_deep)`). It collapses the future-time axis into shared spatial features, runs the Swin blocks, then projects to 3 independent lead-time outputs that stack back onto axis=1 — same `(B, F, H, W, num_outputs)` contract as the base model, so loss and metrics carry over unchanged.
-
-```bash
-# A. Simple — base only (the standard model, single run)
-python train_models.py \
-    --config training.config \
-    --mode mtg_opera_mtgmr \
-    --source dbscan \
-    --stage base
-
-# B. Domain adaptation — base + Swin head fine-tune in one process
-python train_models.py \
-    --config training.config \
-    --mode mtg_opera_mtgmr \
-    --source dbscan \
-    --stage both
-
-# C. Resume / fine-tune a previously-saved base
-python train_models.py \
-    --config training.config \
-    --mode mtg_opera_mtgmr \
-    --source dbscan \
-    --stage finetune \
-    --base_checkpoint models/coalition_mtg_opera_mtgmr_dbscan.keras
-
-# Train every mode listed in [modes].run, both stages, lightning source
-python train_models.py --config training.config --source lightning --stage both
-
-# Override the default dataset path (debug only; --stage base only)
-python train_models.py \
-    --config training.config \
-    --mode mtg_opera_mtgmr --source dbscan --stage base \
-    --dataset_dir our_data/datasets/mtg_opera_mtgmr_dbscan
-```
-
-Outputs under `./models/` (`run_tag = <mode>_<source>`):
-
-```
-checkpoints/<run_tag>_latest.keras                # resumable per-epoch base checkpoint
-checkpoints/<run_tag>_latest.json
-checkpoints/<run_tag>_finetune_latest.keras       # resumable per-epoch finetune checkpoint
-checkpoints/<run_tag>_finetune_latest.json
-coalition_<run_tag>.keras                         # base model
-coalition_<run_tag>_finetuned.keras               # fine-tuned (Swin head) model
-history_<run_tag>.json
-history_<run_tag>_finetuned.json
-```
-
-The per-epoch checkpoint is the run's safety net for the occasional CUDA crash — at most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two tracks (`--source dbscan` vs `--source lightning`) have completely separate checkpoint paths so they can train in parallel on different machines without colliding.
-
-### Step 7 — Evaluate
-
-Loads the trained model, runs evaluation on the test set, and generates diagnostic plots. Both `--source` (sample-selection track) and `--finetuned` (Swin-head model) are wired through every on-disk path so the four artefact combinations (`{base, finetuned} × {dbscan, lightning}`) never collide.
-
-```bash
-# Base model, OPERA-driven sample selection
-python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --source dbscan
-
-# Swin-head fine-tuned variant of the same run
-python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --source dbscan --finetuned
-
-# Lightning-driven sample selection, base model
-python evaluate_coalition.py --mode mtg_lightning --source lightning
-```
-
-For OPERA multiclass modes (`mtg_opera_radar_only`, `mtg_opera_mtgmr`, `mtg_lightning_opera`), the radar branch now emits aggregate per-class precision / recall / F1 / CSI plus macro-F1, macro-CSI, balanced accuracy on top of the existing accuracy and confusion-matrix outputs. Two extra plots ride along: `csi_per_class.png` and `macro_summary_per_leadtime.png` so the dominance of class 0 (`R<10`) is visually obvious next to the balanced numbers.
-
-Output: `evaluation/eval_<mode>_<source>[_finetuned]/` (plots + `evaluation_results.json`).
-
-##### Fine-tune evaluation path
-
-`--finetuned` does not call `tf.keras.models.load_model` on the saved `.keras`. Saved fine-tuned models contain the backbone as a sub-Model, and Keras 2.10's deserializer rebuilds the variable list in a different order than `save_model` wrote it, so the assigns fail with shape mismatches. Instead the script rebuilds the architecture from scratch with `train_models.build_finetune_model` and calls `model.load_weights(...)` which matches by name. Swin hyperparameters get recovered from `history_<run_tag>_finetuned.json`, so the rebuild matches what training produced. The base `coalition_<run_tag>.keras` must sit alongside the fine-tuned file in `--model_dir`; `--stage both` keeps them together automatically.
-
-##### Per-leadtime CSV bundle for Shapley
-
-`bundle_eval_scores.py` reads each mode's `evaluation_results.json` and writes the per-leadtime CSVs `feature_importance_analysis.py --methods classical_shapley` expects. Same `--source` / `--finetuned` flags as `evaluate_coalition.py`, plus a `--mode MODE=LETTERS` flag to override the default coalition pairing.
-
-```bash
-# Default OPERA coalition (mtg_opera_radar_only = o, mtg_opera_mtgmr = om)
-python bundle_eval_scores.py --source dbscan
-
-# Custom coalition for the lightning study
-python bundle_eval_scores.py --source dbscan --prefix lightning \
-    --mode "mtg_lightning_opera_occurrence=l" \
-    --mode "mtg_lightning_opera=or"
-```
-
-##### Full-domain GT vs Pred visualisation
-
-`visualize_gt_vs_pred.py` is a richer companion to `evaluate_coalition.py`'s per-patch plots. For every top-N reference timestep (by qualifying-patch count in the chosen CSV), it builds full 768×1536 Romania-canvas GT and prediction maps for all three lead times, in a single batched `model.predict(...)` call, with everything in memory (no disk writes). The plot is centred on Romania with neighbour-country borders, all 18 patch slots are outlined with a dashed grid, and a second figure zooms into the patch with the most GT activity per timestep.
-
-```bash
-# OPERA multiclass base model
-python visualize_gt_vs_pred.py \
-    --csv our_data/test_data_dbscan.csv \
-    --mode mtg_lightning_opera \
-    --source dbscan --top_n 3
-
-# Lightning occurrence fine-tuned model; threshold from evaluation_results.json
-python visualize_gt_vs_pred.py \
-    --csv our_data/test_data_dbscan.csv \
-    --mode mtg_lightning_opera_occurrence \
-    --source dbscan --top_n 3 --finetuned
-```
-
-Output: `full_domain_plots/full_domain_<run_tag>[_finetuned]/ts<NN>_<date>_<HHMM>.png` plus a `..._zoom_p<NN>.png` per timestep. With cartopy installed, neighbour-country borders draw from Natural Earth's 10m `admin_0_countries` shapefile; without it the script falls back to a coarse hardcoded Romania polygon and prints `Border src: hardcoded_coarse` in the startup banner.
-
-For inference on a date the training pipeline has never seen — no split CSV, no extracted patches, no ranking by qualifying patch count — see the top-level [Inference](#inference) section.
-
-### Utility Scripts
-
-```bash
-# Training-scope non-zero pixel fraction for the LIGHTNING binary head.
-# Defaults to train_data_<source>.csv and writes
-# lightning_fraction_<source>.json so the prior matches what the model
-# sees. Run once per --source you plan to train; train_models.py
-# auto-resolves the matching JSON.
-python lightning_fraction.py --source dbscan
-python lightning_fraction.py --source lightning
-# Broader scope: --scope_csv lightning_active_steps.csv. Legacy
-# everything-on-disk: --scope_csv none.
-
-# Training-scope per-class pixel fractions for the RADAR / OPERA
-# multiclass head. Writes opera_rainfall_fraction_<source>.json which
-# WeightedFocalCategoricalCrossentropy reads to build its alpha_k
-# class weights. Required when [radar_loss].weighting != none in
-# training.config; ignored when the configured radar loss is plain CCE.
-python opera_rainfall_fraction.py --source dbscan
-python opera_rainfall_fraction.py --source lightning
-
-# Generate dataset diagnostic plots (6 panels: diurnal cycle, spatial
-# heatmap, daily timeline, simultaneously-active patches, samples per
-# date, patch survival). --source / --split auto-resolve the sequence
-# CSV (defaults: dbscan + train). Pass --sequences to override.
-python data_statistics.py                                    # train_data_dbscan.csv
-python data_statistics.py --source lightning                 # train_data_lightning.csv
-python data_statistics.py --source dbscan --split validation # validation_data_dbscan.csv
-python data_statistics.py --csv /any/path.csv                # explicit override
-
-# Lightning activity bar plots (reads lightning_active_steps.csv; plots-only).
-python our_data/lightning_data/visualize_lightning_stats.py \
-    --output_dir our_data/lightning_data
-
-# Re-run the DBSCAN patch-selection diagnostic plot for one date.
-# Now styled to match the prediction plotter (Romania-centred view,
-# neighbour-country borders, dashed grid + red active highlight).
-python identify_patches.py --date 2025-05-16 --plot
-python identify_patches.py --date 2025-05-16 --plot --source opera
-```
-
-### Data Acquisition and Arrangement
-
-#### MTG FCI L1C Satellite Data Pipeline (SFTP)
-
-`pipeline_msg_mtg.py` was rewritten to pull FCI L1C from the ANM internal storage via SFTP (instead of EUMETSAT Data Store / `eumdac`) and to read chunks directly with `netCDF4` + `hdf5plugin` (instead of going through Satpy).
-
-```bash
-# 1. Pick the training cadence first (writes our_data/timestep_config.json)
-python validate_timestep.py --step_minutes 15
-
-# 2. Download + process MTG FCI L1C for a time range
-python our_data/satellite_data/pipeline_msg_mtg.py \
-    --start 2026/02/01-0000 \
-    --end   2026/04/01-0000 \
-    --password_file password.txt
-```
-
-**Required arguments:**
-
-| Flag | Description |
-|------|-------------|
-| `--start`, `--end` | Date/time range in `yyyy/mm/dd-hhmm` (UTC). Use `2026/04/01-0000` to include all of March 31. |
-| `--password_file`, `-pw` | Text file containing the SSH password for `anm@192.168.11.223` on a single line. Keep out of git. |
-
-**Optional flags:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--products_file`, `-pf` | JSON file listing MTG channels under the `"mtg"` key. | `satellite_products.json` |
-| `--output_dir`, `-o` | Output directory for processed channels. | `./MTG` in CWD |
-| `--full_disk` | Download all 40 chunks instead of Romania-only. | off |
-| `--timesteps` | Override the minute filter (e.g. `00 10 30 40`) or pass `all` for every native :00/.../:50. | read from `timestep_config.json` |
-| `--skip_download` | Skip SFTP and process files already in `<output_dir>/_raw_chunks/`. | off |
-| `--workers`, `-w` | Parallel workers for repeat-cycle processing. | `10` |
-
-**Key differences from the previous implementation:**
-
-1. **Data source**: EUMETSAT Data Store (`eumdac`) → SFTP from `anm@192.168.11.223:/ShortTermStorage/GEOSTATIONARY/MTG/FCI/`. Date, chunk number, and minute-of-hour filters are applied **server-side** via SSH `ls` with glob patterns before anything is transferred.
-2. **Chunk filter**: `{34, 35, 36, 37, 38}` (±1 buffer) → `{35, 36}` based on the Météo-France FCI scan diagram. Halves transfer volume vs. the previous default.
-3. **Processing**: manual `netCDF4.Dataset` reading is kept but the custom `fci_scanning_angles_to_latlon()` inverse projection and the `ProcessPoolExecutor` chunk-stitching pipeline are replaced by a single `process_repeat_cycle()` function that:
-   - opens each chunk with `netCDF4` (hdf5plugin provides CharLS decompression),
-   - reads `data[<channel>]/measured/effective_radiance` with `scale_factor` / `add_offset` auto-applied,
-   - concatenates Romania chunks vertically,
-   - writes one `.npy` per channel + a sidecar `MTG/mtg_constants.json` describing the geos projection (perspective height, semi-major/minor axes, sub-satellite longitude, sweep axis) and the 1-D scanning angles `x_geos`, `y_geos`.
-4. **No more coordinate `.npy` files**: the old `coordinates/lat_{1,2}km.npy` and `lon_{1,2}km.npy` are gone. `reproject.py` rebuilds the source lat/lon arrays on demand from `mtg_constants.json` via `pyproj.Proj(proj='geos', ...)`.
-5. **Legacy code removed**: the original `eumdac` Data Store path and the inert MSG SEVIRI block that used to live at the bottom of `pipeline_msg_mtg.py` have been deleted. Only the MTG-via-SFTP path remains. If you need to re-enable MSG ingestion you can recover the historical code from `git log`.
-
-> **Network**: you must be on a network with route to `192.168.11.223` (ANM internal/VPN) and have read access to the FCI storage path. The script fails fast if SFTP can't connect or the password file is missing.
-
-#### MTG Helper Scripts
-
-**`summarize_mtg.py`** — scan `_raw_chunks/` and emit a CSV showing how many repeat cycles and chunk files are present per date. Useful to confirm a download is complete before processing.
-
-```bash
-python our_data/satellite_data/summarize_mtg.py
-python our_data/satellite_data/summarize_mtg.py --raw_dir path/to/_raw_chunks --output summary.csv
-```
-
-**`inspect_mtg.py`** — reconstruct a CF-compliant NetCDF from a pipeline `.npy` (using `mtg_constants.json` for the geos grid) or from a reprojected `.npy` (using `romania_grid_lats/lons.npy`), and optionally plot it with matplotlib. Use this to open the data in Panoply / QGIS or to sanity-check a frame.
-
-```bash
-# Plot pipeline output (geostationary grid)
-python our_data/satellite_data/inspect_mtg.py --raw \
-    --npy MTG/vis_06/nc4_2026-02-13-Romania_vis_06/nc4_2026-02-13-Romania_0930_vis_06.npy \
-    --constants MTG/mtg_constants.json
-
-# Plot reprojected output (Romania EPSG:31700 grid)
-python our_data/satellite_data/inspect_mtg.py --reprojected \
-    --npy reprojected_data/satellite_data/MTG/vis_06/.../nc4_..._0930_vis_06.npy
-
-# Save .nc without plotting
-python our_data/satellite_data/inspect_mtg.py --raw --npy <path> --constants <path> --save_nc --no_plot
-```
-
-#### `reproject.py` — MTG branch updates
-
-Two changes were needed to align `reproject.py` with the new pipeline output:
-
-1. **Source grid reconstruction**: previously `reproject_satellite_mtg()` loaded the precomputed `coordinates/lat_{1,2}km.npy` / `lon_{1,2}km.npy` files written by the old pipeline. Those files no longer exist. The new code reads **_base_dir_**/satellite_data/MTG/mtg_constants.json, builds a `pyproj.Proj(proj='geos', h=..., a=..., b=..., lon_0=..., sweep=...)` from the embedded projection parameters, and reconstructs 2-D source lat/lon arrays from `x_geos` / `y_geos` once per resolution. The KD-tree (`PrecomputedMapping`) caching strategy is unchanged.
-2. **Input format**: MTG and lightning inputs are now `.npy` arrays (MTG written by `pipeline_msg_mtg.py`, lightning written by `read_kml_version2.py`). Radar and MSG (disabled) paths still use `.nc`. To get a CF-compliant `.nc` for GIS inspection from any reprojected `.npy`, see `inspect_mtg.py --reprojected` and `inspect_lightning.py`.
-
-The reproject output for MTG remains `.npy` on the Romania 1536×768 grid. Use `inspect_mtg.py --reprojected` to get a CF NetCDF for any single reprojected sample.
-
-#### OPERA Radar Pipeline (SFTP + reproject)
-
-OPERA is an alternative radar source with two products:
-
-| Product | Native resolution | Cadence | File format |
-|---|---|---|---|
-| Maximum reflectivity (dBZ) | 2 km | 15 min | HDF5 (`.h5`) |
-| Instantaneous rainfall rate (mm/h) | 2 km | 15 min | HDF5 (`.h5`) |
-
-Both products are listed in `product_cadences.config` as `opera_reflectivity = 15` and `opera_rainfall_rate = 15`. They raise the validator floor to 15 min when OPERA is in use — comment them out with a leading `#` in the cadences file if you're not using OPERA and want a finer training step.
-
-##### Step 1 — Download (`pipeline_opera.py`)
-
-Connects to `claudiu@64.225.128.186` via SFTP and pulls files from `/eumetsatdata/opera-reflectivity/` and `/eumetsatdata/opera-rainfall-rate/`. Server-side dirs are already partitioned as `{YYYY}/{MM}/{DD}/`, so the local mirror reuses the same hierarchy under **_base_dir_**/opera_data/. Per-product minute filters are read from `timestep_config.json`; the script skips files already present in the cache for resumability.
-
-```bash
-# 1. Pick the training cadence (writes our_data/timestep_config.json)
-python validate_timestep.py --step_minutes 15
-
-# 2. Download OPERA for a date range. If the default --remote_base
-#    /eumetsatdata errors with "No such file", swap in
-#    /home/eumetsatdata as shown below - the mount root differs
-#    between EWC images.
-python our_data/opera_data/pipeline_opera.py \
-    --start 2025/06/15-0000 --end 2025/06/15-2359 \
-    --password_file password.txt \
-    --remote_base /home/eumetsatdata
-```
-
-**Required arguments:**
-
-| Flag | Description |
-|------|-------------|
-| `--start`, `--end` | Date/time range in `yyyy/mm/dd-hhmm` (UTC), end inclusive. |
-| `--password_file`, `-pw` *or* `--ssh_key`, `-i` | **Exactly one** of: text file with the SSH password for `claudiu@64.225.128.186`, **or** a path to a private key (e.g. `~/.ssh/id_ed25519` — matching the `scp -i` example). Mutually exclusive. |
-
-**Optional flags:**
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--cache_dir`, `-c` | Local OPERA root | **_base_dir_**/opera_data/ |
-| `--products` | `opera_reflectivity`, `opera_rainfall_rate`, or both | both |
-| `--timesteps` | Override the per-product minute filter (one filter applied to all chosen products); `all` keeps every native timestep | per-product filter from `timestep_config.json` |
-| `--remote_host` | Override the SSH host | `64.225.128.186` |
-| `--remote_user` | Override the SSH user | `claudiu` |
-| `--remote_base` | Remote directory holding the per-product subdirs. Switch to `/home/eumetsatdata` (or any other path) if the default isn't where the data lives on the VM. | `/eumetsatdata` |
-
-Only `.h5` files are transferred; OPERA-internal metadata or index files in the same directory are skipped. Per-file `[i/total] Downloading <filename>` progress, identical to the MTG pipeline.
-
-**Supported filename conventions** (the timestamp parser tries both):
-
-- ISO (current EWC dump): `2026-05-11T000500Z-reflectivity-composite-opera.h5`
-- Compact (legacy / EUMETSAT): `T_PAAH21_C_LFPW_20250615120000.h5`, `composite_201801011500.h5`
-
-See the top-level [Troubleshooting](#troubleshooting) section for the common OPERA SFTP failure modes (auth, missing dates, alternate mount root).
-
-##### Step 2 — Coverage report (`summarize_opera_data.py`)
-
-Walks the per-date subdirs, parses each filename's timestamp, and produces a per-date / per-product completeness table plus a JSON listing the exact missing timestamps relative to the configured cadence.
-
-```bash
-# Defaults (read cadence from timestep_config.json, both products)
-python our_data/opera_data/summarize_opera_data.py
-
-# Check completeness at native cadence (every :00, :05, :10, ... for reflectivity)
-python our_data/opera_data/summarize_opera_data.py --timesteps all
-
-# Only one product, custom paths
-python our_data/opera_data/summarize_opera_data.py \
-    --products opera_reflectivity \
-    --data_dir D:/backup/opera --output opera_summary.csv \
-    --missing opera_missing.json
-```
-
-The CSV has per-product `_files`, `_on_grid`, `_off_grid`, `_expected`, `_coverage_pct` columns. The JSON has per-date `missing_times` lists (HH:MM) plus per-product overall coverage in `summary`.
-
-##### Step 3 — Reproject to the Romania grid (via `reproject.py --opera`)
-
-OPERA reprojection lives inside the unified `reproject.py` (the old standalone `reproject_opera.py` was removed). Reads each `.h5` file's `/where` metadata, builds `pyproj.Proj(projdef)` source projection, projects via `pyresample` KD-tree onto the EPSG:31700 Stereo70 grid (1536×768), and saves one **`.npy` per file** under **_base_dir_**/reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/. The KD-tree mapping is built **once per product** from the first file and reused across the rest. Day folders run in parallel via the shared `ThreadPoolExecutor`, same as the other product families.
-
-```bash
-# Both OPERA products
-python reproject.py --opera
-
-# All products in a single run (radar + MTG + lightning + OPERA)
-python reproject.py --all
-
-# Single date / custom worker count
-python reproject.py --opera --date 2025-06-15 --workers 8
-```
-
-Output schema (one `.npy` per source `.h5`, plus shared sidecars):
-
-| Path | Contents | Notes |
+| **0** | `validate_timestep.py` | `--step_minutes` desired training step · `--cadences_file` product cadence config · `--output_path` · `--print` show existing config and exit | Picks the master cadence and derives each product's minute filter → `our_data/timestep_config.json`, read by every later step. | `python validate_timestep.py --step_minutes 15`<br>`python validate_timestep.py --print` |
+| **1a** | `our_data/satellite_data/pipeline_msg_mtg.py` | `--start` `--end` range · `--password_file` 2-line credentials · `--products_file` channel list JSON · `--output_dir` · `--timesteps` · `--workers` · `--full_disk` · `--skip_download` | Downloads + pre-processes MTG FCI L1C. | `python our_data/satellite_data/pipeline_msg_mtg.py --start 2025/05/01-0000 --end 2025/05/31-2350 --password_file creds.txt` |
+| **1b** | `our_data/opera_data/pipeline_opera.py` | `--start` `--end` · `--products` reflectivity/rainfall_rate · `--remote_base` EWC mount root · `--remote_host` `--remote_user` `--ssh_key` · `--password_file` · `--cache_dir` · `--timesteps` | Fetches OPERA composite HDF5. If the default `--remote_base /eumetsatdata` errors with "No such file", pass `/home/eumetsatdata` — the mount root differs between EWC images. | `python our_data/opera_data/pipeline_opera.py --start 2025-05-01 --end 2025-05-31`<br>`… --remote_base /home/eumetsatdata` |
+| **1c** | `our_data/lightning_data/linet_export.py` | `--start` `--end` · `--format` txt/kml/asc · `--out` · `--bbox` · `--password_file` · `--lightning-type` · `--amp-threshold` · `--daily-window` · `--pause` · `--force` · `--dry-run` | Downloads LINET strokes. Use `--format kml`: it writes `{out}/kml_data/YYYY-MM-DD/…` which the rasteriser reads directly. | `python our_data/lightning_data/linet_export.py --start 2025-05-01 --end 2025-05-31 --format kml --out our_data/lightning_data --password_file creds.txt` |
+| **1d** | `our_data/lightning_data/read_kml_version2.py` | `--data_root` · `--output_root` · `--date` single date · `--force` overwrite | Rasterises strokes onto the 1 km Romania grid → `density`, `current`, `occurrence`. | `python our_data/lightning_data/read_kml_version2.py --data_root our_data` |
+| **2** | `reproject.py` | `--satellite MTG` \| `--lightning` \| `--opera` \| `--all` (mutually exclusive, required) · `--data_root` · `--date` · `--workers` | Regrids everything onto the 1536 × 768 EPSG:31700 canvas as `.npy`. Also writes the shared `romania_grid_{lats,lons}.npy` and per-source projection constants so the arrays stay self-recoverable. | `python reproject.py --all`<br>`python reproject.py --opera --workers 6`<br>`python reproject.py --satellite MTG --date 2025-05-14` |
+| **3** | `intersect_product_coverage.py` | `--summary` per-product summary CSVs · `--missing` missing-timestep JSONs · `--active` activity index · `--errors_log` · `--timestep_config` · `--output_csv` · `--output_plot` | Intersects per-product coverage into `timestep_manifest.csv` — the timesteps where *all* products exist. Gates step 5. | `python intersect_product_coverage.py --summary mtg=mtg_summary.csv --summary opera=opera_summary.csv` |
+| **4** | `identify_patches.py` | `--threshold` rain-rate cut mm/h (10) · `--eps` DBSCAN radius px (5) · `--min_samples` min cluster px (20) · `--data_root` `--output_dir` · `--date` \| `--start`/`--end` · `--plot` PNG per active step | DBSCAN over OPERA `rainfall_rate`; marks which of the 18 patches are convectively active per timestep → `patch_index.csv`. | `python identify_patches.py`<br>`python identify_patches.py --start 2025-05-01 --end 2025-05-31`<br>`python identify_patches.py --date 2025-05-14 --plot` |
+| **5** | `extract_patch_seq_for_datasets.py` | `--past` past steps (2) · `--future` future steps (3) · `--test_frac` (0.1) · `--val_frac` (0.1) · `--block_hours` block size, must divide 24 (6) · `--manifest` path or `none` to disable the gate · `--data_root` | Builds temporally-continuous sequences and the Czibula block-wise 80/10/10 split → `{train,validation,test}_data_dbscan.csv` + `sequence_meta_dbscan.json`. | `python extract_patch_seq_for_datasets.py`<br>`python extract_patch_seq_for_datasets.py --past 3 --future 3 --block_hours 12`<br>`python extract_patch_seq_for_datasets.py --manifest none` |
+| **6** | `extract_patches.py` | `--products` `satellite_MTG` / `lightning` / `opera` (default all) · `--data_root` `--output_dir` · `--date` | Slices 256 × 256 patches from the reprojected canvases, applying each variable's pooling factor → `patches/{date}/{var}_{HHMM}_{HR\|LR}.npy`. | `python extract_patches.py`<br>`python extract_patches.py --products satellite_MTG opera`<br>`python extract_patches.py --date 2025-05-14` |
+| **7** | `compute_normalization_stats.py` | `--variables` subset · `--sample_fraction` · `--with_percentiles` p01/p50/p99 + MAD · `--reservoir_size` · `--device` auto/cpu/gpu · `--no_split_filter` **diagnostic only — leaks val/test** · `--train_csv` `--sequence_meta` `--timestep_config` `--reproject_root` `--output` `--seed` | Per-variable mean/std over the **training split only** → `normalization_stats_dbscan.json`. Required by step 8; there is no fallback, and a missing variable fails loudly. | `python compute_normalization_stats.py`<br>`python compute_normalization_stats.py --variables ir_105 opera_rainfall_rate`<br>`python compute_normalization_stats.py --device gpu --with_percentiles` |
+| **8** | `create_datasets.py` | `--mode` one of the 5 buildable modes · `--data_root` · `--output_root` | Applies transforms + label binning, writes TFRecord shards plus a per-split `metadata.json` (input shapes, label type, cadence) that drives model construction. | `python create_datasets.py --mode mtg_opera_mtgmr_rainfall`<br>`python create_datasets.py --mode mtg_lightning_opera_occurrence`<br>`python create_datasets.py --mode mtg_opera_mtgmr_continuous` |
+| **9a** | `lightning_fraction.py` | `--scope_csv` scope CSV or `none` for every file on disk · `--data_root` · `--output` | **Lightning modes only.** Training-scope positive-pixel fraction → `lightning_fraction_dbscan.json`, the focal-loss prior. | `python lightning_fraction.py`<br>`python lightning_fraction.py --scope_csv none` |
+| **9b** | `opera_rainfall_fraction.py` | `--scope_csv` · `--data_root` · `--output` | **Rainfall modes only, when `[radar_loss].weighting != none`.** Per-class pixel fractions → `opera_rainfall_fraction_dbscan.json`, the class-weight prior. | `python opera_rainfall_fraction.py` |
+| **10** | `train_models.py` | `--config` · `--mode` single mode (else `[modes].run`) · `--stage` `base`/`finetune`/`both` · `--base_checkpoint` frozen backbone · `--dataset_dir` override path · `--output_dir` `--data_root` · `--fresh` ignore checkpoint · `--list-modes` | Builds the encoder-forecaster from `metadata.json` and trains. `finetune` freezes the backbone and grafts a Swin head; `both` runs the two back-to-back in one process. Resumes from the per-epoch checkpoint unless `--fresh`. | `python train_models.py --list-modes`<br>`python train_models.py --mode mtg_opera_mtgmr_rainfall --stage base`<br>`python train_models.py --mode mtg_lightning_opera_occurrence --stage both`<br>`python train_models.py --config training.config`<br>`python train_models.py --mode mtg_opera_mtgmr_rainfall --stage base --fresh` |
+| **11** | `train_lightning_kd.py` | `--kd_alpha` (0.7) · `--kd_temperature` (4.0) · `--teacher_finetuned` distil from the Swin teacher · `--epochs` (50) · `--batch_size` (8) · `--learning_rate` (1e-4) · `--patience` (10) · `--shuffle_buffer` · `--seed` · `--no_mixed_precision` · `--data_root` `--model_dir` | **Optional.** Distils the teacher into `mtg_opera_occurrence`, a student predicting lightning from satellite + OPERA with **no LINET at inference**. | `python train_lightning_kd.py`<br>`python train_lightning_kd.py --kd_alpha 0.5 --kd_temperature 6.0`<br>`python train_lightning_kd.py --teacher_finetuned` |
+| **12** | `sepconv_ensemble_training.py` | `--mode` `mtg_opera_mtgmr_continuous` · `--lead` train only lead 1/2/3 · `--epochs` (50) · `--batch_size` (8) · `--data_root` `--model_dir` | **Optional baseline.** Three SepConv regression models (one per lead) on the same inputs as the continuous COALITION-4 mode. | `python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous`<br>`python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous --lead 1` |
+
+### OPERA SFTP notes (step 1b)
+
+Two distinct failures both surface as `cannot list …` — tell them apart by what follows.
+
+| Symptom | Cause | What to do |
 |---|---|---|
-| `reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/nc4_{date}-Romania_{HHMM}_{product}.npy` | `float32` array on the 768×1536 Romania grid | `nodata` → NaN, `undetect` → 0 (no precipitation detected) |
-| `reprojected_data/opera_data/opera_constants.json` | Source projection per product: `projdef`, `xsize`, `ysize`, `xscale`, `yscale`, LL/UR corner coords | Written once from the first file of each product |
-| `reprojected_data/romania_grid_lats.npy`, `reprojected_data/romania_grid_lons.npy` | Target lat/lon arrays on the Romania grid | Shared across every product (radar / MTG / lightning / OPERA) |
+| `cannot list …: Permission denied` | The EWC VM rejects password authentication. | Switch to key auth: `--ssh_key ~/.ssh/id_ed25519`, or any other key registered under `claudiu@` on the server. |
+| `cannot list …: No such file`, per date, at a mount root that already resolved | None — this is upstream. `--remote_base` auto-fallback already picked the correct EWC mount, so the remote directories genuinely do not exist for those dates. | Nothing to fix locally. Ask the NMA (National Meteorological Administration) data operators when the target range will land. |
 
-To rebuild a CF-compliant NetCDF for inspection in Panoply / QGIS, point `inspect_mtg.py --reprojected` at one of the `.npy` files — it auto-finds the shared `romania_grid_*.npy` via a walk-up.
+```bash
+python our_data/opera_data/pipeline_opera.py --start 2025-05-01 --end 2025-05-31 \
+    --ssh_key ~/.ssh/id_ed25519
+```
 
-> **Note**: OPERA files are read with `h5py` (the format is plain HDF5, not NetCDF). Make sure `h5py` is installed (`pip install h5py`).
+---
 
-#### Timestep Selection (no interpolation)
+## Table 2 — Validation, inference, visualisation & analysis
 
-Both radar composites and MTG FCI data are acquired at native 10-minute cadence (:00, :10, :20, :30, :40, :50). The training cadence is chosen via [`validate_timestep.py`](#step-0--set-the-training-cadence) and stored in **_base_dir_**/timestep_config.json; the download pipelines (`pipeline_opera.py`, `pipeline_msg_mtg.py`) read that config to decide which native minutes to keep. No optical flow interpolation is used.
+| # | Script | Arguments | What the step does | Commands |
+|---|---|---|---|---|
+| **1** | `evaluate_coalition.py` | `--mode` (required) · `--split` train/validation/test · `--finetuned` \| `--kd` · `--threshold` fixed decision threshold (else optimised on validation) · `--plot_threshold` · `--date` `--hour` sample figure · `--batch_size` · `--data_root` `--model_dir` `--output_dir` | Full metric suite on a held-out split → `evaluation/eval_<run_tag>/evaluation_results.json` + plots. Per-lead metrics feed the coalition study. | `python evaluate_coalition.py --mode mtg_opera_mtgmr_rainfall`<br>`python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --finetuned`<br>`python evaluate_coalition.py --mode mtg_opera_occurrence --kd`<br>`python evaluate_coalition.py --mode mtg_opera_mtgmr_rainfall --split validation` |
+| **2** | `evaluate_sepconv_ensemble.py` | `--mode` `mtg_opera_mtgmr_continuous` · `--split` · `--date` `--hour` · `--batch_size` · `--data_root` `--model_dir` `--output_dir` | Evaluates the SepConv baseline. Continuous predictions are also binned to the 5 rainfall classes so both comparison modes are reported. | `python evaluate_sepconv_ensemble.py --mode mtg_opera_mtgmr_continuous` |
+| **3** | `validate_predictions.py` | `--track` `rainfall`/`lightning`/`kd` (required) · `--year` `--month` (required) · `--date` switches to visualisation · `--mode` · `--finetuned` \| `--kd` · `--stride` Hann stride (128) · `--lightning_low_threshold` (0.90) · `--rainfall_threshold_mmh` selection cut (10) · `--high_coverage_pct` (90) · `--teacher_mode` `--student_mode` `--teacher_finetuned` `--no_student_kd` (kd track) · `--batch_size` · `--data_root` `--model_dir` `--output_dir` | **Extraction (no `--date`):** scans the month for samples with ≥1 pixel ≥10 mm/h, runs inference, tunes the per-lead hysteresis HIGH by maximising aggregate CSI, writes CSV + summary JSON + metrics figure. **Visualisation (`--date`):** plots overlays for that day using the tuned thresholds. `kd` runs teacher and student on identical samples and tunes each independently. | `python validate_predictions.py --track rainfall --year 2025 --month 5`<br>`python validate_predictions.py --track rainfall --year 2025 --month 5 --finetuned`<br>`python validate_predictions.py --track lightning --year 2025 --month 5 --mode mtg_lightning_opera_occurrence`<br>`python validate_predictions.py --track lightning --year 2025 --month 5 --mode mtg_lightning_opera_occurrence --date 2025-05-14`<br>`python validate_predictions.py --track kd --year 2025 --month 5` |
+| **4** | `predict_full_domain.py` | `--mode` `--date` (required) · `--time` \| `--hour` \| `--start-time`/`--end-time` · `--finetuned` \| `--kd` · `--validation_summary` load tuned per-lead thresholds · `--lightning_low_threshold` `--lightning_high_threshold` · `--rainfall_low_threshold` `--rainfall_high_threshold` · `--stride` · `--patches` subset of the 18 (rainfall only) · `--threshold` · `--batch_size` · `--no-plot` `--save-npy` · `--data_root` `--model_dir` `--output_dir` | **Operational inference on any date.** Reads the reprojected full-domain fields and slices all 18 patches on the fly — touches no `patch_index.csv`, split CSV, or pre-extracted patch tile, so it runs on dates the training pipeline has never seen. | `python predict_full_domain.py --mode mtg_opera_mtgmr_rainfall --date 2026-06-30`<br>`python predict_full_domain.py --mode mtg_opera_mtgmr_rainfall --date 2026-06-30 --hour 14`<br>`python predict_full_domain.py --mode mtg_lightning_opera_occurrence --date 2026-06-30 --time 14:30`<br>`python predict_full_domain.py --mode mtg_lightning_opera_occurrence --date 2026-06-30 --validation_summary validation/lightning_2025_05_summary.json`<br>`python predict_full_domain.py --mode mtg_opera_mtgmr_rainfall --date 2026-06-30 --start-time 12:00 --end-time 15:45 --save-npy` |
+| **5** | `visualize_gt_vs_pred.py` | `--csv` split CSV (required) · `--mode` (required) · `--top_n` highest-activity references (5) · `--finetuned` \| `--kd` · `--eval_results` threshold source · `--threshold` · `--no_zoom` · `--no_aggregate_graphs` · `--stride` · same 4 hysteresis flags as above · `--validation_summary` · `--batch_size` · `--data_root` `--model_dir` `--output_dir` | **Training-scope visualiser.** Ranks references in a split by qualifying-patch count and renders GT beside predictions, plus a zoom on the patch with the most GT activity. Hysteresis knobs mirror `predict_full_domain.py` so both render identical post-processing. | `python visualize_gt_vs_pred.py --csv our_data/test_data_dbscan.csv --mode mtg_opera_mtgmr_rainfall`<br>`python visualize_gt_vs_pred.py --csv our_data/validation_data_dbscan.csv --mode mtg_lightning_opera_occurrence --top_n 3`<br>`python visualize_gt_vs_pred.py --csv our_data/test_data_dbscan.csv --mode mtg_opera_occurrence --kd --no_zoom` |
+| **6** | `generate_report.py` | `--year` `--month` (required) · `--track` `rainfall`/`lightning`/`both` · `--language` `ro`/`en` · `--bilingual` · `--model` Ollama tag · `--temperature` (0.1) · `--seed` (42) · `--max_tokens` (2000) · `--refresh_cache` `--no_cache` · `--skip_pdf` · `--pred_coupling` · `--validation_dir` `--assets_dir` `--output` `--data_root` `--model_dir` | Builds a PDF from `validate_predictions.py` outputs with commentary from a local Ollama LLM. `--language en` skips the Romanian translation phase and halves the LLM calls. `--track both` requires both tracks' extraction outputs on disk. | `python generate_report.py --year 2025 --month 5`<br>`python generate_report.py --year 2025 --month 5 --language en`<br>`python generate_report.py --year 2025 --month 5 --track lightning --bilingual`<br>`python generate_report.py --year 2025 --month 5 --skip_pdf --no_cache` |
+| **7** | `bundle_eval_scores.py` | `--mode` repeatable `MODE=LETTERS` · `--prefix` · `--metric` override auto-detection · `--eval_root` `--output_dir` · `--finetuned` | Converts each mode's `evaluation_results.json` into the per-lead-time CSVs classical Shapley expects. Coalition letters encode which input groups a model saw (`o` = OPERA only, `om` = + MTG IR/WV). | `python bundle_eval_scores.py`<br>`python bundle_eval_scores.py --metric HSS`<br>`python bundle_eval_scores.py --mode "mtg_opera_radar_only_rainfall=o" --mode "mtg_opera_mtgmr_rainfall=om"` |
+| **8** | `feature_importance_analysis.py` | `--model` checkpoint · `--data` test dataset dir · `--output` · `--methods` `gradcam_xi` / `shap` / `classical_shapley` · `--num-samples` · `--scores-dir` for classical Shapley · `--model-ablated` `--data-ablated` second model for the ablation diff | Grad-CAM + Xi correlation (spatial attention), SHAP (pixel importance), and classical Shapley (source-level). The ablation pair diffs two Xi matrices to show how remaining inputs absorb a dropped group's role. | `python feature_importance_analysis.py --model models/coalition_mtg_opera_mtgmr_rainfall_dbscan.keras --data our_data/datasets/mtg_opera_mtgmr_rainfall_dbscan/test --output results/fi --methods gradcam_xi`<br>`… --methods gradcam_xi shap`<br>`… --model-ablated models/coalition_mtg_opera_radar_only_rainfall_dbscan.keras --data-ablated our_data/datasets/mtg_opera_radar_only_rainfall_dbscan/test` |
+| **9** | `data_statistics.py` | `--split` train/validation/test · `--csv` explicit override · `--data_root` | Six dataset diagnostic panels: diurnal cycle, spatial heatmap, daily timeline, simultaneously-active patches, samples per date, patch survival. | `python data_statistics.py`<br>`python data_statistics.py --split test` |
 
-For step = 15 min with 10-min sources, the script picks `{00, 10, 30, 40}` — the natives that minimise distance to each grid slot, breaking equidistant ties by preferring the minute closer to the hour boundary. This produces an alternating 10-20-10-20 spacing across the day:
+**Ablation pairs** for step 8 — the mode set is already an ablation ladder:
 
-| Sample | Native minute | Distance to next sample |
+| Full model | Ablated model | Isolates |
 |---|---|---|
-| Slot 0 | :00 | 10 min |
-| Slot 1 | :10 | 20 min |
-| Slot 2 | :30 | 10 min |
-| Slot 3 | :40 | 20 min |
-| Slot 4 | next hour :00 | 10 min |
-
-Both scripts accept `--timesteps all` (keep every native timestep) or `--timesteps NN [NN ...]` (override the config explicitly).
-
-#### Data Ingest (one-time setup)
-
-Each remote source has its own download entry point that writes files directly into the per-source pipeline layout — no intermediate arrangement step:
-
-- **LINET lightning** → [`our_data/lightning_data/linet_export.py`](our_data/lightning_data/linet_export.py)
-- **MTG FCI**        → [`our_data/satellite_data/pipeline_msg_mtg.py`](our_data/satellite_data/pipeline_msg_mtg.py)
-- **OPERA composite** → [`our_data/opera_data/pipeline_opera.py`](our_data/opera_data/pipeline_opera.py)
-- **NWCSAF**         → [`our_data/nwcsaf_data/pipeline_nwcsaf.py`](our_data/nwcsaf_data/pipeline_nwcsaf.py)
-
-LINET KMLs are fetched from the LinetView HTTP export endpoint via direct GETs to `/export/lightning.export` — replacing the manual UI workflow (Historic → date → *Statistics and Data Export* → *Export Stroke data of rectangle* → draw box). Credentials come from a two-line `--password_file` (line 1: username, line 2: password; same pattern as the OPERA / MSG / NWCSAF pipelines) or fall back to the `LINET_USER` / `LINET_PASS` env vars; a POST to `/functions/doLogin.function` yields an `LVSESSION` cookie that `requests.Session` re-uses across the batch. Coordinates in the exported KMLs are in EPSG:4326 (WGS84 lat/lon); the Romania grid transform happens inside [`read_kml_version2.py`](our_data/lightning_data/read_kml_version2.py) via `GridProjection.__call__(lon, lat)`, so no pre-reprojection is needed. The default bbox is the densified WGS84 envelope of the Romania grid (auto-derived from `c4dl.projection.romania_grid_area`).
-
-```bash
-# Credentials via a two-line file (line 1: username, line 2: password)
-python our_data/lightning_data/linet_export.py \
-    --start 2026-06-01 --end 2026-07-01 \
-    --password_file linet_credentials.txt
-
-# Or via env vars (Windows: `setx` only affects NEW shells - use
-# `$env:LINET_USER = "..."` in PowerShell for the current one)
-set LINET_USER=...
-set LINET_PASS=...
-python our_data/lightning_data/linet_export.py --start 2026-06-01 --end 2026-07-01
-```
-
-`--format` defaults to `kml`; in that mode files land directly at `our_data/lightning_data/kml_data/YYYY-MM-DD/YYYY-MM-DD.kml` — the layout [`read_kml_version2.py`](our_data/lightning_data/read_kml_version2.py) walks. Downloads are resume-safe (existing non-empty files are skipped; pass `--force` to overwrite); `--dry-run` prints the per-day plan without contacting the server (no credentials required for a dry run). Mid-day `--start`/`--end` are snapped outward to full UTC calendar days (with a warning), because a `kml_data/YYYY-MM-DD/YYYY-MM-DD.kml` file must hold a complete day; `--daily-window` is incompatible with `--format kml` and errors out. For `--format txt|asc` (analysis exports, not pipeline input) files keep the flat `linet_YYYYMMDDTHHMM_YYYYMMDDTHHMM.{ext}` layout and `--daily-window` remains available.
-
-After download, rasterise LINET KMLs onto the Romania grid — filter-aligned to `products.lightning.filter`, variable-width windows cover every minute of the day so no strokes are lost. Skips already-complete dates by default; pass `--force` to overwrite. Every day also gets a per-day audit JSON at `{output_root}/lightning_filtered_out_{date}.json` listing any strokes whose projected pixel index fell outside the Romania grid (total / kept / filtered-out counts + every dropped stroke's lat/lon).
-
-```bash
-python our_data/lightning_data/read_kml_version2.py
-python our_data/lightning_data/read_kml_version2.py --date 2025-05-15
-python our_data/lightning_data/read_kml_version2.py --force
-```
-
-## Inference
-
-Two entry points, chosen by what data you have on disk:
-
-- **[`predict_full_domain.py`](predict_full_domain.py)** — standalone inference on any date. Reads the reprojected full-domain fields directly (`reproject.py` output), slices all 18 patches on the fly at inference time, runs one batched `model.predict(...)`, and pastes the results onto a 768×1536 Romania canvas. **Does not** touch `patch_index.csv`, the per-source split CSVs, or the pre-extracted `.npy` patch tiles. Use this for operational inference on a date the training pipeline has never seen.
-- **[`visualize_gt_vs_pred.py`](visualize_gt_vs_pred.py)** — training-scope visualiser. Reads a per-source split CSV, ranks reference timesteps by qualifying-patch count, and renders per top-N reference:
-  - **3-row full-domain figure** — Row 1 GT, Row 2 raw Pred, Row 3 post-processing zone overlap (hit / miss / false alarm) using Hann + hysteresis for lightning or `p(argmax)` hysteresis for rainfall. Green/red patch numbering shows which patches DBSCAN selected vs padded.
-  - **3-row zoom figure** — same layout cropped to the qualifying patch with the most GT activity. Row 3 stats are recomputed for the patch window only so the reported hit / miss / false-alarm percentages describe the zoom, not the whole domain.
-  - **Rainfall-only aggregate graphs** (skipped for lightning): `aggregate_pc_hist_raw.png` + `aggregate_pc_hist_hyst.png` (per-class p(c) histograms across all top-N samples, bin counts annotated), `aggregate_class_count_distribution.png` (per-class whole-domain box plots GT/raw/hyst), and an `aggregate_pc_hist_3d/` folder of **10 interactive plotly HTMLs** (5 classes × raw/hyst) — rotatable 3D bar charts where X = softmax bin, Y = patch #, Z = % of that patch's class-c pixels. Open in a browser to inspect. Skip with `--no_aggregate_graphs`.
-
-  The hysteresis knobs (`--lightning_low_threshold` / `--lightning_high_threshold` / `--validation_summary` for lightning; `--rainfall_low_threshold` / `--rainfall_high_threshold` for rainfall) mirror `predict_full_domain.py` so both scripts render the same post-processed output on the same data. Use it for post-hoc sanity checks against the test split.
+| `mtg_opera_mtgmr_rainfall` | `mtg_opera_radar_only_rainfall` | MTG IR/WV |
+| `mtg_lightning_opera_rainfall` | `mtg_opera_mtgmr_rainfall` | LINET lightning |
+| `mtg_lightning_opera_occurrence` | `mtg_opera_occurrence` (KD student) | LINET lightning |
 
 ### End-to-end recipe for a new date
 
-2026-06-30 example, step-aligned reference times every 15 minutes. Steps 1-5 fetch and reproject the raw inputs; steps 6-7 do inference.
+Steps 1–5 fetch and reproject; 6–7 run inference. No training artefact is touched.
 
 ```bash
-# 1. MTG FCI download
-python our_data/satellite_data/pipeline_msg_mtg.py \
-    --start 2026/06/29-0000 --end 2026/06/30-2350 \
-    --password_file password.txt \
-    --products_file our_data/satellite_data/satellite_products.json
-
-# 2. OPERA composite download (--remote_base auto-fallback picks the
-#    right EWC mount root; no flag needed on first run)
-python our_data/opera_data/pipeline_opera.py \
-    -s 2026/06/29-0000 -e 2026/06/30-2350 \
-    --password_file password.txt
-
-# 3. Download LINET KMLs directly into the per-date pipeline layout
-#    (linet_export writes {out}/kml_data/YYYY-MM-DD/YYYY-MM-DD.kml when
-#    --format kml, so read_kml_version2.py picks them up directly).
-#    Credentials via a two-line file (line 1: username, line 2: password).
-python our_data/lightning_data/linet_export.py \
-    --start 2026-06-29 --end 2026-07-01 \
-    --password_file linet_credentials.txt
-
+# 1-3. Acquire MTG, OPERA, LINET for the date (see Table 1, steps 1a-1c)
 # 4. Rasterise LINET onto the Romania grid
-python our_data/lightning_data/read_kml_version2.py
-
-# 5. Reproject MTG + OPERA to EPSG:31700
-python reproject.py --all --workers 12
-
-# 6. Inference - OPERA multiclass (5-class rainfall)
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30
-
-# 7. Inference - Lightning binary occurrence (same input stack, different head)
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30
+python our_data/lightning_data/read_kml_version2.py --data_root our_data --date 2026-06-30
+# 5. Reproject MTG + OPERA
+python reproject.py --satellite MTG --date 2026-06-30
+python reproject.py --opera       --date 2026-06-30
+# 6. Rainfall inference (5-class)
+python predict_full_domain.py --mode mtg_opera_mtgmr_rainfall --date 2026-06-30
+# 7. Lightning inference (binary occurrence)
+python predict_full_domain.py --mode mtg_lightning_opera_occurrence --date 2026-06-30 \
+    --validation_summary validation/lightning_2025_05_summary.json
 ```
 
-### Useful subsets of the inference CLI
+---
 
-Once the raw data is on disk:
+## Table 3 — Architecture & training defaults
 
-```bash
-# One hour only (references 14:00, 14:15, 14:30, 14:45)
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30 --hour 14
+Everything under **COALITION-4** lives in [`training.config`](training.config); per-mode overrides go in `[mode.<name>]`.
 
-# One specific reference time
-python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
-    --date 2026-06-30 --time 14:30
+| Parameter | Value | Scope | Source |
+|---|---|---|---|
+| **Architecture** ||||
+| Encoder | ResBlock + ConvGRU (`ResGRU`), channels `[32, 64, 128]` | all | built from `metadata.json` |
+| Decoder | reversed `[128, 64, 32]`, bilinear upsampling + skip connections | all | — |
+| Input branches | one per tier, merged at matching scales | all | `INPUT_GROUP_KEYS` |
+| Output head | `Conv2D(1, 1×1, sigmoid)` | lightning / continuous | — |
+| Output head | `Conv2D(5, 1×1, softmax)` | rainfall 5-class | — |
+| Past / future timesteps | 3 / 3 | all | `sequence_meta_dbscan.json` |
+| **Base training** (`[defaults]`) ||||
+| Optimizer | `Adam(lr=1e-3)` | base stage | — |
+| Loss | `WeightedFocalLoss(gamma=2.0)`, prior from `lightning_fraction_dbscan.json` (~1 % positive pixels) | lightning | — |
+| Loss | `WeightedFocalCategoricalCrossentropy` (see `[radar_loss]`) | rainfall 5-class | — |
+| Metrics | `iou_metric`, `true_pos`, `false_pos`, `false_neg` | lightning | — |
+| Metrics | `accuracy` | rainfall | — |
+| Epochs / batch size | `20` / `32` | all | `[defaults]` |
+| Dropout / normalisation | `0.1` / `layer` (`none` \| `batch` \| `layer`) | all | `[defaults]` |
+| Shuffle buffer / seed | `256` samples / `0` | all | `[defaults]` |
+| Mixed precision | `true` (fp16 on tensor cores) | all | `[defaults]` |
+| **LR schedule** (`[lr_schedule]`) ||||
+| Type | `cosine_warmup` — linear ramp `min_lr → initial_lr`, then cosine decay back | base stage | `[lr_schedule]` |
+| Initial / min LR | `1e-3` / `1e-6` | base stage | `[lr_schedule]` |
+| Warmup epochs | `3` | base stage | `[lr_schedule]` |
+| **Early stopping** (`[early_stopping]`) ||||
+| Monitor / mode | `val_loss` / `min` | all | `[early_stopping]` |
+| Patience / min delta | `6` / `1e-5` | all | `[early_stopping]` |
+| Restore best weights | `true` | all | `[early_stopping]` |
+| **Radar loss** (`[radar_loss]`) ||||
+| Weighting | `median` (`inverse` \| `median` \| `none`) | rainfall 5-class | `[radar_loss]` |
+| Focal gamma / alpha max | `2.0` / `100.0` (class-weight cap) | rainfall 5-class | `[radar_loss]` |
+| Label smoothing | `0.01` | rainfall 5-class | `[radar_loss]` |
+| *Baseline equivalent* | `weighting = none` + `gamma = 0` → plain `CategoricalCrossentropy(label_smoothing=0.01)` | rainfall 5-class | — |
+| **Swin fine-tune** (`[finetune]`, `--stage finetune`/`both`) ||||
+| Optimizer | `AdamW`, `weight_decay = 0.01` (falls back to `Adam` where unavailable) | finetune | `[finetune]` |
+| Initial / min LR, warmup | `3e-4` / `1e-6`, `3` epochs | finetune | `[finetune]` |
+| Epochs | `20` | finetune | `[finetune]` |
+| Swin blocks | `2` (block 0 = W-MSA, block 1 = SW-MSA) | finetune | `[finetune]` |
+| Window size / heads | `8` / `4` | finetune | `[finetune]` |
+| Head width / dropout | `c_shared = 64` / `0.1` | finetune | `[finetune]` |
+| Backbone | frozen — only the head trains | finetune | — |
+| **Knowledge distillation** (`train_lightning_kd.py`) ||||
+| Loss | `α·L_soft·T² + (1−α)·WeightedFocalLoss` | KD student | — |
+| Alpha / temperature | `0.7` / `4.0` (Hinton canonical) | KD student | `--kd_alpha` / `--kd_temperature` |
+| Optimizer / LR | `Adam` / `1e-4` | KD student | `--learning_rate` |
+| Epochs / batch / patience | `50` / `8` / `10` | KD student | CLI |
+| **SepConv baseline** (`sepconv_ensemble_training.py`) ||||
+| Architecture | 3 independent `SeparableConv2D` models, one per lead; kernel `5×5` | baseline | — |
+| Optimizer | `Adam(lr=0.001, amsgrad=True)`, halve on plateau | baseline | — |
+| Loss | weighted MSE, bin weights `[15, 1, 2, 7, 15, 30, 1000]` | baseline | — |
+| Epochs / batch | `50` / `8` | baseline | CLI |
+| Output | sigmoid `[0,1]` continuous; binned to 5 classes at evaluation | baseline | — |
 
-# Range mode with the Swin fine-tuned model
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30 \
-    --start-time 12:00 --end-time 15:45 --finetuned
+---
 
-# Lightning: override the default hysteresis LOW/HIGH thresholds
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30 --time 14:30 \
-    --lightning_low_threshold 0.90 --lightning_high_threshold 0.95
+## Outputs reference
 
-# Lightning: pull the per-lead tuned HIGH thresholds from a validation summary
-python predict_full_domain.py --mode mtg_lightning_opera_occurrence \
-    --source dbscan --date 2026-06-30 \
-    --validation_summary ./validation/lightning_2025_05_summary.json
+### `predict_full_domain.py` → `inference/predict_<run_tag>[_finetuned|_kd]/`
 
-# Rainfall: override the hysteresis thresholds on p(argmax when rainy)
-python predict_full_domain.py --mode mtg_lightning_opera_rainfall \
-    --source dbscan --date 2026-06-30 --time 14:30 \
-    --rainfall_low_threshold 0.35 --rainfall_high_threshold 0.55
-```
+**Lightning modes** — two PNGs per reference:
+- `predict_<date>_<HHMM>.png` — 2 × 3. Row 1 GT occurrence; Row 2 hit / miss / false-alarm overlap of the Hann-blended + hysteresis prediction (orange = hit, blue = miss, red = false alarm).
+- `predict_<date>_<HHMM>_hits.png` — 1 × 3, correctly-detected pixels only, subtitled `hits = N (X.X% of GT-active)`.
 
-### Output
+**Rainfall modes** — two PNGs per reference when OPERA GT is on disk (falls back to a pred-only 1 × 3 heatmap otherwise):
+- `predict_<date>_<HHMM>.png` — 3 × 3. Row 1 GT class canvas (viridis-5); Row 2 zone overlap of the raw argmax; Row 3 same against the hysteresis-cleaned prediction.
+- `predict_<date>_<HHMM>_perclass_hits.png` — 2 × 3, per-class hits raw vs hysteresis, subtitled with the per-class hit-rate breakdown.
 
-Written under `inference/predict_<run_tag>[_finetuned|_kd]/` (rainfall-track modes carry an implicit `_rainfall` insertion in the run tag).
+**Optional:** `--save-npy` dumps raw `(3, 768, 1536)` canvases (plus `<stem>_hyst.npy` int32 class canvases for rainfall); `--no-plot` skips PNGs; `--patches "5,6,11,12"` restricts to a subset of the 18-patch grid (rainfall only — the lightning path always covers the full canvas via Hann overlap).
 
-Lightning modes produce **two** PNGs per reference timestep:
+### `visualize_gt_vs_pred.py` → `full_domain_plots/full_domain_<run_tag>[…]/`
 
-- **`predict_<date>_<HHMM>.png`** — 2×3 figure. **Row 1** GT lightning occurrence (`gt_red` gradient, pink base removed). **Row 2** post-processed hit / miss / false-alarm overlap of the Hann-blended + hysteresis-thresholded prediction against GT (orange = hit, blue = miss, red = false alarm on a white base). Zone colour legend + h/m/FA formula footer bracket the plots.
-- **`predict_<date>_<HHMM>_hits.png`** — companion 1×3 figure: for each lead, only the correctly-detected pixels rendered in the orange "hit" colour on a white base. Subtitle carries `hits = N (X.X% of GT-active)` per panel.
+- **3-row full-domain figure** — Row 1 GT, Row 2 raw prediction, Row 3 post-processing overlap. Green/red patch numbering shows which patches DBSCAN selected vs padded.
+- **3-row zoom figure** — same layout cropped to the qualifying patch with the most GT activity; Row 3 stats recomputed for that window only.
+- **Rainfall-only aggregate graphs** (skip with `--no_aggregate_graphs`): `aggregate_pc_hist_{raw,hyst}.png` per-class p(c) histograms, `aggregate_class_count_distribution.png` per-class box plots, and `aggregate_pc_hist_3d/` — 10 interactive plotly HTMLs (5 classes × raw/hyst) where X = softmax bin, Y = patch #, Z = % of that patch's class-c pixels.
 
-Rainfall modes produce **two** PNGs per reference timestep whenever OPERA GT is on disk (falls back to a pred-only 1×3 heatmap when it isn't):
+### `validate_predictions.py` → `validation/`
 
-- **`predict_<date>_<HHMM>.png`** — 3×3 figure. **Row 1** GT class canvas (viridis-5). **Row 2** zone overlap of the raw argmax pred vs GT (pre post-processing). **Row 3** same zone overlap but computed against the hysteresis-cleaned pred (`--rainfall_low_threshold` / `--rainfall_high_threshold`). Row 1 has its own viridis-5 colour bar; Rows 2 and 3 share the zone colour legend + h/m/FA formula footer.
-- **`predict_<date>_<HHMM>_perclass_hits.png`** — companion 2×3 figure. **Row 1** per-class hits using the raw argmax pred; **Row 2** per-class hits using the hysteresis-cleaned pred. Each subtitle carries the per-class hit-rate breakdown `C1:X% C2:Y% C3:Z% C4:W%`.
-
-Optional artefacts:
-
-- `--save-npy` dumps the raw `(3, 768, 1536)` prediction canvases as `.npy` next to each PNG. For rainfall, it also writes `<stem>_hyst.npy` — the hysteresis-cleaned int32 class canvases stacked along the lead axis.
-- `--no-plot` skips the PNGs when you only want the raw arrays.
-- `--patches "5,6,11,12"` restricts inference to a subset of the 18-patch grid (radar/rainfall only; the lightning path always covers the full canvas via Hann overlap).
-
-## Validation
-
-[`validate_predictions.py`](validate_predictions.py) sweeps a (year, month) of OPERA rainfall samples and quantifies how well a trained model tracks convective events at each lead time. Two modes, chosen by the presence of `--date`:
-
-### Extraction (no `--date`)
-
-Iterates every OPERA `rainfall_rate` sample in the month, keeps the ones with **at least one pixel ≥ 10 mm/h** as the convective-event set, runs the model in-process for each, and computes two coverage metrics per (sample, lead time):
-
-- **`iou_mask`** — IoU of the binary ≥10 mm/h masks between GT and Pred. Structure-only.
-- **`class_wt`** — per-class weighted overlap macro-averaged across the 5 rainfall classes. Semantic-aware.
-
-Aggregate FAR / POD / CSI are computed per lead time on the binary ≥10 mm/h event across all selected samples.
-
-Emits three files under `validation/`:
+Two coverage metrics per (sample, lead): **`iou_mask`** (IoU of the binary ≥10 mm/h masks — structure only) and **`class_wt`** (per-class weighted overlap macro-averaged across the 5 classes — semantic-aware). Aggregate FAR / POD / CSI are computed per lead on the binary ≥10 mm/h event.
 
 | File | Contents |
 |---|---|
-| `<track>_<year>_<month>_samples.csv` | One row per sample, columns for both metrics × each lead time. |
-| `<track>_<year>_<month>_summary.json` | Aggregate: total selected, count above 90% per lead × per metric, difference-in-percent, FAR/POD/CSI per lead, initial selection list, high-coverage lists. |
-| `<track>_<year>_<month>_metrics.png` | Left: grouped bars for FAR/POD/CSI per lead. Right: scatter of per-sample coverages (IoU vs per-class weighted, marker per lead time). |
+| `<track>_<year>_<month>_samples.csv` | One row per sample; both metrics × each lead time. |
+| `<track>_<year>_<month>_summary.json` | Totals, counts above `--high_coverage_pct` per lead × metric, FAR/POD/CSI per lead, initial selection list, tuned `post_processing` thresholds. |
+| `<track>_<year>_<month>_metrics.png` | Left: grouped FAR/POD/CSI bars per lead. Right: per-sample coverage scatter (IoU vs class-weighted, marker per lead). |
+| `<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` | Visualisation mode. Left: structure overlay (red = GT class == Pred class and both ≥10 mm/h). Right: 256 × 256 zoom into the most GT-active patch — red matched, blue misses, orange false alarms. |
 
-```bash
-python validate_predictions.py --track rainfall --year 2025 --month 5
-python validate_predictions.py --track rainfall --year 2025 --month 5 --finetuned
-```
+Visualisation title colour: **green** if the date cleared the coverage threshold for that lead/metric, **orange** if selected but below it. A date absent from the initial selection raises `SystemExit`.
 
-### Visualization (`--date` given)
+### `feature_importance_analysis.py` → `--output` (default `results/feature_importance/`)
 
-Reads the JSON produced by an earlier extraction and, for **every reference on that date** that was selected, writes three figures (one per lead time). Each figure has two panels:
+| File | Content |
+|---|---|
+| `prediction_diagnostics.png` | 4-panel MAE / RMSE / value comparison / heatmap |
+| `xi_matrix.csv`, `xi_heatmap.html`, `xi_bar_chart.html`, `xi_boxplots.html` | Xi correlations (inputs × timesteps) and its interactive views |
+| `gradcam_rank*_*.png` | 5-panel Grad-CAM comparison plots |
+| `shap_spatial_maps.png`, `shap_bar_chart.html`, `shap_importance.csv` | SHAP spatial + global importance |
+| `method_comparison.{csv,html}`, `method_correlations.csv` | Grad-CAM + Xi vs SHAP, with Spearman + Pearson agreement |
+| `xi_matrix_ablated.csv`, `ablation_impact.html` | Only with `--model-ablated` / `--data-ablated` |
 
-- **Left**: structure overlay — red pixels where GT class == Pred class AND both are ≥ 10 mm/h. The percentage of GT-active pixels matched is in the panel title.
-- **Right**: 256×256 zoom into the patch (out of 18) with the most GT-active pixels. Matched pixels red, GT-only pixels blue (misses), Pred-only pixels orange (false alarms).
+---
 
-Title colour: **green** if the date cleared the 90% coverage threshold for that lead time / metric; **orange** if the date is in the initial selection but did not clear 90%; raises `SystemExit` if the date is not in the initial selection at all.
+## Knowledge distillation (lightning track)
 
-```bash
-python validate_predictions.py --track rainfall --year 2025 --month 5 --date 2025-05-14
-```
-
-Output: `validation/<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` per (reference, lead time). If a date has 8 selected references, that's 8 × 3 = 24 figures.
-
-### Lightning track (`--track lightning`)
-
-Structural clone of the rainfall extractor with three lightning-specific twists:
-
-- **Sample selection**: **OPERA-driven for parity with the rainfall track** — a reference is kept when the OPERA `rainfall_rate` canvas has any pixel ≥ `--rainfall_threshold_mmh` (default 10 mm/h). The legacy LINET-driven cut (`≥ 1 active pixel`) still lives in `select_samples_lightning` but is opt-in via Python and unreachable from the CLI.
-- **Inference**: Hann-blended overlapping-patch inference at `--stride` (default 128 → 55 patches per reference, 3× the non-overlapping cost, kills the 256-pixel tiling seams). Post-processing is hysteresis thresholding with a fixed `--lightning_low_threshold` = 0.90 and a **per-lead high threshold tuned inside the extraction run** by sweeping a 0.91..0.99 grid and picking the value that maximises aggregate CSI at that lead. The tuning table + chosen thresholds are persisted in `summary.json → post_processing`.
-- **Visualisation**: one 2×3 figure per selected reference (rows = pipeline stage, cols = lead times) — row 1 is the GT lightning occurrence, row 2 is the post-processed hit / miss / false-alarm overlap against GT (orange / blue / red palette). All three lead times on a single figure, matching the spec.
-
-```bash
-# Extraction (tunes per-lead high threshold)
-python validate_predictions.py --track lightning --year 2025 --month 5 \
-    --mode mtg_lightning_opera_occurrence --source dbscan
-
-# Visualisation (reads tuned thresholds from the summary JSON)
-python validate_predictions.py --track lightning --year 2025 --month 5 \
-    --mode mtg_lightning_opera_occurrence --source dbscan --date 2025-05-14
-```
-
-The tuned per-lead thresholds are consumable by [`predict_full_domain.py`](predict_full_domain.py) via `--validation_summary <summary.json>` so the operational inference pipeline uses the exact same post-processing values.
-
-### Notes
-
-- The model, source, and finetuned toggle default to `mtg_lightning_opera` / `dbscan` / base; override with `--mode`, `--source`, `--finetuned` if needed.
-
-## Knowledge Distillation (lightning track)
-
-Standard Hinton-style teacher-student distillation for the lightning-occurrence head. Trains a **student** model that produces the same lightning-occurrence prognosis as the full-input **teacher**, but WITHOUT access to LINET at inference time — only MTG (satellite) + OPERA (composite radar). Useful whenever the LINET feed is late, missing, or being validated.
+Hinton-style teacher–student distillation producing a student that gives the same lightning prognosis **without LINET at inference** — useful whenever the LINET feed is late, missing, or itself being validated.
 
 | | Teacher | Student |
 |---|---|---|
-| Mode | `mtg_lightning_opera_occurrence` | `mtg_opera_occurrence` (new — see [`create_datasets.py`](create_datasets.py)) |
-| HR inputs | LINET (density + current + occurrence) + MTG vis_06 | MTG vis_06 only |
-| MR inputs | OPERA reflectivity + rainfall_rate + MTG IR/WV | (same) |
-| Label | Binary lightning occurrence at t+15/+30/+45 | (same) |
-| Weights file | `coalition_mtg_lightning_opera_occurrence_dbscan.keras` (base) or `..._finetuned.keras` (Swin head) | `coalition_mtg_opera_occurrence_dbscan_kd.keras` (produced by the KD trainer) |
+| Mode | `mtg_lightning_opera_occurrence` | `mtg_opera_occurrence` |
+| HR inputs | LINET (density + current + occurrence) + MTG `vis_06` | MTG `vis_06` only |
+| MR inputs | OPERA reflectivity + rainfall_rate + MTG IR/WV | *(same)* |
+| Label | Binary lightning occurrence at t+15/+30/+45 | *(same)* |
+| Weights | `coalition_mtg_lightning_opera_occurrence_dbscan[_finetuned].keras` | `coalition_mtg_opera_occurrence_dbscan_kd.keras` |
 
-### KD loss (Hinton, adapted for binary sigmoid outputs)
+**KD loss** (adapted for binary sigmoid outputs):
 
 ```
 logit(p) = log(p / (1 - p))                        # inverse sigmoid
 soft_x   = sigmoid(logit(p_x) / T)                 # temperature-softened
-L_soft   = BCE(soft_teacher, soft_student) * T ** 2
+L_soft   = BCE(soft_teacher, soft_student) * T**2  # gradient-scale fix
 L_hard   = WeightedFocalLoss(y_gt, student)        # supervised anchor
 L_total  = alpha * L_soft + (1 - alpha) * L_hard
 ```
 
-Defaults are the canonical Hinton values: `alpha = 0.7`, `temperature = 4.0`. Both configurable per-run via `--kd_alpha` and `--kd_temperature` on [`train_lightning_kd.py`](train_lightning_kd.py) — see the [Thresholds Reference](#thresholds-reference) for tuning implications.
+The student reuses the **teacher's dataset** directly, so both see identically-shuffled batches; LINET channels are sliced away on the fly (`teacher_hr[..., -1:]` = the trailing `vis_06` channel). No separate `mtg_opera_occurrence` dataset needs to exist.
 
-### Training
+---
 
-The KD script reuses the teacher's dataset directly — the student sees the same shuffled batches, with LINET channels sliced away on the fly (`teacher_hr[..., -1:]` = the last MTG vis_06 channel).
+## Automated report generation
 
-```bash
-# Train the student (teacher checkpoint must already exist under models/)
-python train_lightning_kd.py --data_root ./our_data --model_dir ./models \
-    --epochs 50 --batch_size 8
+Turns `validate_predictions.py` outputs into a standalone PDF for meteorologists who have never seen the model. Runs a local Ollama LLM for data-first English commentary, then (unless `--language en`) translates each paragraph to Romanian with a meteorological glossary in the system prompt. All prompts are **text-only** — figures are rendered for the human reader but never sent to the model, which reads pre-computed metadata instead. Output is deterministic given the same validation outputs, model tag, temperature, and seed.
 
-# Non-default hyperparameters
-python train_lightning_kd.py --kd_alpha 0.5 --kd_temperature 6.0
-
-# Distil from the finetuned teacher (Swin head) instead of the base
-python train_lightning_kd.py --teacher_finetuned
-```
-
-Outputs:
-- `models/coalition_mtg_opera_occurrence_dbscan_kd.keras`
-- `models/history_mtg_opera_occurrence_dbscan_kd.json` (records `kd_alpha`, `kd_temperature`, per-epoch losses, wall time)
-
-### Inference
-
-Same `predict_full_domain.py` flow as the teacher, with `--kd` to select the KD-trained student weights:
-
-```bash
-python predict_full_domain.py --mode mtg_opera_occurrence --source dbscan \
-    --kd --date 2026-06-30
-```
-
-`--kd` and `--finetuned` are mutually exclusive (the KD student is trained fresh, no Swin head).
-
-### Validation — teacher vs student on the same samples
-
-New `--track kd` in [`validate_predictions.py`](validate_predictions.py) runs BOTH models on the same OPERA-selected samples and tunes each model's per-lead hysteresis high threshold **independently**:
-
-```bash
-# Extraction: emits kd_YYYY_MM_{samples.csv, summary.json, metrics_{FAR,POD,CSI,IoU}.png}
-python validate_predictions.py --track kd --year 2025 --month 5
-
-# Visualisation: emits kd_YYYY_MM_YYYY-MM-DD_HHMM.png per selected reference
-python validate_predictions.py --track kd --year 2025 --month 5 --date 2025-05-14
-
-# Alternative teacher / student modes or checkpoints
-python validate_predictions.py --track kd --year 2025 --month 5 \
-    --teacher_finetuned                 # distil from swin teacher
-python validate_predictions.py --track kd --year 2025 --month 5 \
-    --no_student_kd                      # load plain student (rare)
-```
-
-Output figures:
-- **`kd_YYYY_MM_metrics_{FAR|POD|CSI|IoU}.png`** — 4 files, one per metric. Teacher vs student bars grouped per lead time (t+15/+30/+45).
-- **`kd_YYYY_MM_YYYY-MM-DD_HHMM.png`** — 3×3 comparison per reference: row 1 = GT alone, row 2 = GT + teacher red overlay, row 3 = GT + student red overlay, columns = lead times.
-
-Summary JSON contains BOTH tracks' `post_processing.high_threshold_per_lead` blocks so predict-side inference can consume either model's tuned thresholds via `--validation_summary`.
-
-### Report generation
-
-If `kd_YYYY_MM_summary.json` exists in `--validation_dir` when [`generate_report.py`](generate_report.py) runs, a **Knowledge Distillation** section is auto-added to the PDF: one Gemma-generated Romanian paragraph interpreting teacher vs student performance, followed by the 4 metric figures and per-reference 3×3 figures embedded. No CLI flag needed — pure auto-detect. Cost: 1 additional English call + 1 translation.
-
-## Automated Report Generation
-
-[`generate_report.py`](generate_report.py) turns the outputs of `validate_predictions.py` into a standalone PDF for meteorologists who have never seen the internal model. It runs a local Ollama-hosted LLM (default `gemma3:27b-it-q4_K_M`) for data-first commentary in English, then — unless `--language en` is passed — translates each paragraph to Romanian in a second Gemma call with a meteorological glossary in the system prompt. All prompts are **text-only** — the coupling-mask PNG is rendered for the human reader but never sent to the model; Gemma reads pre-computed per-coupled-cell metadata instead. Everything is deterministic given the same validation outputs, model tag, `temperature` (defaults to `0.1` — Gemma collapses to empty completions at exactly `0.0`), and seed.
-
-**Sample-selection parity**: both tracks use the SAME OPERA-driven selection criterion (`RAINFALL_THRESHOLD_MMH = 10.0 mm/h` anywhere on the canvas at the reference timestep — see the [Thresholds Reference](#thresholds-reference)). This means `initial_selection` in each track's `summary.json` holds the same list of references, so the report's reference count equals whichever track you loaded (union = intersection under parity).
+**Sample-selection parity:** both tracks use the same OPERA-driven criterion (≥10 mm/h anywhere on the canvas at the reference timestep), so `initial_selection` holds the same references in each track's summary.
 
 ### Prerequisites
 
 ```powershell
-# 1. Install pip deps into the tfenv (or your project env)
 & "C:\path\to\tfenv\python.exe" -m pip install fpdf2 ollama Pillow tzdata
-
-# 2. Ollama server running on http://localhost:11434 and the target model pulled
-ollama pull gemma3:27b-it-q4_K_M
+ollama pull gemma3:27b-it-q4_K_M      # server on http://localhost:11434
 ```
 
-`tzdata` is only needed on Windows Python installs that don't ship system timezone data — the report renders the cover-page timestamp in Europe/Bucharest local time (EET/EEST) so the "Generated:" line matches wall-clock time for a Romanian reader. Missing `tzdata` triggers a hand-rolled EU DST fallback that computes EET/EEST from the last Sunday of March / October, so this is a nice-to-have rather than a hard requirement.
+`tzdata` is optional — it renders the cover timestamp in Europe/Bucharest (EET/EEST); without it a hand-rolled EU DST fallback applies.
 
-### What the report contains
+### Contents
 
-One PDF per (year, month). Structure:
+One PDF per (year, month): **cover** → **clickable table of contents** → **executive summary** → **per-lead metrics sections** (one per track × lead, with `metrics.png` embedded) → **per-reference event sections** (coupling-mask figure: blue = rainfall ≥10 mm/h only, orange = lightning only, red = coupled cells; caption built from per-cell bounding box, 8-way cardinal centroid, peak mm/h, and lightning-active count — cells under `MIN_CELL_SIZE_PIXELS` are dropped as noise) → **data appendix** with min/mean/max IoU per lead per track.
 
-1. **Cover** — header banner from [`assets/`](assets/), title, period (`Raport de validare — august 2026` in RO, `Validation report — August 2026` in EN — month is spelled out, not `2025-05` numeric), tracks with descriptive names (`clasificarea cantităților de precipitații instantanee (OPERA)` / `instantaneous rainfall intensity classification (OPERA)`), generation timestamp in Europe/Bucharest local time (`EET`/`EEST`), and localized labels (`Perioada:` / `Period:` etc — nothing hardcoded in Romanian in an English run).
-2. **Table of contents (page 2)** — one line per section with the actual page number, each entry a **clickable link** that jumps to that section in the PDF viewer.
-3. **Executive summary** — one Gemma paragraph naming the period, shared selection criterion, and the per-lead FAR/POD/CSI evolution across t+15/+30/+45 for each track.
-4. **Per-lead metrics sections** — one per (track × lead time), with the aggregate `metrics.png` embedded and a paragraph interpreting that lead's performance vs the other two.
-5. **Per-reference event sections** — for every selected reference, a **coupling-mask figure** (blue = rainfall ≥ 10 mm/h only, orange = active lightning only, red = coupled cells) embedded in the PDF as decoration, plus a caption produced from per-coupled-cell metadata: bounding box + 8-way cardinal centroid + peak mm/h + lightning-active count per cell (cells smaller than `MIN_CELL_SIZE_PIXELS = 10` are dropped as noise). When any cell is present, the caption uses *"precipitation of X mm/h paired with Y% of the lightning strokes inside the same convective cell, in the &lt;cardinal&gt; of Romania"*; when the list is empty, it describes rainfall and lightning as separate observations.
-6. **Data appendix** — min / mean / max IoU per lead per track from `samples.csv`.
+Every numeric claim comes from a pre-computed facts block; the LLM paraphrases, never invents.
 
-Every page (page 2 onward — cover is intentionally unnumbered) carries a small grey page number at the bottom-right corner. Every numeric claim comes from a pre-computed FACTS block. Gemma paraphrases the facts, never invents them; no vision calls at any stage.
+---
 
-Empty Gemma responses are auto-retried up to 3× with a small temperature nudge (`+0.05` per attempt, floored at `0.05`) and the retry loop prints the `done_reason` so a stuck run is diagnosable at a glance; if all retries still return empty text, `generate_report.py` fails loudly with the last response metadata rather than silently producing a report with blank paragraphs.
+## Thresholds reference
 
-### Usage
+Tune these to change behaviour without touching the architecture.
 
-```bash
-# Combined rainfall + lightning report (requires both tracks' extraction outputs).
-# Default --language ro produces a Romanian PDF; --language en skips the
-# translation phase entirely and renders the raw English text (halves the
-# Gemma calls).
-python generate_report.py --year 2025 --month 5
+| Constant | Default | CLI override | Purpose | Effect of changing |
+|---|---|---|---|---|
+| `DBSCAN_THRESHOLD` | `10` mm/h | `--threshold` | Rain-rate cut for training-patch selection. | Lower → weaker events enter training. Higher → smaller, more selective training set. |
+| `DBSCAN_EPS` | `5` px | — | DBSCAN neighbourhood radius. | Larger → clusters merge. Smaller → cells fragment. |
+| `DBSCAN_MIN_SAMPLES` | `20` px | — | Minimum cluster size; smaller regions become noise. | Lower → tiny cells qualify. Higher → only substantial storms. |
+| `RAINFALL_THRESHOLD_MMH` | `10.0` mm/h | `--rainfall_threshold_mmh` | Validation **sample-selection** scope. The binary event for FAR/POD/CSI/IoU stays anchored to class ≥ 1 — that is the model's trained decision boundary. | Lower → more samples selected. Higher → only intense convection. |
+| `HIGH_COVERAGE_PCT` | `90.0` % | `--high_coverage_pct` | Coverage above which a sample counts as "high coverage" per lead; drives the green/orange visualisation title. | Lower → more samples graded good. Higher → stricter grading. |
+| `DEFAULT_STRIDE` | `128` px | `--stride` | Hann-blended inference stride — 50 % overlap → 55 patches per reference, which removes the 256-px tiling seams. | `64` → 75 % overlap, smoother but ~4× cost. `256` → no overlap, seams return. |
+| `LIGHTNING_LOW_THRESHOLD` | `0.90` | `--lightning_low_threshold` | Hysteresis LOW: a pixel is positive iff `p ≥ low` **and** its 8-connected component contains a `p ≥ high` seed. | Lower → wider cells. Higher → tighter cells, fewer marginal detections. |
+| `LIGHTNING_HIGH_GRID` | `0.91 … 0.99` step `0.01` | — | Sweep grid; the per-lead HIGH is tuned by maximising aggregate CSI and persisted in `summary.json → post_processing`. | Narrower → faster tuning, fewer operating points. |
+| `DEFAULT_HIGH_THRESHOLD` | `0.95` | `--lightning_high_threshold` | Fallback HIGH when no `--validation_summary` is given. | Only affects inference without a tuned summary. |
+| `DEFAULT_RAIN_LOW` / `DEFAULT_RAIN_HIGH` | `0.35` / `0.55` | `--rainfall_low_threshold` / `--rainfall_high_threshold` | Hysteresis on `p(argmax)` when the argmax is a rainy class. Lower than the lightning pair because probability is split across 5 classes. Rejected pixels drop to class 0. | Lower → more marginal rainy pixels survive. Higher → tighter blobs. |
+| `RAINFALL_CLASS_EDGES` | `10, 20, 30, 40` mm/h | — | The 5-class boundaries, shared by the `_rainfall` and `_continuous` heads. | Changing requires retraining the head. |
+| `RAINFALL_MAX_MMH` | `70` mm/h | — | Normalisation scale for the continuous head. | Changing requires retraining. |
+| `DEFAULT_KD_ALPHA` | `0.7` | `--kd_alpha` | Weight on the soft-teacher loss. | Higher → student mimics teacher more, weaker GT anchoring. |
+| `DEFAULT_KD_TEMPERATURE` | `4.0` | `--kd_temperature` | Softening temperature for both models' sigmoid outputs. | Higher → softer targets. `T=1` disables softening. |
+| `STUDENT_HR_CHANNELS` | `1` | — | Trailing HR channels the student keeps (= `vis_06`). | Changing requires a matching HR layout change and retraining. |
+| `MIN_CELL_SIZE_PIXELS` | `10` px | — | Minimum connected component reported as a coupled cell in the report. | Lower → more cells, longer captions. Higher → only large systems. |
+| `DEFAULT_OLLAMA_SEED` / `_TEMPERATURE` / `_MAX_TOKENS` | `42` / `0.1` / `2000` | `--seed` / `--temperature` / `--max_tokens` | Report determinism and per-call length cap. | `temperature = 0.0` triggers empty-completion collapse in Gemma — keep it at `0.1`. |
 
-# English-only report — skip the RO translation phase
-python generate_report.py --year 2025 --month 5 --language en
+---
 
-# Single track
-python generate_report.py --year 2025 --month 5 --track rainfall
+## Data products
 
-# Non-default model / paths, bilingual PDF (Romanian + English)
-python generate_report.py --year 2025 --month 5 \
-    --model gemma3:27b-it-q4_K_M \
-    --validation_dir ./validation \
-    --output ./validation/report_2025_05.pdf \
-    --bilingual
+| Source | Products | Native cadence | Native resolution | Role | Entry point |
+|---|---|---|---|---|---|
+| **MTG FCI L1C** | `vis_06`, `ir_38`, `ir_105`, `wv_63`, `wv_73` | 10 min | 1 km (`vis_06`) / 2 km (IR/WV) | Satellite features (HR + MR) | `our_data/satellite_data/pipeline_msg_mtg.py` |
+| **OPERA composite** | `reflectivity` (dBZ), `rainfall_rate` (mm/h) | 15 min | 2 km | Precipitation target + features | `our_data/opera_data/pipeline_opera.py` |
+| **LINET** | `density`, `current`, `occurrence` | 10 min, filter-aligned | KML → 1 km grid | Lightning target + features | `our_data/lightning_data/linet_export.py`, `read_kml_version2.py` |
 
-# Iterate on prompts / facts extractor without spending Gemma calls
-python generate_report.py --year 2025 --month 5 --skip_pdf
+`opera_rainfall_rate_hr` is an HR-extracted alias of the same reprojected file, used as the 256 × 256 label so the output head matches the HR decoder.
 
-# Use / refresh the on-disk translation cache
-python generate_report.py --year 2025 --month 5              # read + write cache
-python generate_report.py --year 2025 --month 5 --refresh_cache  # ignore cached, rewrite
-python generate_report.py --year 2025 --month 5 --no_cache       # bypass entirely
+**Satellite channel selection** — 5 channels chosen by physical property:
+
+| Physical property | MTG FCI |
+|---|---|
+| Cloud optical thickness (VIS) | `vis_06` (0.6 µm) |
+| Cloud phase discrimination (SWIR) | `ir_38` (3.8 µm) |
+| Cloud top temperature (TIR) | `ir_105` (10.5 µm) |
+| Upper-tropospheric moisture (WV) | `wv_63` (6.3 µm) |
+| Mid-tropospheric moisture (WV) | `wv_73` (7.3 µm) |
+
+---
+
+## Directory structure
+
+```
+coalition4-rcnn/
+├── c4dl/                     # shared library: projection + model layers
+├── our_data/
+│   ├── satellite_data/       # MTG acquisition
+│   ├── opera_data/           # OPERA acquisition
+│   ├── lightning_data/       # LINET export + rasterisation
+│   ├── reprojected_data/     # Romania-grid canvases + grid coord sidecars
+│   ├── patches/              # {var}_{HHMM}_{HR|LR}.npy per date
+│   ├── datasets/             # <mode>_dbscan/{train,validation,test} TFRecords
+│   ├── patch_index/          # patch_index.csv
+│   ├── timestep_config.json  # master cadence + per-product minute filters
+│   ├── sequence_meta_dbscan.json
+│   └── normalization_stats_dbscan.json
+├── models/                   # coalition_<run_tag>[_finetuned|_kd].keras + history
+│   └── checkpoints/          # resumable per-epoch state
+├── evaluation/               # eval_<run_tag>/evaluation_results.json + plots
+├── inference/                # predict_full_domain output
+├── validation/               # validate_predictions output + PDF reports
+├── full_domain_plots/        # visualize_gt_vs_pred output
+├── training.config           # all training hyperparameters
+├── product_cadences.config   # per-product native cadences
+├── run_opera.config          # end-to-end runbook (comments only)
+└── pipeline_config.py        # SOURCE constant
 ```
 
-### Cost
+---
 
-Per report with N selected references and both tracks: `2 × (7 + N)` Gemma calls in the default (Romanian) mode — English generation + Romanian translation. `--language en` halves that to `(7 + N)` since the translation phase is skipped. For N = 10 in RO mode that's ~34 calls, ~3-5 minutes on CPU with `gemma3:27b-it-q4_K_M` — **all text-only** since prompt C now reads per-cell metadata (see [Thresholds Reference](#thresholds-reference) → `MIN_CELL_SIZE_PIXELS`) rather than the coupling PNG. The coupling PNG is still rendered and embedded in the PDF for the human reader, just not sent to the model.
+## Key differences from MeteoSwiss COALITION-4
 
-Total wall time is printed at the end of every run (`Total report-generation wall time: X.Xs (Y.Y min)`) so successive runs can be compared without external timing.
+- **Domain:** Romania (EPSG:31700, 1536 × 768 @ 1 km) instead of Switzerland.
+- **Radar:** OPERA European composite instead of MeteoSwiss RZC/CZC/LZC. NMA (National Meteorological Administration) radar was evaluated and dropped.
+- **Satellite:** MTG FCI instead of MSG SEVIRI; the MSG branch and its 3 km LR tier were removed.
+- **NWCSAF** cloud products were evaluated and dropped, which retired the LR tier.
+- **Sample selection:** DBSCAN over OPERA `rainfall_rate` on an 18-patch grid, with a Czibula block-wise 80/10/10 split.
+- **Additions:** optional Swin-transformer domain-adaptation head, knowledge distillation for a LINET-free lightning student, a SepConv regression baseline, and an automated LLM report pipeline.
 
-## Thresholds Reference
-
-Every knob in the codebase that decides "what counts" — sample selection, event definition, post-processing binarisation, connected-component filtering, per-lead tuning bounds. **Change these to tune behaviour** without touching the architecture. Values in $\color{red}{\text{red}}$ are the ones you'd tune if a result looks off.
-
-### Validation + report thresholds
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `RAINFALL_THRESHOLD_MMH` | $\color{red}{10.0}$ mm/h | [validate_predictions.py:132](validate_predictions.py#L132) & [generate_report.py:267](generate_report.py#L267) | `--rainfall_threshold_mmh` (validate_predictions.py) — **selection scope only**; the binary event for FAR/POD/CSI/IoU stays anchored to class ≥ 1 (10 mm/h) since that's the trained model's decision boundary. | Sample selection cut for the rainfall track (and lightning under parity), plus the `>= X mm/h` label on the metrics figure. In `generate_report.py` also defines coupled-cell membership. | Lowering → more samples selected, smaller cells in coupled_cells. Raising → only intense convection, fewer references per report. |
-| `HIGH_COVERAGE_PCT` | $\color{red}{90.0}$ % | [validate_predictions.py:144](validate_predictions.py#L144) | `--high_coverage_pct` (validate_predictions.py) — takes effect at extraction time; visualisation mode reads whatever the JSON was written with. | Threshold above which a sample counts as "high coverage" per lead time. Populates `samples_above_threshold_per_lead`, `difference_pct_per_lead`, `high_coverage_samples_per_lead` in the summary JSON. Drives the green/orange suptitle colour in visualisation mode. | Lowering (e.g. 80) → more samples flagged "good", green titles more common. Raising (95+) → stricter grading, orange dominates. |
-| `LIGHTNING_LOW_THRESHOLD` | $\color{red}{0.90}$ | [validate_predictions.py:777](validate_predictions.py#L777) & [lightning_postproc.py:55](lightning_postproc.py#L55) | `--lightning_low_threshold` (validate_predictions.py, predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis LOW threshold applied to the Hann-blended probability canvas. A pixel is positive iff `p ≥ low` AND its 8-connected component contains a `p ≥ high` seed. | Lowering → wider spread of positives per convective cell (more permissive edges). Raising → tighter cells, fewer marginal detections. |
-| `LIGHTNING_HIGH_GRID` | $\color{red}{0.91, 0.92, …, 0.99}$ (step 0.01) | [validate_predictions.py:778](validate_predictions.py#L778) | n/a (source edit) | Sweep grid for the hysteresis HIGH threshold tuned per lead by maximising aggregate CSI. Persisted in `summary.json → post_processing.tuning_scores`. | Narrowing/coarsening the grid → faster tuning but fewer candidate operating points. Extending below 0.91 or above 0.99 → explore more/less conservative seeds. |
-| `MIN_CELL_SIZE_PIXELS` | $\color{red}{10}$ pixels | [generate_report.py:268](generate_report.py#L268) | n/a (source edit) | Minimum connected-component size (8-conn) for a coupled cell to be reported in the FACTS block for prompt C. Specks below this are treated as noise and never surface to Gemma. | Lowering → more cells reported, longer FACTS block per reference, Gemma may over-describe minor overlaps. Raising → only large convective systems get the coupled phrasing. |
-
-### Post-processing (predict + validate)
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `DEFAULT_STRIDE` | $\color{red}{128}$ px | [lightning_postproc.py:54](lightning_postproc.py#L54) | `--stride` (validate_predictions.py & predict_full_domain.py) | Overlap stride for Hann-blended inference. Default = 50% overlap → 55 patches per reference on the 768×1536 canvas. | Halving to 64 → 75% overlap, smoother blending but ~4× inference cost. Raising to 256 → no overlap (baseline), visible tiling seams every 256 px. |
-| `DEFAULT_HIGH_THRESHOLD` | $\color{red}{0.95}$ | [lightning_postproc.py:56](lightning_postproc.py#L56) | `--lightning_high_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) — falls back to this when `--validation_summary` isn't given. | Fallback hysteresis HIGH used by `predict_full_domain.py --lightning_high_threshold` when no tuned value is supplied via `--validation_summary`. | Only affects operational inference without a validation summary. Tune per lead by running `validate_predictions.py --track lightning` and pointing predict at the resulting JSON. |
-| `DEFAULT_RAIN_LOW` | $\color{red}{0.35}$ | [visualize_gt_vs_pred.py](visualize_gt_vs_pred.py) | `--rainfall_low_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis LOW threshold applied to `p(argmax)` on the rainfall softmax when the argmax is a rainy class (1..4). Lower than the lightning threshold because probability is split across 5 classes. Selected pixels keep their argmax class; rejected pixels drop to class 0 (dry). | Lowering → more marginal rainy pixels survive the cleanup. Raising → tighter blobs, more of the model's uncertain rainy predictions get discarded. |
-| `DEFAULT_RAIN_HIGH` | $\color{red}{0.55}$ | [visualize_gt_vs_pred.py](visualize_gt_vs_pred.py) | `--rainfall_high_threshold` (predict_full_domain.py, visualize_gt_vs_pred.py) | Hysteresis HIGH seed threshold for the same rainfall post-processing (a component from the LOW mask survives only if it contains at least one pixel `p(argmax) ≥ HIGH`). | Lowering → more components qualify as seeds, larger cleaned blobs. Raising → stricter seeds, only the model's most confident rainy pixels anchor a component. |
-| `LIGHTNING_MIN_ACTIVE_PIXELS` | $\color{red}{1}$ pixel | [validate_predictions.py:780](validate_predictions.py#L780) | n/a (no CLI - opt-in via Python) | Legacy — only used if you call `select_samples_lightning` directly from Python (opt-in LINET-driven cut). The default lightning validation path uses OPERA-driven selection instead, so this constant is unreachable via the CLI. | No effect on the CLI. Change only if scripting a custom LINET-only selection. |
-
-### Data pipeline thresholds (DBSCAN + lightning periods)
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `DBSCAN_THRESHOLD` | $\color{red}{10}$ mm/h | [identify_patches.py:115](identify_patches.py#L115) | `--threshold` (identify_patches.py) | Pixels below this are ignored by the DBSCAN clustering that selects training patches (OPERA-driven). Same physical meaning as `RAINFALL_THRESHOLD_MMH` — coincidental match. | Lowering → weaker rainfall events included in training. Raising → more selective, smaller training set. |
-| `DBSCAN_EPS` | $\color{red}{5}$ pixels | [identify_patches.py:116](identify_patches.py#L116) | n/a (source edit) | Neighbourhood radius in pixels for DBSCAN's density definition. | Larger → clusters merge (fewer, bigger regions). Smaller → cells fragment (more, smaller regions). |
-| `DBSCAN_MIN_SAMPLES` | $\color{red}{20}$ | [identify_patches.py:117](identify_patches.py#L117) | n/a (source edit) | Minimum cluster size (pixels) for DBSCAN to accept a component; smaller regions become noise. | Lowering → tiny convective cells become valid training samples. Raising → only substantial storms qualify. |
-| `DEFAULT_FRACTION_THRESHOLD_RATIO` | $\color{red}{0.30}$ (30%) | [identify_lightning_periods.py:105](identify_lightning_periods.py#L105) | `--fraction_ratio` (identify_lightning_periods.py) | Lightning-active period definition: a timestep counts as "active" when its occurrence-fraction is ≥ 30% of the day's average. Drives sample selection for the lightning-source training track. | Lowering → more timesteps marked lightning-active (weaker convection kept). Raising → only lightning-heavy periods survive. |
-
-### Class boundaries (rainfall multiclass)
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `THRESHOLDS_NORM` | $\color{red}{[10/70, 20/70, 30/70, 40/70]}$ | [sepconv_ensemble_training.py:65](sepconv_ensemble_training.py#L65) & [evaluate_sepconv_ensemble.py:42](evaluate_sepconv_ensemble.py#L42) | n/a (source edit) | Class boundaries for the 5-class rainfall multiclass head (normalised by the 70 mm/h scale factor: R<10, 10-20, 20-30, 30-40, ≥40 mm/h). | Changing boundaries → different class definitions; requires retraining the multiclass head. |
-| `N_RAINFALL_CLASSES` | $\color{red}{5}$ | [validate_predictions.py:140](validate_predictions.py#L140) | n/a (source edit) | Number of classes the rainfall multiclass head outputs. Must match `THRESHOLDS_NORM` (N_classes = len(boundaries) + 1). | Only change if you retrain the head with a different class scheme; validate_predictions expects 5. |
-
-### Knowledge distillation (student training)
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `DEFAULT_KD_ALPHA` | $\color{red}{0.7}$ | [train_lightning_kd.py:82](train_lightning_kd.py#L82) | `--kd_alpha` (train_lightning_kd.py) | Weight on the soft-teacher (distillation) loss in `L = alpha*L_soft + (1-alpha)*L_hard`. Canonical Hinton value. | Higher → student mimics teacher more, weaker GT anchoring. Lower → student behaves more like a from-scratch supervised model. |
-| `DEFAULT_KD_TEMPERATURE` | $\color{red}{4.0}$ | [train_lightning_kd.py:83](train_lightning_kd.py#L83) | `--kd_temperature` (train_lightning_kd.py) | Temperature for softening both teacher and student sigmoid outputs before the BCE distillation loss. Canonical Hinton value. | Higher → softer distribution (more subtle knowledge). Lower → sharper, distillation approaches hard-label BCE. `T=1` disables softening. |
-| `STUDENT_HR_CHANNELS` | $\color{red}{1}$ | [train_lightning_kd.py:88](train_lightning_kd.py#L88) & [validate_predictions.py](validate_predictions.py) (`KD_STUDENT_HR_CHANNELS`) | n/a (source edit) | Number of trailing HR channels the student keeps from the teacher's input (= MTG vis_06, last one in the dict-merge order). Changing this requires a matching change to `create_datasets.HR_LIGHTNING_CONFIG` and re-training. | Only change if the teacher's HR channel layout changes; the split point defines what the student sees at inference. |
-| `KD_TEACHER_MODE` / `KD_STUDENT_MODE` | $\color{red}{\text{mtg\_lightning\_opera\_occurrence}}$ / $\color{red}{\text{mtg\_opera\_occurrence}}$ | [validate_predictions.py](validate_predictions.py) | `--teacher_mode` / `--student_mode` (validate_predictions.py --track kd) | Which mode configs get loaded in the KD extraction / visualisation. | Almost never overridden; kept as CLI hooks in case an alt teacher/student pair is added later. |
-
-### Deterministic-generation knobs (report only)
-
-| Constant | Default | Location | CLI override | Purpose | Impact if changed |
-|---|---|---|---|---|---|
-| `DEFAULT_MODEL_TAG` | $\color{red}{\text{gemma3:27b-it-q4\_K\_M}}$ | [generate_report.py:46](generate_report.py#L46) | `--model` (generate_report.py) | Ollama model tag used for every English generation + Romanian translation call. Must be pulled locally (`ollama pull …`). | Smaller quants trade quality for RAM footprint; a different family may need prompt-template tweaks. |
-| `DEFAULT_OLLAMA_SEED` | $\color{red}{42}$ | [generate_report.py](generate_report.py) | `--seed` (generate_report.py) | Seed passed to Ollama for reproducible generation. Same seed + same prompt + fixed temperature → identical output across runs. | Any change breaks output determinism across runs but doesn't change quality; useful if you deliberately want variation. |
-| `DEFAULT_OLLAMA_TEMPERATURE` | $\color{red}{0.1}$ | [generate_report.py](generate_report.py) | `--temperature` (generate_report.py) | Sampling temperature for Gemma. Paired with the fixed seed this is still effectively deterministic while avoiding Gemma's `temperature=0.0` empty-completion collapse. The retry loop nudges by `+0.05` per attempt (floored at `0.05`) if a call still returns empty. | Raising further introduces more variation. Lowering to exactly `0.0` re-exposes the empty-output failure mode Gemma has at that boundary. |
-| `DEFAULT_OLLAMA_MAX_TOKENS` | $\color{red}{2000}$ | [generate_report.py](generate_report.py) | `--max_tokens` (generate_report.py) | Hard cap on Ollama's `num_predict` per call. Guards against runaway repetition loops wedging the whole run. | Lowering → shorter paragraphs (safer for CPU-bound runs). Raising → longer answers, higher per-call latency. |
-
-## Architecture Summary
-
-The model uses a multi-branch encoder with resolution-specific input streams:
-
-- **HR branch** (1 km): radar products + lightning + MTG vis_06 → ConvGRU over 3 input timesteps
-- **MR branch** (2 km): MTG IR/WV channels and/or OPERA → ConvGRU over 3 input timesteps
-
-Branches merge at matching spatial scales during the encoder's downsampling stages. The decoder generates 3 future frames (T+15, T+30, T+45 min) autoregressively from the encoded state.
-
-- **Lightning target**: weighted focal loss (γ=2) to handle severe class imbalance (~1% positive pixels)
-- **Radar / OPERA target**: categorical cross-entropy with 5 precipitation intensity classes
-
-### Dynamic Model Construction
-
-The model architecture is built dynamically from `metadata.json` saved by `create_datasets.py`. Each dataset records its input group names (e.g. `past_hr`, `past_mr`), their shapes `[T, H, W, C]`, and the label type. `train_models.py` reads this metadata and:
-
-1. Creates one input branch per group
-2. Computes the spatial downsampling factor from the ratio of each input's resolution to the maximum resolution
-3. Concatenates inputs that share the same resolution
-4. Builds the encoder-decoder with the correct channel counts
-
-This means a dataset created with any subset of inputs produces a matching model with the corresponding branches — no code changes needed. The Swin head from `--stage finetune` similarly inherits the backbone's shape.
-
-## Key Differences from Original COALITION-4 (MeteoSwiss)
-
-| Aspect | Original (Switzerland) | This adaptation (Romania) |
-|---|---|---|
-| Projection | EPSG:21781 (Swiss Grid) | EPSG:31700 (Stereo70) |
-| Grid size | 710×640 | 1536×768 |
-| Patch size | 32×32 (variable position) | 256×256 (fixed 6×3 grid) |
-| Temporal resolution | 5 min | 15 min |
-| Input timesteps | 12 (60 min) | 3 (30 min) + current |
-| Output timesteps | 12 (60 min) | 3 (45 min) |
-| Satellite | MSG SEVIRI (12 channels) | MSG (5 ch) or MTG FCI (5 ch) |
-| DEM / NWP | Included | Removed (validated via Grad-CAM + ξ analysis) |
-| Lightning network | MeteoSwiss | LINET |
-| Dataset split | By year | Czibula temporal blocks (10/10/80 within configurable blocks per day) |
-
-## Feature Importance Analysis
-
-After training, the model's learned representations can be analysed with three complementary methods using `feature_importance_analysis.py`:
-
-| Method | What it measures | Requirements |
-|--------|-----------------|--------------|
-| **Grad-CAM + Xi** | Spatial attention per input, correlated with output via Chatterjee's rank coefficient | 1 trained model |
-| **SHAP** | Pixel-level feature importance via DeepExplainer | 1 trained model |
-
-The script also produces a **prediction diagnostics** panel (MAE, RMSE, predicted-vs-target curves, and a per-sample MAE heatmap across lead times).
-
-### Quick Start
-
-```bash
-conda activate tfenv
-
-# Grad-CAM + Xi analysis only (fastest)
-python feature_importance_analysis.py \
-    --model models/coalition_mtg_lightning_lightning.keras \
-    --data our_data/datasets/mtg_lightning_lightning/test \
-    --methods gradcam_xi
-
-# Grad-CAM + Xi + SHAP
-python feature_importance_analysis.py \
-    --model models/coalition_mtg_lightning_lightning.keras \
-    --data our_data/datasets/mtg_lightning_lightning/test \
-    --methods gradcam_xi shap
-```
-
-### CLI Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--model` | Path to `.keras` model file | (required) |
-| `--data` | Path to saved test dataset directory | (required) |
-| `--output` | Output directory for results | `results/feature_importance` |
-| `--methods` | Which analyses to run (`gradcam_xi`, `shap`) | `gradcam_xi shap` |
-| `--num-samples` | Number of test samples to average Grad-CAM over | `4` |
-
-### Outputs
-
-All results are saved to `--output` (default `results/feature_importance/`):
-
-| File | Content |
-|------|---------|
-| `prediction_diagnostics.png` | 4-panel MAE/RMSE/value comparison/heatmap |
-| `xi_matrix.csv` | Xi correlations (inputs x timesteps) |
-| `xi_heatmap.html` | Interactive Xi heatmap |
-| `xi_bar_chart.html` | Top-N inputs by Xi |
-| `xi_boxplots.html` | Xi distribution per input |
-| `gradcam_rank*_*.png` | 5-panel Grad-CAM comparison plots |
-| `shap_spatial_maps.png` | SHAP importance heatmaps |
-| `shap_bar_chart.html` | Global SHAP importance |
-| `shap_importance.csv` | SHAP values per input |
-| `method_comparison.csv` | Grad-CAM + Xi vs SHAP side-by-side |
-| `method_correlations.csv` | Spearman + Pearson between methods |
-| `method_comparison.html` | Normalised bar chart comparing methods |
-
-## Troubleshooting
-
-Consolidated notes from failure modes we've actually hit. Each entry lists the symptom, the root cause, and the fix — commands that used to need a manual workaround have been patched to work on first run, so what's here is the residue that still requires human attention.
-
-### GPU / training runtime
-
-- **Windows fatal exception: access violation during training.** Mid-batch VRAM spikes past the block TensorFlow reserved on first use → null-pointer deref inside the CUDA runtime. `train_models.py` calls `configure_tf_runtime()` at start, which enables memory growth + disables XLA to keep the footprint predictable, so the failure now surfaces as a clean `ResourceExhaustedError` you can react to (lower `batch_size` in `[defaults]` or the per-mode override).
-- **Recovering from a crashed training run.** The per-epoch resumable checkpoint under `models/checkpoints/<run_tag>_latest.keras` (base) or `<run_tag>_finetune_latest.keras` (fine-tune) is the safety net. At most one epoch of work is lost. Pass `--fresh` to ignore an existing checkpoint and start over. The two `--source` tracks have completely separate checkpoint paths so they never collide on the same disk.
-- **Fine-tune loss is NaN from the first few steps.** Historically two things dragged the loss to `NaN` under `mixed_float16`: the Swin head's pre-softmax `Q@Kᵀ` overflowing fp16 and the multiclass softmax saturating to a class probability of exactly 0. The build fixed both in place — `train_finetune()` now sets `global_clipnorm=1.0` on AdamW, and `build_finetune_model()` uses `CategoricalCrossentropy(label_smoothing=0.01)` for the radar branch. If you still see NaNs, verify the base checkpoint is finite (i.e. wasn't produced by an earlier crashed run) before blaming the fine-tune.
-- **`Could not load dynamic library 'cudart64_110.dll'` on `import tensorflow`.** All the CUDA DLLs are on Windows `PATH` but Python 3.8+ no longer honours `PATH` for C-extension DLL loading — TensorFlow finds CUDA via the `CUDA_PATH` environment variable specifically. Fix: `setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"`, then close and reopen the terminal (`setx` only affects new shells). Verify in the new shell with `$env:CUDA_PATH` (PowerShell) or `echo %CUDA_PATH%` (cmd) — must print the CUDA install root before the TF check succeeds.
-- **`conda install cudatoolkit=11.2 cudnn=8.1.0` silently downgraded Python to 3.9.** conda-forge only has 2021-era CUDA 11.2 packages, which were built for Python 3.6–3.9. Installing them into a 3.10 env forces conda to downgrade Python. Fix — do NOT install CUDA via conda; use the NVIDIA installers as described in [Installation](#installation) step 1 and let CUDA live at system level. Recover an already-broken env by removing it (`conda env remove -n tfenv`) and starting the install recipe from scratch.
-
-### Local package / imports
-
-- **`ModuleNotFoundError: No module named 'c4dl'`.** The local `c4dl/` package hasn't been installed into the active environment. Every script that reprojects (radar, MTG, OPERA, lightning) imports `c4dl.projection`, and every script that reads the on-disk datasets imports `c4dl.datasets`. Fix: from the project root with the environment active, run `pip install -e .` once. Same install works for both `tfenv` and any secondary Python you use (e.g. a diagnostic-only env without TensorFlow).
-- **`_ARRAY_API not found` on `import tensorflow`.** TensorFlow <2.11 was compiled against the numpy 1.x C API and refuses to load under numpy 2.x. `requirements.txt` now pins `numpy<2`, so fresh installs are fine. If an old environment already installed numpy 2.x before the pin landed, downgrade explicitly: `pip install "numpy<2"`.
-- **`CRSError: Invalid projection ... no database context specified`.** pyproj was pip-installed on Windows, so its bundled `proj.db` sits at `site-packages\pyproj\proj_dir\share\proj\`; conda's `PROJ_DATA` env var still points at `<env>\Library\share\proj\`, which pip does not populate. Two databases in two places, and the env var wins. Fix: install the geo stack via conda-forge (`conda install -c conda-forge pyproj proj geopandas pyogrio shapely cartopy`) — that populates `Library\share\proj` so the env var actually points at a valid database, and everything downstream (`pyogrio`, `geopandas`, `cartopy`, `read_kml_version2.py`) shares the same PROJ ABI. Follow the [install order](#installation) from a clean env if the current one has mixed pip / conda installs.
-- **`AttributeError: module 'pyproj' has no attribute 'CRS'`** *(or `pyproj.__file__` prints `None`).* This is the ghost-package pattern that appears after switching pyproj from pip to conda-forge on Windows. `pip uninstall pyproj` removes the module files but leaves the `site-packages\pyproj\` directory in place. When `conda install pyproj` runs next, it sees the directory already exists and skips repopulating it. Python then imports the empty directory as an implicit namespace package with no code inside, and every attribute lookup (`CRS`, `__version__`, `__file__`) misses. `importlib.util.find_spec('pyproj').submodule_search_locations` will point at the leftover directory. Fix — physically wipe the directory, then reinstall:
-  ```cmd
-  conda remove -y pyproj
-  rmdir /s /q <env>\Lib\site-packages\pyproj
-  conda install -c conda-forge --force-reinstall pyproj proj -y
-  ```
-  Same pattern applies to any geo package flipped from pip to conda-forge (`geopandas`, `pyogrio`, `shapely`, `cartopy`). If in doubt, `rmdir` the leftover directory before the conda install.
-
-### Data ingest
-
-- **`cannot list ...: Permission denied` on the OPERA SFTP.** Password auth is being rejected by the EWC VM. Switch to key auth: pass `--ssh_key ~/.ssh/id_ed25519` (or another key registered under `claudiu@` on the server).
-- **`cannot list ...` after the mount root has resolved.** The `--remote_base` auto-fallback picks the correct EWC mount, so seeing "no such file" per date at the *right* base means the remote dirs genuinely don't exist for those dates. Upstream OPERA archive gap; nothing to fix on our end. Ask the ANM data operators when the target range will land.
-- **Stale `patch_index.csv` after an `identify_patches.py --date <one>` test.** Older versions of `identify_patches.py` overwrote the master CSV with just the single date's rows on every `--date` run. The current version writes the master only when `--date` is *not* set, so a single-day `--plot` no longer clobbers the historical index. If you need to refresh the whole thing, re-run without `--date` (with `--start` / `--end` for a range).
-
-### Plotting / visualisation
-
-- **`Border src: hardcoded_coarse` in the startup banner of `visualize_gt_vs_pred.py` / `predict_full_domain.py` / `identify_patches.py --plot`.** `cartopy` isn't installed in this environment, so the script fell back to a coarse hardcoded Romania polygon (no neighbour borders). Install with `conda install -c conda-forge cartopy` and the banner will report `natural_earth_10m` instead — the pip wheels for cartopy's GEOS/PROJ deps are flaky on Windows, so conda is strongly preferred.
+---
 
 ## References
 
-- Leinonen, J., et al. (2022). Seamless lightning nowcasting with recurrent-convolutional deep learning. *Monthly Weather Review*, 150(6).
-- Czibula, G., et al. (2024). SepConv-based precipitation nowcasting using radar data. *Natural Hazards and Earth System Sciences*.
-- Selvaraju, R. R., et al. (2017). Grad-CAM: Visual explanations from deep networks. *ICCV*.
-- Chatterjee, S. (2021). A new coefficient of correlation. *Journal of the American Statistical Association*.
+- Leinonen, J., Hamann, U., Germann, U. — *Seamless lightning nowcasting with recurrent-convolutional deep learning* (COALITION-4).
+- Czibula, G. et al. — block-wise temporal splitting for meteorological nowcasting datasets.
+- Hinton, G., Vinyals, O., Dean, J. — *Distilling the Knowledge in a Neural Network*.
 
 ## License
 
-This project is developed at ANM Romania under the EUMETSAT Training Placement Scheme.
+See [LICENSE](LICENSE).

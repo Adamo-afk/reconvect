@@ -45,6 +45,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
+from pipeline_config import SOURCE
+
 
 # =============================================================================
 # Configuration
@@ -139,7 +141,7 @@ def patch_activity_from_sequences(seq_data):
     Each sequence row's `patch_numbers` IS the activity ground truth
     for what the model trains on at that reference timestep, so
     plots 1-4 build directly from this rather than the upstream
-    patch_index.csv / lightning_patches.csv. Consequence: the
+    patch_index.csv. Consequence: the
     diagnostics always reflect the split CSV on disk (no risk of a
     stale upstream file showing one date while the training CSV
     spans eighty).
@@ -499,14 +501,6 @@ def main():
         help="Path to our_data directory"
     )
     parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Sample-selection track. Selects which per-source split "
-             "CSV to read by default (train_data_<source>.csv). "
-             "Ignored when --csv is given explicitly. "
-             "Default: dbscan."
-    )
-    parser.add_argument(
         "--split", type=str, default="train",
         choices=["train", "validation", "test"],
         help="Which split to plot when --csv is auto-resolved "
@@ -531,7 +525,7 @@ def main():
                 seq_path = alt_path
     else:
         seq_path = os.path.join(
-            args.data_root, f"{args.split}_data_{args.source}.csv",
+            args.data_root, f"{args.split}_data_{SOURCE}.csv",
         )
     out_dir = os.path.join(args.data_root, 'data_statistics')
     os.makedirs(out_dir, exist_ok=True)
@@ -540,7 +534,7 @@ def main():
     print("COALITION-4 Dataset Statistics")
     print("=" * 60)
     print(f"Data root : {args.data_root}")
-    print(f"Source    : {args.source}  (split={args.split})")
+    print(f"Source    : {SOURCE}  (split={args.split})")
     print(f"Sequences : {seq_path}")
     print(f"Output    : {out_dir}")
 
@@ -568,10 +562,10 @@ def main():
             if other == args.split:
                 continue
             other_path = os.path.join(
-                args.data_root, f"{other}_data_{args.source}.csv",
+                args.data_root, f"{other}_data_{SOURCE}.csv",
             )
             if not os.path.isfile(other_path):
-                print(f"  ({other}_data_{args.source}.csv not found - "
+                print(f"  ({other}_data_{SOURCE}.csv not found - "
                       f"plots 1-4 will skip it)")
                 continue
             extra = load_sequences(other_path)
@@ -588,7 +582,7 @@ def main():
     # timestep_config.json (fallback) so the daily-timeline grid sizes
     # itself correctly for any --step_minutes validate_timestep.py was
     # run with.
-    step_minutes = _load_step_minutes(args.data_root, args.source)
+    step_minutes = _load_step_minutes(args.data_root, SOURCE)
     print(f"  step_minutes: {step_minutes} (from config)")
 
     # Generate plots

@@ -23,7 +23,11 @@ from tensorflow.keras.optimizers import Adam
 #     sys.path.append(file_path)
 
 from c4dl.ml.models.blocks import ConvBlock, ResBlock
-from c4dl.features.batch import BatchSequence
+# NOTE: BatchSequence is imported lazily inside train_model() below. It is
+# the MeteoSwiss-era batch pipeline (numba-backed) and is NOT used by the
+# Romanian adaptation, which trains via train_models.py off pre-built
+# TFRecord datasets. Keeping the import lazy means the layers/losses/metrics
+# in this module stay importable without numba installed.
 from c4dl.ml.models.optimizers import AdaBeliefOptimizer
 from c4dl.ml.models.rnn import ResGRU
 
@@ -764,6 +768,7 @@ def train_model(model, strategy, batch_gen, epochs,
         # callbacks = [checkpoint, reducelr, earlystop]
         callbacks = [reducelr, earlystop]
 
+        from c4dl.features.batch import BatchSequence
         batch_seq_train = BatchSequence(batch_gen, dataset='train')
         batch_seq_valid = BatchSequence(batch_gen, dataset='valid')
 

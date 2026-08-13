@@ -40,6 +40,8 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from pipeline_config import SOURCE
+
 
 # =============================================================================
 # Configuration
@@ -116,32 +118,13 @@ def resolve_index_source(data_root, source):
       driven, produced by identify_patches.py for either --source radar or
       --source opera) with the cadence from timestep_config.json
       (STEP_MINUTES).
-    - source='lightning': reads our_data/lightning_periods/lightning_patches.csv
-      with the cadence from lightning_periods_config.json (step_minutes).
-      identify_lightning_periods.py no longer aggregates - each surviving
       occurrence map produces one row at the native step_minutes cadence -
       so the effective sequence step equals step_minutes.
     """
-    if source == 'dbscan':
+    if source == SOURCE:
         return (
             os.path.join(data_root, 'patch_index', 'patch_index.csv'),
             STEP_MINUTES,
-        )
-    if source == 'lightning':
-        lp_dir = os.path.join(data_root, 'lightning_periods')
-        cfg_path = os.path.join(lp_dir, 'lightning_periods_config.json')
-        if not os.path.isfile(cfg_path):
-            print(
-                f"ERROR: {cfg_path} not found.\n"
-                f"Run from the project root:\n"
-                f"    python identify_lightning_periods.py",
-                file=sys.stderr,
-            )
-            sys.exit(2)
-        lp_cfg = json.loads(Path(cfg_path).read_text())
-        return (
-            os.path.join(lp_dir, 'lightning_patches.csv'),
-            int(lp_cfg['step_minutes']),
         )
     raise ValueError(f"Unknown source: {source}")
 
@@ -156,10 +139,7 @@ def load_patch_index(data_root, source='dbscan'):
     csv_path, _ = resolve_index_source(data_root, source)
     if not os.path.isfile(csv_path):
         print(f"ERROR: {csv_path} not found")
-        if source == 'dbscan':
-            print("Run identify_patches.py first.")
-        else:
-            print("Run identify_lightning_periods.py first.")
+        print("Run identify_patches.py first.")
         return {}
 
     index = {}
@@ -290,8 +270,7 @@ def find_all_sequences(index, past_steps, future_steps,
         index: dict from load_patch_index()
         past_steps, future_steps: window size in step units
         step_minutes: spacing between adjacent steps (default: module-level
-            STEP_MINUTES from timestep_config.json; pass aggregation_minutes
-            when consuming a lightning_patches.csv index).
+            STEP_MINUTES from timestep_config.json).
     """
     if step_minutes is None:
         step_minutes = STEP_MINUTES
@@ -572,18 +551,6 @@ def main():
              f"(default: {DEFAULT_BLOCK_HOURS})"
     )
     parser.add_argument(
-        "--source", type=str, default='dbscan',
-        choices=['dbscan', 'lightning'],
-        help="Activity-index source. 'dbscan' (default) reads "
-             "patch_index.csv from identify_patches.py (DBSCAN clusters - "
-             "the underlying sensor is whatever was passed to "
-             "identify_patches's own --source flag, either radar / RZC or "
-             "opera_rainfall_rate). Uses step_minutes from "
-             "timestep_config.json. 'lightning' reads lightning_patches.csv "
-             "from identify_lightning_periods.py and uses step_minutes from "
-             "lightning_periods_config.json as the step interval."
-    )
-    parser.add_argument(
         "--manifest", type=str, default=None,
         help="Path to timestep_manifest.csv from intersect_product_coverage.py "
              "(default: auto-discover at <data_root>/timestep_manifest.csv). "
@@ -595,7 +562,7 @@ def main():
     args = parser.parse_args()
 
     # Resolve effective cadence + index path from the chosen source
-    _, effective_step_minutes = resolve_index_source(args.data_root, args.source)
+    _, effective_step_minutes = resolve_index_source(args.data_root, SOURCE)
 
     train_frac = 1.0 - args.test_frac - args.val_frac
     n_blocks = 24 // args.block_hours if 24 % args.block_hours == 0 else '?'
@@ -604,7 +571,7 @@ def main():
     print("COALITION-4 Sequence Extractor (Czibula temporal block split)")
     print("=" * 70)
     print(f"Data root        : {args.data_root}")
-    print(f"Activity source  : {args.source}")
+    print(f"Activity source  : {SOURCE}")
     print(f"Step interval    : {effective_step_minutes} min")
     print(f"Window           : {args.past} past + current + {args.future} future "
           f"= {args.past + 1 + args.future} steps "
@@ -615,8 +582,8 @@ def main():
           f"train {train_frac:.0%} per block")
 
     # Load patch index
-    print(f"\nLoading {args.source} patch index...")
-    index = load_patch_index(args.data_root, source=args.source)
+    print(f"\nLoading {SOURCE} patch index...")
+    index = load_patch_index(args.data_root, source=SOURCE)
     if not index:
         return
 
@@ -637,7 +604,7 @@ def main():
     manifest_set = (load_manifest_timesteps(manifest_path)
                     if manifest_path else None)
     drops_csv_path = os.path.join(
-        args.data_root, f'extract_patch_seq_drops_{args.source}.csv'
+        args.data_root, f'extract_patch_seq_drops_{SOURCE}.csv'
     )
     index = apply_manifest_gate(index, manifest_set, drops_csv_path)
     if not index:
@@ -653,7 +620,7 @@ def main():
     print(f"  {len(all_sequences)} qualifying sequences found")
 
     if not all_sequences:
-        print(f"No qualifying sequences. Check the {args.source} index CSV.")
+        print(f"No qualifying sequences. Check the {SOURCE} index CSV.")
         return
 
     # Split using Czibula method
@@ -668,7 +635,7 @@ def main():
     # (domain-adaptation pipeline trains both and uses them as separate
     # feature extractors).
     print("\nSaving results...")
-    src = args.source
+    src = SOURCE
     save_sequences(
         train,
         os.path.join(args.data_root, f'train_data_{src}.csv'),
@@ -694,7 +661,7 @@ def main():
     # traceability. Suffixed by source so the two tracks don't clobber
     # each other's metadata.
     seq_meta = {
-        "source": args.source,
+        "source": SOURCE,
         "step_minutes": effective_step_minutes,
         "source_step_minutes_native": STEP_MINUTES,
         "past_steps": args.past,

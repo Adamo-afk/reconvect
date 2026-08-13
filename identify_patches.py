@@ -2,17 +2,17 @@
 COALITION-4 patch identification pipeline.
 
 Full pipeline for identifying which 256×256 patches from the standardized
-6×3 grid contain convective activity, based on DBSCAN clustering of RZC
-(rain rate) radar data.
+6×3 grid contain convective activity, based on DBSCAN clustering of the
+OPERA instantaneous rainfall_rate field (mm/h).
 
 Steps:
-    1. Read raw RZC radar NetCDF files
-    2. Reproject to the Romania 1536×768 EPSG:31700 grid
-    3. Run DBSCAN to identify convective clusters (threshold >10, eps=5)
-    4. Create binary mask: all cluster pixels = 1, rest = 0
-    5. Overlay fixed 6×3 grid (18 patches of 256×256)
-    6. Mark patches with ≥1 non-zero pixel as active
-    7. Save patch index (CSV + JSON)
+    1. Read pre-reprojected OPERA rainfall_rate .npy files
+       (written by reproject.py --opera)
+    2. Run DBSCAN to identify convective clusters (threshold >10, eps=5)
+    3. Create binary mask: all cluster pixels = 1, rest = 0
+    4. Overlay fixed 6×3 grid (18 patches of 256×256)
+    5. Mark patches with ≥1 non-zero pixel as active
+    6. Save patch index (CSV + JSON)
 
 Grid layout (1536×768, numbered left-to-right, top-to-bottom):
     R1:  1   2   3   4   5   6
@@ -20,7 +20,8 @@ Grid layout (1536×768, numbered left-to-right, top-to-bottom):
     R3: 13  14  15  16  17  18
 
 Input structure:
-    {data_root}/radar_data/RZC/nc4_YYYY-MM-DD-Romania_RZC/*.nc
+    {data_root}/reprojected_data/opera_data/rainfall_rate/
+        nc4_YYYY-MM-DD-Romania_rainfall_rate/*.npy
 
 Output:
     {output_dir}/patch_index.csv
@@ -53,17 +54,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 
 
-def load_valid_minutes(source='radar'):
+def load_valid_minutes():
     """
-    Read the per-source minute filter from timestep_config.json.
+    Read the OPERA minute filter from timestep_config.json.
 
-    For `source='radar'` returns the `products.radar.filter` set (e.g.
-    `{'00','10','30','40'}` for step=15 with 10-min radar). For
-    `source='opera'` returns `products.opera_rainfall_rate.filter`
-    (the DBSCAN driver) — typically `{'00','15','30','45'}` for the
-    15-min cadence.
+    Returns `products.opera_rainfall_rate.filter` — the DBSCAN driver,
+    typically `{'00','15','30','45'}` for the 15-min cadence.
 
-    Errors out if the config or the requested product is missing.
+    Errors out if the config or the product entry is missing.
     """
     if not TIMESTEP_CONFIG_PATH.exists():
         print(
@@ -74,9 +72,7 @@ def load_valid_minutes(source='radar'):
         )
         sys.exit(2)
     cfg = json.loads(TIMESTEP_CONFIG_PATH.read_text())
-    product_key = (
-        'opera_rainfall_rate' if source == 'opera' else 'radar'
-    )
+    product_key = 'opera_rainfall_rate'
     flt = cfg["products"].get(product_key, {}).get("filter")
     if flt is None:
         print(
@@ -123,7 +119,7 @@ DBSCAN_MIN_SAMPLES = 20  # minimum cluster size
 # Mirrors the helpers in visualize_gt_vs_pred.py so the
 # patch-selection diagnostic plot reads as a consistent panel of the same
 # Romania visualisation - just with the GT/Pred rows swapped for the
-# RZC field + DBSCAN mask. Coords go lat/lon -> EPSG:31700 -> pixel via
+# OPERA field + DBSCAN mask. Coords go lat/lon -> EPSG:31700 -> pixel via
 # the canvas's known UTM extent (no GeoAxes needed).
 
 # UTM zone 35N (EPSG:31700) extent of the Romania grid, from c4dl/projection.py.
@@ -259,104 +255,16 @@ def _overlay_borders(ax, *, color="black", linewidth=1.3):
 # Radar I/O
 # =============================================================================
 
-def get_preferred_radar_group(ds):
-    """Determine the correct radar group name in the NetCDF hierarchy."""
-    data_group = ds.groups['data']
-    if 'radarpicture_0' in data_group.groups:
-        return 'radarpicture_0'
-    elif 'radarpicture' in data_group.groups:
-        return 'radarpicture'
-    else:
-        raise ValueError(f"No radarpicture group found. Available: {list(data_group.groups.keys())}")
 
 
-def read_radar_netcdf(filepath):
-    """
-    Read a single radar NetCDF file and return the datamap plus
-    source coordinate grids.
-
-    Returns:
-        tuple: (datamap, lat_grid, lon_grid) — all 2D numpy arrays
-    """
-    with Dataset(filepath, 'r') as ds:
-        radarpicture = get_preferred_radar_group(ds)
-        proj = ds.groups['data'].groups[radarpicture].groups['projection']
-        datamap = ds.groups['data'].groups[radarpicture].groups['datamap'].variables['datamap'][:]
-
-        lats = np.linspace(
-            float(proj.getncattr('lat_ul')),
-            float(proj.getncattr('lat_lr')),
-            int(proj.getncattr('size_y'))
-        )
-        lons = np.linspace(
-            float(proj.getncattr('lon_ul')),
-            float(proj.getncattr('lon_lr')),
-            int(proj.getncattr('size_x'))
-        )
-
-        lon_grid, lat_grid = np.meshgrid(lons, lats)
-
-    return datamap, lat_grid, lon_grid
 
 
-def parse_radar_filename(filename):
-    """
-    Parse datetime from radar filename.
-
-    Handles nc4 format: nc4_2025-05-15-Romania_0110_RZC.nc
-        → parts[1][:10] = date, parts[2] = HHMM
-
-    Returns:
-        tuple: (date_str 'YYYY-MM-DD', time_str 'HH:MM', iso_str)
-    """
-    basename = os.path.splitext(os.path.basename(filename))[0]
-    parts = basename.split('_')
-
-    # nc4 format: nc4_{date-Romania}_{HHMM}_{product}
-    if parts[0] == 'nc4' and len(parts) >= 3:
-        date_str = parts[1][:10]  # '2025-05-15' from '2025-05-15-Romania'
-        time_str_raw = parts[2]   # '0110'
-        dt = datetime.strptime(f"{date_str} {time_str_raw}", '%Y-%m-%d %H%M')
-    else:
-        # Fallback: first 12 chars = YYYYMMDDHHMM (old raw radar naming)
-        dt = datetime.strptime(basename[:12], '%Y%m%d%H%M')
-
-    return (
-        dt.strftime('%Y-%m-%d'),
-        dt.strftime('%H:%M'),
-        dt.strftime('%Y-%m-%dT%H:%M:%S.000000000')
-    )
 
 
 # =============================================================================
 # Reprojection
 # =============================================================================
 
-def reproject_to_romania(datamap, source_lats, source_lons, target_lats, target_lons):
-    """
-    Reproject radar data to the Romania 1536×768 grid using nearest-neighbor.
-
-    Args:
-        datamap: 2D source data
-        source_lats, source_lons: 2D source coordinate grids
-        target_lats, target_lons: 2D target coordinate grids
-
-    Returns:
-        np.ndarray: Reprojected data (768×1536), flipped vertically
-    """
-    source_geo = geometry.GridDefinition(lons=source_lons, lats=source_lats)
-    target_geo = geometry.GridDefinition(lons=target_lons, lats=target_lats)
-
-    reprojected = kd_tree.resample_nearest(
-        source_geo, datamap, target_geo,
-        radius_of_influence=5000,
-        fill_value=0.0
-    )
-
-    # Flip vertically to match Romania grid orientation (same as test_nc.py)
-    reprojected = np.flipud(reprojected)
-
-    return reprojected
 
 
 # =============================================================================
@@ -371,8 +279,8 @@ def dbscan_binary_mask(datamap, threshold=None, eps=None, min_samples=None):
     Everything else (noise + below threshold) is 0.
 
     Args:
-        datamap: 2D array (768×1536) of reprojected RZC values
-        threshold: minimum RZC value to consider. Defaults to the
+        datamap: 2D array (768×1536) of reprojected OPERA rain rate
+        threshold: minimum rain rate to consider. Defaults to the
             current module-level `DBSCAN_THRESHOLD` so CLI overrides
             (which reassign that global) actually take effect.
         eps: DBSCAN neighborhood radius. Defaults to `DBSCAN_EPS`.
@@ -461,9 +369,9 @@ def identify_active_patches(binary_mask):
 # =============================================================================
 
 def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str,
-                    output_dir, source='radar'):
+                    output_dir):
     """
-    Plot the EPSG:31700-reprojected RZC / OPERA data with the 6×3 patch grid overlay.
+    Plot the EPSG:31700-reprojected OPERA data with the 6×3 patch grid overlay.
 
     Styled to match `visualize_gt_vs_pred.py`: Romania
     sits centred in the figure, neighbour-country borders frame the
@@ -472,8 +380,7 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
 
     Args:
         reprojected: 2D array (768×1536) of reprojected rain-rate values
-            (RZC mm/h when source='radar', OPERA instantaneous rain rate
-            mm/h when source='opera').
+            (OPERA instantaneous rain rate, mm/h).
         binary_mask: 2D array (768×1536) of DBSCAN binary mask
         active_patches: list of active patch numbers (1-indexed)
         date_str: 'YYYY-MM-DD'
@@ -483,16 +390,8 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     _ensure_borders_cached()
     c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
 
-    # Source-aware labels for the rain-rate panel. Both products are
-    # KD-tree reprojected into the Romania EPSG:31700 grid in mm/h;
-    # only the title + colorbar label change so the same plot reads
-    # correctly for either track.
-    if source == 'opera':
-        field_title = 'OPERA instantaneous rain rate (reprojected)'
-        field_cbar  = 'OPERA rain rate (mm/h)'
-    else:
-        field_title = 'RZC (reprojected)'
-        field_cbar  = 'RZC (mm/h)'
+    field_title = 'OPERA instantaneous rain rate (reprojected)'
+    field_cbar  = 'OPERA rain rate (mm/h)'
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 8),
                              constrained_layout=True)
@@ -679,7 +578,7 @@ def plot_binary_mask_selection(binary_mask, active_patches,
 
 
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
-                        date_str, time_str, output_dir, source,
+                        date_str, time_str, output_dir,
                         data_root):
     """
     Write a CF-compliant NetCDF mirroring `plot_patch_grid()`.
@@ -704,7 +603,6 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
         time_str: 'HH:MM'.
         output_dir: matches the PNG `output_dir`; the `.nc` lands under
             `<output_dir>/nc/`.
-        source: 'radar' or 'opera'; controls the variable name and
             long_name so the file is self-describing in GIS.
         data_root: project `our_data/` root, used to locate
             `reprojected_data/romania_grid_{lats,lons}.npy`.
@@ -740,14 +638,9 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
     active_set = set(active_patches)
     is_active_grid = np.isin(patch_id_grid, list(active_set)).astype(np.int8)
 
-    if source == "opera":
-        data_var_name = "opera_rainfall_rate"
-        long_name = "OPERA instantaneous rainfall rate (DBSCAN driver)"
-        units = "mm/h"
-    else:
-        data_var_name = "RZC"
-        long_name = "Reprojected RZC rain rate (DBSCAN driver)"
-        units = "mm/h"
+    data_var_name = "opera_rainfall_rate"
+    long_name = "OPERA instantaneous rainfall rate (DBSCAN driver)"
+    units = "mm/h"
 
     ds = xr.Dataset(
         {
@@ -803,7 +696,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                          f"{date_str} {time_str} UTC",
         "active_patches": ",".join(str(p) for p in active_patches)
                           if active_patches else "",
-        "source":        f"identify_patches.py (--source {source})",
+        "source":        "identify_patches.py (OPERA rainfall_rate)",
         "Conventions":   "CF-1.8",
     }
 
@@ -821,31 +714,30 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
 # File discovery
 # =============================================================================
 
-# Valid minutes per source are loaded lazily (and cached) from
+# Valid minutes are loaded lazily (and cached) from
 # timestep_config.json so identify_patches.py works at any cadence
-# selected by validate_timestep.py. Keyed by source ('radar' or 'opera').
+# selected by validate_timestep.py.
 _VALID_MINUTES_CACHE: dict[str, set[str]] = {}
 
 
-def _valid_minutes_for(source):
-    cached = _VALID_MINUTES_CACHE.get(source)
+def _valid_minutes_for():
+    cached = _VALID_MINUTES_CACHE.get('opera_rainfall_rate')
     if cached is None:
-        cached = load_valid_minutes(source)
-        _VALID_MINUTES_CACHE[source] = cached
+        cached = load_valid_minutes()
+        _VALID_MINUTES_CACHE['opera_rainfall_rate'] = cached
     return cached
 
 
-def is_on_grid(filename, source='radar'):
+def is_on_grid(filename):
     """
-    Check if a filename's timestamp falls on the configured cadence grid
-    for the given source (radar uses `products.radar.filter`, OPERA uses
-    `products.opera_rainfall_rate.filter`).
+    Check if a filename's timestamp falls on the configured OPERA cadence
+    grid (`products.opera_rainfall_rate.filter`).
 
     Handles:
         nc4_2025-05-15-Romania_0110_RZC.nc  → parts[2] = '0110' → '10'
         202406131215something.nc             → basename[10:12] = '15'
     """
-    valid_minutes = _valid_minutes_for(source)
+    valid_minutes = _valid_minutes_for()
     basename = os.path.splitext(os.path.basename(filename))[0]
     parts = basename.split('_')
 
@@ -862,62 +754,17 @@ def is_on_grid(filename, source='radar'):
     return True  # include if pattern not recognized
 
 
-def discover_rzc_files(data_root):
-    """
-    Discover RZC NetCDF files on the configured cadence grid.
-
-    The valid minute set is read from our_data/timestep_config.json, so
-    a step=15 / cadence=10 setup keeps minutes {:00, :10, :30, :40} while
-    step=10 keeps every native minute. Files at off-grid timestamps are skipped.
-
-    Scans: {data_root}/radar_data/RZC/nc4_*-Romania_RZC/*.nc
-
-    Returns:
-        list[tuple]: Sorted list of (date_str, filepath) pairs
-    """
-    rzc_dir = os.path.join(data_root, 'radar_data', 'RZC')
-    if not os.path.isdir(rzc_dir):
-        print(f"RZC directory not found: {rzc_dir}")
-        return []
-
-    results = []
-    filtered = 0
-    date_dir_pattern = re.compile(r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_RZC$')
-
-    for entry in sorted(os.listdir(rzc_dir)):
-        match = date_dir_pattern.match(entry)
-        if not match:
-            continue
-
-        date_str = match.group(1)
-        day_dir = os.path.join(rzc_dir, entry)
-
-        if not os.path.isdir(day_dir):
-            continue
-
-        nc_files = sorted(f for f in os.listdir(day_dir) if f.endswith('.nc'))
-        for nc_file in nc_files:
-            if not is_on_grid(nc_file):
-                filtered += 1
-                continue
-            filepath = os.path.join(day_dir, nc_file)
-            results.append((date_str, filepath))
-
-    if filtered > 0:
-        print(f"Filtered {filtered} non-quarter-hour files")
-
-    return results
 
 
 def discover_opera_files(data_root):
     """
     Discover the reprojected OPERA rainfall-rate `.npy` files.
 
-    Unlike the RZC path (which reads raw source NetCDFs and reprojects
+    Unlike raw source NetCDFs (which would need reprojecting
     on the fly inside this script), the OPERA branch consumes the
     output of `reproject.py --opera`. The arrays are already on the
     Romania 1536×768 grid, so the DBSCAN step skips the per-file
-    reprojection done for RZC.
+    reprojection at read time.
 
     Scans: {data_root}/reprojected_data/opera_data/rainfall_rate/
                 nc4_{date}-Romania_rainfall_rate/*.npy
@@ -950,7 +797,7 @@ def discover_opera_files(data_root):
         for f in sorted(os.listdir(day_dir)):
             if not f.endswith('.npy'):
                 continue
-            if not is_on_grid(f, source='opera'):
+            if not is_on_grid(f):
                 filtered += 1
                 continue
             results.append((date_str, os.path.join(day_dir, f)))
@@ -979,18 +826,6 @@ def parse_opera_filename(filepath):
 # Pipeline
 # =============================================================================
 
-def process_single_file(filepath, target_lats, target_lons):
-    """
-    Full pipeline for a single RZC source file:
-        read → reproject → DBSCAN → binary mask → identify patches.
-    """
-    date_str, time_str, iso_str = parse_radar_filename(filepath)
-    datamap, src_lats, src_lons = read_radar_netcdf(filepath)
-    reprojected = reproject_to_romania(datamap, src_lats, src_lons,
-                                  target_lats, target_lons)
-    binary_mask = dbscan_binary_mask(reprojected)
-    active_patches = identify_active_patches(binary_mask)
-    return date_str, time_str, iso_str, active_patches, reprojected, binary_mask
 
 
 def process_single_opera_file(filepath):
@@ -1013,7 +848,7 @@ def process_single_opera_file(filepath):
 
 
 def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
-                 source='radar', start_date=None, end_date=None):
+                 start_date=None, end_date=None):
     """
     Run the full patch identification pipeline.
 
@@ -1022,15 +857,13 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
         output_dir: Where to save CSV + JSON
         date_filter: Optional YYYY-MM-DD to process a single date
         save_plots: If True, save a PNG for each active timestamp
-        source: 'radar' (RZC source NetCDFs, reproject in-script) or
-                'opera' (pre-reprojected OPERA rainfall_rate .npy files).
         start_date: Optional inclusive lower bound YYYY-MM-DD
         end_date:   Optional inclusive upper bound YYYY-MM-DD
     """
     print("=" * 70)
     print("COALITION-4 Patch Identification Pipeline")
     print("=" * 70)
-    print(f"Source     : {source}")
+    print("Source     : OPERA rainfall_rate (pre-reprojected)")
     print(f"Data root  : {data_root}")
     print(f"Output dir : {output_dir}")
     print(f"Grid       : {GRID_WIDTH}×{GRID_HEIGHT} → {N_COLS}×{N_ROWS} patches of {PATCH_SIZE}×{PATCH_SIZE}")
@@ -1039,12 +872,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
         print(f"Plots      : enabled")
 
     # Discover files
-    if source == 'opera':
-        all_files = discover_opera_files(data_root)
-        source_label = "OPERA rainfall_rate"
-    else:
-        all_files = discover_rzc_files(data_root)
-        source_label = "RZC"
+    all_files = discover_opera_files(data_root)
+    source_label = "OPERA rainfall_rate"
 
     if date_filter:
         all_files = [(d, f) for d, f in all_files if d == date_filter]
@@ -1066,15 +895,9 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     dates = sorted(set(d for d, _ in all_files))
     print(f"Found {len(all_files)} {source_label} files across {len(dates)} dates")
 
-    # The RZC path needs target lat/lon for its per-file reprojection.
-    # The OPERA path consumes pre-reprojected data, so target_lats/lons are unused.
-    target_lats = target_lons = None
-    if source == 'radar':
-        print("\nInitializing Romania grid projection...")
-        grid_projection = GridProjection(romania_grid_area)
-        y, x = np.mgrid[:grid_projection.area.height, :grid_projection.area.width]
-        target_lons, target_lats = grid_projection.inverse(y, x)
-        print(f"Target grid shape: {target_lats.shape}")
+    # OPERA is consumed pre-reprojected (reproject.py --opera writes the
+    # Romania-grid .npy), so there is no per-file reprojection here and
+    # no target lat/lon grid to build.
 
     # Plot output directory
     plot_dir = os.path.join(output_dir, 'plots') if save_plots else None
@@ -1085,10 +908,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
 
     for i, (date_str, filepath) in enumerate(all_files):
         try:
-            if source == 'opera':
-                out = process_single_opera_file(filepath)
-            else:
-                out = process_single_file(filepath, target_lats, target_lons)
+            out = process_single_opera_file(filepath)
             if out is None:
                 continue
             d, t, iso, active, reprojected, binary_mask = out
@@ -1106,7 +926,6 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                 if save_plots:
                     plot_patch_grid(
                         reprojected, binary_mask, active, d, t, plot_dir,
-                        source=source,
                     )
                     # Sibling `_selection.png` file — binary mask +
                     # orange 6x3 candidate polygon + green/red patch
@@ -1117,7 +936,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                     )
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
-                        d, t, plot_dir, source=source,
+                        d, t, plot_dir,
                         data_root=data_root,
                     )
             else:
@@ -1251,7 +1070,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="COALITION-4 patch identification pipeline. "
                     "Identifies which 256×256 patches from the fixed 6×3 grid "
-                    "contain convective activity based on DBSCAN clustering of RZC data."
+                    "contain convective activity based on DBSCAN clustering "
+                    "of OPERA rainfall_rate."
     )
     parser.add_argument(
         "--data_root", "-d", type=str, default=DEFAULT_DATA_ROOT,
@@ -1276,7 +1096,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--threshold", type=float, default=DBSCAN_THRESHOLD,
-        help=f"RZC threshold for DBSCAN (default: {DBSCAN_THRESHOLD})"
+        help=f"Rain-rate threshold (mm/h) for DBSCAN (default: {DBSCAN_THRESHOLD})"
     )
     parser.add_argument(
         "--eps", type=float, default=DBSCAN_EPS,
@@ -1289,14 +1109,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--plot", action="store_true",
         help="Save a PNG for each active timestamp (requires --date)"
-    )
-    parser.add_argument(
-        "--source", type=str, default='radar', choices=['radar', 'opera'],
-        help="Activity driver: 'radar' (legacy RZC source NetCDFs, "
-             "reprojected in-script) or 'opera' (pre-reprojected OPERA "
-             "rainfall_rate .npy from reproject.py --opera). Same DBSCAN "
-             "threshold semantics — both interpret values as rain rate "
-             "in mm/h. Default: radar."
     )
 
     args = parser.parse_args()
@@ -1320,7 +1132,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         date_filter=args.date,
         save_plots=args.plot,
-        source=args.source,
         start_date=args.start,
         end_date=args.end,
     )

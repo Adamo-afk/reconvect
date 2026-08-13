@@ -34,6 +34,8 @@ import numpy as np
 
 from lightning_fraction import load_scope_set
 
+from pipeline_config import SOURCE
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = str(PROJECT_ROOT / 'our_data')
@@ -186,14 +188,6 @@ def main():
         help="Path to our_data directory",
     )
     parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Which extract_patch_seq source to scope by. 'dbscan' "
-             "(default) scopes to train_data_dbscan.csv and writes "
-             "opera_rainfall_fraction_dbscan.json; 'lightning' mirrors "
-             "that for the lightning-driven track.",
-    )
-    parser.add_argument(
         "--output", "-o", type=str, default=None,
         help="Output JSON path (default: "
              "our_data/opera_rainfall_fraction_<source>.json).",
@@ -209,13 +203,13 @@ def main():
     scope_csv = (
         args.scope_csv
         if args.scope_csv is not None
-        else os.path.join(args.data_root, f"train_data_{args.source}.csv")
+        else os.path.join(args.data_root, f"train_data_{SOURCE}.csv")
     )
     output_path = (
         args.output
         if args.output
         else os.path.join(
-            args.data_root, f"opera_rainfall_fraction_{args.source}.json"
+            args.data_root, f"opera_rainfall_fraction_{SOURCE}.json"
         )
     )
 
@@ -223,12 +217,12 @@ def main():
     print("OPERA rainfall-rate class fractions (training-scope)")
     print("=" * 60)
     print(f"  data_root  : {args.data_root}")
-    print(f"  source     : {args.source}")
+    print(f"  source     : {SOURCE}")
     print(f"  scope_csv  : {scope_csv}")
     print(f"  output     : {output_path}")
 
     scope_keys = load_scope_set(
-        scope_csv, data_root=args.data_root, source=args.source,
+        scope_csv, data_root=args.data_root, source=SOURCE,
     )
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")
@@ -238,7 +232,7 @@ def main():
 
     stats = compute_class_fractions(args.data_root, scope_keys)
     stats['_scope'] = {
-        'source':       args.source,
+        'source':       SOURCE,
         'scope_csv':    None if scope_keys is None else str(Path(scope_csv).resolve()),
         'n_scope_keys': None if scope_keys is None else len(scope_keys),
     }

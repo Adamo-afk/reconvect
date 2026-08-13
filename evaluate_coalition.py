@@ -43,6 +43,8 @@ from tensorflow.keras.layers import (
     LayerNormalization
 )
 
+from pipeline_config import SOURCE
+
 
 # ============================================================================
 # Custom Layers — embedded for standalone model loading
@@ -1173,7 +1175,7 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
     if label_type is None:
         # Best-effort fallback. The caller normally passes label_type
         # straight through from the dataset's metadata.json so we don't
-        # misclassify modes like `mtg_lightning_opera` (which has
+        # misclassify modes like `mtg_lightning_opera_rainfall` (which has
         # 'lightning' in its name but actually uses the 5-class OPERA
         # rainfall target, i.e. label_type='radar').
         mode_cfg = get_mode_config(mode)
@@ -1186,7 +1188,7 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
     n_label_ch = LABEL_CHANNELS[label_type]
 
     input_groups = {}
-    for key in ["past_hr", "past_lr", "past_mr"]:
+    for key in ["past_hr", "past_mr"]:
         cfg = mode_config.get(key)
         if cfg is not None:
             input_groups[key] = cfg
@@ -1527,7 +1529,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
 
     Args:
         mode: one of the entries in TRAINING_MODES (e.g.
-            `mtg_lightning_opera_occurrence`, `mtg_opera_mtgmr`).
+            `mtg_lightning_opera_occurrence`, `mtg_opera_mtgmr_rainfall`).
             When kd=True, this is the STUDENT mode (e.g.
             `mtg_opera_occurrence`); the teacher's dataset is used
             for evaluation.
@@ -1561,34 +1563,16 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         )
     data_root = Path(data_root)
     model_dir = Path(model_dir)
-    # Central naming (inserts "rainfall" for radar-labelled modes). We
-    # also compute the legacy tag so pre-migration checkpoints, history
-    # files, and dataset dirs still resolve — matches the fallback logic
-    # in visualize_gt_vs_pred.load_model_artifact.
-    from train_models import build_run_tag, legacy_run_tag as _legacy_tag
+    # Central naming: `<mode>_<source>` (+ variant suffix). See
+    # train_models.build_run_tag.
+    from train_models import build_run_tag
     run_tag = build_run_tag(mode, source)
-    legacy_tag = _legacy_tag(mode, source)
     variant_suffix = ("_finetuned" if finetuned
                       else "_kd" if kd
                       else "")
     artifact_tag = f"{run_tag}{variant_suffix}"
-    legacy_artifact_tag = f"{legacy_tag}{variant_suffix}"
     output_dir = Path(output_dir) / f"eval_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    def _resolve_read(dir_root: Path, kind_prefix: str, kind_suffix: str,
-                     is_dir: bool = False) -> Path:
-        """Return the new-name path if it exists, else the legacy path if
-        that exists, else the new-name path (so the caller emits the
-        canonical error message)."""
-        new = dir_root / f"{kind_prefix}{run_tag}{kind_suffix}"
-        legacy = dir_root / f"{kind_prefix}{legacy_tag}{kind_suffix}"
-        exists = (Path.is_dir if is_dir else Path.is_file)
-        if not exists(new) and exists(legacy):
-            print(f"NOTE: using legacy-named {legacy.name}. "
-                  f"Rename to {new.name} to adopt the new naming.")
-            return legacy
-        return new
 
     # KD student was trained on the TEACHER's dataset (past_hr sliced at
     # forward time). At eval, we need the teacher's dataset dir here too;
@@ -1600,14 +1584,10 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     if kd:
         kd_hist_path = model_dir / f"history_{artifact_tag}.json"
         if not kd_hist_path.is_file():
-            legacy_hist = model_dir / f"history_{legacy_artifact_tag}.json"
-            if legacy_hist.is_file():
-                kd_hist_path = legacy_hist
-            else:
-                raise FileNotFoundError(
-                    f"KD history not found: {kd_hist_path}. Train the student "
-                    f"first via train_lightning_kd.py."
-                )
+            raise FileNotFoundError(
+                f"KD history not found: {kd_hist_path}. Train the student "
+                f"first via train_lightning_kd.py."
+            )
         with open(kd_hist_path) as f:
             kd_hist = json.load(f)
         teacher_mode = kd_hist.get("teacher_mode")
@@ -1619,25 +1599,15 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             )
         kd_student_hr_channels = int(kd_hist.get("student_hr_channels", 1))
         kd_teacher_run_tag = build_run_tag(teacher_mode, source)
-        kd_teacher_legacy_tag = _legacy_tag(teacher_mode, source)
         # Datasets dir points at the TEACHER, not the student.
-        teacher_new = data_root / "datasets" / kd_teacher_run_tag
-        teacher_legacy = data_root / "datasets" / kd_teacher_legacy_tag
-        if not teacher_new.is_dir() and teacher_legacy.is_dir():
-            print(f"NOTE: using legacy teacher dataset dir "
-                  f"{teacher_legacy.name}. Rename to {teacher_new.name}.")
-            dataset_root = teacher_legacy
-        else:
-            dataset_root = teacher_new
+        dataset_root = data_root / "datasets" / kd_teacher_run_tag
     else:
-        dataset_root = _resolve_read(
-            data_root / "datasets", "", "", is_dir=True,
-        )
+        dataset_root = data_root / "datasets" / run_tag
 
     # Authoritative label_type comes from the dataset's metadata.json
     # (written by create_datasets.py). Mode-name heuristics misclassify
-    # modes like `mtg_lightning_opera` which has 'lightning' in its name
-    # but targets OPERA 5-class rainfall.
+    # modes like `mtg_lightning_opera_rainfall` which has 'lightning' in
+    # its name but targets OPERA 5-class rainfall.
     meta_path = dataset_root / split / "metadata.json"
     if meta_path.is_file():
         with open(meta_path) as f:
@@ -1672,30 +1642,17 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     csv_name = SPLIT_CSV[split]
 
     # ---- 1. Plot training history ----
-    history_new = model_dir / f"history_{artifact_tag}.json"
-    history_legacy = model_dir / f"history_{legacy_artifact_tag}.json"
-    history_path = (history_new if history_new.is_file()
-                    or not history_legacy.is_file()
-                    else history_legacy)
+    history_path = model_dir / f"history_{artifact_tag}.json"
     if history_path.is_file():
-        if history_path == history_legacy:
-            print(f"NOTE: using legacy-named history file {history_path.name}. "
-                  f"Rename to {history_new.name} to adopt the new naming.")
         print(f"\n1. Plotting training history from {history_path}")
         plot_training_history(history_path, output_dir)
     else:
         print(f"\n1. WARNING: History file not found: {history_path}")
 
     # ---- 2. Load model (with mixed precision matching training) ----
-    model_new = model_dir / f"coalition_{artifact_tag}.keras"
-    model_legacy = model_dir / f"coalition_{legacy_artifact_tag}.keras"
-    model_path = (model_new if model_new.is_file() or not model_legacy.is_file()
-                  else model_legacy)
+    model_path = model_dir / f"coalition_{artifact_tag}.keras"
     if not model_path.is_file():
-        raise FileNotFoundError(f"Model not found: {model_new}")
-    if model_path == model_legacy:
-        print(f"NOTE: loading legacy-named checkpoint {model_path.name}. "
-              f"Rename to {model_new.name} to adopt the new naming.")
+        raise FileNotFoundError(f"Model not found: {model_path}")
 
     print(f"\n2. Loading model from {model_path}")
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
@@ -1734,7 +1691,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         # uses, then call `model.load_weights(...)` which matches by name
         # (not by index). Requires the base checkpoint path because the
         # backbone is loaded fresh from there.
-        base_ckpt = _resolve_read(model_dir, "coalition_", ".keras")
+        base_ckpt = model_dir / f"coalition_{run_tag}.keras"
         if not base_ckpt.is_file():
             raise FileNotFoundError(
                 f"Fine-tune evaluation needs the base checkpoint at "
@@ -1932,31 +1889,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate trained COALITION-4 model on test set."
     )
-    from train_models import all_mode_choices
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=all_mode_choices([
-            "mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-            "mtg_opera_radar_only", "mtg_opera_mtgmr",
-            "mtg_lightning_opera", "mtg_lightning_opera_occurrence",
+        choices=[
+            "mtg_lightning",
+            "mtg_radar_rainfall", "mtg_radar_continuous_rainfall",
+            "mtg_opera_radar_only_rainfall", "mtg_opera_mtgmr_rainfall",
+            "mtg_lightning_opera_rainfall",
+            "mtg_lightning_opera_occurrence",
             "mtg_opera_occurrence",
-        ]),
+        ],
         help="Model variant to evaluate. Matches the modes registered "
              "in train_models.TRAINING_MODES and create_datasets. For "
              "the KD student, pass its student mode (e.g. "
-             "mtg_opera_occurrence) together with --kd. Rainfall-track "
-             "modes accept an optional `_rainfall` suffix mirroring "
-             "the on-disk run-tag naming."
-    )
-    parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Sample-selection track the artifacts were built from. "
-             "`dbscan` = OPERA-driven (patch_index.csv from "
-             "identify_patches --source opera); `lightning` = "
-             "lightning-driven (lightning_patches.csv from "
-             "identify_lightning_periods.py). Drives every on-disk "
-             "path (model, history, datasets/, CSVs)."
+             "mtg_opera_occurrence) together with --kd."
     )
     parser.add_argument(
         "--finetuned", action="store_true",
@@ -2030,7 +1976,7 @@ def main():
         plot_date=args.date,
         plot_hour=args.hour,
         split=args.split,
-        source=args.source,
+        source=SOURCE,
         finetuned=args.finetuned,
         kd=args.kd,
     )

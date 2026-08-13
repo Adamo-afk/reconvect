@@ -14,7 +14,6 @@ section and one entry per active product:
     [cadences]
     radar               = 10
     mtg                 = 10
-    nwcsaf              = 10
     lightning           = null
     opera_reflectivity  = 15
     opera_rainfall_rate = 15
@@ -42,9 +41,7 @@ Output (default: our_data/timestep_config.json):
         "max_native_cadence_minutes": 10,
         "minute_filter": [0, 10, 30, 40],   # union across products
         "products": {
-            "radar":     {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
             "mtg":       {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
-            "nwcsaf":    {"cadence_minutes": 10, "filter": [0, 10, 30, 40]},
             "lightning": {"cadence_minutes": null, "filter": null}
         },
         "cadences_source": "/abs/path/to/product_cadences.json",
@@ -94,7 +91,6 @@ def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
             f"  [cadences]\n"
             f"  radar     = 10\n"
             f"  mtg       = 10\n"
-            f"  nwcsaf    = 10\n"
             f"  lightning = null\n"
         )
 

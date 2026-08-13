@@ -77,6 +77,8 @@ from train_models import (
     WallTimeCallback,
 )
 
+from pipeline_config import SOURCE
+
 
 # ============================================================================
 # Constants (Hinton et al. defaults; overridable via CLI)
@@ -182,8 +184,8 @@ class KDModel(tf.keras.Model):
 
     def _student_inputs(self, inputs: dict) -> dict:
         """Derive the student's inputs from a teacher-format batch. Only
-        past_hr changes (slice the LAST N channels = vis_06); past_mr and
-        past_lr pass through unchanged since the mode configs share them."""
+        past_hr changes (slice the LAST N channels = vis_06); past_mr
+        passes through unchanged since the mode configs share it."""
         student_hr = inputs["past_hr"][..., -self.student_hr_channels:]
         return {
             "past_hr": student_hr,
@@ -257,28 +259,16 @@ def load_teacher(model_dir: Path, source: str,
                  finetuned: bool = False) -> tf.keras.Model:
     """Load the frozen teacher. Uses the same custom_objects list as
     train_models.build_finetune_model so ResBlock / ResGRU / etc. round-
-    trip cleanly. Falls back to the legacy filename (no "rainfall"
-    insertion) when the new-name file isn't on disk, matching the
-    backward-compat behaviour of visualize_gt_vs_pred.load_model_artifact."""
-    from train_models import build_run_tag, legacy_run_tag
+    trip cleanly."""
+    from train_models import build_run_tag
     suffix = "_finetuned" if finetuned else ""
-    new_path = model_dir / (
+    path = model_dir / (
         f"coalition_{build_run_tag(TEACHER_MODE, source)}{suffix}.keras"
     )
-    legacy_path = model_dir / (
-        f"coalition_{legacy_run_tag(TEACHER_MODE, source)}{suffix}.keras"
-    )
-    if new_path.is_file():
-        path = new_path
-    elif legacy_path.is_file():
-        print(f"NOTE: loading legacy-named teacher {legacy_path.name}. "
-              f"Rename to {new_path.name} to adopt the new naming.")
-        path = legacy_path
-    else:
+    if not path.is_file():
         raise SystemExit(
-            f"Teacher checkpoint not found (looked for {new_path.name} and "
-            f"{legacy_path.name}). Train the base teacher first "
-            f"(see train_models.py --mode {TEACHER_MODE})."
+            f"Teacher checkpoint not found: {path.name}. Train the base "
+            f"teacher first (see train_models.py --mode {TEACHER_MODE})."
         )
     print(f"Loading teacher: {path.name}")
     teacher = tf.keras.models.load_model(
@@ -308,8 +298,8 @@ def load_teacher(model_dir: Path, source: str,
 def student_input_shapes(teacher_input_shapes: dict,
                           student_hr_channels: int) -> dict:
     """Derive input_shapes for the student mode from the teacher's, by
-    dropping all but the last `student_hr_channels` HR channels. past_mr /
-    past_lr pass through unchanged (shared between the two configs)."""
+    dropping all but the last `student_hr_channels` HR channels. past_mr
+    passes through unchanged (shared between the two configs)."""
     out = dict(teacher_input_shapes)
     hr_shape = list(out["past_hr"])            # [T, H, W, C_teacher]
     hr_shape[-1] = student_hr_channels          # → [T, H, W, C_student]
@@ -342,17 +332,9 @@ def train_kd(
 
     # We consume the TEACHER's dataset, not a separate student one - see
     # the module docstring for why this is correct given the HR channel
-    # ordering. Teacher mode is lightning-labelled so build_run_tag returns
-    # the same string as legacy_run_tag would (no "rainfall" insertion),
-    # but we still route through the helper for consistency and add a
-    # legacy-name fallback in case the dataset was built pre-migration.
-    from train_models import build_run_tag, legacy_run_tag
+    # ordering.
+    from train_models import build_run_tag
     dataset_dir = data_root / "datasets" / build_run_tag(TEACHER_MODE, source)
-    if not dataset_dir.is_dir():
-        legacy_dir = data_root / "datasets" / legacy_run_tag(TEACHER_MODE, source)
-        if legacy_dir.is_dir():
-            print(f"NOTE: using legacy dataset dir {legacy_dir.name}.")
-            dataset_dir = legacy_dir
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
     for d in (train_dir, val_dir):
@@ -446,10 +428,6 @@ def train_kd(
     )
     total_time = time.time() - t0
 
-    # STUDENT_MODE (mtg_opera_occurrence) is lightning-labelled so
-    # build_run_tag is a no-op vs the legacy form; using the helper
-    # anyway so the naming stays consistent if the student mode ever
-    # switches to a radar-labelled variant.
     student_run_tag = build_run_tag(STUDENT_MODE, source)
     student_path = model_dir / f"coalition_{student_run_tag}_kd.keras"
     student.save(str(student_path))
@@ -501,10 +479,6 @@ def main() -> int:
     )
     p.add_argument("--data_root", type=str, default="./our_data")
     p.add_argument("--model_dir", type=str, default="./models")
-    p.add_argument("--source", type=str, default="dbscan",
-                   choices=["dbscan", "lightning"],
-                   help="Patch source the teacher was trained on. Selects "
-                        "the correct dataset directory + ones_fraction JSON.")
     p.add_argument("--teacher_finetuned", action="store_true",
                    help="Distil from coalition_..._finetuned.keras instead "
                         "of the base teacher.")
@@ -543,7 +517,7 @@ def main() -> int:
         data_root=Path(args.data_root), model_dir=Path(args.model_dir),
         epochs=args.epochs, batch_size=args.batch_size,
         alpha=args.kd_alpha, temperature=args.kd_temperature,
-        source=args.source, teacher_finetuned=args.teacher_finetuned,
+        source=SOURCE, teacher_finetuned=args.teacher_finetuned,
         learning_rate=args.learning_rate, patience=args.patience,
         seed=args.seed, shuffle_buffer=args.shuffle_buffer,
         mixed_precision=not args.no_mixed_precision,

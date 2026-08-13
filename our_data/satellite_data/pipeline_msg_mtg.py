@@ -65,7 +65,9 @@ TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 # 40 body chunks per repeat cycle.
 ROMANIA_CHUNKS = {35, 36}
 
-# Remote machine hosting the FCI data (ANM internal network)
+# Remote machine hosting the FCI data (NMA internal network).
+# NOTE: REMOTE_USER below is the literal login account on that host — it
+# stays lowercase "anm" regardless of how the institution is named in prose.
 REMOTE_HOST = "192.168.11.223"
 REMOTE_USER = "anm"
 REMOTE_FCI_DIR = "/ShortTermStorage/GEOSTATIONARY/MTG/FCI/"

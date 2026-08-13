@@ -33,15 +33,15 @@ Minimum on-disk requirements (nothing else):
 
 Usage:
     # Full day of predictions at every reference step (96 timesteps at step=15)
-    python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    python predict_full_domain.py --mode mtg_lightning_opera_rainfall --source dbscan \
         --date 2026-06-30
 
     # One hour only (references :00 :15 :30 :45)
-    python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    python predict_full_domain.py --mode mtg_lightning_opera_rainfall --source dbscan \
         --date 2026-06-30 --hour 14
 
     # One specific reference time
-    python predict_full_domain.py --mode mtg_lightning_opera --source dbscan \
+    python predict_full_domain.py --mode mtg_lightning_opera_rainfall --source dbscan \
         --date 2026-06-30 --time 14:30
 
     # Custom range and the Swin fine-tuned model
@@ -85,15 +85,18 @@ from visualize_gt_vs_pred import (
     plot_full_domain_predictions_only,
 )
 import visualize_gt_vs_pred as _vf
-from train_models import build_run_tag, all_mode_choices, normalize_mode
+from train_models import build_run_tag
 
-_MODE_CHOICES = all_mode_choices([
-    "mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-    "mtg_opera_radar_only", "mtg_opera_mtgmr",
-    "mtg_lightning_opera",
+from pipeline_config import SOURCE
+
+_MODE_CHOICES = [
+    "mtg_lightning",
+    "mtg_radar_rainfall", "mtg_radar_continuous_rainfall",
+    "mtg_opera_radar_only_rainfall", "mtg_opera_mtgmr_rainfall",
+    "mtg_lightning_opera_rainfall",
     "mtg_lightning_opera_occurrence",
     "mtg_opera_occurrence",
-])
+]
 
 
 # ============================================================================
@@ -103,23 +106,13 @@ _MODE_CHOICES = all_mode_choices([
 # `find_reprojected_file_*` dispatcher to hit for each variable name.
 
 _VARIABLE_TO_GROUP: dict[str, str] = {
-    # Legacy ANM radar (RZC and friends)
-    "RZC": "radar", "CZC": "radar", "EZC-20": "radar", "LZC": "radar",
-    "BZC": "radar", "CPCH": "radar",
     # LINET lightning (already on the Romania grid via read_kml)
     "density": "lightning", "current": "lightning", "occurrence": "lightning",
-    # MSG SEVIRI (currently disabled in the active build)
-    "VIS006": "satellite_MSG", "IR_039": "satellite_MSG",
-    "IR_108": "satellite_MSG", "WV_062": "satellite_MSG",
-    "WV_073": "satellite_MSG",
     # MTG FCI
     "vis_06": "satellite_MTG", "ir_38": "satellite_MTG",
     "ir_105": "satellite_MTG", "wv_63": "satellite_MTG", "wv_73": "satellite_MTG",
     # OPERA composite
     "opera_reflectivity": "opera", "opera_rainfall_rate": "opera",
-    # NWCSAF (dropped from active build but kept for completeness)
-    "ctth_alti": "nwcsaf", "ctth_tempe": "nwcsaf",
-    "cmic_phase": "nwcsaf", "cmic_cot": "nwcsaf",
 }
 
 INPUT_STEP_OFFSETS = [-2, -1, 0]      # t-2, t-1, t0 relative to reference
@@ -323,7 +316,7 @@ def build_inputs_for_reference(data_root: Path, mode_config: dict,
     inputs: dict[str, np.ndarray] = {}
     kept_sets: list[set[int]] = []
     per_group_batches: dict[str, tuple[np.ndarray, list[int]]] = {}
-    for group_key in ("past_hr", "past_mr", "past_lr"):
+    for group_key in ("past_hr", "past_mr"):
         if mode_config.get(group_key) is None:
             continue
         batch, kept = _build_group_batch(
@@ -973,15 +966,9 @@ def main() -> int:
     )
     parser.add_argument("--mode", required=True, type=str,
                         choices=_MODE_CHOICES,
-                        help="Model variant. Rainfall-track modes accept "
-                             "an optional `_rainfall` suffix (e.g. "
-                             "`mtg_lightning_opera_rainfall`) that mirrors "
-                             "the on-disk run-tag naming; the canonical "
-                             "short form (`mtg_lightning_opera`) works too.")
-    parser.add_argument("--source", type=str, default="dbscan",
-                        choices=["dbscan", "lightning"],
-                        help="Selects normalization_stats_<source>.json and "
-                             "the trained model file suffix.")
+                        help="Model variant. The name states its own track: "
+                             "`_rainfall` for the OPERA 5-class head, "
+                             "`_occurrence` for the lightning binary head.")
     parser.add_argument("--date", required=True, type=str,
                         help="Reference date (YYYY-MM-DD).")
     time_group = parser.add_mutually_exclusive_group()
@@ -1082,7 +1069,7 @@ def main() -> int:
     variant_suffix = ("_finetuned" if args.finetuned
                       else "_kd" if args.kd
                       else "")
-    run_tag = build_run_tag(args.mode, args.source)
+    run_tag = build_run_tag(args.mode, SOURCE)
     output_dir = Path(args.output_dir) / (
         f"predict_{run_tag}{variant_suffix}"
     )
@@ -1094,9 +1081,9 @@ def main() -> int:
                                if x.strip()]
 
     # 1. Init sequence config + normalization stats (per-source paths)
-    init_sequence_config(str(data_root), args.source)
+    init_sequence_config(str(data_root), SOURCE)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{args.source}.json"
+        data_root / f"normalization_stats_{SOURCE}.json"
     )
 
     mode_config = get_mode_config(args.mode)
@@ -1112,7 +1099,7 @@ def main() -> int:
                      else "KD student" if args.kd
                      else "base")
     print(f"  Mode:            {args.mode}  (label_type={label_type})")
-    print(f"  Source:          {args.source}  ({variant_label})")
+    print(f"  Source:          {SOURCE}  ({variant_label})")
     print(f"  Date:            {args.date}")
     print(f"  Reference times: {len(ref_times)} step-aligned slots "
           f"(step={step_minutes} min)")
@@ -1132,7 +1119,7 @@ def main() -> int:
     # probability heatmap's colormap centering.
     print("\nLoading model...")
     model = load_model_artifact(
-        model_dir, args.mode, args.source, args.finetuned, kd=args.kd,
+        model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
