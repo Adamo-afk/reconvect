@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/reconvect-logo.gif" width="180" alt="ReConvect"/>
+  <img src="assets/reconvect-logo.gif" width="480" alt="ReConvect"/>
 </div>
 
 # COALITION-4 Nowcasting System — Romanian Adaptation
