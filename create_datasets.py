@@ -3,24 +3,29 @@ create_datasets.py — COALITION-4 Romanian Adaptation
 =====================================================
 Creates train, validation, and test TF datasets from pre-extracted .npy patches.
 
-Usage:
-    python create_datasets.py --mode mtg_lightning --data_root ./our_data
-    python create_datasets.py --mode mtg_radar --data_root ./our_data
-    python create_datasets.py --mode mtg_radar_continuous --data_root ./our_data
+Every mode reads OPERA in MR and MTG vis_06 in HR; the lightning modes
+add the three LINET channels to HR. Mode names state their own track:
+`_rainfall` = OPERA rainfall 5-class, `_continuous` = OPERA rainfall
+regression, `_occurrence` = lightning binary. See BUILDABLE_MODES.
 
-OPERA Shapley study (4-model coalition, "is NWCSAF useful?"):
-    python create_datasets.py --mode mtg_opera_radar_only --data_root ./our_data
-    python create_datasets.py --mode mtg_opera_mtgmr      --data_root ./our_data
-    python create_datasets.py --mode mtg_opera_nwcsaf     --data_root ./our_data
-    python create_datasets.py --mode mtg_opera_full       --data_root ./our_data
+Usage:
+    # Rainfall track (5-class)
+    python create_datasets.py --mode mtg_opera_radar_only_rainfall  --data_root ./our_data
+    python create_datasets.py --mode mtg_opera_mtgmr_rainfall       --data_root ./our_data
+    python create_datasets.py --mode mtg_lightning_opera_rainfall   --data_root ./our_data
+
+    # Rainfall track, continuous head (SepConv baseline)
+    python create_datasets.py --mode mtg_opera_mtgmr_continuous     --data_root ./our_data
+
+    # Lightning track (binary occurrence)
+    python create_datasets.py --mode mtg_lightning_opera_occurrence --data_root ./our_data
 
 The training cadence is read from our_data/timestep_config.json (set via
 validate_timestep.py) and the per-sample window from
-our_data/sequence_meta_<source>.json (written by
-extract_patch_seq_for_datasets.py). MSG modes are disabled in this build —
-see comments in get_mode_config().
+our_data/sequence_meta_dbscan.json (written by
+extract_patch_seq_for_datasets.py).
 
-Inputs (per --source = dbscan | lightning):
+Inputs (<source> is always `dbscan` — see pipeline_config.SOURCE):
     - train_data_<source>.csv, validation_data_<source>.csv,
       test_data_<source>.csv in data_root/
     - sequence_meta_<source>.json in data_root/
@@ -28,10 +33,10 @@ Inputs (per --source = dbscan | lightning):
     - normalization_stats_<source>.json in data_root/
     - .npy patch files in data_root/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
 
-Outputs (per --mode and --source):
-    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/train/
-    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/validation/
-    - Saved tf.data.Dataset in data_root/datasets/{mode}_{source}/test/
+Outputs (per --mode):
+    - TFRecord shards in data_root/datasets/{mode}_{source}/train/
+    - TFRecord shards in data_root/datasets/{mode}_{source}/validation/
+    - TFRecord shards in data_root/datasets/{mode}_{source}/test/
     - metadata.json per split (input_shapes, label_type, step_minutes, ...)
 """
 
@@ -46,6 +51,8 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
+from pipeline_config import SOURCE
+
 
 # ============================================================================
 # Per-variable transforms (data-driven via normalization_stats.json)
@@ -59,10 +66,9 @@ import tensorflow as tf
 # if the JSON is missing, or if a required variable is missing from it,
 # the call raises a clear error pointing the user at the stats script.
 #
-# Variables that use simple physical scaling (BZC, VIS, EZC = x/k) or are
-# categorical/binary (occurrence, cmic_phase) are NOT driven by the JSON.
-# Their transforms are hardcoded because the scaling factor is a property
-# of the physical units, not the training distribution.
+# Variables that are categorical/binary (occurrence) are NOT driven by
+# the JSON. Their transforms are hardcoded because the scaling is a
+# property of the physical units, not the training distribution.
 
 _NORMALIZATION_STATS_CACHE: dict | None = None
 _NORMALIZATION_PATH: Path | None = None
@@ -158,56 +164,6 @@ def _apply_linear_zscore(x: np.ndarray, var: str) -> np.ndarray:
     return (x - mean) / std
 
 
-# ---- Radar ----
-def transform_rzc(x):
-    """RZC rain rate: log10 + z-score; heavy-tailed, zero-inflated."""
-    return _apply_log_zscore(x, "RZC")
-
-
-def transform_czc(x):
-    """CZC composite reflectivity (dBZ): linear z-score."""
-    return _apply_linear_zscore(x, "CZC")
-
-
-def transform_lzc(x):
-    """LZC liquid water content: log10 + z-score; heavy-tailed."""
-    return _apply_log_zscore(x, "LZC")
-
-
-def transform_ezc(x):
-    """EZC-20 echo-top height: simple physical scaling (x / 1.97), fill=0.
-
-    Hardcoded scale — not data-driven. Echo-top is a physical altitude
-    measure; the divisor expresses an empirically chosen unit conversion
-    rather than a statistical centring, so it stays out of the JSON.
-    """
-    x = np.where(np.isnan(x), 0.0, x)
-    return x / 1.97
-
-
-def transform_bzc(x):
-    """BZC base reflectivity: simple physical scaling (x / 100), fill=0.
-
-    Hardcoded. BZC stores integer-coded dBZ * 100 in the source files
-    so the `/100` recovers the physical unit; this is a unit conversion,
-    not a statistical normalisation.
-    """
-    x = np.where(np.isnan(x), 0.0, x)
-    return x / 100.0
-
-
-def transform_cpch(x):
-    """CPCH precipitation: log10(x) only, fill=0.01, threshold=0.1.
-
-    Hardcoded — pure log transform (no z-score). The threshold drops
-    sub-noise rates to the fill value to keep the log finite.
-    """
-    x = np.where(np.isnan(x), 0.01, x)
-    x = np.where(x < 0.1, 0.01, x)
-    x = np.clip(x, 0.01, None)
-    return np.log10(x)
-
-
 # ---- Lightning ----
 def transform_lightning_density(x):
     """Lightning density: log10 + z-score."""
@@ -231,9 +187,9 @@ def transform_occurrence(x):
 
 # ---- Satellite (per-channel data-driven stats) ----
 def transform_vis(x):
-    """Solar visible channels (VIS006, vis_06, ...): x / 100.
+    """Solar visible channel (vis_06): x / 100.
 
-    Hardcoded — same unit-conversion logic as BZC: the source data is
+    Hardcoded unit conversion: the source data is
     stored as integer reflectance % * 100, so `/100` recovers a value
     already in a sensible model-friendly range. No z-score needed.
     """
@@ -241,21 +197,11 @@ def transform_vis(x):
     return x / 100.0
 
 
-def transform_ir039(x):
-    """MSG IR_039 / MTG ir_38 (solar+thermal): linear z-score."""
-    # MSG and MTG share the transform body but use different per-channel
-    # stats. The two configs below bind the right variable name.
-    return _apply_linear_zscore(x, "IR_039")
-
 
 def transform_ir38(x):
     """MTG ir_38: linear z-score."""
     return _apply_linear_zscore(x, "ir_38")
 
-
-def transform_ir108(x):
-    """MSG IR_108 thermal channel: linear z-score."""
-    return _apply_linear_zscore(x, "IR_108")
 
 
 def transform_ir105(x):
@@ -263,63 +209,16 @@ def transform_ir105(x):
     return _apply_linear_zscore(x, "ir_105")
 
 
-def transform_wv062(x):
-    """MSG WV_062 water-vapour channel: linear z-score."""
-    return _apply_linear_zscore(x, "WV_062")
-
 
 def transform_wv63(x):
     """MTG wv_63 water-vapour channel: linear z-score."""
     return _apply_linear_zscore(x, "wv_63")
 
 
-def transform_wv073(x):
-    """MSG WV_073 water-vapour channel: linear z-score."""
-    return _apply_linear_zscore(x, "WV_073")
-
 
 def transform_wv73(x):
     """MTG wv_73 water-vapour channel: linear z-score."""
     return _apply_linear_zscore(x, "wv_73")
-
-
-# ---- NWCSAF ----
-def transform_ctth_alti(x):
-    """NWCSAF cloud-top altitude: linear z-score (sentinel 65535 dropped)."""
-    return _apply_linear_zscore(x, "ctth_alti")
-
-
-def transform_ctth_tempe(x):
-    """NWCSAF cloud-top temperature: linear z-score (sentinel 65535 dropped)."""
-    return _apply_linear_zscore(x, "ctth_tempe")
-
-
-def transform_cmic_phase(x):
-    """Cloud-top phase: one-hot.
-
-    Hardcoded. Categorical variable with five classes — no continuous
-    normalisation makes sense.
-
-    Input is expected to be int8 codes 0–4 from reproject.py (NaN replaced
-    with 0 = "no cloud / missing" at reproject time, so this function no
-    longer needs to handle NaN). 4×4 LR pooling in extract_patches.py
-    can still produce fractional values when a block mixes categories,
-    so a final round-to-nearest still happens here before the one-hot.
-    """
-    x = np.round(x).astype(np.int32)
-    h, w = x.shape
-    one_hot = np.zeros((h, w, 5), dtype=np.float32)
-    mapping = {0: 4, 1: 0, 2: 1, 3: 2, 4: 3}
-    for val, ch in mapping.items():
-        one_hot[:, :, ch] = (x == val).astype(np.float32)
-    known = np.isin(x, list(mapping.keys()))
-    one_hot[:, :, 4] = np.where(~known, 1.0, one_hot[:, :, 4])
-    return one_hot
-
-
-def transform_cmic_cot(x):
-    """NWCSAF cloud optical thickness: log10 + z-score (sentinel dropped)."""
-    return _apply_log_zscore(x, "cmic_cot")
 
 
 # ---- OPERA radar (new) ----
@@ -336,7 +235,7 @@ def transform_opera_reflectivity(x):
 def transform_opera_rainfall_rate(x):
     """OPERA instantaneous rain rate (mm/h): log10 + z-score.
 
-    Heavy-tailed, zero-inflated, same family as RZC; clip-then-log
+    Heavy-tailed and zero-inflated; clip-then-log
     flattens the distribution before z-scoring.
     """
     return _apply_log_zscore(x, "opera_rainfall_rate")
@@ -349,52 +248,49 @@ def label_transform_occurrence(x):
     return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
-def label_transform_rzc_multiclass(x):
-    """RZC rain rate → 5-class one-hot label.
-    Classes (mm/h):  0: R<10,  1: 10≤R<20,  2: 20≤R<30,  3: 30≤R<40,  4: R≥40
-    Returns (H, W, 5) float32 array.
-    """
-    x = np.where(np.isnan(x), 0.0, x)
-    x = np.clip(x, 0.0, None)
-    h, w = x.shape
-    one_hot = np.zeros((h, w, 5), dtype=np.float32)
-    one_hot[:, :, 0] = (x < 10.0).astype(np.float32)
-    one_hot[:, :, 1] = ((x >= 10.0) & (x < 20.0)).astype(np.float32)
-    one_hot[:, :, 2] = ((x >= 20.0) & (x < 30.0)).astype(np.float32)
-    one_hot[:, :, 3] = ((x >= 30.0) & (x < 40.0)).astype(np.float32)
-    one_hot[:, :, 4] = (x >= 40.0).astype(np.float32)
-    return one_hot
+# Shared 5-class rain-rate bin edges (mm/h). The continuous label below
+# normalises against RAINFALL_MAX_MMH so the two heads describe the same
+# physical quantity on different scales — that is what makes the
+# `*_rainfall` (5-class) and `*_continuous` (regression) modes directly
+# comparable in the SepConv baseline study.
+RAINFALL_CLASS_EDGES = (10.0, 20.0, 30.0, 40.0)
+RAINFALL_MAX_MMH = 70.0
 
 
 def label_transform_opera_rainfall_multiclass(x):
     """OPERA instantaneous rain rate → 5-class one-hot label.
 
-    Uses the same bin boundaries as `label_transform_rzc_multiclass`
-    (<10, 10–20, 20–30, 30–40, ≥40 mm/h) so that COALITION-4 trained on
-    OPERA labels stays comparable with the RZC-trained baseline. The
-    label patch is loaded from `opera_rainfall_rate_hr` (HR alias of the
-    same reprojected file) so the output shape matches the 256×256 HR head.
+    Classes (mm/h):  0: R<10, 1: 10≤R<20, 2: 20≤R<30, 3: 30≤R<40, 4: R≥40.
+    The label patch is loaded from `opera_rainfall_rate_hr` (HR alias of
+    the same reprojected file) so the output shape matches the 256×256
+    HR head. Returns (H, W, 5) float32.
     """
     x = np.where(np.isnan(x), 0.0, x)
     x = np.clip(x, 0.0, None)
     h, w = x.shape
+    e0, e1, e2, e3 = RAINFALL_CLASS_EDGES
     one_hot = np.zeros((h, w, 5), dtype=np.float32)
-    one_hot[:, :, 0] = (x < 10.0).astype(np.float32)
-    one_hot[:, :, 1] = ((x >= 10.0) & (x < 20.0)).astype(np.float32)
-    one_hot[:, :, 2] = ((x >= 20.0) & (x < 30.0)).astype(np.float32)
-    one_hot[:, :, 3] = ((x >= 30.0) & (x < 40.0)).astype(np.float32)
-    one_hot[:, :, 4] = (x >= 40.0).astype(np.float32)
+    one_hot[:, :, 0] = (x < e0).astype(np.float32)
+    one_hot[:, :, 1] = ((x >= e0) & (x < e1)).astype(np.float32)
+    one_hot[:, :, 2] = ((x >= e1) & (x < e2)).astype(np.float32)
+    one_hot[:, :, 3] = ((x >= e2) & (x < e3)).astype(np.float32)
+    one_hot[:, :, 4] = (x >= e3).astype(np.float32)
     return one_hot
 
 
-def label_transform_rzc_continuous(x):
-    """RZC rain rate → continuous label in [0, 1] via min-max normalization.
-    NaN → 0, clip to [0, 70], divide by 70.
-    Returns (H, W) float32 array.
+def label_transform_opera_rainfall_continuous(x):
+    """OPERA instantaneous rain rate → continuous label in [0, 1].
+
+    NaN → 0, clip to [0, RAINFALL_MAX_MMH], divide by RAINFALL_MAX_MMH.
+    Target of the `*_continuous` modes, which exist so the SepConv
+    ensemble (a regression model) can be baselined against COALITION-4
+    on identical inputs — either continuous-vs-continuous, or by binning
+    both back to the 5 classes via RAINFALL_CLASS_EDGES.
+    Returns (H, W) float32.
     """
     x = np.where(np.isnan(x), 0.0, x)
-    x = np.clip(x, 0.0, 70.0)
-    return (x / 70.0).astype(np.float32)
+    x = np.clip(x, 0.0, RAINFALL_MAX_MMH)
+    return (x / RAINFALL_MAX_MMH).astype(np.float32)
 
 
 # Number of label channels per target type
@@ -412,27 +308,10 @@ LABEL_CHANNELS = {
 # Variable name → (transform_function, produces_extra_channels)
 # produces_extra_channels: None for scalar transforms, int for one-hot etc.
 
-HR_RADAR_CONFIG = {
-    "RZC":    (transform_rzc, None),
-    "CZC":    (transform_czc, None),
-    "EZC-20": (transform_ezc, None),
-    "LZC":    (transform_lzc, None),
-    "BZC":    (transform_bzc, None),
-    "CPCH":   (transform_cpch, None),
-}
-
 HR_LIGHTNING_CONFIG = {
     "density":    (transform_lightning_density, None),
     "current":    (transform_lightning_current, None),
     "occurrence": (transform_occurrence, None),
-}
-
-MSG_SAT_CONFIG = {
-    "VIS006": (transform_vis, None),
-    "IR_039": (transform_ir039, None),
-    "IR_108": (transform_ir108, None),
-    "WV_062": (transform_wv062, None),
-    "WV_073": (transform_wv073, None),
 }
 
 MTG_HR_SAT_CONFIG = {
@@ -454,167 +333,155 @@ OPERA_MR_CONFIG = {
     "opera_rainfall_rate": (transform_opera_rainfall_rate, None),
 }
 
-NWCSAF_CONFIG = {
-    "ctth_alti":  (transform_ctth_alti, None),
-    "ctth_tempe": (transform_ctth_tempe, None),
-    "cmic_phase": (transform_cmic_phase, 5),  # one-hot → 5 channels
-    "cmic_cot":   (transform_cmic_cot, None),
-}
+# ============================================================================
+# Resolution tiers
+# ============================================================================
+# Two input tiers survive. The names are historical — see the note below.
+#
+#   past_hr  "high resolution"    1 km native, 256x256 px patch, no pooling
+#            Channels: MTG vis_06; LINET density / current / occurrence
+#            (LINET is rasterised straight onto the 1 km Romania grid).
+#
+#   past_mr  "medium resolution"  2 km native, 128x128 px patch, 2x2 pooling
+#            Channels: OPERA reflectivity + rainfall_rate;
+#                      MTG ir_38 / ir_105 / wv_63 / wv_73.
+#
+# WHY "MEDIUM" WHEN IT IS NOW THE COARSEST TIER:
+# There used to be a third tier, `past_lr` ("low resolution", 3 km native,
+# 64x64 patch, 4x4 pooling), carrying MSG SEVIRI and NWCSAF. Both products
+# were retired, so that tier is gone and MR is now the coarsest input. The
+# name is kept because it is baked into the input-tensor names of every
+# trained checkpoint and into every dataset's metadata.json — renaming it
+# would invalidate existing models.
+#
+# ON-DISK SUFFIX CAVEAT: extracted patches are named
+# `{variable}_{HHMM}_{HR|LR}.npy` — only TWO suffixes, where `_LR` means
+# "was pooled" rather than naming a tier. MR-tier variables therefore live
+# in `_LR` files. Since the LR tier is gone, every `_LR` patch on disk is
+# now MR: 128x128 at 2 km. The mode config carries the suffix explicitly
+# as the third element of each group tuple, so nothing infers it.
+
+# Iteration order of the input groups. This order sets the model's input
+# ordering, so it must stay stable across dataset builds and checkpoints.
+INPUT_GROUP_KEYS = ("past_hr", "past_mr")
+
+
+# ============================================================================
+# Mode registry
+# ============================================================================
+# Single source of truth for which modes exist. Every `--mode` CLI in the
+# project builds its `choices=` from these tuples rather than hardcoding
+# its own copy, so adding a mode means editing `get_mode_config` below
+# plus one entry here.
+#
+# Naming: the mode name states its own track — `_rainfall` = OPERA
+# rainfall 5-class, `_continuous` = OPERA rainfall regression,
+# `_occurrence` = lightning binary. train_models.build_run_tag appends
+# `_<source>` to get the on-disk artefact tag.
+
+# Modes create_datasets.py can build a dataset for.
+BUILDABLE_MODES = (
+    "mtg_opera_radar_only_rainfall",
+    "mtg_opera_mtgmr_rainfall",
+    "mtg_lightning_opera_rainfall",
+    "mtg_opera_mtgmr_continuous",
+    "mtg_lightning_opera_occurrence",
+)
+
+# The KD student has no dataset of its own — train_lightning_kd.py feeds
+# it the teacher's dataset with past_hr sliced to the student's channels.
+# It is a valid --mode for evaluate / predict / visualize / validate.
+KD_STUDENT_MODES = (
+    "mtg_opera_occurrence",
+)
+
+# Everything get_mode_config understands.
+MODE_NAMES = BUILDABLE_MODES + KD_STUDENT_MODES
 
 
 def get_mode_config(mode):
     """Return input group configurations and label config for a given mode.
 
-    Accepts both the canonical mode name (`mtg_lightning_opera`) and its
-    `_rainfall`-suffixed alias (`mtg_lightning_opera_rainfall`) — the
-    alias is normalised via train_models.normalize_mode so the two are
-    fully interchangeable at every callsite.
-
     Returns:
         dict with keys for each input tensor group:
             "past_hr":  (var_config_dict, resolution, suffix)
-            "past_lr":  (var_config_dict, resolution, suffix)
-            "past_mr":  (var_config_dict, resolution, suffix) or None
+            "past_mr":  (var_config_dict, resolution, suffix)
         and:
             "label_var": str — variable name for labels
             "label_transform": callable
             "label_suffix": str — HR or LR
     """
-    # Local import: train_models pulls TF, but get_mode_config is called
-    # from lightweight paths (e.g. CLI arg parsing). Deferring the import
-    # keeps those paths cheap when TF isn't otherwise needed.
-    from train_models import normalize_mode
-    mode = normalize_mode(mode)
+    # HR (256 px) always carries MTG vis_06; the lightning modes add the
+    # three LINET channels alongside it. MR (128 px, 2 km native, 2x pool)
+    # always carries OPERA, optionally joined by MTG IR/WV. There is no LR
+    # tier in this build.
+    hr_vis = MTG_HR_SAT_CONFIG
+    hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
+    mr_opera = OPERA_MR_CONFIG
+    mr_opera_mtg = {**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}
 
-    # Common: radar + lightning at HR
-    hr_base = {**HR_RADAR_CONFIG, **HR_LIGHTNING_CONFIG}
-
-    # MSG modes are disabled in this build (MSG SEVIRI ingestion was
-    # removed from pipeline_msg_mtg.py). The recipes are kept commented
-    # so they can be re-enabled if the MSG branch is brought back.
-    # if mode == "msg_lightning":
-    #     return {
-    #         "past_hr": (hr_base, 256, "HR"),
-    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-    #         "past_mr": None,
-    #         "label_var": "occurrence",
-    #         "label_transform": label_transform_occurrence,
-    #         "label_suffix": "HR",
-    #         "label_type": "lightning",
-    #     }
-    # elif mode == "msg_radar":
-    #     return {
-    #         "past_hr": (hr_base, 256, "HR"),
-    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-    #         "past_mr": None,
-    #         "label_var": "RZC",
-    #         "label_transform": label_transform_rzc_multiclass,
-    #         "label_suffix": "HR",
-    #         "label_type": "radar",
-    #     }
-    if mode == "mtg_lightning":
-        hr_with_vis = {**hr_base, **MTG_HR_SAT_CONFIG}
+    # --- Rainfall track: OPERA rainfall_rate 5-class -------------------
+    if mode == "mtg_opera_radar_only_rainfall":
+        # Lightest baseline: MTG vis_06 + OPERA. No MTG IR/WV, no lightning.
         return {
-            "past_hr": (hr_with_vis, 256, "HR"),
-            "past_mr": (MTG_MR_SAT_CONFIG, 128, "LR"),  # 2km stored as LR
-            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
-            "label_var": "occurrence",
-            "label_transform": label_transform_occurrence,
-            "label_suffix": "HR",
-            "label_type": "lightning",
-        }
-    elif mode == "mtg_radar":
-        hr_with_vis = {**hr_base, **MTG_HR_SAT_CONFIG}
-        return {
-            "past_hr": (hr_with_vis, 256, "HR"),
-            "past_mr": (MTG_MR_SAT_CONFIG, 128, "LR"),
-            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
-            "label_var": "RZC",
-            "label_transform": label_transform_rzc_multiclass,
+            "past_hr": (hr_vis, 256, "HR"),
+            "past_mr": (mr_opera, 128, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
             "label_type": "radar",
         }
-    # elif mode == "msg_radar_continuous":
-    #     return {
-    #         "past_hr": (hr_base, 256, "HR"),
-    #         "past_lr": ({**MSG_SAT_CONFIG, **NWCSAF_CONFIG}, 64, "LR"),
-    #         "past_mr": None,
-    #         "label_var": "RZC",
-    #         "label_transform": label_transform_rzc_continuous,
-    #         "label_suffix": "HR",
-    #         "label_type": "radar_continuous",
-    #     }
-    elif mode == "mtg_radar_continuous":
-        hr_with_vis = {**hr_base, **MTG_HR_SAT_CONFIG}
+    elif mode == "mtg_opera_mtgmr_rainfall":
+        # Baseline + MTG IR/WV in MR.
         return {
-            "past_hr": (hr_with_vis, 256, "HR"),
-            "past_mr": (MTG_MR_SAT_CONFIG, 128, "LR"),
-            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
-            "label_var": "RZC",
-            "label_transform": label_transform_rzc_continuous,
+            "past_hr": (hr_vis, 256, "HR"),
+            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+    elif mode == "mtg_lightning_opera_rainfall":
+        # Heaviest input stack: LINET in HR alongside MTG vis_06, plus
+        # OPERA + MTG IR/WV in MR. Pair with
+        # `mtg_lightning_opera_occurrence` (same inputs, lightning label)
+        # for the dual-target experiment.
+        return {
+            "past_hr": (hr_lightning_vis, 256, "HR"),
+            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
+
+    # --- Rainfall track, continuous head (SepConv baseline) -----------
+    elif mode == "mtg_opera_mtgmr_continuous":
+        # Identical input stack to `mtg_opera_mtgmr_rainfall`; the only
+        # difference is the head, which regresses normalised rain rate
+        # instead of emitting 5 classes. That pairing is the point: it
+        # lets the SepConv ensemble be baselined against COALITION-4
+        # either continuous-vs-continuous, or with both binned back to
+        # the 5 classes via RAINFALL_CLASS_EDGES.
+        return {
+            "past_hr": (hr_vis, 256, "HR"),
+            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_continuous,
             "label_suffix": "HR",
             "label_type": "radar_continuous",
         }
-    # ------------------------------------------------------------------
-    # OPERA-driven modes for the NWCSAF Shapley study (4-model coalition).
-    # OPERA is always present in MR; MTG IR/WV and NWCSAF are toggled.
-    # HR carries only MTG vis_06 (no legacy radar/lightning channels).
-    # Label is `opera_rainfall_rate_hr` (HR alias) so the 256×256 head
-    # stays compatible with the existing decoder.
-    # ------------------------------------------------------------------
-    elif mode == "mtg_opera_radar_only":
-        return {
-            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
-            "past_mr": (OPERA_MR_CONFIG, 128, "LR"),
-            "past_lr": None,
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
-    elif mode == "mtg_opera_mtgmr":
-        return {
-            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
-            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
-            "past_lr": None,
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
-    elif mode == "mtg_lightning_opera":
-        # Heaviest OPERA-track input stack: lightning channels in HR
-        # alongside MTG vis_06, plus OPERA + MTG IR/WV in MR. No ANM
-        # radar (it isn't reprojected on the OPERA track) and no
-        # NWCSAF (dropped from the active build). Label is OPERA
-        # rainfall_rate 5-class - the standard OPERA-track target.
-        # Pair this with `mtg_lightning_opera_occurrence` (same inputs,
-        # lightning-occurrence label) for the dual-target experiment.
-        hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
-        return {
-            "past_hr": (hr_lightning_vis, 256, "HR"),
-            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
-            "past_lr": None,
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
+
+    # --- Lightning track: binary occurrence ---------------------------
     elif mode == "mtg_lightning_opera_occurrence":
-        # Same input stack as `mtg_lightning_opera` (lightning + MTG
-        # vis_06 in HR, OPERA + MTG IR/WV in MR). Sample selection is
-        # still OPERA-driven (use --source dbscan with patch_index.csv
-        # from identify_patches --source opera). The only difference
-        # vs `mtg_lightning_opera` is the label head: predict binary
-        # lightning occurrence at T+future_steps instead of OPERA
-        # rainfall. Loss switches to the WeightedFocalLoss (label_type
-        # == 'lightning'), so the focal-loss prior reads
-        # `lightning_fraction.json` at training time.
-        hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
+        # Same input stack as `mtg_lightning_opera_rainfall`; the label
+        # head predicts binary lightning occurrence at T+future_steps
+        # instead of OPERA rainfall. Loss switches to WeightedFocalLoss
+        # (label_type == 'lightning'), whose prior reads
+        # lightning_fraction.json at training time.
         return {
             "past_hr": (hr_lightning_vis, 256, "HR"),
-            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
-            "past_lr": None,
+            "past_mr": (mr_opera_mtg, 128, "LR"),
             "label_var": "occurrence",
             "label_transform": label_transform_occurrence,
             "label_suffix": "HR",
@@ -622,50 +489,25 @@ def get_mode_config(mode):
         }
     elif mode == "mtg_opera_occurrence":
         # KNOWLEDGE-DISTILLATION STUDENT (see train_lightning_kd.py).
-        # Same MR/label stack as the teacher `mtg_lightning_opera_occurrence`
-        # so predictions from both models land on the exact same 768x1536
-        # binary-occurrence canvases and can be diffed directly; the ONLY
-        # difference is the HR branch, which loses LINET here (MTG vis_06
-        # only vs. HR_LIGHTNING_CONFIG + MTG vis_06 for the teacher).
-        # Rationale: student produces a lightning-occurrence prognosis
-        # from satellite-only inputs at inference time, useful whenever
-        # the LINET feed is late, missing, or being validated.
+        # Same MR/label stack as the teacher
+        # `mtg_lightning_opera_occurrence`, so predictions from both land
+        # on the exact same 768x1536 binary-occurrence canvases and can be
+        # diffed directly; the ONLY difference is the HR branch, which
+        # loses LINET here. Rationale: the student produces a lightning
+        # prognosis from satellite + OPERA alone, useful whenever the
+        # LINET feed is late, missing, or being validated.
         return {
-            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
-            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
-            "past_lr": None,
+            "past_hr": (hr_vis, 256, "HR"),
+            "past_mr": (mr_opera_mtg, 128, "LR"),
             "label_var": "occurrence",
             "label_transform": label_transform_occurrence,
             "label_suffix": "HR",
             "label_type": "lightning",
         }
-    elif mode == "mtg_opera_nwcsaf":
-        return {
-            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
-            "past_mr": (OPERA_MR_CONFIG, 128, "LR"),
-            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
-    elif mode == "mtg_opera_full":
-        return {
-            "past_hr": (MTG_HR_SAT_CONFIG, 256, "HR"),
-            "past_mr": ({**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}, 128, "LR"),
-            "past_lr": (NWCSAF_CONFIG, 64, "LR"),
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_multiclass,
-            "label_suffix": "HR",
-            "label_type": "radar",
-        }
     else:
         raise ValueError(
-            f"Unknown mode: {mode}. Use: mtg_lightning, mtg_radar, "
-            f"mtg_radar_continuous, mtg_opera_radar_only, "
-            f"mtg_opera_mtgmr, mtg_lightning_opera, "
-            f"mtg_lightning_opera_occurrence, mtg_opera_occurrence. "
-            f"(MSG modes are currently disabled.)"
+            f"Unknown mode: {mode}. Use one of: "
+            f"{', '.join(sorted(MODE_NAMES))}."
         )
 
 
@@ -700,7 +542,7 @@ N_INPUT: int | None = None
 N_LABEL: int | None = None
 
 
-def init_sequence_config(data_root, source: str = "dbscan") -> None:
+def init_sequence_config(data_root, source: str = SOURCE) -> None:
     """Load `sequence_meta_<source>.json` and populate module globals.
 
     Must be called exactly once before any function that depends on
@@ -850,7 +692,7 @@ def generate_samples(csv_path, patches_dir, mode_config):
     """Generator that yields one (inputs_dict, label) per qualifying patch.
 
     Yields:
-        inputs_dict: dict with keys like "past_hr", "past_lr", ("past_mr")
+        inputs_dict: dict with keys "past_hr" and "past_mr",
                      each value is np.ndarray (T, H, W, C)
         label:       np.ndarray (T_future, 256, 256, C_label)
                      C_label=1 for lightning, C_label=5 for radar
@@ -864,9 +706,9 @@ def generate_samples(csv_path, patches_dir, mode_config):
     label_type = mode_config["label_type"]
     n_label_channels = LABEL_CHANNELS[label_type]
 
-    # Determine input groups (past_hr, past_lr, optionally past_mr)
+    # Determine input groups (past_hr, past_mr)
     input_groups = {}
-    for key in ["past_hr", "past_lr", "past_mr"]:
+    for key in INPUT_GROUP_KEYS:
         cfg = mode_config.get(key)
         if cfg is not None:
             input_groups[key] = cfg  # (var_config, resolution, suffix)
@@ -950,7 +792,7 @@ def generate_samples(csv_path, patches_dir, mode_config):
 def get_output_signature(mode_config):
     """Build the tf output signature for the generator."""
     input_specs = {}
-    for key in ["past_hr", "past_lr", "past_mr"]:
+    for key in INPUT_GROUP_KEYS:
         cfg = mode_config.get(key)
         if cfg is None:
             continue
@@ -1119,18 +961,18 @@ def load_tfrecord_dataset(shard_dir: Path,
     return ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
 
-def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None):
+def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     """Create and save train, validation, and test datasets.
 
     Args:
         data_root: path to our_data/ directory containing CSVs and patches/
-        mode: one of mtg_lightning, mtg_radar, mtg_radar_continuous,
-            mtg_opera_radar_only, mtg_opera_mtgmr
+        mode: one of the names registered in get_mode_config, e.g.
+            mtg_lightning, mtg_radar_rainfall,
+            mtg_opera_mtgmr_rainfall, mtg_lightning_opera_occurrence
         source: which extract_patch_seq source the sample CSVs came from
             ('dbscan' = patch_index.csv from identify_patches, or
-            'lightning' = lightning_patches.csv from
-            identify_lightning_periods). The dataset directory is suffixed
-            by source so the two tracks coexist on disk.
+            always pipeline_config.SOURCE). The dataset directory is
+            suffixed by source.
         output_root: where to save datasets (default: data_root/datasets/)
     """
     data_root = Path(data_root)
@@ -1154,12 +996,9 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
     # Suffix the dataset dir with the source so radar- and lightning-
     # driven runs don't clobber each other (the domain-adaptation
     # pipeline trains both and uses them as separate feature extractors).
-    # Additional insertion of "rainfall" for radar-labelled modes so
-    # `datasets/mtg_lightning_opera_rainfall_dbscan/` is self-describing
-    # (mtg_lightning_opera used to hide the fact that it outputs rainfall
-    # multiclass); occurrence modes carry "occurrence" in the mode name
-    # already so nothing gets inserted for them. See
-    # train_models.build_run_tag for the single source of truth.
+    # The mode name already states its track, so
+    # `datasets/mtg_lightning_opera_rainfall_dbscan/` is self-describing.
+    # See train_models.build_run_tag for the single source of truth.
     from train_models import build_run_tag
     save_dir = output_root / build_run_tag(mode, source)
 
@@ -1215,8 +1054,8 @@ def create_and_save_datasets(data_root, mode, source="dbscan", output_root=None)
         # `load_tfrecord_dataset(split_dir, mode_config)`.
         # `track` and `run_tag` mirror the naming convention documented in
         # train_models.build_run_tag - `track` is the human-facing label
-        # ("rainfall"/"occurrence") and `run_tag` is the full artefact
-        # tag with "rainfall" inserted for radar-labelled modes.
+        # ("rainfall"/"occurrence") and `run_tag` is the full artefact tag
+        # `<mode>_<source>`.
         _track = ("occurrence" if mode_config["label_type"] == "lightning"
                   else "rainfall")
         meta = {
@@ -1263,23 +1102,10 @@ def main():
         description="Create COALITION-4 TF datasets from pre-extracted patches."
     )
     parser.add_argument(
-        "--mode", type=str, required=True,
-        choices=["mtg_lightning", "mtg_radar", "mtg_radar_continuous",
-                 "mtg_opera_radar_only", "mtg_opera_mtgmr",
-                 "mtg_lightning_opera", "mtg_lightning_opera_occurrence"],
-        help="Dataset mode (MSG modes are disabled in this build)."
-    )
-    parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Which extract_patch_seq source the sample CSVs came from. "
-             "Selects which sequence_meta_<source>.json and "
-             "{train,validation,test}_data_<source>.csv are read, and "
-             "lands the output dataset at datasets/<mode>_<source>/. "
-             "'dbscan' (default) = patch_index.csv from identify_patches "
-             "(either --source radar/RZC or --source opera at that step). "
-             "'lightning' = lightning_patches.csv from "
-             "identify_lightning_periods.",
+        "--mode", type=str, required=True, choices=list(BUILDABLE_MODES),
+        help="Dataset mode. The KD student (mtg_opera_occurrence) is "
+             "absent by design: it trains on the teacher's dataset with "
+             "past_hr sliced — see train_lightning_kd.py."
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
@@ -1291,14 +1117,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Populate the module-level schema constants from the per-source
-    # sequence metadata before any sample-generating function is called.
-    init_sequence_config(args.data_root, args.source)
+    # Populate the module-level schema constants from the sequence
+    # metadata before any sample-generating function is called.
+    init_sequence_config(args.data_root, SOURCE)
 
     create_and_save_datasets(
         data_root=args.data_root,
         mode=args.mode,
-        source=args.source,
+        source=SOURCE,
         output_root=args.output_root
     )
 

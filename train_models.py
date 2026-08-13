@@ -12,7 +12,8 @@ Two ways to run
 
 2. Train a single mode (still reads hyperparameters from the config):
 
-       python train_models.py --config training.config --mode mtg_opera_full
+       python train_models.py --config training.config \
+           --mode mtg_opera_mtgmr_rainfall
 
 Available training modes
 ------------------------
@@ -21,38 +22,42 @@ is. The dataset for each mode must already exist under
 `our_data/datasets/<mode>/` (created by create_datasets.py — see its CLI
 choices for the full list).
 
-  - mtg_lightning
-        Inputs:  radar + LINET lightning + MTG vis_06 (HR) + MTG IR/WV (MR).
-        Target:  binary lightning occurrence.
-
-  - mtg_radar
-        Inputs:  same channel set as mtg_lightning.
-        Target:  5-class precipitation (RZC bins).
-
-  - mtg_radar_continuous
-        Inputs:  same as mtg_radar.
-        Target:  continuous RZC regression in [0, 1] (normalised).
-
-  - mtg_opera_radar_only
+  - mtg_opera_radar_only_rainfall
         Inputs:  MTG vis_06 (HR) + OPERA reflectivity + rainfall_rate (MR).
                  No MTG IR/WV. No lightning.
-        Target:  opera_rainfall_rate 5-class (same bin edges as RZC).
-
-  - mtg_opera_mtgmr
-        Inputs:  mtg_opera_radar_only + MTG IR/WV in MR.
-        Target:  same as mtg_opera_radar_only.
-
-  - mtg_lightning_opera
-        Inputs:  lightning (density / current / occurrence) + MTG vis_06
-                 in HR; OPERA reflectivity + rainfall_rate + MTG IR/WV
-                 in MR. No ANM radar. No NWCSAF.
         Target:  opera_rainfall_rate 5-class.
 
+  - mtg_opera_mtgmr_rainfall
+        Inputs:  mtg_opera_radar_only_rainfall + MTG IR/WV in MR.
+        Target:  same as mtg_opera_radar_only_rainfall.
+
+  - mtg_lightning_opera_rainfall
+        Inputs:  lightning (density / current / occurrence) + MTG vis_06
+                 in HR; OPERA reflectivity + rainfall_rate + MTG IR/WV
+                 in MR.
+        Target:  opera_rainfall_rate 5-class.
+
+  - mtg_opera_mtgmr_continuous
+        Inputs:  same as mtg_opera_mtgmr_rainfall.
+        Target:  opera_rainfall_rate continuous regression in [0, 1].
+                 Exists so the SepConv ensemble baseline can be compared
+                 against COALITION-4 on identical inputs — either
+                 continuous-vs-continuous, or with both binned back to
+                 the 5 classes.
+
   - mtg_lightning_opera_occurrence
-        Inputs:  same as mtg_lightning_opera.
+        Inputs:  same as mtg_lightning_opera_rainfall.
         Target:  lightning binary occurrence (focal loss). Pairs with
-                 mtg_lightning_opera as the dual-target experiment on
-                 OPERA-driven sample selection.
+                 mtg_lightning_opera_rainfall as the dual-target experiment
+                 on identical inputs.
+
+A sixth mode, `mtg_opera_occurrence`, is the knowledge-distillation
+student. It is NOT trainable here — see train_lightning_kd.py.
+
+Mode names carry their own track marker: `_rainfall` (5-class),
+`_continuous` (regression), `_occurrence` (lightning binary). The mode
+name is therefore also the artefact tag — `build_run_tag` just appends
+`_<source>`.
 
 Hyperparameters, the run list, the LR schedule, and the early-stopping
 configuration all live in `training.config`. See the docstring at the top
@@ -74,6 +79,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from pipeline_config import SOURCE
+
 
 # =============================================================================
 # Documented training modes
@@ -85,35 +92,28 @@ from pathlib import Path
 # a matching entry here so `--list-modes` and config validation keep working.
 
 TRAINING_MODES: dict[str, dict[str, str]] = {
-    "mtg_lightning": {
-        "target":  "lightning (binary occurrence)",
-        "summary": "Radar + lightning + MTG (vis_06 HR / IR/WV MR).",
-    },
-    "mtg_radar": {
-        "target":  "RZC 5-class precipitation",
-        "summary": "Same channel set as mtg_lightning, different label head.",
-    },
-    "mtg_radar_continuous": {
-        "target":  "RZC continuous regression",
-        "summary": "Same channels as mtg_radar with a continuous target.",
-    },
-    "mtg_opera_radar_only": {
+    "mtg_opera_radar_only_rainfall": {
         "target":  "opera_rainfall_rate 5-class",
         "summary": "Baseline: MTG vis_06 + OPERA. No MTG IR/WV, no lightning.",
     },
-    "mtg_opera_mtgmr": {
+    "mtg_opera_mtgmr_rainfall": {
         "target":  "opera_rainfall_rate 5-class",
         "summary": "Baseline + MTG IR/WV in MR.",
     },
-    "mtg_lightning_opera": {
+    "mtg_lightning_opera_rainfall": {
         "target":  "opera_rainfall_rate 5-class",
         "summary": "Lightning + MTG vis_06 in HR; OPERA + MTG IR/WV in MR; "
                    "OPERA rainfall as label.",
     },
+    "mtg_opera_mtgmr_continuous": {
+        "target":  "opera_rainfall_rate continuous regression",
+        "summary": "Same inputs as mtg_opera_mtgmr_rainfall, regression "
+                   "head. Counterpart for the SepConv ensemble baseline.",
+    },
     "mtg_lightning_opera_occurrence": {
         "target":  "lightning binary occurrence",
-        "summary": "Same inputs as mtg_lightning_opera; target is lightning "
-                   "occurrence instead of OPERA rainfall.",
+        "summary": "Same inputs as mtg_lightning_opera_rainfall; target is "
+                   "lightning occurrence instead of OPERA rainfall.",
     },
 }
 
@@ -121,114 +121,24 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
 # =============================================================================
 # Run-tag naming for saved model artefacts
 # =============================================================================
-# Rainfall modes have no track marker in their mode name (e.g.
-# `mtg_lightning_opera` outputs OPERA rainfall multiclass but reads as
-# a "lightning + opera" mode from the filename alone). Occurrence modes
-# already carry "occurrence" in the mode name. To make saved artefacts
-# self-describing we insert "rainfall" between mode and source when the
-# label_type is radar or radar_continuous:
+# Every mode name carries its own track marker — rainfall-headed modes end
+# in `_rainfall`, lightning-headed modes in `_occurrence` (or are named
+# `mtg_lightning`). So the artefact tag is just `<mode>_<source>`:
 #
 #     mtg_lightning_opera_occurrence + dbscan
 #         -> coalition_mtg_lightning_opera_occurrence_dbscan.keras
-#            (unchanged; "occurrence" already in the mode name)
-#     mtg_lightning_opera             + dbscan
+#     mtg_lightning_opera_rainfall   + dbscan
 #         -> coalition_mtg_lightning_opera_rainfall_dbscan.keras
-#            (was ..._dbscan.keras; NEW naming inserts "rainfall")
 #
-# Loaders (visualize_gt_vs_pred.load_model_artifact,
-# train_lightning_kd.load_teacher) fall back to the legacy filename
-# when the new-name file is missing on disk, so previously-trained
-# checkpoints keep loading without a rename step.
-
-# Every mode whose label_type is radar or radar_continuous in
-# create_datasets.get_mode_config. Kept as a hardcoded set (rather than
-# a runtime lookup) so this helper has zero import-order dependency on
-# create_datasets and can be called from any module.
-_RAINFALL_MODES: frozenset[str] = frozenset({
-    "mtg_radar",
-    "mtg_radar_continuous",
-    "mtg_opera_radar_only",
-    "mtg_opera_mtgmr",
-    "mtg_lightning_opera",
-    "mtg_opera_nwcsaf",
-    "mtg_opera_full",
-})
-
-
-def _is_rainfall_mode(mode: str) -> bool:
-    """True when the mode outputs precipitation predictions (radar or
-    radar_continuous label_type). See _RAINFALL_MODES for the canonical
-    list; add new radar-headed modes there when introducing them."""
-    return mode in _RAINFALL_MODES
-
-
-_RAINFALL_ALIAS_SUFFIX = "_rainfall"
-
-
-def normalize_mode(mode: str) -> str:
-    """Resolve a `<mode>_rainfall` alias down to the canonical mode name.
-
-    Users see run-tag filenames like `mtg_lightning_opera_rainfall_dbscan`
-    on disk, so it's natural to type `--mode mtg_lightning_opera_rainfall`
-    to match. The canonical mode registry (create_datasets.get_mode_config)
-    still keys off the shorter `mtg_lightning_opera` form — this helper
-    strips the alias suffix when (and only when) the base is a
-    rainfall-track mode, so the two forms are interchangeable at every
-    entry point.
-
-    Lightning modes already carry their track descriptor in the name
-    (`_occurrence`), so nothing needs to change for them.
-    """
-    if mode.endswith(_RAINFALL_ALIAS_SUFFIX):
-        base = mode[: -len(_RAINFALL_ALIAS_SUFFIX)]
-        if _is_rainfall_mode(base):
-            return base
-    return mode
-
-
-def rainfall_mode_alias(mode: str) -> str:
-    """Return the user-facing `_rainfall`-suffixed alias for a rainfall
-    mode; the same string for lightning modes. Inverse of normalize_mode
-    on the alias half of the mapping."""
-    canonical = normalize_mode(mode)
-    if _is_rainfall_mode(canonical):
-        return f"{canonical}{_RAINFALL_ALIAS_SUFFIX}"
-    return canonical
-
-
-def all_mode_choices(base_modes) -> list[str]:
-    """Given an iterable of canonical mode names, return the list expanded
-    with the `_rainfall`-suffixed alias for each rainfall-track mode.
-    Meant to feed `argparse`'s `choices=` so both forms are accepted at
-    the CLI. Order is preserved and duplicates are stripped."""
-    out: list[str] = []
-    for m in base_modes:
-        if m not in out:
-            out.append(m)
-        alias = rainfall_mode_alias(m)
-        if alias != m and alias not in out:
-            out.append(alias)
-    return out
+# `source` is the sample-selection track (dbscan | lightning), so the two
+# tracks never overwrite each other's weights, history, or datasets.
 
 
 def build_run_tag(mode: str, source: str) -> str:
-    """Return the filename tag used for saved model artefacts. Inserts
-    "rainfall" for radar-labelled modes; leaves lightning modes alone.
-
-    Idempotent w.r.t. the `_rainfall`-suffixed alias: passing
-    `mtg_lightning_opera_rainfall` produces the same tag as passing
-    `mtg_lightning_opera`, so callers don't need to normalize first.
-    """
-    mode = normalize_mode(mode)
-    if _is_rainfall_mode(mode):
-        return f"{mode}_rainfall_{source}"
+    """Return the filename tag used for saved model artefacts, checkpoints,
+    and dataset directories. Single source of truth for the convention —
+    every script that reads or writes an artefact routes through here."""
     return f"{mode}_{source}"
-
-
-def legacy_run_tag(mode: str, source: str) -> str:
-    """The old naming scheme (no 'rainfall' insertion). Kept as a
-    fallback for loaders so pre-migration checkpoints still work."""
-    return f"{normalize_mode(mode)}_{source}"
 
 
 # =============================================================================
@@ -925,12 +835,13 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
 
     The model architecture adapts to whatever inputs the dataset provides.
     Input shapes are read from the dataset metadata so adding or removing
-    input groups (e.g. dropping NWCSAF) requires no code changes here.
+    input groups requires no code changes here.
 
     Args:
         input_shapes: dict from metadata.json["input_shapes"], e.g.
-            {"past_hr": [3, 256, 256, 10], "past_mr": [3, 128, 128, 4],
-             "past_lr": [3, 64, 64, 8]}
+            {"past_hr": [3, 256, 256, 1], "past_mr": [3, 128, 128, 6]}
+            (HR = 1 km / 256 px, MR = 2 km / 128 px — see the resolution
+            note at the top of create_datasets.py)
         label_type: "lightning" or "radar" (determines loss + output head)
         past_timesteps: number of input timesteps
         future_timesteps: number of output timesteps
@@ -1609,7 +1520,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         dataset_dir: explicit path to the dataset directory. When
             provided, overrides the default data_root/datasets/{mode}_{source}.
         source: extract_patch_seq source ('dbscan' = patch_index.csv,
-            or 'lightning' = lightning_patches.csv) the dataset was built
+            (always pipeline_config.SOURCE) the dataset was built
             from. Selects which datasets/<mode>_<source>/ directory to
             read and is appended to the checkpoint / model / history
             filenames so the two tracks don't clobber each other.
@@ -1629,28 +1540,16 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Mode + source together are the unique experiment identifier. The
-    # tag inserts "rainfall" for radar-labelled modes so saved artefacts
-    # (weights + history + checkpoints) AND dataset directories are all
-    # self-describing. See build_run_tag / legacy_run_tag at the top of
-    # this module.
+    # Mode + source together are the unique experiment identifier, and the
+    # mode name already states its own track, so the tag names saved
+    # artefacts (weights + history + checkpoints) AND dataset directories
+    # self-describingly. See build_run_tag at the top of this module.
     run_tag = build_run_tag(mode, source)
 
     if dataset_dir is not None:
         dataset_dir = Path(dataset_dir)
     else:
         dataset_dir = data_root / "datasets" / run_tag
-        # Backwards compatibility: pre-migration datasets were saved as
-        # `datasets/{mode}_{source}` without the rainfall insertion. If
-        # the new-name directory isn't on disk but the legacy one is,
-        # use the legacy path (and print a rename hint).
-        if not dataset_dir.exists():
-            legacy_dir = data_root / "datasets" / legacy_run_tag(mode, source)
-            if legacy_dir.exists():
-                print(f"NOTE: using legacy dataset dir {legacy_dir.name}. "
-                      f"Rename to {dataset_dir.name} to adopt the new "
-                      f"naming (backwards-compat fallback active).")
-                dataset_dir = legacy_dir
 
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
@@ -1907,12 +1806,6 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     run_tag = build_run_tag(mode, source)
 
     dataset_dir = data_root / "datasets" / run_tag
-    if not dataset_dir.exists():
-        legacy_dir = data_root / "datasets" / legacy_run_tag(mode, source)
-        if legacy_dir.exists():
-            print(f"NOTE: using legacy dataset dir {legacy_dir.name}. "
-                  f"Rename to {dataset_dir.name} to adopt the new naming.")
-            dataset_dir = legacy_dir
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
     for d in [train_dir, val_dir]:
@@ -2189,17 +2082,6 @@ def main():
         help="Root directory containing datasets/ and lightning_fraction.json.",
     )
     parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Which extract_patch_seq source the training dataset was "
-             "built from. 'dbscan' (default) = patch_index.csv from "
-             "identify_patches (whichever sensor that script was run "
-             "with). 'lightning' = lightning_patches.csv from "
-             "identify_lightning_periods. Selects datasets/<mode>_<source>/ "
-             "as the input and suffixes every saved checkpoint / model / "
-             "history with `_<source>`.",
-    )
-    parser.add_argument(
         "--stage", type=str, default="base",
         choices=["base", "finetune", "both"],
         help="Training stage. 'base' (default) trains the standard "
@@ -2284,12 +2166,12 @@ def main():
         )
 
     print(f"Training {len(modes_to_run)} mode(s): {modes_to_run} "
-          f"(source={args.source}, stage={args.stage})\n")
+          f"(source={SOURCE}, stage={args.stage})\n")
 
     for i, mode in enumerate(modes_to_run, start=1):
         print("#" * 70)
         print(f"# [{i}/{len(modes_to_run)}] mode: {mode}  "
-              f"source: {args.source}  stage: {args.stage}")
+              f"source: {SOURCE}  stage: {args.stage}")
         print("#" * 70)
         params = merge_for_mode(cfg, mode)
         print(f"  Effective hyperparameters: {params}")
@@ -2307,7 +2189,7 @@ def main():
                 dropout=params["dropout"],
                 norm=params["norm"],
                 dataset_dir=args.dataset_dir,
-                source=args.source,
+                source=SOURCE,
                 shuffle_buffer=params["shuffle_buffer"],
                 mixed_precision=params["mixed_precision"],
                 lr_schedule_cfg=cfg["lr_schedule"],
@@ -2329,7 +2211,7 @@ def main():
                 data_root=args.data_root,
                 base_model_path=ft_base,
                 output_dir=args.output_dir,
-                source=args.source,
+                source=SOURCE,
                 batch_size=params["batch_size"],
                 finetune_cfg=cfg["finetune"],
                 shuffle_buffer=params["shuffle_buffer"],

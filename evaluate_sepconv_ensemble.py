@@ -9,8 +9,7 @@ Post-processing: continuous prediction → 5 classes via thresholds at
 normalized rain rates [10/60, 20/60, 30/60, 40/60].
 
 Usage:
-    python evaluate_sepconv_ensemble.py --mode msg_radar
-    python evaluate_sepconv_ensemble.py --mode mtg_radar
+    python evaluate_sepconv_ensemble.py --mode mtg_opera_mtgmr_continuous
 
 Outputs: ./evaluation/eval_sepconv_ensemble_{mode}/
 """
@@ -25,6 +24,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 
+from create_datasets import get_mode_config, load_tfrecord_dataset
+from pipeline_config import SOURCE
+from train_models import build_run_tag
+
 
 # ============================================================================
 # Constants
@@ -37,7 +40,7 @@ CLASS_NAMES = ["R<10", "10≤R<20", "20≤R<30", "30≤R<40", "R≥40"]
 N_CLASSES = 5
 
 # Label info (must match create_datasets.py continuous mode)
-# RZC normalized: clip(RZC, 0, 70) / 70
+# OPERA rainfall_rate normalized: clip(R, 0, 70) / 70
 # Thresholds at physical 10, 20, 30, 40 mm/h → normalized
 THRESHOLDS_NORM = [10.0 / 70.0, 20.0 / 70.0, 30.0 / 70.0, 40.0 / 70.0]
 
@@ -342,7 +345,7 @@ def plot_predictions_for_date_hour(ensemble, data_root, mode, output_dir,
     n_label_ch = LABEL_CHANNELS["radar_continuous"]
 
     input_groups = {}
-    for key in ["past_hr", "past_lr", "past_mr"]:
+    for key in ["past_hr", "past_mr"]:
         cfg = mode_config.get(key)
         if cfg is not None:
             input_groups[key] = cfg
@@ -595,7 +598,11 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate SepConv ensemble (regression).")
-    parser.add_argument("--mode", type=str, required=True, choices=["msg_radar_continuous", "mtg_radar_continuous"])
+    parser.add_argument("--mode", type=str,
+                        default="mtg_opera_mtgmr_continuous",
+                        choices=["mtg_opera_mtgmr_continuous"],
+                        help="Continuous-target COALITION-4 mode whose "
+                             "dataset this baseline was trained on.")
     parser.add_argument("--data_root", type=str, default="./our_data")
     parser.add_argument("--model_dir", type=str, default="./models")
     parser.add_argument("--output_dir", type=str, default="./evaluation")

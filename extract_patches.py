@@ -8,21 +8,18 @@ their per-row windows and slices the active patches at each (date, time)
 from the cached reprojected data.
 
 Resolution categories:
-    HR (1km)  -> no pooling   -> 256x256  (radar, lightning, MTG vis_06)
+    HR (1km)  -> no pooling   -> 256x256  (lightning, MTG vis_06)
     LR (2km)  -> 2x2 avg pool -> 128x128  (MTG IR/WV channels)
-    LR (3km)  -> 4x4 avg pool ->  64x64   (MSG, NWCSAF)
 
 Output:
     our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
     Each file has shape (num_active_patches, H, W).
     Patch order matches the active patches from the source patch-index
-    (patch_index.csv for --source dbscan, lightning_patches.csv for
-    --source lightning), so the idx_t* columns in the split CSVs index
+    (patch_index.csv), so the idx_t* columns in the split CSVs index
     into these files correctly.
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
     python extract_patches.py --source dbscan
-    python extract_patches.py --source lightning
     python extract_patches.py --source dbscan --date 2025-05-15
     python extract_patches.py --source dbscan --products satellite_MTG opera
 """
@@ -36,6 +33,8 @@ import json
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from pipeline_config import SOURCE
 
 
 # =============================================================================
@@ -56,23 +55,6 @@ N_PATCHES = N_COLS * N_ROWS
 #   pool_factor: 1 = no pooling, 2 = 2×2, 4 = 4×4
 # -----------------------------------------------------------------------------
 
-RADAR_PRODUCTS = {
-    'RZC':    ('radar', 'HR', 1),
-    'BZC':    ('radar', 'HR', 1),
-    'CZC':    ('radar', 'HR', 1),
-    'EZC-20': ('radar', 'HR', 1),
-    'LZC':    ('radar', 'HR', 1),
-    'CPCH':   ('radar', 'HR', 1),
-}
-
-MSG_PRODUCTS = {
-    'VIS006': ('satellite_MSG', 'LR', 4),
-    'IR_039': ('satellite_MSG', 'LR', 4),
-    'IR_108': ('satellite_MSG', 'LR', 4),
-    'WV_062': ('satellite_MSG', 'LR', 4),
-    'WV_073': ('satellite_MSG', 'LR', 4),
-}
-
 MTG_PRODUCTS = {
     'vis_06': ('satellite_MTG', 'HR', 1),
     'ir_38':  ('satellite_MTG', 'LR', 2),
@@ -87,13 +69,6 @@ LIGHTNING_PRODUCTS = {
     'occurrence': ('lightning', 'HR', 1),
 }
 
-NWCSAF_PRODUCTS = {
-    'ctth_alti':  ('nwcsaf', 'LR', 4),
-    'ctth_tempe': ('nwcsaf', 'LR', 4),
-    'cmic_phase': ('nwcsaf', 'LR', 4),
-    'cmic_cot':   ('nwcsaf', 'LR', 4),
-}
-
 # OPERA: max reflectivity (dBZ) + rainfall_rate (mm/h), 2 km native → 2× pool.
 # `opera_rainfall_rate_hr` is an alias of `opera_rainfall_rate` extracted at
 # HR (no pooling, 256×256) so it can be used as the multi-class label target
@@ -106,11 +81,8 @@ OPERA_PRODUCTS = {
 
 # Group name → CLI flag mapping
 PRODUCT_GROUPS = {
-    'radar':         RADAR_PRODUCTS,
-    'satellite_MSG': MSG_PRODUCTS,
     'satellite_MTG': MTG_PRODUCTS,
     'lightning':     LIGHTNING_PRODUCTS,
-    'nwcsaf':        NWCSAF_PRODUCTS,
     'opera':         OPERA_PRODUCTS,
 }
 
@@ -163,14 +135,10 @@ def average_pool(data, factor):
 # =============================================================================
 
 def _resolve_index_csv(data_root, source):
-    """Path to the per-source patch-activity index CSV."""
-    if source == 'dbscan':
+    """Path to the patch-activity index CSV."""
+    if source == SOURCE:
         return os.path.join(data_root, 'patch_index', 'patch_index.csv')
-    if source == 'lightning':
-        return os.path.join(
-            data_root, 'lightning_periods', 'lightning_patches.csv'
-        )
-    raise ValueError(f"Unknown --source: {source!r}")
+    raise ValueError(f"Unknown source: {source!r}")
 
 
 def read_patch_index(data_root, source='dbscan'):
@@ -178,25 +146,17 @@ def read_patch_index(data_root, source='dbscan'):
     Read the per-source patch-activity index and return a dict
     `{(date, 'HH:MM'): [active_patch_numbers]}`.
 
-    For `source='dbscan'` this is `our_data/patch_index/patch_index.csv`
-    (produced by identify_patches.py, regardless of whether that script
-    was run with --source radar or --source opera). For
-    `source='lightning'` it's `our_data/lightning_periods/lightning_patches.csv`
-    (produced by identify_lightning_periods.py). Both files share the
-    same `date,time_utc,iso_timestamp,patch_1..patch_18` schema, so the
-    parser is identical.
+    The index is `our_data/patch_index/patch_index.csv`, produced by
+    identify_patches.py from DBSCAN clusters in OPERA rainfall_rate.
+    Schema: `date,time_utc,iso_timestamp,patch_1..patch_18`.
 
     Returns: dict keyed by (date, 'HH:MM') with the sorted list of
     1-indexed active patch numbers as the value.
     """
     csv_path = _resolve_index_csv(data_root, source)
     if not os.path.isfile(csv_path):
-        if source == 'dbscan':
-            print(f"ERROR: patch_index.csv not found at {csv_path}")
-            print("Run identify_patches.py first.")
-        else:
-            print(f"ERROR: lightning_patches.csv not found at {csv_path}")
-            print("Run identify_lightning_periods.py first.")
+        print(f"ERROR: patch_index.csv not found at {csv_path}")
+        print("Run identify_patches.py first.")
         return {}
 
     index: dict[tuple[str, str], list[int]] = {}
@@ -298,7 +258,7 @@ def load_sequence_timesteps(data_root, source):
 # which minute marks each product is available at:
 #
 #   opera_rainfall_rate.filter = [0, 15, 30, 45]   ← OPERA, the patch index driver
-#   mtg.filter / nwcsaf.filter = [0, 10, 30, 40]   ← 10-min products at 15-min step
+#   mtg.filter = [0, 10, 30, 40]   ← 10-min product at 15-min step
 #
 # The patch index runs on OPERA's grid (:00, :15, :30, :45). When we ask
 # for MTG's `vis_06` at OPERA :15, no file exists at that exact minute —
@@ -350,11 +310,8 @@ def _load_product_filter(product_key: str) -> set[int] | None:
 # so this remains correct if the user reverts lightning to a continuous
 # cadence in product_cadences.config.
 _FILTER_PRODUCT_KEY = {
-    'radar':         'radar',
-    'satellite_MSG': None,        # legacy / not in current config - skip snap
     'satellite_MTG': 'mtg',
     'lightning':     'lightning',
-    'nwcsaf':        'nwcsaf',
     'opera':         'opera_rainfall_rate',
 }
 
@@ -397,24 +354,6 @@ def _resolve_hhmm(hhmm: str, group: str) -> str:
 # File discovery per product
 # =============================================================================
 
-def find_reprojected_file_radar(data_root, variable, date_str, time_str):
-    """
-    Find a reprojected radar .npy file.
-
-    Path: reprojected_data/radar_data/{var}/nc4_{date}-Romania_{var}/
-          nc4_{date}-Romania_{HHMM}_{var}.npy
-
-    HHMM is snapped to the radar minute filter from timestep_config.json
-    so a request at e.g. :15 maps to the nearest available :10.
-    """
-    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'radar')
-    day_folder = f"nc4_{date_str}-Romania_{variable}"
-    filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
-    path = os.path.join(
-        data_root, 'reprojected_data', 'radar_data',
-        variable, day_folder, filename
-    )
-    return path if os.path.isfile(path) else None
 
 
 def find_reprojected_file_satellite(data_root, instrument, channel,
@@ -422,10 +361,10 @@ def find_reprojected_file_satellite(data_root, instrument, channel,
     """
     Find a reprojected satellite .npy file.
 
-    Path: reprojected_data/satellite_data/{MSG|MTG}/{channel}/
+    Path: reprojected_data/satellite_data/MTG/{channel}/
           nc4_{date}-Romania_{channel}/nc4_{date}-Romania_{HHMM}_{channel}.npy
 
-    HHMM is snapped to the instrument's minute filter — MTG/MSG at 10-min
+    HHMM is snapped to the instrument's minute filter — MTG at 10-min
     cadence have {00, 10, 30, 40}; OPERA at 15-min has {00, 15, 30, 45};
     snapping resolves the mismatch when these are mixed in one sample.
     """
@@ -474,25 +413,6 @@ def find_reprojected_file_lightning(data_root, product, date_str, time_str):
     return native_path if os.path.isfile(native_path) else None
 
 
-def find_reprojected_file_nwcsaf(data_root, variable, date_str, time_str):
-    """
-    Find a reprojected NWCSAF `.npy` file. After the unification in reproject.py,
-    each NWCSAF variable is stored as its own per-variable `.npy` mirroring
-    the radar / MTG layout — no more multi-variable `.nc` files.
-
-    Path: reprojected_data/nwcsaf_data/{variable}/nc4_{date}-Romania_{variable}/
-          nc4_{date}-Romania_{HHMM}_{variable}.npy
-
-    HHMM is snapped to the NWCSAF minute filter (same shape as MTG's).
-    """
-    hhmm = _resolve_hhmm(time_str.replace(':', ''), 'nwcsaf')
-    day_folder = f"nc4_{date_str}-Romania_{variable}"
-    filename = f"nc4_{date_str}-Romania_{hhmm}_{variable}.npy"
-    path = os.path.join(
-        data_root, 'reprojected_data', 'nwcsaf_data', variable,
-        day_folder, filename,
-    )
-    return path if os.path.isfile(path) else None
 
 
 def find_reprojected_file_opera(data_root, variable, date_str, time_str):
@@ -525,22 +445,12 @@ def find_reprojected_file(data_root, variable, group, date_str, time_str):
     Returns:
         str or None: path to the reprojected file, or None if not found
     """
-    if group == 'radar':
-        return find_reprojected_file_radar(data_root, variable, date_str, time_str)
-    elif group == 'satellite_MSG':
-        return find_reprojected_file_satellite(
-            data_root, 'MSG', variable, date_str, time_str
-        )
-    elif group == 'satellite_MTG':
+    if group == 'satellite_MTG':
         return find_reprojected_file_satellite(
             data_root, 'MTG', variable, date_str, time_str
         )
     elif group == 'lightning':
         return find_reprojected_file_lightning(
-            data_root, variable, date_str, time_str
-        )
-    elif group == 'nwcsaf':
-        return find_reprojected_file_nwcsaf(
             data_root, variable, date_str, time_str
         )
     elif group == 'opera':
@@ -556,9 +466,8 @@ def find_reprojected_file(data_root, variable, group, date_str, time_str):
 
 def load_reprojected(filepath, variable=None, group=None):
     """
-    Load a reprojected `.npy` file. All product families now write `.npy`;
-    multi-variable NWCSAF `.nc` files were removed when reproject.py was
-    unified, so `variable` and `group` are no longer used here.
+    Load a reprojected `.npy` file. Every product family writes `.npy`,
+    so `variable` and `group` are no longer used here.
 
     Returns:
         np.ndarray: 2D array (768×1536) as float32.
@@ -619,9 +528,8 @@ def run_extraction(data_root, output_root, source='dbscan',
     Args:
         data_root:      path to our_data directory
         output_root:    path to output patches directory
-        source:         'dbscan' (patch_index.csv from identify_patches)
-                        or 'lightning' (lightning_patches.csv from
-                        identify_lightning_periods). Picks both the
+        source:         sample-selection source (always
+                        pipeline_config.SOURCE). Picks both the
                         activity-index file and the split CSV suffix.
         date_filter:    optional YYYY-MM-DD to restrict processing
         product_filter: optional list of group names to process
@@ -785,21 +693,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--products", nargs='+',
-        choices=['radar', 'satellite_MSG', 'satellite_MTG',
-                 'lightning', 'nwcsaf', 'opera'],
+        choices=list(PRODUCT_GROUPS),
         default=None,
         help="Product groups to extract (default: all)"
-    )
-    parser.add_argument(
-        "--source", type=str, default='dbscan',
-        choices=['dbscan', 'lightning'],
-        help="Which extract_patch_seq source to follow. 'dbscan' "
-             "(default) reads patch_index.csv from identify_patches "
-             "and walks train/val/test_data_dbscan.csv. 'lightning' "
-             "reads lightning_patches.csv from identify_lightning_periods "
-             "and walks train/val/test_data_lightning.csv. The split "
-             "CSVs already incorporate the timestep_manifest.csv gate, "
-             "so no separate manifest read is needed."
     )
 
     args = parser.parse_args()
@@ -809,7 +705,7 @@ if __name__ == "__main__":
     run_extraction(
         data_root=args.data_root,
         output_root=output_root,
-        source=args.source,
+        source=SOURCE,
         date_filter=args.date,
         product_filter=args.products,
     )

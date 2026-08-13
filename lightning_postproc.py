@@ -245,9 +245,8 @@ def build_inputs_for_reference_overlapped(
 ) -> tuple[dict[str, np.ndarray], list[tuple[int, int]]]:
     """Build model inputs for every overlapping position on the canvas.
 
-    Returns (inputs_dict, positions) where inputs_dict has "past_hr" /
-    "past_mr" / "past_lr" keys (whichever the mode config declares),
-    each shaped (N_positions, T, H_res, W_res, C_group). `positions`
+    Returns (inputs_dict, positions) where inputs_dict has "past_hr" and
+    "past_mr" keys, each shaped (N_positions, T, H_res, W_res, C_group). `positions`
     is the list of (r0, c0) top-left coords, in the same order as the
     batch axis so paste_predictions_hann_blended can zip them back
     onto the canvas.
@@ -262,7 +261,7 @@ def build_inputs_for_reference_overlapped(
     positions = enumerate_positions(canvas_shape, patch_size, stride)
     inputs: dict[str, np.ndarray] = {}
     all_missing = True
-    for group_key in ("past_hr", "past_mr", "past_lr"):
+    for group_key in ("past_hr", "past_mr"):
         if mode_config.get(group_key) is None:
             continue
         batch = _build_group_batch_overlapped(

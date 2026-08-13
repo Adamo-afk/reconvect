@@ -38,7 +38,7 @@ Policy decisions (also recorded inside the JSON for traceability)
    (e.g. permanent radar beam blockage); a single scalar avoids that.
 
 3. **Source: reprojected data, not patches.** Patches under
-   `our_data/patches/` are filtered by RZC-based DBSCAN activity (for
+   `our_data/patches/` are filtered by OPERA-based DBSCAN activity (for
    radar mode) or by lightning activity (for lightning mode). Computing
    stats on them would bias every input variable's distribution toward
    convective scenes. Reading directly from
@@ -46,7 +46,7 @@ Policy decisions (also recorded inside the JSON for traceability)
    grid** at each timestep, removing that bias.
 
 4. **Missing-pixel handling.** Pixels that are NaN, or that match a
-   per-variable "missing sentinel" (e.g. NWCSAF 65535, OPERA nodata),
+   per-variable "missing sentinel" (e.g. OPERA nodata),
    are **dropped before Welford accumulation**. Replacing them with the
    variable's fill value (as the live `create_datasets.py` transforms
    still do at inference) would have silently dragged the mean toward
@@ -56,13 +56,13 @@ Policy decisions (also recorded inside the JSON for traceability)
 
 5. **Domain-informed pre-norm before z-scoring.** Heavy-tailed,
    zero-inflated variables (rain rate, lightning density/current,
-   cmic_cot, opera_rainfall_rate) are clipped to a positive floor and
+   opera_rainfall_rate) are clipped to a positive floor and
    then `log10`-transformed before mean/std are taken. Linear-scale
    variables (radar reflectivity composites, satellite brightness
    temperatures, cloud-top altitude/temperature, opera_reflectivity)
    are left in physical units. Simple physical scaling (`x/100` for
-   BZC/VIS, `x/1.97` for EZC) and categorical/binary variables
-   (occurrence, cmic_phase) are not driven by this script.
+   vis_06) and categorical/binary variables
+   (occurrence) are not driven by this script.
 
 6. **Near-constant detection.** A variable whose `std < eps*|mean|`
    (default `eps=1e-3`) is flagged `near_constant=true` in the JSON.
@@ -77,7 +77,7 @@ See `_OUTPUT_SCHEMA_NOTES` in the source for the full JSON structure.
 Usage
 -----
     python compute_normalization_stats.py
-    python compute_normalization_stats.py --variables RZC ir_105 cmic_cot
+    python compute_normalization_stats.py --variables ir_105 opera_rainfall_rate
     python compute_normalization_stats.py --no_split_filter
     python compute_normalization_stats.py --sample_fraction 0.1
     python compute_normalization_stats.py --with_percentiles
@@ -98,6 +98,8 @@ from pathlib import Path
 
 import numpy as np
 
+from pipeline_config import SOURCE
+
 
 # =============================================================================
 # Configuration
@@ -117,9 +119,7 @@ DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
 # timestep_config.json. OPERA has two entries in the config (reflectivity /
 # rainfall_rate) but they share the same filter, so either one works.
 _SOURCE_TO_TSCONFIG_PRODUCT = {
-    "radar":     "radar",
     "mtg":       "mtg",
-    "nwcsaf":    "nwcsaf",
     "opera":     "opera_rainfall_rate",
     "lightning": "lightning",
 }
@@ -128,7 +128,7 @@ _SOURCE_TO_TSCONFIG_PRODUCT = {
 #
 # Each entry declares:
 #   source         : which reprojected sub-tree to look in
-#                    (radar | mtg | lightning | nwcsaf | opera)
+#                    (mtg | lightning | opera)
 #   transform      : 'log_zscore' or 'linear'
 #   fill           : value used to fill NaN at inference time (NOT used by
 #                    the stats accumulator — see policy #4)
@@ -138,16 +138,9 @@ _SOURCE_TO_TSCONFIG_PRODUCT = {
 #                    are dropped from the stats accumulator AND replaced with
 #                    `fill` at inference time
 #
-# Variables not listed here either use simple physical scaling (BZC, VIS,
-# EZC = x/k) or are categorical/binary (occurrence, cmic_phase).
+# Variables not listed here are categorical/binary (occurrence) or use
+# simple physical scaling, and so are not data-driven.
 NORMALIZATION_SPEC: dict[str, dict] = {
-    # --- Radar composites (Swiss MeteoSwiss conventions) ---
-    "RZC":      {"source": "radar",     "transform": "log_zscore",
-                 "fill": 0.01,  "clip_min": 0.01},
-    "LZC":      {"source": "radar",     "transform": "log_zscore",
-                 "fill": 0.5,   "clip_min": 0.5},
-    "CZC":      {"source": "radar",     "transform": "linear",
-                 "fill": -5.0},
     # --- MTG FCI L1C brightness temperatures ---
     "ir_38":    {"source": "mtg",       "transform": "linear",
                  "fill": 274.0},
@@ -162,13 +155,6 @@ NORMALIZATION_SPEC: dict[str, dict] = {
                  "fill": 1e-4,  "clip_min": 1e-4},
     "current":  {"source": "lightning", "transform": "log_zscore",
                  "fill": 1e-8,  "clip_min": 1e-8},
-    # --- NWCSAF L2 cloud products (variables live INSIDE CTTH / CMIC files) ---
-    "ctth_alti":  {"source": "nwcsaf",  "transform": "linear",
-                   "fill": -1000.0,  "missing_above": 60000},
-    "ctth_tempe": {"source": "nwcsaf",  "transform": "linear",
-                   "fill": 330.0,    "missing_above": 60000},
-    "cmic_cot":   {"source": "nwcsaf",  "transform": "log_zscore",
-                   "fill": 0.1, "clip_min": 0.1, "missing_above": 60000},
     # --- OPERA radar composites ---
     "opera_reflectivity":  {"source": "opera", "transform": "linear",
                             "fill": -32.0},
@@ -402,7 +388,7 @@ def load_product_filters(timestep_config_path: Path
     """Read every product's minute filter from timestep_config.json.
 
     Returns a dict mapping NORMALIZATION_SPEC source names ('radar',
-    'mtg', 'nwcsaf', 'opera', 'lightning') to the set of valid
+    'mtg', 'opera', 'lightning') to the set of valid
     minute-of-hour values. Missing or null filters become empty sets
     (treated as 'no snap' downstream).
     """
@@ -509,11 +495,11 @@ _LIGHTNING_NAME_PATTERN = re.compile(
 )
 
 
-def _walk_radar_or_mtg(root: Path, var: str,
+def _walk_mtg(root: Path, var: str,
                        training_keys: set[tuple[str, str]]
                        ) -> list[Path]:
     """
-    `reprojected_data/radar_data/{VAR}/nc4_{date}-Romania_{VAR}/nc4_{date}-Romania_{HHMM}_{VAR}.npy`
+    `reprojected_data/satellite_data/MTG/{VAR}/nc4_{date}-Romania_{VAR}/nc4_{date}-Romania_{HHMM}_{VAR}.npy`
     or
     `reprojected_data/satellite_data/MTG/{ch}/nc4_{date}-Romania_{ch}/nc4_{date}-Romania_{HHMM}_{ch}.npy`
     """
@@ -562,36 +548,6 @@ def _walk_lightning(root: Path, var: str,
     return out
 
 
-def _walk_nwcsaf(root: Path, var: str,
-                 training_keys: set[tuple[str, str]]
-                 ) -> list[Path]:
-    """
-    After the reproject pipeline unification, NWCSAF is written as one
-    `.npy` per variable, same layout as radar / MTG / OPERA:
-
-      reprojected_data/nwcsaf_data/{variable}/
-          nc4_{date}-Romania_{variable}/nc4_{date}-Romania_{HHMM}_{variable}.npy
-
-    Walks that tree and returns the matching file paths (filtered by
-    `training_keys` when supplied).
-    """
-    var_root = root / var
-    if not var_root.is_dir():
-        return []
-    out: list[Path] = []
-    for day_dir in sorted(var_root.iterdir()):
-        if not day_dir.is_dir():
-            continue
-        for f in sorted(day_dir.iterdir()):
-            m = _NPY_NAME_PATTERN.match(f.name)
-            if not m:
-                continue
-            date_str = m.group(1)
-            hhmm = m.group(2)
-            if training_keys and (date_str, hhmm) not in training_keys:
-                continue
-            out.append(f)
-    return out
 
 
 def _walk_opera(root: Path, var: str,
@@ -642,8 +598,8 @@ def discover_inputs(reproject_root: Path, var: str,
 
     `training_keys` is on the master grid (e.g. {:00, :15, :30, :45}
     when step=15). Different products live on different minute grids:
-    MTG / NWCSAF / radar at {:00, :10, :30, :40}; OPERA at the master
-    grid. Without a snap, the matcher would skip MTG/NWCSAF files at
+    MTG at {:00, :10, :30, :40}; OPERA at the master
+    grid. Without a snap, the matcher would skip MTG files at
     :10 and :40 even though `extract_patches.py` loads them at runtime
     (via its cadence snap). To keep the stats aligned with the files
     actually used in training, snap the training keys to each product's
@@ -658,10 +614,8 @@ def discover_inputs(reproject_root: Path, var: str,
         if flt:
             keys = snap_keys_to_filter(training_keys, flt)
 
-    if source == "radar":
-        return _walk_radar_or_mtg(reproject_root / "radar_data", var, keys)
     if source == "mtg":
-        return _walk_radar_or_mtg(
+        return _walk_mtg(
             reproject_root / "satellite_data" / "MTG", var, keys,
         )
     if source == "lightning":
@@ -681,10 +635,6 @@ def discover_inputs(reproject_root: Path, var: str,
         # Neither exists - return [] so the caller's empty-list branch
         # logs a clean "0 file(s) match" line.
         return []
-    if source == "nwcsaf":
-        return _walk_nwcsaf(
-            reproject_root / "nwcsaf_data", var, keys,
-        )
     if source == "opera":
         return _walk_opera(
             reproject_root / "opera_data", var, keys,
@@ -696,7 +646,7 @@ def load_array(item, source: str) -> np.ndarray | None:
     """Load a 2-D array from a reprojected `.npy` file.
 
     After the reproject pipeline unification, every product family
-    (radar, MTG, lightning, NWCSAF, OPERA) writes one `.npy` per
+    (MTG, lightning, OPERA) writes one `.npy` per
     (variable, timestep), so the loader is the same everywhere.
     """
     try:
@@ -810,16 +760,6 @@ def main() -> int:
                         default=str(DEFAULT_REGRID_ROOT),
                         help=f'Reprojected-data root '
                              f'(default: {DEFAULT_REGRID_ROOT})')
-    parser.add_argument('--source', type=str, default='dbscan',
-                        choices=['dbscan', 'lightning'],
-                        help="Which extract_patch_seq source to compute "
-                             "stats for. Selects "
-                             "train_data_<source>.csv + "
-                             "sequence_meta_<source>.json as inputs and "
-                             "writes normalization_stats_<source>.json. "
-                             "The two tracks need separate stats because "
-                             "their training distributions differ. "
-                             "(default: dbscan)")
     parser.add_argument('--train_csv', type=str, default=None,
                         help='Explicit path to the training CSV. '
                              'Defaults to '
@@ -850,7 +790,7 @@ def main() -> int:
                         help=f'Path to timestep_config.json (default: '
                              f'{DEFAULT_TIMESTEP_CONFIG}). Used to snap '
                              f'training keys onto each product\'s cadence '
-                             f'grid so 10-min products (MTG/NWCSAF) get '
+                             f'grid so 10-min products (MTG) get '
                              f'their :10/:40 files counted, not just :00/:30.')
     parser.add_argument('--device', choices=['auto', 'cpu', 'gpu'],
                         default='auto',
@@ -890,17 +830,17 @@ def main() -> int:
     train_csv = Path(
         args.train_csv
         if args.train_csv
-        else DEFAULT_DATA_ROOT / f"train_data_{args.source}.csv"
+        else DEFAULT_DATA_ROOT / f"train_data_{SOURCE}.csv"
     )
     seq_meta_path = Path(
         args.sequence_meta
         if args.sequence_meta
-        else DEFAULT_DATA_ROOT / f"sequence_meta_{args.source}.json"
+        else DEFAULT_DATA_ROOT / f"sequence_meta_{SOURCE}.json"
     )
     output_path = Path(
         args.output
         if args.output
-        else DEFAULT_DATA_ROOT / f"normalization_stats_{args.source}.json"
+        else DEFAULT_DATA_ROOT / f"normalization_stats_{SOURCE}.json"
     )
 
     variables = None
@@ -928,7 +868,7 @@ def main() -> int:
                         if train_csv.exists() else 0) - 1
 
     # Per-product minute filters from timestep_config.json. Used to snap
-    # training keys onto each product's own cadence grid so MTG/NWCSAF
+    # training keys onto each product's own cadence grid so MTG
     # files at :10 and :40 are matched (not only :00/:30).
     product_filters = load_product_filters(Path(args.timestep_config))
 
@@ -945,7 +885,7 @@ def main() -> int:
           f"{'GPU (CuPy)' if use_gpu else 'CPU (numpy)'}"
           f"{' [forced cpu]' if args.device == 'cpu' else ''}"
           f"{' [auto-fallback: no GPU]' if args.device == 'auto' and not use_gpu else ''}")
-    print(f"Source              : {args.source}")
+    print(f"Source              : {SOURCE}")
     print(f"Output              : {output_path}")
     print()
 
@@ -970,7 +910,7 @@ def main() -> int:
     payload = {
         "computed_utc":   datetime.now(timezone.utc)
                                  .isoformat(timespec="seconds"),
-        "source":         args.source,
+        "source":         SOURCE,
         "reproject_root":    str(reproject_root),
         "training_filter": {
             "train_csv":       (None if args.no_split_filter else str(train_csv)),

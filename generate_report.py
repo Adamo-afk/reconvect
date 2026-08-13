@@ -835,7 +835,7 @@ def render_pred_coupling_figure(
 
     The rainfall model is expected to be a 5-class rainfall-rate head
     (mode registered in create_datasets.get_mode_config; e.g.
-    `mtg_lightning_opera`). The lightning model is the occurrence head
+    `mtg_lightning_opera_rainfall`). The lightning model is the occurrence head
     (`mtg_lightning_opera_occurrence`) or the KD student
     (`mtg_opera_occurrence`) — post-processing is Hann-blended overlap
     inference + per-lead hysteresis (see lightning_postproc.py). Per-

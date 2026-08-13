@@ -8,8 +8,6 @@ and emit the per-leadtime CSVs that `feature_importance_analysis.py
     results/eval_scores/
         eval_leadtime-<prefix>-o.csv      <- mode with OPERA only
         eval_leadtime-<prefix>-om.csv     <- OPERA + MTG IR/WV
-        eval_leadtime-<prefix>-on.csv     <- OPERA + NWCSAF
-        eval_leadtime-<prefix>-omn.csv    <- OPERA + both
 
 Each CSV has one numeric value per row, no header, in lead-time order
 (t+15, t+30, t+45). The coalition letter on the right of the filename
@@ -19,15 +17,14 @@ README.md (Step 11 of the Shapley runbook).
 
 The classical Shapley formula then computes per-source contributions:
 
-    phi(n) = 1/2 * [ (v_omn - v_om) + (v_on - v_o) ]    (NWCSAF)
-    phi(m) = 1/2 * [ (v_omn - v_on) + (v_om - v_o) ]    (MTG IR/WV)
+    phi(m) = v_om - v_o                                (MTG IR/WV)
 
 where v_<coalition> is the metric value for that model.
 
 Usage
 -----
-Default — four OPERA Shapley modes, CSI (lightning) or accuracy (radar)
-auto-detected from each JSON:
+Default — the two OPERA coalition modes, CSI (lightning) or accuracy
+(radar) auto-detected from each JSON:
 
     python bundle_eval_scores.py
 
@@ -42,7 +39,6 @@ Custom output directory:
 Override the coalition mapping (e.g. for a different Shapley study):
 
     python bundle_eval_scores.py \\
-        --mode "mtg_lightning_no_nwcsaf=o" \\
         --mode "mtg_lightning=on"          \\
         --prefix lightning
 """
@@ -55,15 +51,17 @@ import json
 import sys
 from pathlib import Path
 
+from pipeline_config import SOURCE
 
-# Default 2-mode OPERA coalition (NWCSAF was dropped from the active
-# build). Each (mode, letters) pair maps the trained-mode name to its
+
+# Default 2-mode OPERA coalition. Each (mode, letters) pair maps the
+# trained-mode name to its
 # source-letter combination. 'o' = OPERA-only baseline, 'om' = baseline
 # + MTG IR/WV. Pass repeated `--mode MODE=LETTERS` to override the
 # pairing (e.g. when including the lightning-as-input modes).
 DEFAULT_COALITION = [
-    ("mtg_opera_radar_only", "o"),
-    ("mtg_opera_mtgmr",      "om"),
+    ("mtg_opera_radar_only_rainfall", "o"),
+    ("mtg_opera_mtgmr_rainfall",      "om"),
 ]
 
 # Lead-time keys exactly as written into evaluation_results.json by
@@ -140,7 +138,9 @@ def bundle_eval_scores(coalition: list[tuple[str, str]],
 
     for mode, letters in coalition:
         # Match the directory naming convention used by
-        # evaluate_coalition.py: eval_{mode}_{source}[_finetuned].
+        # evaluate_coalition.py: eval_{mode}_{source}[_finetuned]. Inlined
+        # rather than importing train_models.build_run_tag so this script
+        # stays free of the TensorFlow import.
         run_tag = f"{mode}_{source}"
         if finetuned:
             run_tag = f"{run_tag}_finetuned"
@@ -193,7 +193,7 @@ def bundle_eval_scores(coalition: list[tuple[str, str]],
 
 
 def _parse_mode_arg(raw: str) -> tuple[str, str]:
-    """Parse `MODE=LETTERS` (e.g. `mtg_opera_full=omn`)."""
+    """Parse `MODE=LETTERS` (e.g. `mtg_opera_mtgmr_rainfall=om`)."""
     if "=" not in raw:
         raise argparse.ArgumentTypeError(
             f"--mode expects MODE=LETTERS, got {raw!r}"
@@ -219,8 +219,8 @@ def main() -> int:
         "--mode", action="append", type=_parse_mode_arg, default=None,
         metavar="MODE=LETTERS",
         help="Repeatable mapping of trained-mode name to its "
-             "coalition-letter string. e.g. `mtg_opera_full=omn`. If "
-             "omitted, the four-mode OPERA Shapley study is used "
+             "coalition-letter string. e.g. `mtg_opera_mtgmr_rainfall=om`. If "
+             "omitted, the two-mode OPERA coalition is used "
              f"({DEFAULT_COALITION}).",
     )
     parser.add_argument(
@@ -247,13 +247,6 @@ def main() -> int:
         "--output_dir", type=str, default="results/eval_scores",
         help="Directory for the bundled per-leadtime CSVs "
              "(default: results/eval_scores/).",
-    )
-    parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Sample-selection track. Must match the --source flag "
-             "the evaluation run used. Drives the eval_<mode>_<source> "
-             "directory lookup (default: dbscan).",
     )
     parser.add_argument(
         "--finetuned", action="store_true",
@@ -284,7 +277,7 @@ def main() -> int:
             eval_root=eval_root,
             output_dir=output_dir,
             metric=args.metric,
-            source=args.source,
+            source=SOURCE,
             finetuned=args.finetuned,
         )
     except (FileNotFoundError, KeyError, ValueError) as e:

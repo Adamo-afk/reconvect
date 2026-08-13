@@ -48,7 +48,7 @@ Outputs (only two, by design)
     One row per surviving (date, HHMM) timestep, with the per-product
     snapped HHMM each product loaded so the manifest doubles as an
     audit trail:
-        date,hhmm,mtg_hhmm,nwcsaf_hhmm,opera_hhmm,...
+        date,hhmm,mtg_hhmm,opera_hhmm,...
 - `intersect_summary.png` (default: our_data/intersect_summary.png)
     Per-date stacked bar chart: kept timesteps + drops attributed to
     each product / error log.
@@ -57,7 +57,6 @@ Example
 -------
     python intersect_product_coverage.py \
         --summary mtg=mtg_summary.csv \
-        --summary nwcsaf=nwcsaf_summary.csv \
         --summary opera=opera_summary.csv \
         --summary lightning=lightning_summary.csv \
         --active lightning=lightning_active_steps.csv \
@@ -94,12 +93,8 @@ DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
 #   - the `products.<name>` block in timestep_config.json (for the filter)
 #   - the conventional missing-JSON file name (alongside the summary CSV)
 PRODUCT_LAYOUT: dict[str, dict[str, str]] = {
-    "radar":     {"tsconfig_product": "radar",
-                  "missing_name":     "radar_missing_timesteps.json"},
     "mtg":       {"tsconfig_product": "mtg",
                   "missing_name":     "mtg_missing_timesteps.json"},
-    "nwcsaf":    {"tsconfig_product": "nwcsaf",
-                  "missing_name":     "nwcsaf_missing_timesteps.json"},
     "opera":     {"tsconfig_product": "opera_rainfall_rate",
                   "missing_name":     "opera_missing_timesteps.json"},
     "lightning": {"tsconfig_product": "lightning",
@@ -207,12 +202,6 @@ def load_missing(product: str, json_path: Path) -> set[tuple[str, str]]:
             # treat those as missing too because the reproject would
             # have failed on them.
             times = list(times) + list(block.get("incomplete_times", []) or [])
-        elif product == "nwcsaf":
-            # nwcsaf_missing_timesteps.json: per-date 'missing' or
-            # 'missing_times' depending on the build (handle both).
-            times = (block.get("missing_times")
-                     or block.get("missing")
-                     or [])
         else:
             # Generic fallback for radar / lightning / future products.
             times = (block.get("missing_times")
@@ -464,9 +453,7 @@ def write_plot(kept, dropped, dates, step_minutes, product_keys,
     colours = {
         "kept":            "#4caf50",
         "unscanned_date":  "#bdbdbd",
-        "radar":           "#7e57c2",
         "mtg":             "#42a5f5",
-        "nwcsaf":          "#ff9800",
         "opera":           "#ef5350",
         "lightning":       "#ffd54f",
         "error_log":       "#212121",

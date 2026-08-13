@@ -9,9 +9,14 @@ Loss: weighted MSE from Czibula et al. 2024 (upweights high precipitation).
 Labels: one-hot from create_datasets.py auto-converted to continuous midpoints.
 Classification: recovered at evaluation time via post-processing thresholds.
 
+Baseline counterpart to COALITION-4's `mtg_opera_mtgmr_continuous` mode:
+same inputs, same continuous OPERA rainfall target, different
+architecture. Compare the two either continuous-vs-continuous, or with
+both binned back to the 5 classes via create_datasets.RAINFALL_CLASS_EDGES.
+
 Usage:
-    python train_sepconv_ensemble.py --mode msg_radar --epochs 50 --batch_size 8
-    python train_sepconv_ensemble.py --mode msg_radar --lead 1 --epochs 50
+    python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous         --epochs 50 --batch_size 8
+    python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous         --lead 1 --epochs 50
 """
 
 import argparse
@@ -29,23 +34,26 @@ from tensorflow.keras.layers import (
 from tensorflow.keras import Model
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callback
 
+from create_datasets import get_mode_config, load_tfrecord_dataset
+from pipeline_config import SOURCE
+from train_models import build_run_tag
+
 
 # ============================================================================
 # Mode configurations
 # ============================================================================
 
+# Branch shapes mirror create_datasets.get_mode_config for the matching
+# COALITION-4 mode, so the SepConv baseline consumes byte-identical
+# batches. `mtg_opera_mtgmr_continuous`:
+#   HR  = MTG vis_06                                        -> 1 channel
+#   MR  = OPERA reflectivity + rainfall_rate + MTG IR/WV     -> 6 channels
+# Leading 3 = past timesteps (t-2, t-1, t0).
 MODE_CONFIGS = {
-    "msg_radar_continuous": {
+    "mtg_opera_mtgmr_continuous": {
         "branches": {
-            "past_hr": {"shape": (3, 256, 256, 9), "resolution": 256},
-            "past_lr": {"shape": (3, 64, 64, 13), "resolution": 64},
-        },
-    },
-    "mtg_radar_continuous": {
-        "branches": {
-            "past_hr": {"shape": (3, 256, 256, 10), "resolution": 256},
-            "past_mr": {"shape": (3, 128, 128, 4), "resolution": 128},
-            "past_lr": {"shape": (3, 64, 64, 8), "resolution": 64},
+            "past_hr": {"shape": (3, 256, 256, 1), "resolution": 256},
+            "past_mr": {"shape": (3, 128, 128, 6), "resolution": 128},
         },
     },
 }
@@ -61,7 +69,7 @@ LEAD_NAMES = {1: "t+15", 2: "t+30", 3: "t+45"}
 LEAD_MINUTES = {1: 15, 2: 30, 3: 45}
 
 # Post-processing thresholds to recover 5 classes (used in evaluation)
-# Raw RZC normalized by /70: thresholds at 10, 20, 30, 40 mm/h
+# Raw rain rate normalized by /70: thresholds at 10, 20, 30, 40 mm/h
 THRESHOLDS_NORM = [10.0 / 70.0, 20.0 / 70.0, 30.0 / 70.0, 40.0 / 70.0]
 
 
@@ -171,8 +179,10 @@ def extract_lead_time(inputs, labels, lead_idx):
     return inputs, labels[lead_idx - 1]
 
 
-def prepare_dataset(ds_path, lead_idx, batch_size, shuffle=False):
-    ds = tf.data.Dataset.load(str(ds_path))
+def prepare_dataset(ds_path, mode, lead_idx, batch_size, shuffle=False):
+    # Datasets are TFRecord shards written by create_datasets.py; the
+    # mode_config supplies the parse signature.
+    ds = load_tfrecord_dataset(Path(ds_path), get_mode_config(mode))
     ds = ds.map(lambda x, y: extract_lead_time(x, y, lead_idx),
                 num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
@@ -216,10 +226,11 @@ def train_base_model(mode, lead_idx, data_root, model_dir, epochs, batch_size):
     print(f"  Training Bm{lead_idx} ({lead_name} = {LEAD_MINUTES[lead_idx]} min)")
     print(f"{'─' * 60}")
 
+    ds_root = data_root / "datasets" / build_run_tag(mode, SOURCE)
     train_ds = prepare_dataset(
-        data_root / "datasets" / mode / "train", lead_idx, batch_size, True)
+        ds_root / "train", mode, lead_idx, batch_size, True)
     val_ds = prepare_dataset(
-        data_root / "datasets" / mode / "validation", lead_idx, batch_size, False)
+        ds_root / "validation", mode, lead_idx, batch_size, False)
 
     model = build_sepconv_base_model(mode, lead_idx)
     print(f"  Parameters: {model.count_params():,}")
@@ -265,14 +276,16 @@ def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    ds_root = data_root / "datasets" / build_run_tag(mode, SOURCE)
     for split in ["train", "validation"]:
-        if not (data_root / "datasets" / mode / split).exists():
-            raise FileNotFoundError(f"Dataset not found: {data_root}/datasets/{mode}/{split}")
+        if not (ds_root / split).exists():
+            raise FileNotFoundError(f"Dataset not found: {ds_root / split}")
 
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
-    n_train = sum(1 for _ in tf.data.Dataset.load(str(data_root / "datasets" / mode / "train")))
-    n_val = sum(1 for _ in tf.data.Dataset.load(str(data_root / "datasets" / mode / "validation")))
+    mode_config = get_mode_config(mode)
+    n_train = sum(1 for _ in load_tfrecord_dataset(ds_root / "train", mode_config))
+    n_val = sum(1 for _ in load_tfrecord_dataset(ds_root / "validation", mode_config))
 
     print("=" * 70)
     print(f"SepConv ENSEMBLE Training (Regression) — Mode: {mode}")
@@ -301,7 +314,7 @@ def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
         "total_params": sum(r["model_params"] for r in all_results.values()),
         "label_info": {
             "type": "continuous",
-            "normalization": "RZC / 70 → [0, 1]",
+            "normalization": "opera_rainfall_rate / 70 → [0, 1]",
             "thresholds_for_classification": THRESHOLDS_NORM,
         },
         "config": {
@@ -327,7 +340,11 @@ def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Train SepConv ensemble (regression).")
-    parser.add_argument("--mode", type=str, required=True, choices=["msg_radar_continuous", "mtg_radar_continuous"])
+    parser.add_argument("--mode", type=str,
+                        default="mtg_opera_mtgmr_continuous",
+                        choices=list(MODE_CONFIGS),
+                        help="Continuous-target COALITION-4 mode whose "
+                             "dataset this baseline consumes.")
     parser.add_argument("--data_root", type=str, default="./our_data")
     parser.add_argument("--model_dir", type=str, default="./models")
     parser.add_argument("--epochs", type=int, default=50)

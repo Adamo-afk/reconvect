@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime, timedelta
 
+from pipeline_config import SOURCE
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = str(PROJECT_ROOT / 'our_data')
@@ -356,16 +358,6 @@ def main():
         help="Path to our_data directory"
     )
     parser.add_argument(
-        "--source", type=str, default="dbscan",
-        choices=["dbscan", "lightning"],
-        help="Which extract_patch_seq source to scope by. 'dbscan' "
-             "(default) scopes to train_data_dbscan.csv and writes "
-             "lightning_fraction_dbscan.json. 'lightning' scopes to "
-             "train_data_lightning.csv and writes "
-             "lightning_fraction_lightning.json. The two tracks need "
-             "separate priors because they sample different timesteps.",
-    )
-    parser.add_argument(
         "--output", "-o", type=str, default=None,
         help="Output JSON path (default: "
              "our_data/lightning_fraction_<source>.json)."
@@ -387,13 +379,13 @@ def main():
     scope_csv = (
         args.scope_csv
         if args.scope_csv is not None
-        else os.path.join(args.data_root, f"train_data_{args.source}.csv")
+        else os.path.join(args.data_root, f"train_data_{SOURCE}.csv")
     )
     output_path = (
         args.output
         if args.output
         else os.path.join(
-            args.data_root, f"lightning_fraction_{args.source}.json"
+            args.data_root, f"lightning_fraction_{SOURCE}.json"
         )
     )
 
@@ -401,12 +393,12 @@ def main():
     print("Lightning pixel fraction (training-scope)")
     print("=" * 60)
     print(f"  data_root  : {args.data_root}")
-    print(f"  source     : {args.source}")
+    print(f"  source     : {SOURCE}")
     print(f"  scope_csv  : {scope_csv}")
     print(f"  output     : {output_path}")
 
     scope_keys = load_scope_set(
-        scope_csv, data_root=args.data_root, source=args.source,
+        scope_csv, data_root=args.data_root, source=SOURCE,
     )
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")
@@ -418,7 +410,7 @@ def main():
 
     # Add scope metadata so the resulting JSON is self-describing.
     stats['_scope'] = {
-        'source':       args.source,
+        'source':       SOURCE,
         'scope_csv':    None if scope_keys is None else str(Path(scope_csv).resolve()),
         'n_scope_keys': None if scope_keys is None else len(scope_keys),
     }
