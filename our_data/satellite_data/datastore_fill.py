@@ -175,7 +175,23 @@ def fill_gaps(gaps: dict[str, list[str]],
         )
 
     key, secret = load_credentials(credentials_file)
-    datastore = eumdac.DataStore(eumdac.AccessToken((key, secret)))
+
+    # Exchange key/secret for a bearer token up front. This is the auth
+    # smoke test: bad credentials fail here with a clear message instead
+    # of surfacing later as an opaque search error. The token is
+    # short-lived and eumdac refreshes it automatically mid-run.
+    try:
+        token = eumdac.AccessToken((key, secret))
+        if verbose:
+            print(f"EUMDAC token acquired, expires {token.expiration}")
+    except Exception as exc:                         # noqa: BLE001
+        raise SystemExit(
+            f"EUMDAC authentication failed: {exc}\n"
+            f"Check the consumer key and secret "
+            f"(https://api.eumetsat.int/api-key/)."
+        )
+
+    datastore = eumdac.DataStore(token)
     collection = datastore.get_collection(FDHSI_COLLECTION_ID)
 
     raw_path = Path(raw_dir)
