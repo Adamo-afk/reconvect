@@ -20,6 +20,7 @@ Output structure (COALITION-4 convention):
     {output_root}/density/nc4_yyyy-mm-dd-Romania_density/lightning_density_yyyymmdd_HHMM.npy
     {output_root}/current/nc4_yyyy-mm-dd-Romania_current/lightning_current_yyyymmdd_HHMM.npy
     {output_root}/occurrence/nc4_yyyy-mm-dd-Romania_occurrence/lightning_occurrence_yyyymmdd_HHMM.npy
+    {output_root}/filtered_out_reports/lightning_filtered_out_yyyy-mm-dd.json   (audit only)
 
 Output is `.npy` (just the binned grid, no lat/lon metadata). Lightning
 is already on the Romania grid by virtue of being binned via
@@ -291,11 +292,18 @@ def write_filtered_out_report(output_root, date_str, grid_projection,
                               inside_df, outside_df):
     """Write the per-day JSON audit of strokes that fell outside the grid.
 
-    Path: {output_root}/lightning_filtered_out_{date_str}.json
+    Path: {output_root}/filtered_out_reports/lightning_filtered_out_{date_str}.json
     Contents: totals + every dropped stroke's (lat, lon) in EPSG:4326.
+
+    Kept in its own subdirectory so the per-day audits don't accumulate
+    loose at the top of `output_root` beside the density / current /
+    occurrence data folders. Nothing downstream reads these files - they
+    exist so you can see how much a wider LINET export bbox is spilling
+    past the grid edge (a sudden jump means the bbox drifted; a drop to
+    zero on a convective day means it got too narrow).
     """
-    output_root = Path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    report_dir = Path(output_root) / "filtered_out_reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
     report = {
         "date": date_str,
         "grid_extent_epsg31700": list(grid_projection.area.area_extent),
@@ -313,7 +321,7 @@ def write_filtered_out_report(output_root, date_str, grid_projection,
             )
         ],
     }
-    report_path = output_root / f"lightning_filtered_out_{date_str}.json"
+    report_path = report_dir / f"lightning_filtered_out_{date_str}.json"
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
     return report_path, report
