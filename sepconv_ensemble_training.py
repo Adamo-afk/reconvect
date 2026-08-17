@@ -36,7 +36,9 @@ from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callbac
 
 from create_datasets import get_mode_config, load_tfrecord_dataset
 from pipeline_config import SOURCE
-from train_models import build_run_tag
+from train_models import (build_run_tag,
+                          weighted_loss_multiple_thresholds,
+                          RAINFALL_MSE_WEIGHTS)
 
 
 # ============================================================================
@@ -76,35 +78,6 @@ THRESHOLDS_NORM = [10.0 / 70.0, 20.0 / 70.0, 30.0 / 70.0, 40.0 / 70.0]
 # ============================================================================
 # Weighted MSE loss (from paper)
 # ============================================================================
-
-def weighted_loss_multiple_thresholds(weights, max_value=1.0):
-    """Weighted MSE that upweights high precipitation values.
-
-    Splits [0, max_value] into len(weights) bins and applies different
-    weights per bin. Paper used weights=[15, 1, 2, 7, 15, 30, 1000].
-    """
-    num_steps = len(weights)
-    thresholds = [max_value * i / num_steps for i in range(1, num_steps)]
-
-    def inner_weighted_loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        diff = K.pow(y_true - y_pred, 2)
-
-        masks_less = [K.cast(K.less(y_true, t), K.floatx())
-                      for t in thresholds]
-        masks_greater = [K.cast(K.greater_equal(y_true, t), K.floatx())
-                         for t in [0.0] + thresholds]
-
-        result = tf.constant(0.0, dtype=tf.float32)
-        for i in range(len(masks_less)):
-            result += weights[i] * K.mean(
-                masks_less[i] * masks_greater[i] * diff)
-        result += weights[-1] * K.mean(masks_greater[-1] * diff)
-        return result
-
-    return inner_weighted_loss
-
 
 # ============================================================================
 # Base model (regression: sigmoid output)
@@ -236,7 +209,7 @@ def train_base_model(mode, lead_idx, data_root, model_dir, epochs, batch_size):
     print(f"  Parameters: {model.count_params():,}")
 
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, amsgrad=True)
-    loss = weighted_loss_multiple_thresholds([15, 1, 2, 7, 15, 30, 1000])
+    loss = weighted_loss_multiple_thresholds()
     model.compile(optimizer=optimizer, loss=loss)
 
     reduce_lr = ReduceLROnPlateau(
@@ -291,7 +264,7 @@ def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
     print(f"SepConv ENSEMBLE Training (Regression) — Mode: {mode}")
     print("=" * 70)
     print(f"  Output: sigmoid [0,1] (continuous rain rate)")
-    print(f"  Loss: weighted MSE [15, 1, 2, 7, 15, 30, 1000]")
+    print(f"  Loss: weighted MSE {RAINFALL_MSE_WEIGHTS} (shared with COALITION-4)")
     print(f"  Optimizer: Adam (AMSGrad, lr=0.001, halve on plateau)")
     print(f"  Train: {n_train}, Val: {n_val}")
 

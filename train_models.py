@@ -827,6 +827,50 @@ def _build_radar_loss(class_fractions, radar_loss_cfg):
     )
 
 
+# ============================================================================
+# Continuous rainfall loss (regression head)
+# ============================================================================
+# Weights from Czibula et al. The `_continuous` modes exist to be compared
+# against the SepConv ensemble baseline, so BOTH models must minimise the
+# same objective — otherwise an architecture comparison is confounded by a
+# loss change. sepconv_ensemble_training.py imports this function rather
+# than keeping its own copy, so the two cannot drift apart.
+RAINFALL_MSE_WEIGHTS = [15, 1, 2, 7, 15, 30, 1000]
+
+
+def weighted_loss_multiple_thresholds(weights=None, max_value=1.0):
+    """Weighted MSE that upweights high precipitation.
+
+    Splits [0, max_value] into len(weights) equal bins and applies a
+    per-bin weight to the squared error, so the rare intense-rainfall
+    pixels are not drowned out by the dry majority. Operates on the
+    normalised target (rain rate / RAINFALL_MAX_MMH), hence max_value=1.
+    """
+    if weights is None:
+        weights = RAINFALL_MSE_WEIGHTS
+    num_steps = len(weights)
+    thresholds = [max_value * i / num_steps for i in range(1, num_steps)]
+
+    def inner_weighted_loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        diff = tf.pow(y_true - y_pred, 2)
+
+        masks_less = [tf.cast(y_true < t, tf.float32) for t in thresholds]
+        masks_greater = [tf.cast(y_true >= t, tf.float32)
+                         for t in [0.0] + thresholds]
+
+        result = tf.constant(0.0, dtype=tf.float32)
+        for i in range(len(masks_less)):
+            result += weights[i] * tf.reduce_mean(
+                masks_less[i] * masks_greater[i] * diff)
+        result += weights[-1] * tf.reduce_mean(masks_greater[-1] * diff)
+        return result
+
+    inner_weighted_loss.__name__ = "weighted_mse_rainfall"
+    return inner_weighted_loss
+
+
 def build_coalition_model(input_shapes, label_type, past_timesteps=3,
                           future_timesteps=3, dropout=0, norm=None,
                           ones_fraction=0.0106,
@@ -942,6 +986,17 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
                             activation='sigmoid', dtype='float32')
         loss = WeightedFocalLoss(ones_fraction=ones_fraction, gamma=2.0)
         metrics = [iou_metric, true_pos, false_pos, false_neg]
+    elif label_type == "radar_continuous":
+        # Regression head: ONE channel, sigmoid into [0, 1] matching the
+        # normalised label (rain rate / RAINFALL_MAX_MMH). Deliberately
+        # the same weighted MSE the SepConv baseline minimises so the two
+        # differ only in architecture. Do NOT route this through the
+        # 5-class branch below - the label carries 1 channel, not 5.
+        num_outputs = 1
+        final_conv = Conv2D(num_outputs, kernel_size=(1, 1),
+                            activation='sigmoid', dtype='float32')
+        loss = weighted_loss_multiple_thresholds()
+        metrics = ['mae', 'mse']
     else:  # radar multiclass
         num_outputs = 5
         final_conv = Conv2D(num_outputs, kernel_size=(1, 1),
@@ -1612,7 +1667,11 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         ones_fraction = 0.0106  # unused for radar
         # Only load the radar prior when the configured loss actually
         # needs it - keeps plain-CCE runs from failing on a missing JSON.
-        needs_prior = (radar_loss_cfg or {}).get("weighting", "none") != "none"
+        # The continuous head minimises weighted MSE and never touches
+        # the per-class prior, so only the 5-class head requires it.
+        needs_prior = (label_type == "radar" and
+                       (radar_loss_cfg or {}).get("weighting", "none")
+                       != "none")
         class_fractions = (
             load_class_fractions(data_root, source) if needs_prior else None
         )
@@ -1847,7 +1906,11 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
         class_fractions = None
     else:
         ones_fraction = 0.0106  # unused for radar
-        needs_prior = (radar_loss_cfg or {}).get("weighting", "none") != "none"
+        # The continuous head minimises weighted MSE and never touches
+        # the per-class prior, so only the 5-class head requires it.
+        needs_prior = (label_type == "radar" and
+                       (radar_loss_cfg or {}).get("weighting", "none")
+                       != "none")
         class_fractions = (
             load_class_fractions(data_root, source) if needs_prior else None
         )
