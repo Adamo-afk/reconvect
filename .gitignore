@@ -128,3 +128,16 @@ eumdac.txt
 *.key
 id_rsa*
 id_ed25519*
+
+# Named explicitly rather than relying on the broad `our_data/*/*` rule
+# above, so these stay protected even if that rule is ever narrowed.
+our_data/lightning_data/linet_credentials.txt
+our_data/opera_data/password.txt
+our_data/satellite_data/data_store_credentials.txt
+our_data/satellite_data/password.txt
+
+# =============================================================================
+# Local scratch notes — not part of the codebase
+# =============================================================================
+command.txt
+prompts.txt
