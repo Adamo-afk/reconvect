@@ -77,8 +77,8 @@ DEFAULT_BBOX = ROMANIA_GRID_LONLAT_BBOX  # (min_lon, min_lat, max_lon, max_lat)
 DEFAULT_FORMAT = "kml"
 # For --format kml, files are written to `{DEFAULT_OUT}/kml_data/{date}/{date}.kml`
 # so read_kml_version2.py (which defaults to reading from
-# our_data/lightning_data) finds them without an intermediate
-# lightning_arrange step. For txt/asc, files land flat under {DEFAULT_OUT}.
+# our_data/lightning_data) finds them directly. For txt/asc, files land
+# flat under {DEFAULT_OUT}.
 DEFAULT_OUT = str(_PROJECT_ROOT / "our_data" / "lightning_data")
 REQUEST_TIMEOUT = 300          # export of an active day can be slow
 PAUSE_BETWEEN_REQUESTS = 2.0   # be polite to the internal server
@@ -331,9 +331,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default=DEFAULT_OUT,
                    help=f"output root (default: {DEFAULT_OUT}). For --format kml, "
                         f"files land at {{out}}/kml_data/YYYY-MM-DD/YYYY-MM-DD.kml "
-                        f"— the layout read_kml_version2.py reads directly, so no "
-                        f"lightning_arrange step is needed. For txt/asc, files land "
-                        f"flat at {{out}}/linet_*.{{ext}}.")
+                        f"— the layout read_kml_version2.py reads directly. "
+                        f"For txt/asc, files land flat at "
+                        f"{{out}}/linet_*.{{ext}}.")
     p.add_argument("--password_file", "-pw", type=str, default=None,
                    help="Path to a two-line text file with LinetView credentials "
                         "(line 1: username, line 2: password). If omitted, falls "
