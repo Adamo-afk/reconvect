@@ -112,3 +112,19 @@ EUMETSAT_presentations/
 *.log
 tensorboard_logs/
 logs/
+
+# =============================================================================
+# Credentials — NEVER commit
+# =============================================================================
+# The download pipelines take a two-line credentials file (--password_file,
+# --ssh_key, --eumdac_credentials). Root-level *.txt is otherwise tracked
+# (requirements.txt), so these are named explicitly rather than blanket-ignored.
+creds.txt
+credentials.txt
+eumdac.txt
+*credentials*.txt
+*_secret*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
