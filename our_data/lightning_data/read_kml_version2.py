@@ -13,7 +13,7 @@ the LINET strokes in its preceding `cadence` window. Date is extracted
 from the KML filename (dd_mm_yyyy.kml or dd.mm.yyyy.kml) and the whole
 arranged directory is walked unless `--date` is given.
 
-Input structure (from arrange_lightning_data.py):
+Input structure (written directly by linet_export.py --format kml):
     {data_root}/kml_data/yyyy-mm-dd/yyyy-mm-dd.kml
 
 Output structure (COALITION-4 convention):
@@ -841,7 +841,15 @@ def run_all(data_root, output_root, date_filter=None, force=False):
         print(f"Discovered {len(dates)} dates")
 
     if not dates:
-        print("\nNo dates found. Run arrange_lightning_data.py first.")
+        print(
+            f"\nNo dates found under {data_root}/kml_data/.\n"
+            f"Download the KMLs first - linet_export.py writes them "
+            f"straight into the layout this script walks:\n"
+            f"    python our_data/lightning_data/linet_export.py \\\n"
+            f"        --start YYYY-MM-DD --end YYYY-MM-DD \\\n"
+            f"        --format kml --out {data_root} "
+            f"--password_file <creds>"
+        )
         return
 
     for date_str, kml_path in dates:
