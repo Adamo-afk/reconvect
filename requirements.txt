@@ -101,3 +101,7 @@ cartopy
 
 # Data processing
 pandas
+
+# EUMETSAT Data Store client. Optional - only needed for
+# summarize_mtg.py --fill-from-datastore (MTG gap backfill).
+eumdac

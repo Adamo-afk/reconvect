@@ -125,7 +125,7 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 | # | Script | Arguments | What the step does | Commands |
 |---|---|---|---|---|
 | **0** | `validate_timestep.py` | `--step_minutes N` desired master training cadence, in minutes · `--cadences_file PATH` per-product native cadence config file · `--output_path PATH` where the generated timestep config lands · `--print` show the existing config and exit | Picks the master cadence and derives each product's minute filter → `our_data/timestep_config.json`, read by every later step. | `python validate_timestep.py --step_minutes 15`<br>`python validate_timestep.py --print` |
-| **1a** | `our_data/satellite_data/pipeline_msg_mtg.py` | `--start` `--end` `yyyy/mm/dd-hhmm` download window, both required · `--password_file PATH` text file holding the SSH password · `--products_file PATH` JSON listing which FCI channels to fetch · `--output_dir PATH` destination root for downloaded MTG data · `--timesteps` override the per-product minute filter · `--workers N` parallel download and processing worker count · `--full_disk` fetch full disk instead of Romania chunks · `--skip_download` reprocess local files without downloading again | Downloads + pre-processes MTG FCI L1C. | `python our_data/satellite_data/pipeline_msg_mtg.py --start 2025/05/01-0000 --end 2025/05/31-2350 --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$ |
+| **1a** | `our_data/satellite_data/pipeline_msg_mtg.py` | `--start` `--end` `yyyy/mm/dd-hhmm` download window, both required · `--password_file PATH` text file holding the SSH password · `--products_file PATH` JSON listing which FCI channels to fetch · `--output_dir PATH` destination root for downloaded MTG data · `--timesteps` override the per-product minute filter · `--workers N` parallel download and processing worker count · `--full_disk` fetch full disk instead of Romania chunks · `--skip_download` reprocess local files without downloading again · `--fill-gaps` backfill shortfall from the EUMETSAT Data Store · `--eumdac_credentials PATH` two-line EUMDAC key and secret | Downloads + pre-processes MTG FCI L1C. | `python our_data/satellite_data/pipeline_msg_mtg.py --start 2025/05/01-0000 --end 2025/05/31-2350 --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$ |
 | **1b** | `our_data/opera_data/pipeline_opera.py` | `--start` `--end` `yyyy/mm/dd-hhmm` window, **end inclusive** · `--ssh_key PATH` SSH private key; excludes `--password_file` · `--password_file PATH` text file holding the SSH password · `--products` reflectivity, rainfall_rate, or both by default · `--remote_base PATH` remote EWC mount root directory · `--remote_host` `--remote_user` SSH endpoint and login account · `--cache_dir PATH` local OPERA destination root directory · `--timesteps` override the per-product minute filter | Fetches OPERA composite HDF5. If the default `--remote_base /eumetsatdata` errors with "No such file", pass `/home/eumetsatdata` — the mount root differs between EWC images. | `python our_data/opera_data/pipeline_opera.py --start 2025/05/01-0000 --end 2025/05/31-2359 --ssh_key `$\color{red}{\textbf{\textit{path/to/ssh-key}}}$<br>`… --remote_base /home/eumetsatdata` |
 | **1c** | `our_data/lightning_data/linet_export.py` | `--start` `--end` `YYYY-MM-DD` period, **end EXCLUSIVE** · `--format` txt point list, kml, or asc · `--out PATH` destination root for the exported strokes · `--bbox` lon/lat rectangle limiting the export area · `--password_file PATH` text file holding the LINET password · `--lightning-type` 0 all, 1 cloud-to-ground, 2 intracloud · `--amp-threshold` minimum stroke amplitude to keep · `--daily-window` split the request into per-day windows · `--pause` seconds to wait between successive requests · `--force` re-download even when the output exists · `--dry-run` plan the fetch without downloading anything | Downloads LINET strokes. Use `--format kml`: it writes `{out}/kml_data/YYYY-MM-DD/…` which the rasteriser reads directly. | `python our_data/lightning_data/linet_export.py --start 2025-05-01 --end 2025-06-01 --format kml --out our_data/lightning_data --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$<br>*(`--end 2025-06-01` to cover all of May — the bound is exclusive)* |
 | **1d** | `our_data/lightning_data/read_kml_version2.py` | `--data_root PATH` root holding the downloaded KML files · `--output_root PATH` destination for the rasterised grid arrays · `--date YYYY-MM-DD` process one date instead of all · `--force` reprocess and overwrite the existing outputs | Rasterises strokes onto the 1 km Romania grid → `density`, `current`, `occurrence`. | `python our_data/lightning_data/read_kml_version2.py --data_root our_data` |
@@ -141,6 +141,48 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 | **10** | `train_models.py` | `--config PATH` training config carrying all hyperparameters · `--mode` train one mode instead of the list · `--stage base\|finetune\|both` base training, Swin head, or both · `--base_checkpoint PATH` frozen backbone for the finetune stage · `--dataset_dir PATH` override the derived dataset directory · `--output_dir PATH` destination for saved models and history · `--data_root PATH` root holding datasets and loss priors · `--fresh` ignore any saved per-epoch checkpoint · `--list-modes` print the mode registry and exit | Builds the encoder-forecaster from `metadata.json` and trains. `finetune` freezes the backbone and grafts a Swin head; `both` runs the two back-to-back in one process. Resumes from the per-epoch checkpoint unless `--fresh`. | `python train_models.py --list-modes`<br>`python train_models.py --mode mtg_opera_mtgmr_rainfall --stage base`<br>`python train_models.py --mode mtg_lightning_opera_occurrence --stage both`<br>`python train_models.py --config training.config`<br>`python train_models.py --mode mtg_opera_mtgmr_rainfall --stage base --fresh` |
 | **11** | `train_lightning_kd.py` | `--kd_alpha` weight on the soft-teacher distillation loss · `--kd_temperature` softening temperature for both models' outputs · `--teacher_finetuned` distil from the Swin teacher instead · `--epochs` `--batch_size` training length and samples per step · `--learning_rate` Adam learning rate for the student · `--patience` early-stopping patience, counted in epochs · `--shuffle_buffer` samples held in RAM for shuffling · `--seed` RNG seed for reproducible student training · `--no_mixed_precision` disable fp16 compute on tensor cores · `--data_root` `--model_dir` dataset root and checkpoint destination | **Optional.** Distils the teacher into `mtg_opera_occurrence`, a student predicting lightning from satellite + OPERA with **no LINET at inference**. | `python train_lightning_kd.py`<br>`python train_lightning_kd.py --kd_alpha 0.5 --kd_temperature 6.0`<br>`python train_lightning_kd.py --teacher_finetuned` |
 | **12** | `sepconv_ensemble_training.py` | `--mode` continuous-target mode supplying the training dataset · `--lead 1\|2\|3` train one lead only, not all · `--epochs` `--batch_size` training length and samples per step · `--data_root` `--model_dir` dataset root and checkpoint destination | **Optional baseline.** Three SepConv regression models (one per lead) on the same inputs as the continuous COALITION-4 mode. | `python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous`<br>`python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous --lead 1` |
+
+### MTG gap backfill from the EUMETSAT Data Store (step 1a)
+
+The NMA internal server is the primary MTG source. Whatever never arrived there can be recovered from the EUMETSAT Data Store — opt-in, so a routine run never generates Data Store traffic on its own.
+
+The cycle is **summarise → fill → re-summarise**, and it runs entirely inside `summarize_mtg.py`:
+
+```bash
+# after a download, in one step
+python our_data/satellite_data/pipeline_msg_mtg.py --start … --end … \
+    --password_file creds.txt --fill-gaps --eumdac_credentials eumdac.txt
+
+# or standalone, to inspect the gaps before committing to a download
+python our_data/satellite_data/summarize_mtg.py --fill-from-datastore --fill-dry-run
+python our_data/satellite_data/summarize_mtg.py --fill-from-datastore \
+    --eumdac_credentials eumdac.txt
+```
+
+| Detail | Behaviour |
+|---|---|
+| Collection | **FDHSI** (`EO:EUM:DAT:0662`) only — it carries all five channels at the resolutions used. HRFI would add `vis_06` at 500 m, which the pipeline pools away. |
+| What gets filled | Both `missing_times` (no chunks) and `incomplete_times` (one of the two Romania chunks). `--no-fill-incomplete` restricts it to fully-absent cycles. |
+| Chunks | 35 and 36, matching `ROMANIA_CHUNKS`. |
+| Landing place | Straight into `_raw_chunks/` under native Data Store filenames — the same convention `parse_fci_filename` already reads, so no renaming step exists. |
+| Credentials | `--eumdac_credentials PATH` (two lines: key, then secret), or `EUMDAC_KEY` / `EUMDAC_SECRET`. Get a key at <https://api.eumetsat.int/api-key/>. |
+| Dependency | `eumdac`, imported lazily — the summary runs normally without it and only errors if the backfill is requested. |
+
+**What gets recorded.** After the second summary, a `datastore_fill` block is written into `mtg_missing_timesteps.json` alongside the refreshed `mtg_summary.csv`:
+
+```json
+"datastore_fill": {
+  "collection_id": "EO:EUM:DAT:0662",
+  "files_downloaded": 42,
+  "files": ["W_XX-EUMETSAT-Darmstadt,...,_0071_0035.nc", "…"],
+  "timesteps_filled": { "2025-05-14": ["11:40", "11:50"] },
+  "coverage_before_pct": 95.9, "coverage_after_pct": 99.1,
+  "missing_before": 416, "missing_after": 38,
+  "skipped_already_present": 0, "errors": []
+}
+```
+
+The same count and file list print to the console. Partial downloads are deleted rather than left behind, so a re-run resumes cleanly and files already on disk are skipped.
 
 ### OPERA SFTP notes (step 1b)
 

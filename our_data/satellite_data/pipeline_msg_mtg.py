@@ -897,6 +897,17 @@ if __name__ == "__main__":
         help='Download all 40 chunks instead of Romania-only',
     )
     parser.add_argument(
+        '--fill-gaps', action='store_true',
+        help='After downloading, summarise coverage and pull any missing '
+             'or single-chunk repeat cycles from the EUMETSAT Data Store, '
+             'then re-summarise. Requires `eumdac` and EUMDAC credentials.',
+    )
+    parser.add_argument(
+        '--eumdac_credentials', type=str, default=None,
+        help='Two-line EUMDAC credentials file (key, then secret) used by '
+             '--fill-gaps. Falls back to EUMDAC_KEY / EUMDAC_SECRET.',
+    )
+    parser.add_argument(
         '--skip_download', action='store_true',
         help='Skip SFTP download; process files already in '
              '<output_dir>/_raw_chunks/',
@@ -976,3 +987,19 @@ if __name__ == "__main__":
         skip_download=args.skip_download,
         workers=args.workers,
     )
+
+    if args.fill_gaps:
+        # The NMA server is the primary source; whatever never arrived
+        # there is recovered from the EUMETSAT Data Store. Delegated to
+        # summarize_mtg so there is exactly one implementation of the
+        # summarise -> fill -> re-summarise cycle.
+        import subprocess
+        cmd = [sys.executable,
+               str(Path(__file__).resolve().parent / 'summarize_mtg.py'),
+               '--fill-from-datastore']
+        if args.eumdac_credentials:
+            cmd += ['--eumdac_credentials', args.eumdac_credentials]
+        print("\n" + "=" * 70)
+        print("Download phase complete - checking coverage and backfilling")
+        print("=" * 70)
+        raise SystemExit(subprocess.call(cmd))

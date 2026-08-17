@@ -411,6 +411,29 @@ if __name__ == "__main__":
         help="Override the cadence minute filter (e.g. 00 10 30 40). "
              "Default: read from timestep_config.json.",
     )
+    parser.add_argument(
+        '--fill-from-datastore', action='store_true',
+        help="After summarising, fetch every missing / incomplete repeat "
+             "cycle from the EUMETSAT Data Store (FDHSI) into --raw_dir, "
+             "then re-summarise and record what was obtained. Requires "
+             "the `eumdac` package and EUMDAC credentials.",
+    )
+    parser.add_argument(
+        '--eumdac_credentials', type=str, default=None,
+        help="Two-line text file for --fill-from-datastore: EUMDAC key on "
+             "line 1, secret on line 2. Falls back to the EUMDAC_KEY and "
+             "EUMDAC_SECRET environment variables.",
+    )
+    parser.add_argument(
+        '--fill-dry-run', action='store_true',
+        help="With --fill-from-datastore, list what would be fetched "
+             "without downloading anything.",
+    )
+    parser.add_argument(
+        '--no-fill-incomplete', action='store_true',
+        help="With --fill-from-datastore, recover only fully-missing "
+             "cycles and leave one-chunk cycles alone.",
+    )
 
     args = parser.parse_args()
 
@@ -434,3 +457,47 @@ if __name__ == "__main__":
     print_table(rows)
     save_csv(rows, args.output)
     save_missing_json(dates, filter_minutes, args.missing)
+
+    if not args.fill_from_datastore:
+        sys.exit(0)
+
+    # ---- Backfill pass -------------------------------------------------
+    # The first summary above located the gaps. Fetch them from the Data
+    # Store, then summarise a SECOND time so the CSV / JSON on disk
+    # describe the post-backfill state, and record what was obtained.
+    from datastore_fill import collect_gaps, fill_gaps, print_report
+
+    before_json = build_missing_timesteps(dates, filter_minutes)
+    before = before_json['summary']
+    gaps = collect_gaps(before_json,
+                        include_incomplete=not args.no_fill_incomplete)
+
+    report = fill_gaps(
+        gaps,
+        raw_dir=args.raw_dir,
+        credentials_file=args.eumdac_credentials,
+        dry_run=args.fill_dry_run,
+    )
+    print_report(report)
+
+    if report['files_downloaded'] and not args.fill_dry_run:
+        print("\nRe-summarising after backfill ...\n")
+        rows, dates = summarize(args.raw_dir, filter_minutes)
+        print_table(rows)
+        save_csv(rows, args.output)
+
+    after = build_missing_timesteps(dates, filter_minutes)
+    report['coverage_before_pct'] = before['overall_coverage_pct']
+    report['coverage_after_pct'] = after['summary']['overall_coverage_pct']
+    report['missing_before'] = before['total_missing']
+    report['missing_after'] = after['summary']['total_missing']
+    after['datastore_fill'] = report
+
+    with open(args.missing, 'w') as f:
+        json.dump(after, f, indent=2)
+
+    print(f"\nCoverage {report['coverage_before_pct']}% -> "
+          f"{report['coverage_after_pct']}%  "
+          f"({report['missing_before']} -> {report['missing_after']} missing)")
+    print(f"Backfill record written into {args.missing} "
+          f"under `datastore_fill`.")
