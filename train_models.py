@@ -66,7 +66,7 @@ of that file for the editable fields.
 Requires:
     - TensorFlow 2.x with GPU support
     - Pre-built TF datasets from create_datasets.py
-    - our_data/lightning_fraction.json (for lightning modes only)
+    - our_data/lightning_fraction_dbscan.json (for `_occurrence` modes only)
 """
 
 import argparse
@@ -1566,7 +1566,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
             file). Used to name the saved model / history files and to
             locate the default dataset directory.
         data_root: path to our_data/ containing datasets/{mode}_{source}/
-            and lightning_fraction.json.
+            and lightning_fraction_<source>.json.
         epochs: number of training epochs.
         batch_size: training batch size.
         output_dir: where to save model + history.
@@ -2142,7 +2142,7 @@ def main():
     )
     parser.add_argument(
         "--data_root", type=str, default="./our_data",
-        help="Root directory containing datasets/ and lightning_fraction.json.",
+        help="Root directory containing datasets/ and lightning_fraction_<source>.json.",
     )
     parser.add_argument(
         "--stage", type=str, default="base",
