@@ -478,7 +478,7 @@ def get_mode_config(mode):
         # head predicts binary lightning occurrence at T+future_steps
         # instead of OPERA rainfall. Loss switches to WeightedFocalLoss
         # (label_type == 'lightning'), whose prior reads
-        # lightning_fraction.json at training time.
+        # lightning_fraction_<source>.json at training time.
         return {
             "past_hr": (hr_lightning_vis, 256, "HR"),
             "past_mr": (mr_opera_mtg, 128, "LR"),
