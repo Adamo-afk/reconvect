@@ -179,7 +179,7 @@ python our_data/satellite_data/summarize_mtg.py --fill-from-datastore \
 |---|---|
 | Collection | **FDHSI** (`EO:EUM:DAT:0662`) only — it carries all five channels at the resolutions used. HRFI would add `vis_06` at 500 m, which the pipeline pools away. |
 | What gets filled | Both `missing_times` (no chunks) and `incomplete_times` (one of the two Romania chunks). `--no-fill-incomplete` restricts it to fully-absent cycles. |
-| Chunks | 35 and 36, matching `ROMANIA_CHUNKS`. |
+| Chunks | 35 and 36, matching `ROMANIA_CHUNKS` — see the chunk map under [Data products](#data-products). |
 | Landing place | Straight into `_raw_chunks/` under native Data Store filenames — the same convention `parse_fci_filename` already reads, so no renaming step exists. |
 | Credentials | `--eumdac_credentials PATH` (two lines: key, then secret), or `EUMDAC_KEY` / `EUMDAC_SECRET`. Get a key at <https://api.eumetsat.int/api-key/>. |
 | Dependency | `eumdac`, imported lazily — the summary runs normally without it and only errors if the backfill is requested. |
@@ -463,6 +463,23 @@ Tune these to change behaviour without touching the architecture.
 | Cloud top temperature (TIR) | `ir_105` (10.5 µm) |
 | Upper-tropospheric moisture (WV) | `wv_63` (6.3 µm) |
 | Mid-tropospheric moisture (WV) | `wv_73` (7.3 µm) |
+
+**Chunk selection** — FCI does not deliver the disk as one file. Each repeat cycle is split into **40 body chunks**, numbered south → north, each a latitude band of the geostationary disk. The number is the trailing `_00NN` in the filename that `parse_fci_filename` reads.
+
+<div align="center">
+  <img src="assets/MTG_chunks.png" width="900" alt="MTG-FCI chunk map: 40 latitude-band chunks over the geostationary disk, with per-chunk scan offsets"/>
+  <br/>
+  <sub><em>FCI scan chunk map — source: <a href="https://meteofrance.com/">Météo-France</a></em></sub>
+</div>
+
+Romania falls in **chunks 35 and 36** — `ROMANIA_CHUNKS`, applied in `pipeline_msg_mtg.py` and `datastore_fill.py` alike. Two consequences:
+
+| | |
+|---|---|
+| Volume | Fetching 2 of 40 chunks is a **20× reduction**. The filter is applied *before* transfer, so the discarded 38 never cross the wire. `--full_disk` overrides it and pulls all 40. |
+| Latency | Chunks 35–36 are scanned at roughly **+8 min** into the 10-minute cycle (see the offsets on the left of the diagram). A cycle is not complete on the server the moment it nominally starts — a run chasing the current hour will legitimately find the newest slot absent. |
+
+The diagram is Météo-France's, so its highlight sits on chunks 36–37, their own band. Ours is one chunk further south.
 
 ---
 
