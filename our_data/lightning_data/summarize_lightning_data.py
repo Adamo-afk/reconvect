@@ -44,9 +44,15 @@ import os
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+
+# Matches reproject.py's default. Scanning is I/O-bound — every array is
+# read in full to test a single condition — so the useful worker count
+# tracks disk throughput rather than core count.
+DEFAULT_WORKERS = 6
 
 
 # =============================================================================
@@ -130,37 +136,95 @@ def has_activity(npy_path: Path) -> bool:
     return bool(np.any(data != 0))
 
 
-def scan_product(data_dir: Path, product: str) -> dict[str, dict[str, bool]]:
+def scan_day(args: tuple[str, str, str]) -> tuple[str, dict[str, bool]]:
+    """Scan one (product, date) directory. Worker for the process pool.
+
+    Must live at module level so ProcessPoolExecutor can pickle it — the
+    same constraint reproject.py's workers are written under. Takes and
+    returns plain types for the same reason.
+
+    Args:
+        args: (day_dir, date_str, product) — paths as str, not Path.
+
+    Returns:
+        (date_str, {HHMM: active_bool})
     """
-    Scan one sub-product's date directories.
+    day_dir_str, date_str, product = args
+    day_dir = Path(day_dir_str)
+    expected_date_compact = date_str.replace('-', '')
+    result: dict[str, bool] = {}
+
+    for filename in sorted(os.listdir(day_dir)):
+        fm = FILE_PATTERN.match(filename)
+        if not fm or fm.group('product') != product:
+            continue
+        if fm.group('date') != expected_date_compact:
+            # Stray file from another date in this subdir — skip.
+            continue
+        result[fm.group('hhmm')] = has_activity(day_dir / filename)
+
+    return date_str, result
+
+
+def scan_product(data_dir: Path, product: str,
+                 workers: int = DEFAULT_WORKERS) -> dict[str, dict[str, bool]]:
+    """
+    Scan one sub-product's date directories, one worker per date.
 
     Returns: {date_str: {HHMM: active_bool}}, where `active_bool` is True
     if the .npy file exists AND has at least one non-zero pixel.
+
+    Parallel per day rather than per file: the unit of work is then large
+    enough to dwarf the process-dispatch overhead, while still giving
+    hundreds of independent tasks. Every array is read in full only to
+    test `np.any(data != 0)`, so across three products and a full archive
+    this is hundreds of gigabytes of reads — serial scanning is the
+    bottleneck, not the arithmetic.
     """
     out: dict[str, dict[str, bool]] = defaultdict(dict)
     prod_root = data_dir / PRODUCTS[product]["subdir"]
     if not prod_root.is_dir():
         return out
 
+    tasks: list[tuple[str, str, str]] = []
     for entry in sorted(os.listdir(prod_root)):
         m = DATE_DIR_PATTERN.match(entry)
         if not m:
             continue
-        date_str = m.group(1)
         day_dir = prod_root / entry
         if not day_dir.is_dir():
             continue
+        tasks.append((str(day_dir), m.group(1), product))
 
-        expected_date_compact = date_str.replace('-', '')
-        for filename in sorted(os.listdir(day_dir)):
-            fm = FILE_PATTERN.match(filename)
-            if not fm or fm.group('product') != product:
-                continue
-            if fm.group('date') != expected_date_compact:
-                # Stray file from another date in this subdir — skip.
-                continue
-            hhmm = fm.group('hhmm')
-            out[date_str][hhmm] = has_activity(day_dir / filename)
+    if not tasks:
+        return dict(out)
+
+    # One worker is pointless overhead; fall back to a plain loop so the
+    # single-threaded path stays debuggable.
+    n_workers = max(1, min(workers, len(tasks)))
+    if n_workers == 1:
+        for task in tasks:
+            date_str, result = scan_day(task)
+            if result:
+                out[date_str] = result
+        return dict(out)
+
+    print(f"  scanning {product}: {len(tasks)} date(s), {n_workers} workers")
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = {executor.submit(scan_day, t): t[1] for t in tasks}
+        done = 0
+        for future in as_completed(futures):
+            date_str = futures[future]
+            try:
+                date_str, result = future.result()
+                if result:
+                    out[date_str] = result
+            except Exception as exc:                      # noqa: BLE001
+                print(f"  WARNING: {product} {date_str} failed: {exc}",
+                      file=sys.stderr)
+            done += 1
+            if done % 100 == 0 or done == len(tasks):
+                print(f"    [{done}/{len(tasks)}]", flush=True)
 
     return dict(out)
 
@@ -176,12 +240,45 @@ def expected_hhmm_set(minute_filter: set[int]) -> set[str]:
             for m in minute_filter}
 
 
+def date_range(start: str | None, end: str | None) -> list[str]:
+    """Every YYYY-MM-DD from start to end inclusive, or [] if unbounded.
+
+    Declaring the expected range is what turns "no files for this date"
+    into a reported gap. Inferring it from the files found cannot see a
+    date absent from disk entirely — it is simply not described, and so
+    never appears as missing coverage.
+    """
+    if not start or not end:
+        return []
+    from datetime import datetime, timedelta
+    try:
+        d0 = datetime.strptime(start, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"ERROR: --start/--end must be YYYY-MM-DD "
+              f"(got {start!r}, {end!r})", file=sys.stderr)
+        sys.exit(2)
+    if d1 < d0:
+        print(f"ERROR: --end {end} precedes --start {start}", file=sys.stderr)
+        sys.exit(2)
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
 def summarize(activity_by_product: dict[str, dict[str, dict[str, bool]]],
-              minute_filter: set[int]):
+              minute_filter: set[int],
+              start: str | None = None,
+              end: str | None = None):
     """
     Build per-date stats.
 
     `activity_by_product[p][date][HHMM] = bool` from scan_product().
+    `start`/`end` (YYYY-MM-DD, inclusive) declare the range the cache is
+    EXPECTED to cover; dates in range with no maps are reported as fully
+    missing rather than omitted.
 
     Returns (rows, detail) where:
         rows: list of per-date dicts ready for CSV / table
@@ -192,6 +289,21 @@ def summarize(activity_by_product: dict[str, dict[str, dict[str, bool]]],
     all_dates: set[str] = set()
     for p in PRODUCTS:
         all_dates.update(activity_by_product[p].keys())
+
+    expected_dates = date_range(start, end)
+    if expected_dates:
+        empty = [d for d in expected_dates if d not in all_dates]
+        outside = sorted(all_dates - set(expected_dates))
+        all_dates.update(expected_dates)
+        print(f"Expected range : {expected_dates[0]} .. {expected_dates[-1]} "
+              f"({len(expected_dates)} dates)")
+        if empty:
+            print(f"  {len(empty)} date(s) in range have NO maps at all "
+                  f"— reported as fully missing")
+        if outside:
+            print(f"  WARNING: {len(outside)} date(s) on disk fall OUTSIDE "
+                  f"the range and are still reported: {outside[:5]}"
+                  + (" ..." if len(outside) > 5 else ""))
 
     rows: list[dict] = []
     detail: dict = {}
@@ -385,6 +497,21 @@ def save_active_csv(activity_by_product: dict[str, dict[str, dict[str, bool]]],
 # CLI
 # =============================================================================
 
+def render_chart(rows, output_path):
+    """Monthly coverage chart from the per-date rows."""
+    # One implementation, in the canonical summariser, so the
+    # three product charts cannot drift apart.
+    sys.path.insert(0, str(PROJECT_ROOT / 'our_data' / 'satellite_data'))
+    from summarize_mtg import plot_monthly
+    found = {r['date']: r['complete_union'] for r in rows}
+    expected = {r['date']: r['expected_grid'] for r in rows}
+    span = f"{min(found)} .. {max(found)}" if found else ""
+    return plot_monthly(found, output_path,
+                        title=f"LINET coverage  {span}",
+                        per_date_expected=expected,
+                        ylabel="active timesteps")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Summarise lightning .npy cache by date + emit the "
@@ -403,6 +530,31 @@ def main() -> int:
         '--active', '-a', type=str, default=str(DEFAULT_ACTIVE_CSV),
         help=f'Output active-steps CSV consumed by intersect_product_coverage.py '
              f'(default: {DEFAULT_ACTIVE_CSV})',
+    )
+    parser.add_argument(
+        '--chart', type=str, nargs='?', const='lightning_coverage.png', default=None,
+        help="Render a monthly coverage chart (faded bars + line through "
+             "the bar tops, with the cadence expectation as a dashed "
+             "reference). Optional PNG path; defaults to "
+             "lightning_coverage.png at the project root.",
+    )
+    parser.add_argument(
+        '--start', type=str, default=None,
+        help="First date the cache is EXPECTED to cover (YYYY-MM-DD). "
+             "Dates in range with no maps are reported as fully missing "
+             "instead of being omitted. Without this the range is inferred "
+             "from the files found, so an entirely absent date is invisible.",
+    )
+    parser.add_argument(
+        '--end', type=str, default=None,
+        help="Last expected date, inclusive (YYYY-MM-DD). See --start.",
+    )
+    parser.add_argument(
+        '--workers', '-w', type=int, default=DEFAULT_WORKERS,
+        help=f'Parallel workers for the per-date scan (default: '
+             f'{DEFAULT_WORKERS}, matching reproject.py). Every .npy is '
+             f'read in full to test for a non-zero pixel, so this is '
+             f'disk-bound; 1 forces the serial path.',
     )
 
     args = parser.parse_args()
@@ -427,7 +579,7 @@ def main() -> int:
     print()
 
     activity_by_product = {
-        p: scan_product(data_dir, p) for p in PRODUCTS
+        p: scan_product(data_dir, p, workers=args.workers) for p in PRODUCTS
     }
     for p in PRODUCTS:
         n_dates = len(activity_by_product[p])
@@ -439,10 +591,13 @@ def main() -> int:
         print(f"  {p:10s} : {n_dates} dates, {n_files} files, {n_active} active")
     print()
 
-    rows, _detail = summarize(activity_by_product, minute_filter)
+    rows, _detail = summarize(activity_by_product, minute_filter,
+                              start=args.start, end=args.end)
     print_table(rows)
 
     save_summary_csv(rows, Path(args.output))
+    if args.chart:
+        render_chart(rows, args.chart)
     save_active_csv(activity_by_product, minute_filter, Path(args.active))
 
     return 0

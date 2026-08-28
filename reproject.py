@@ -586,7 +586,8 @@ def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=Non
     Output: .npy files containing the reprojected 2-D array on the
     768×1536 EPSG:31700 grid. The shared Romania-grid lat/lon arrays
     are written once by run() at reprojected_data/romania_grid_{lats,lons}.npy
-    (not per-product). Use inspect_mtg.py to reconstruct full .nc files
+    (not per-product). Use inspect_lightning.py as a template to
+    reconstruct full .nc files
     for GIS viewing.
     """
     mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')

@@ -99,6 +99,11 @@ from pathlib import Path
 import numpy as np
 
 from pipeline_config import SOURCE
+from periods import (
+    normalization_stats_name,
+    sequence_meta_name,
+    split_csv_name,
+)
 
 
 # =============================================================================
@@ -807,6 +812,11 @@ def main() -> int:
                              'our_data/normalization_stats_<source>.json.')
     parser.add_argument('--seed', type=int, default=0,
                         help='RNG seed (default: 0).')
+    parser.add_argument('--period', type=str, default=None,
+                        help='Ensemble member label (e.g. 2025warm). Scopes '
+                             'the default train CSV, sequence metadata and '
+                             'output filename to that member. Omit for the '
+                             'unscoped, whole-archive files.')
 
     args = parser.parse_args()
     if not args.with_percentiles:
@@ -826,21 +836,24 @@ def main() -> int:
 
     # Resolve per-source paths. The user can override any of them with
     # an explicit flag - we only build the default when it's missing.
+    # Statistics are per-period as well as per-source: a member trained on
+    # the warm half-year must be normalised by warm-half statistics, or the
+    # z-scores carry information from dates that member never trained on.
     reproject_root = Path(args.reproject_root)
     train_csv = Path(
         args.train_csv
         if args.train_csv
-        else DEFAULT_DATA_ROOT / f"train_data_{SOURCE}.csv"
+        else DEFAULT_DATA_ROOT / split_csv_name("train", SOURCE, args.period)
     )
     seq_meta_path = Path(
         args.sequence_meta
         if args.sequence_meta
-        else DEFAULT_DATA_ROOT / f"sequence_meta_{SOURCE}.json"
+        else DEFAULT_DATA_ROOT / sequence_meta_name(SOURCE, args.period)
     )
     output_path = Path(
         args.output
         if args.output
-        else DEFAULT_DATA_ROOT / f"normalization_stats_{SOURCE}.json"
+        else DEFAULT_DATA_ROOT / normalization_stats_name(SOURCE, args.period)
     )
 
     variables = None
@@ -911,6 +924,7 @@ def main() -> int:
         "computed_utc":   datetime.now(timezone.utc)
                                  .isoformat(timespec="seconds"),
         "source":         SOURCE,
+        "period":         args.period,
         "reproject_root":    str(reproject_root),
         "training_filter": {
             "train_csv":       (None if args.no_split_filter else str(train_csv)),

@@ -19,9 +19,10 @@ Output:
     into these files correctly.
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
-    python extract_patches.py --source dbscan
-    python extract_patches.py --source dbscan --date 2025-05-15
-    python extract_patches.py --source dbscan --products satellite_MTG opera
+    python extract_patches.py
+    python extract_patches.py --date 2025-05-15
+    python extract_patches.py --products satellite_MTG opera
+    python extract_patches.py --period w48 --products opera
 """
 
 import numpy as np
@@ -135,10 +136,20 @@ def average_pool(data, factor):
 # =============================================================================
 
 def _resolve_index_csv(data_root, source):
-    """Path to the patch-activity index CSV."""
-    if source == SOURCE:
+    """Path to the patch-activity index CSV.
+
+    One index serves every period. identify_patches.py has no period
+    concept - it marks convective activity from OPERA alone - and each
+    period's split CSVs are gated subsets of the same index, so they all
+    read it. The tag is still checked, so a typo surfaces here rather
+    than as a silently empty extraction.
+    """
+    if source == SOURCE or source.startswith(f"{SOURCE}_"):
         return os.path.join(data_root, 'patch_index', 'patch_index.csv')
-    raise ValueError(f"Unknown source: {source!r}")
+    raise ValueError(
+        f"Unknown source: {source!r} "
+        f"(expected {SOURCE!r} or {SOURCE}_<period>)"
+    )
 
 
 def read_patch_index(data_root, source='dbscan'):
@@ -189,7 +200,9 @@ def _load_step_minutes_from_sequence_meta(data_root, source):
     if not os.path.isfile(meta_path):
         print(
             f"ERROR: {meta_path} not found.\n"
-            f"Run extract_patch_seq_for_datasets.py --source {source} first.",
+            f"Run extract_patch_seq_for_datasets.py first"
+            + (f" with --period {source[len(SOURCE) + 1:]}"
+               if source != SOURCE else "") + ".",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -649,7 +662,7 @@ def run_extraction(data_root, output_root, source='dbscan',
         patches_str = ','.join(str(p) for p in active_patches)
         if (idx + 1) % 50 == 0 or idx == 0 or idx == len(index) - 1:
             print(f"  [{idx+1}/{len(index)}] {date_str} {time_str} "
-                  f"patches=[{patches_str}] → {n_saved} saved, "
+                  f"patches=[{patches_str}] -> {n_saved} saved, "
                   f"{n_missing} missing")
 
     # Summary
@@ -666,7 +679,7 @@ def run_extraction(data_root, output_root, source='dbscan',
     for var_name, (group, res_tag, pool_factor) in sorted(all_vars.items()):
         out_size = PATCH_SIZE // pool_factor
         print(f"    {var_name:<14} {group:<16} {res_tag}  "
-              f"{out_size}×{out_size}")
+              f"{out_size}x{out_size}")
 
 
 # =============================================================================
@@ -676,7 +689,7 @@ def run_extraction(data_root, output_root, source='dbscan',
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="COALITION-4 patch extraction pipeline. "
-                    "Extracts 256×256 patches from reprojected data based on "
+                    "Extracts 256x256 patches from reprojected data based on "
                     "the patch index, with resolution-dependent pooling."
     )
     parser.add_argument(
@@ -697,15 +710,29 @@ if __name__ == "__main__":
         default=None,
         help="Product groups to extract (default: all)"
     )
+    parser.add_argument(
+        "--period", type=str, default=None, metavar="LABEL",
+        help="Slice patches for a period-suffixed split set, e.g. "
+             f"--period w48 reads {{train,validation,test}}_data_{SOURCE}_w48"
+             ".csv. Omit for the unsuffixed whole-archive splits. Lets "
+             "split sets built under different gates coexist: the patch "
+             "index is shared, but each period's splits select their own "
+             "subset of it.",
+    )
 
     args = parser.parse_args()
 
     output_root = args.output_dir or os.path.join(args.data_root, 'patches')
 
+    # The split CSVs, the sequence metadata and the saved patches are all
+    # keyed by this tag, so it has to be assembled once and threaded
+    # through rather than re-derived at each call site.
+    source = f"{SOURCE}_{args.period}" if args.period else SOURCE
+
     run_extraction(
         data_root=args.data_root,
         output_root=output_root,
-        source=SOURCE,
+        source=source,
         date_filter=args.date,
         product_filter=args.products,
     )

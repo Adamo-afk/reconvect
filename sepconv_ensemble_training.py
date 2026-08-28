@@ -36,9 +36,11 @@ from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callbac
 
 from create_datasets import get_mode_config, load_tfrecord_dataset
 from pipeline_config import SOURCE
-from train_models import (build_run_tag,
-                          weighted_loss_multiple_thresholds,
-                          RAINFALL_MSE_WEIGHTS)
+# `weighted_loss_multiple_thresholds` / RAINFALL_MSE_WEIGHTS are NOT
+# imported any more: those were built for the /70-bounded continuous head.
+# The baseline's target is log_zscore, so its weighting is derived from
+# measured class frequencies instead — see build_sepconv_loss below.
+from train_models import build_run_tag
 
 
 # ============================================================================
@@ -51,24 +53,32 @@ from train_models import (build_run_tag,
 #   HR  = MTG vis_06                                        -> 1 channel
 #   MR  = OPERA reflectivity + rainfall_rate + MTG IR/WV     -> 6 channels
 # Leading 3 = past timesteps (t-2, t-1, t0).
-MODE_CONFIGS = {
-    "mtg_opera_mtgmr_continuous": {
-        "branches": {
-            "past_hr": {"shape": (3, 256, 256, 1), "resolution": 256},
-            "past_mr": {"shape": (3, 128, 128, 6), "resolution": 128},
-        },
-    },
-}
+# The baseline is radar-only by design — no MTG, no LINET. Modality
+# enrichment is what RECONVECT is being credited for, so handing it to
+# the baseline would erase the very difference under test.
+SEPCONV_MODE = "opera_sepconv_logz"
 
 # Architecture constants (from paper)
 HR_SIZE = 256
 KERNEL = (5, 5)
 ACTIVATION = 'selu'
 DEPTH_MULT = 1
-TARGET_CHANNELS = 200
 
-LEAD_NAMES = {1: "t+15", 2: "t+30", 3: "t+45"}
-LEAD_MINUTES = {1: 15, 2: 30, 3: 45}
+# Base models, per the paper: Bm1, Bm3, Bm5 predict 1, 3 and 5 steps
+# ahead. On our 15-minute grid that is 15, 45 and 75 minutes — the paper's
+# 6-minute grid made them 6, 18 and 30.
+SEPCONV_BASE_LEADS = (1, 3, 5)
+STEP_MINUTES = 15
+MAX_COMPOSED_STEPS = 8
+
+LEAD_MINUTES = {k: k * STEP_MINUTES for k in range(1, MAX_COMPOSED_STEPS + 1)}
+LEAD_NAMES = {k: f"t+{v}" for k, v in LEAD_MINUTES.items()}
+
+# Which of the 5 available past frames (t-4 .. t0) feed the model during
+# TRAINING. The paper trains every base model on the last four frames,
+# Phi_i(M_t-3, M_t-2, M_t-1, M_t) = M_t+i; t-4 is used only by the
+# composition scheme at inference. Index 0 is t-4.
+TRAIN_FRAME_SLICE = slice(1, 5)
 
 # Post-processing thresholds to recover 5 classes (used in evaluation)
 # Raw rain rate normalized by /70: thresholds at 10, 20, 30, 40 mm/h
@@ -83,83 +93,208 @@ THRESHOLDS_NORM = [10.0 / 70.0, 20.0 / 70.0, 30.0 / 70.0, 40.0 / 70.0]
 # Base model (regression: sigmoid output)
 # ============================================================================
 
-def build_sepconv_base_model(mode, lead_idx):
-    """Build one SepConv base model.
+# Paper architecture constants (Czibula et al. 2024, Fig. 2).
+SEPCONV_PAST_STEPS = 4        # l = 4 previous frames, one Input each
+SEPCONV_EXPAND = 51           # per-input SeparableConv2D output width
+SEPCONV_TRUNK_WIDE = 100      # first reduction from the 204-wide concat
+SEPCONV_TRUNK_NARROW = 50     # second reduction
+SEPCONV_REPEATS = 4           # the "X4" blocks in Fig. 2
 
-    Output: (batch, 256, 256, 1) — continuous rain rate in [0, 1] via sigmoid.
+
+def build_sepconv_base_model(lead_steps, input_size=HR_SIZE,
+                             in_channels=1, out_channels=1):
+    """One SepConv base model, faithful to Czibula et al. 2024 Fig. 2.
+
+    Topology, per the paper:
+        4 Inputs (one per past frame)
+          -> SeparableConv2D  C_in -> 51   + SELU     (per input)
+          -> Concatenate                    = 204
+          -> SeparableConv2D  204 -> 100   + SELU
+          -> SeparableConv2D  100 -> 100   + SELU     x4
+          -> SeparableConv2D  100 -> 50    + SELU
+          -> SeparableConv2D   50 -> 50    + SELU     x4
+          -> SeparableConv2D   50 -> C_out            (LINEAR)
+    ten hidden separable layers plus the output layer.
+
+    Two documented deviations from the paper:
+
+    1. `C_in = 1`, not 6. The paper stacks six reflectivity elevations
+       (R01-R04, R06-R07); we have a single OPERA composite rainfall-rate
+       field. The 51-wide expansion is kept as published, so the concat is
+       still 204 and the trunk is untouched — only the first layer's input
+       depth changes.
+
+    2. The output layer is LINEAR, where the paper applies SELU after
+       every separable layer. Our target is log_zscore rain rate, whose
+       dry point mass sits at z = -0.291; SELU's negative saturation floor
+       is -lambda*alpha = -1.758, so SELU would in fact reach it. Linear
+       is kept anyway because the upper tail runs to z = +9.5 and there is
+       no reason to put a saturating nonlinearity in front of a regression
+       target we later exponentiate — an error at the top of the range
+       becomes multiplicative in mm/h.
+
+    Args:
+        lead_steps: how many steps ahead this base model predicts (1, 3
+            or 5), used only for naming.
+        input_size: patch edge, 256.
+        in_channels: channels per past frame (1 for OPERA rainfall).
+        out_channels: predicted channels (1).
+
+    Returns:
+        keras Model with `SEPCONV_PAST_STEPS` named inputs.
     """
-    config = MODE_CONFIGS[mode]
-    branches = config["branches"]
-    n_timesteps = 3
-    n_total_inputs = len(branches) * n_timesteps
-    expand_ch = TARGET_CHANNELS // n_total_inputs + 1
+    inputs = [
+        Input(shape=(input_size, input_size, in_channels), name=f"past_t{t}")
+        for t in range(SEPCONV_PAST_STEPS)
+    ]
 
-    inputs = {}
-    for key, cfg in branches.items():
-        inputs[key] = Input(shape=cfg["shape"], name=key)
+    # --- per-input expansion -------------------------------------------
+    expanded = []
+    for t, inp in enumerate(inputs):
+        x = SeparableConv2D(SEPCONV_EXPAND, KERNEL, padding='same',
+                            depth_multiplier=DEPTH_MULT,
+                            name=f"expand_t{t}")(inp)
+        x = Activation(ACTIVATION, name=f"expand_selu_t{t}")(x)
+        expanded.append(x)
 
-    branch_features = []
-    for key, cfg in branches.items():
-        branch_input = inputs[key]
-        resolution = cfg["resolution"]
-        timestep_features = []
-        for t in range(n_timesteps):
-            xt = Lambda(lambda x, _t=t: x[:, _t],
-                        name=f"{key}_t{t}")(branch_input)
-            xt = SeparableConv2D(expand_ch, KERNEL, padding='same',
-                                 depth_multiplier=DEPTH_MULT,
-                                 name=f"{key}_expand_t{t}")(xt)
-            xt = Activation(ACTIVATION)(xt)
-            timestep_features.append(xt)
+    x = Concatenate(axis=-1, name="concat")(expanded)   # 4 x 51 = 204
 
-        branch_feat = Concatenate(axis=-1,
-                                   name=f"{key}_time_cat")(timestep_features)
-        if resolution < HR_SIZE:
-            scale = HR_SIZE // resolution
-            branch_feat = UpSampling2D(
-                size=(scale, scale), interpolation='bilinear',
-                name=f"{key}_upsample")(branch_feat)
-        branch_features.append(branch_feat)
-
-    if len(branch_features) > 1:
-        x = Concatenate(axis=-1, name="branch_merge")(branch_features)
-    else:
-        x = branch_features[0]
-
-    for i in range(5):
-        x = SeparableConv2D(100, KERNEL, padding='same',
+    # --- trunk: 204 -> 100 (x5) -> 50 (x5) ------------------------------
+    x = SeparableConv2D(SEPCONV_TRUNK_WIDE, KERNEL, padding='same',
+                        name="trunk_100_0")(x)
+    x = Activation(ACTIVATION, name="trunk_100_selu_0")(x)
+    for i in range(1, SEPCONV_REPEATS + 1):
+        x = SeparableConv2D(SEPCONV_TRUNK_WIDE, KERNEL, padding='same',
                             name=f"trunk_100_{i}")(x)
-        x = Activation(ACTIVATION)(x)
-    for i in range(5):
-        x = SeparableConv2D(50, KERNEL, padding='same',
-                            name=f"trunk_50_{i}")(x)
-        x = Activation(ACTIVATION)(x)
+        x = Activation(ACTIVATION, name=f"trunk_100_selu_{i}")(x)
 
-    # Regression output: 1 channel, sigmoid bounds to [0, 1]
-    x = SeparableConv2D(1, KERNEL, padding='same', name="output_conv")(x)
-    outputs = Activation('sigmoid', name="output_sigmoid")(x)
+    x = SeparableConv2D(SEPCONV_TRUNK_NARROW, KERNEL, padding='same',
+                        name="trunk_50_0")(x)
+    x = Activation(ACTIVATION, name="trunk_50_selu_0")(x)
+    for i in range(1, SEPCONV_REPEATS + 1):
+        x = SeparableConv2D(SEPCONV_TRUNK_NARROW, KERNEL, padding='same',
+                            name=f"trunk_50_{i}")(x)
+        x = Activation(ACTIVATION, name=f"trunk_50_selu_{i}")(x)
+
+    # Linear output — see deviation 2 above. Do NOT add an activation
+    # here: the value is in log_zscore space and is exponentiated
+    # downstream, so saturation is silently destructive.
+    outputs = SeparableConv2D(out_channels, KERNEL, padding='same',
+                              name="output_conv")(x)
 
     return Model(inputs=inputs, outputs=outputs,
-                 name=f"sepconv_ensemble_{mode}_bm{lead_idx}")
+                 name=f"sepconv_bm{lead_steps}")
 
 
 # ============================================================================
 # Dataset: extract single lead time (labels already continuous)
 # ============================================================================
 
-def extract_lead_time(inputs, labels, lead_idx):
-    """(3, 256, 256, 1) → single lead → (256, 256, 1)"""
-    return inputs, labels[lead_idx - 1]
+class WeightedMSELogZ(tf.keras.losses.Loss):
+    """MSE re-weighted by rainfall class, evaluated in log_zscore space.
+
+    Necessary, not cosmetic: 99.815% of training pixels are class 0, and
+    in this space the dry point mass sits at z = -0.291 while 10-40 mm/h
+    spans z = +5.55..+6.72. Plain MSE is minimised by emitting -0.291
+    everywhere, which is a worse failure mode than the smoothing the
+    paper reports.
+
+    Weights come from measured class frequencies (see
+    train_models.load_sepconv_class_weights) and the class of a pixel is
+    decided from the TARGET, so the weighting is a property of the data
+    rather than of the current prediction.
+
+    The paper's own weighting is unpublished; this scheme is ours and is
+    reported as ours.
+    """
+
+    def __init__(self, edges_z, weights, name="weighted_mse_logz", **kw):
+        super().__init__(name=name, **kw)
+        self.edges_z = [float(e) for e in edges_z]
+        self.weights = [float(w) for w in weights]
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        # Class index from the target: 0 below the first edge, then one
+        # step per edge crossed.
+        cls = tf.zeros_like(y_true, dtype=tf.int32)
+        for edge in self.edges_z:
+            cls += tf.cast(y_true >= edge, tf.int32)
+        w = tf.gather(tf.constant(self.weights, tf.float32), cls)
+        return tf.reduce_mean(w * tf.square(y_true - y_pred))
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"edges_z": self.edges_z, "weights": self.weights})
+        return cfg
 
 
-def prepare_dataset(ds_path, mode, lead_idx, batch_size, shuffle=False):
-    # Datasets are TFRecord shards written by create_datasets.py; the
-    # mode_config supplies the parse signature.
-    ds = load_tfrecord_dataset(Path(ds_path), get_mode_config(mode))
-    ds = ds.map(lambda x, y: extract_lead_time(x, y, lead_idx),
+def build_sepconv_loss(data_root, source, weights_period=None,
+                       stats_period=None):
+    """Weighted MSE with class edges mapped into log_zscore space.
+
+    The two scopes are deliberately opposite, and conflating them is a
+    silent-corruption bug in both directions:
+
+    * `stats_period` — the mean/std defining the space. Scoped to this
+      model's own training split. A z-value only means something relative
+      to the constants that produced it, so the invariant that matters is
+      that TRAINING and INVERSION use the same ones: whatever is passed
+      here must also be passed to `sepconv_predict.to_mmh`. Mixing them
+      recovers the wrong mm/h, monotonically worse with intensity.
+
+      Not shared with RECONVECT on purpose. Its training split contains
+      36 of this model's test timestamps, so borrowing its statistics
+      would let them into the constants defining this model's space.
+
+    * `weights_period` — the class balance of the split this model
+      actually trains on. Scoped for the same reason: the baseline uses a
+      longer sequence window and therefore a different set of rows.
+    """
+    from create_datasets import (RAINFALL_CLASS_EDGES, mmh_to_logz,
+                                 set_normalization_stats_path)
+    from periods import normalization_stats_name, data_tag
+    from train_models import load_sepconv_class_weights
+
+    stats_file = normalization_stats_name(source, stats_period)
+    set_normalization_stats_path(Path(data_root) / stats_file)
+
+    weights = load_sepconv_class_weights(data_root, source, weights_period)
+    edges_z = [float(mmh_to_logz(e)) for e in RAINFALL_CLASS_EDGES]
+
+    print(f"  Loss: weighted MSE in log_zscore space")
+    print(f"    stats (shared)     : {stats_file}")
+    print(f"    weights scope      : "
+          f"opera_rainfall_fraction_{data_tag(source, weights_period)}.json")
+    print(f"    class edges (mm/h) : {list(RAINFALL_CLASS_EDGES)}")
+    print(f"    class edges (z)    : {[round(e, 4) for e in edges_z]}")
+    print(f"    weights            : {[round(w, 1) for w in weights]}")
+    return WeightedMSELogZ(edges_z, weights)
+
+
+def extract_lead_time(inputs, labels, lead_steps):
+    """Reshape one sample for a SepConv base model.
+
+    Inputs arrive as a dict with `past_hr` of shape (5, 256, 256, 1) —
+    frames t-4 .. t0. Training uses the last four, matching the paper's
+    Phi_i(M_t-3, M_t-2, M_t-1, M_t). Labels arrive as (8, 256, 256, 1);
+    a base model targets exactly one of them.
+    """
+    frames = inputs["past_hr"][TRAIN_FRAME_SLICE]
+    model_inputs = {f"past_t{i}": frames[i] for i in range(SEPCONV_PAST_STEPS)}
+    return model_inputs, labels[lead_steps - 1]
+
+
+def prepare_dataset(ds_path, lead_steps, batch_size, shuffle=False,
+                    shuffle_buffer=1000):
+    # TFRecord shards written by create_datasets.py; the mode config
+    # supplies the parse signature.
+    ds = load_tfrecord_dataset(Path(ds_path), get_mode_config(SEPCONV_MODE))
+    ds = ds.map(lambda x, y: extract_lead_time(x, y, lead_steps),
                 num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
-        ds = ds.shuffle(1000)
+        ds = ds.shuffle(shuffle_buffer)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
@@ -191,44 +326,74 @@ class WallTimeCallback(Callback):
 # Train one base model
 # ============================================================================
 
-def train_base_model(mode, lead_idx, data_root, model_dir, epochs, batch_size):
+def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
+                     learning_rate=1e-3, lr_patience=5, es_patience=10,
+                     period=None):
+    """Train one base model Bm{lead_steps}.
+
+    Optimiser parity with the paper: AMSGrad variant of Adam at lr 1e-3,
+    with a callback that halves the rate when validation loss plateaus.
+    The paper does not state its stopping criterion or epoch budget, so
+    `--es_patience` / `--epochs` are ours and are recorded in the history
+    JSON alongside the sweep that chose them.
+    """
     data_root = Path(data_root)
-    lead_name = LEAD_NAMES[lead_idx]
+    lead_name = LEAD_NAMES[lead_steps]
 
-    print(f"\n{'─' * 60}")
-    print(f"  Training Bm{lead_idx} ({lead_name} = {LEAD_MINUTES[lead_idx]} min)")
-    print(f"{'─' * 60}")
+    print(f"\n{'-' * 60}")
+    print(f"  Training Bm{lead_steps} "
+          f"({lead_name} = {LEAD_MINUTES[lead_steps]} min ahead)")
+    print(f"{'-' * 60}")
 
-    ds_root = data_root / "datasets" / build_run_tag(mode, SOURCE)
-    train_ds = prepare_dataset(
-        ds_root / "train", mode, lead_idx, batch_size, True)
-    val_ds = prepare_dataset(
-        ds_root / "validation", mode, lead_idx, batch_size, False)
+    ds_root = (data_root / "datasets"
+               / build_run_tag(SEPCONV_MODE, SOURCE, period))
+    train_ds = prepare_dataset(ds_root / "train", lead_steps, batch_size, True)
+    val_ds = prepare_dataset(ds_root / "validation", lead_steps, batch_size)
 
-    model = build_sepconv_base_model(mode, lead_idx)
+    model = build_sepconv_base_model(lead_steps)
     print(f"  Parameters: {model.count_params():,}")
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001, amsgrad=True)
-    loss = weighted_loss_multiple_thresholds()
-    model.compile(optimizer=optimizer, loss=loss)
+    # AMSGrad-Adam, lr 1e-3 — as published.
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate,
+                                         amsgrad=True)
+    # Both scopes follow this run's own split. Statistics are NOT shared
+    # with RECONVECT: its training split contains 36 of the baseline's
+    # own test timestamps, which would put them inside the constants that
+    # define the baseline's space. What actually has to hold is that
+    # training and inversion agree — so sepconv_predict must denormalise
+    # with this same period.
+    loss = build_sepconv_loss(data_root, SOURCE,
+                              weights_period=period, stats_period=period)
+    model.compile(optimizer=optimizer, loss=loss, metrics=["mse", "mae"])
 
     reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=5,
+        monitor='val_loss', factor=0.5, patience=lr_patience,
         min_lr=1e-15, min_delta=0.0001, verbose=1)
     early_stop = EarlyStopping(
-        monitor='val_loss', patience=10,
+        monitor='val_loss', patience=es_patience,
         restore_best_weights=True, verbose=1)
     wall_timer = WallTimeCallback()
 
     history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
                         callbacks=[reduce_lr, early_stop, wall_timer], verbose=1)
 
-    model_path = Path(model_dir) / f"sepconv_ensemble_{mode}_bm{lead_idx}.keras"
+    run_tag = build_run_tag(SEPCONV_MODE, SOURCE, period)
+    model_path = Path(model_dir) / f"sepconv_{run_tag}_bm{lead_steps}.keras"
     model.save(str(model_path))
     print(f"  Saved: {model_path}")
 
     return {
-        "lead_idx": lead_idx, "lead_name": lead_name,
+        "lead_idx": lead_steps, "lead_name": lead_name,
+        "lead_minutes": LEAD_MINUTES[lead_steps],
+        "hyperparameters": {
+            "learning_rate": learning_rate,
+            "optimizer": "adam_amsgrad",
+            "lr_schedule": "ReduceLROnPlateau factor=0.5 "
+                           f"patience={lr_patience}",
+            "early_stopping_patience": es_patience,
+            "epochs_budget": epochs,
+            "batch_size": batch_size,
+        },
         "history": {k: [float(v) for v in vals]
                     for k, vals in history.history.items()},
         "wall_times": wall_timer.epoch_times,
@@ -244,37 +409,56 @@ def train_base_model(mode, lead_idx, data_root, model_dir, epochs, batch_size):
 # Main
 # ============================================================================
 
-def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
+def train(data_root, model_dir, epochs=50, batch_size=8, lead=None,
+          learning_rate=1e-3, lr_patience=5, es_patience=10, period=None):
     data_root = Path(data_root)
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    ds_root = data_root / "datasets" / build_run_tag(mode, SOURCE)
+    ds_root = (data_root / "datasets"
+               / build_run_tag(SEPCONV_MODE, SOURCE, period))
     for split in ["train", "validation"]:
         if not (ds_root / split).exists():
-            raise FileNotFoundError(f"Dataset not found: {ds_root / split}")
+            raise FileNotFoundError(
+                f"Dataset not found: {ds_root / split}\n"
+                f"The SepConv baseline needs its own past=4/future=8 "
+                f"sequence set. Build it with:\n"
+                f"    python extract_patch_seq_for_datasets.py "
+                f"--past 4 --future 8 --period <label> --start ... --end ...\n"
+                f"    python create_datasets.py --mode {SEPCONV_MODE} "
+                f"--period <label>")
 
-    tf.keras.mixed_precision.set_global_policy('mixed_float16')
+    # NOTE: no mixed precision here. The target lives in log_zscore space
+    # with a tail at z = +9.5 and a loss weight up to 1000x, so the
+    # weighted squared error reaches ~1e5 — comfortably inside fp32 but
+    # close enough to fp16's 65504 ceiling that overflow is a real risk.
+    # The model is 100k parameters; there is nothing to gain by taking it.
+    tf.keras.mixed_precision.set_global_policy('float32')
 
-    mode_config = get_mode_config(mode)
+    mode_config = get_mode_config(SEPCONV_MODE)
     n_train = sum(1 for _ in load_tfrecord_dataset(ds_root / "train", mode_config))
     n_val = sum(1 for _ in load_tfrecord_dataset(ds_root / "validation", mode_config))
 
     print("=" * 70)
-    print(f"SepConv ENSEMBLE Training (Regression) — Mode: {mode}")
+    print(f"SepConv-ens baseline (Czibula et al. 2024) — {SEPCONV_MODE}")
     print("=" * 70)
-    print(f"  Output: sigmoid [0,1] (continuous rain rate)")
-    print(f"  Loss: weighted MSE {RAINFALL_MSE_WEIGHTS} (shared with COALITION-4)")
-    print(f"  Optimizer: Adam (AMSGrad, lr=0.001, halve on plateau)")
+    print(f"  Inputs   : {SEPCONV_PAST_STEPS} x OPERA rainfall_rate, "
+          f"radar-only by design")
+    print(f"  Target   : log_zscore rain rate, LINEAR output head")
+    print(f"  Optimizer: Adam (AMSGrad, lr={learning_rate}, halve on plateau)")
+    print(f"  Precision: float32 (see note in train())")
     print(f"  Train: {n_train}, Val: {n_val}")
 
-    leads_to_train = [lead] if lead is not None else [1, 2, 3]
+    leads_to_train = [lead] if lead is not None else list(SEPCONV_BASE_LEADS)
+    print(f"  Base models: {[f'Bm{k} (t+{LEAD_MINUTES[k]}min)' for k in leads_to_train]}")
     total_start = time.time()
     all_results = {}
 
-    for lead_idx in leads_to_train:
-        all_results[f"bm{lead_idx}"] = train_base_model(
-            mode, lead_idx, data_root, model_dir, epochs, batch_size)
+    for lead_steps in leads_to_train:
+        all_results[f"bm{lead_steps}"] = train_base_model(
+            lead_steps, data_root, model_dir, epochs, batch_size,
+            learning_rate=learning_rate, lr_patience=lr_patience,
+            es_patience=es_patience, period=period)
 
     total_time = time.time() - total_start
 
@@ -312,20 +496,39 @@ def train(mode, data_root, model_dir, epochs=50, batch_size=8, lead=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SepConv ensemble (regression).")
-    parser.add_argument("--mode", type=str,
-                        default="mtg_opera_mtgmr_continuous",
-                        choices=list(MODE_CONFIGS),
-                        help="Continuous-target COALITION-4 mode whose "
-                             "dataset this baseline consumes.")
+    parser = argparse.ArgumentParser(
+        description="Train the SepConv-ens baseline (Czibula et al. 2024). "
+                    "Radar-only by design; consumes the "
+                    f"{SEPCONV_MODE} dataset built on a past=4/future=8 "
+                    "sequence window.")
     parser.add_argument("--data_root", type=str, default="./our_data")
     parser.add_argument("--model_dir", type=str, default="./models")
+    parser.add_argument("--period", type=str, default=None,
+                        help="Ensemble member label, if the baseline is "
+                             "being trained per period. Omit for the "
+                             "whole-archive run used by the comparison.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--lead", type=int, default=None, choices=[1, 2, 3])
+    parser.add_argument("--lead", type=int, default=None,
+                        choices=list(SEPCONV_BASE_LEADS),
+                        help="Train one base model instead of all three. "
+                             f"{SEPCONV_BASE_LEADS} = "
+                             f"{[LEAD_MINUTES[k] for k in SEPCONV_BASE_LEADS]} "
+                             f"minutes ahead.")
+    parser.add_argument("--learning_rate", type=float, default=1e-3,
+                        help="Published value is 1e-3; exposed for the "
+                             "documented tuning sweep.")
+    parser.add_argument("--lr_patience", type=int, default=5,
+                        help="Epochs on a val_loss plateau before the rate "
+                             "is halved.")
+    parser.add_argument("--es_patience", type=int, default=10,
+                        help="Early-stopping patience. Not stated in the "
+                             "paper; ours, and recorded in the history JSON.")
     args = parser.parse_args()
-    train(mode=args.mode, data_root=args.data_root, model_dir=args.model_dir,
-          epochs=args.epochs, batch_size=args.batch_size, lead=args.lead)
+    train(data_root=args.data_root, model_dir=args.model_dir,
+          epochs=args.epochs, batch_size=args.batch_size, lead=args.lead,
+          learning_rate=args.learning_rate, lr_patience=args.lr_patience,
+          es_patience=args.es_patience, period=args.period)
 
 
 if __name__ == "__main__":

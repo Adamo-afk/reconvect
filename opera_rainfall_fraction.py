@@ -12,17 +12,22 @@ Classes match `label_transform_opera_rainfall_multiclass` in
     3: 30 <= R < 40
     4: R >= 40
 
-Scope works exactly like `lightning_fraction.py`: per-source by default
-(`--source dbscan` scopes to `train_data_dbscan.csv` and writes
-`opera_rainfall_fraction_dbscan.json`). Reusing
-`lightning_fraction.load_scope_set` keeps the (date, HHMM) snap rules
-identical so the prior is computed over the same timesteps the dataset
-actually contains.
+Scope follows the split the prior will be used with. By default that is
+`train_data_<source>.csv`, writing `opera_rainfall_fraction_<source>.json`;
+`--period LABEL` moves both to the labelled variants without either path
+being typed out. Reusing `lightning_fraction.load_scope_set` keeps the
+(date, HHMM) snap rules identical so the prior is computed over the same
+timesteps the dataset actually contains.
+
+The prior must always be scoped to the model's OWN training split. A
+prior computed over a different window describes a class balance that
+model never trained on, and the weighted loss it feeds would then correct
+for an imbalance that is not the one present.
 
 Usage:
-    python opera_rainfall_fraction.py --source dbscan
-    python opera_rainfall_fraction.py --source lightning
-    python opera_rainfall_fraction.py --source dbscan --scope_csv none
+    python opera_rainfall_fraction.py
+    python opera_rainfall_fraction.py --period w48
+    python opera_rainfall_fraction.py --scope_csv none
 """
 
 import argparse
@@ -34,6 +39,7 @@ import numpy as np
 
 from lightning_fraction import load_scope_set
 
+from periods import data_tag, split_csv_name
 from pipeline_config import SOURCE
 
 
@@ -188,28 +194,41 @@ def main():
         help="Path to our_data directory",
     )
     parser.add_argument(
+        "--period", "-p", type=str, default=None, metavar="LABEL",
+        help="Scope the prior to a period's training split and name the "
+             "output to match: --period w48 reads train_data_<source>_w48"
+             ".csv and writes opera_rainfall_fraction_<source>_w48.json. "
+             "Omit for the unsuffixed whole-archive split. --scope_csv and "
+             "--output still override either path individually.",
+    )
+    parser.add_argument(
         "--output", "-o", type=str, default=None,
         help="Output JSON path (default: "
-             "our_data/opera_rainfall_fraction_<source>.json).",
+             "our_data/opera_rainfall_fraction_<source>[_<period>].json).",
     )
     parser.add_argument(
         "--scope_csv", "-s", type=str, default=None,
         help="Scope the scan by (date, HHMM) pairs read from this CSV. "
-             "Defaults to our_data/train_data_<source>.csv. Pass 'none' "
-             "to scan every .npy on disk.",
+             "Defaults to our_data/train_data_<source>[_<period>].csv. "
+             "Pass 'none' to scan every .npy on disk.",
     )
     args = parser.parse_args()
 
+    # Both defaults come from the same tag, so the prior cannot end up
+    # scoped to one split and named after another - which is silent, and
+    # produces a plausible-looking file describing the wrong distribution.
+    tag = data_tag(SOURCE, args.period)
     scope_csv = (
         args.scope_csv
         if args.scope_csv is not None
-        else os.path.join(args.data_root, f"train_data_{SOURCE}.csv")
+        else os.path.join(args.data_root,
+                          split_csv_name("train", SOURCE, args.period))
     )
     output_path = (
         args.output
         if args.output
         else os.path.join(
-            args.data_root, f"opera_rainfall_fraction_{SOURCE}.json"
+            args.data_root, f"opera_rainfall_fraction_{tag}.json"
         )
     )
 
@@ -218,11 +237,12 @@ def main():
     print("=" * 60)
     print(f"  data_root  : {args.data_root}")
     print(f"  source     : {SOURCE}")
+    print(f"  period     : {args.period or 'none (whole archive)'}")
     print(f"  scope_csv  : {scope_csv}")
     print(f"  output     : {output_path}")
 
     scope_keys = load_scope_set(
-        scope_csv, data_root=args.data_root, source=SOURCE,
+        scope_csv, data_root=args.data_root, source=tag,
     )
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")
@@ -233,6 +253,7 @@ def main():
     stats = compute_class_fractions(args.data_root, scope_keys)
     stats['_scope'] = {
         'source':       SOURCE,
+        'period':       args.period,
         'scope_csv':    None if scope_keys is None else str(Path(scope_csv).resolve()),
         'n_scope_keys': None if scope_keys is None else len(scope_keys),
     }

@@ -53,6 +53,35 @@ import tensorflow as tf
 
 from pipeline_config import SOURCE
 
+# Sentinel: `stats_period=None` legitimately means "global statistics", so
+# None cannot double as "not supplied".
+_UNSET = object()
+
+from periods import (
+    Period,
+    load_seasons,
+    normalization_stats_name,
+    sequence_meta_name,
+    split_csv_name,
+)
+from compress_datasets import (
+    DEFAULT_LEVEL as _ARCHIVE_LEVEL,
+    DEFAULT_MAX_CONCURRENT as _ARCHIVE_MAX_CONCURRENT,
+    default_workers as _default_archive_workers,
+)
+from ensemble_plan import (
+    append_state,
+    enumerate_members,
+    format_plan,
+    load_index_dates,
+    registry_path,
+    require_last_state,
+    state_member,
+    state_period,
+)
+
+_ARCHIVE_WORKERS = _default_archive_workers()
+
 
 # ============================================================================
 # Per-variable transforms (data-driven via normalization_stats.json)
@@ -278,6 +307,45 @@ def label_transform_opera_rainfall_multiclass(x):
     return one_hot
 
 
+def label_transform_opera_rainfall_logz(x):
+    """OPERA instantaneous rain rate → log_zscore target (SepConv baseline).
+
+    Applies exactly the same spec the field gets as an *input* channel —
+    fill 0.01, clip 0.01, log10, then the global train-split mean/std.
+    That symmetry is the point: the SepConv baseline predicts the field
+    in the space it consumes it, so a composed rollout can feed its own
+    output back in without a change of units.
+
+    Deliberately NOT the `/RAINFALL_MAX_MMH` scaling used by
+    `label_transform_opera_rainfall_continuous`. That one is bounded in
+    [0, 1] and linear in mm/h, which crushes the 10-70 mm/h band this
+    comparison is about into the top 14% of its range.
+
+    Inverting for physical-space thresholding is `10 ** (z * std + mean)`
+    — see `logz_to_mmh`. Never threshold in z-space.
+
+    Returns (H, W) float32.
+    """
+    return _apply_log_zscore(x, "opera_rainfall_rate").astype(np.float32)
+
+
+def logz_to_mmh(z):
+    """Inverse of `label_transform_opera_rainfall_logz`: z → mm/h.
+
+    Calibration and verification both happen in physical space, so this
+    is the only sanctioned way back out of a SepConv prediction.
+    """
+    spec = _norm("opera_rainfall_rate")
+    return np.power(10.0, np.asarray(z) * spec["std"] + spec["mean"])
+
+
+def mmh_to_logz(mmh):
+    """Forward map, for putting class edges into z-space (reporting only)."""
+    spec = _norm("opera_rainfall_rate")
+    clipped = np.clip(np.asarray(mmh, dtype=np.float64), 0.01, None)
+    return (np.log10(clipped) - spec["mean"]) / spec["std"]
+
+
 def label_transform_opera_rainfall_continuous(x):
     """OPERA instantaneous rain rate → continuous label in [0, 1].
 
@@ -298,6 +366,7 @@ LABEL_CHANNELS = {
     "lightning": 1,           # binary occurrence
     "radar": 5,               # 5-class precipitation
     "radar_continuous": 1,    # continuous rain rate [0, 1]
+    "radar_logz": 1,          # rain rate in log_zscore space (SepConv)
 }
 
 
@@ -386,6 +455,11 @@ BUILDABLE_MODES = (
     "mtg_lightning_opera_rainfall",
     "mtg_opera_mtgmr_continuous",
     "mtg_lightning_opera_occurrence",
+    # Baseline comparison pair — radar-only, see get_mode_config.
+    # `opera_sepconv_logz` needs a past=4/future=8 sequence set;
+    # `opera_radar_only_rainfall` uses the standard RECONVECT window.
+    "opera_sepconv_logz",
+    "opera_radar_only_rainfall",
 )
 
 # The KD student has no dataset of its own — train_lightning_kd.py feeds
@@ -419,6 +493,37 @@ def get_mode_config(mode):
     hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
     mr_opera = OPERA_MR_CONFIG
     mr_opera_mtg = {**OPERA_MR_CONFIG, **MTG_MR_SAT_CONFIG}
+
+    # --- Baseline comparison modes -------------------------------------
+    # Both are radar-only: no MTG, no LINET. Modality enrichment is the
+    # thing RECONVECT is being credited for, so the baseline and the
+    # ablation must not receive it.
+    if mode == "opera_sepconv_logz":
+        # SepConv-ens target. The rainfall field is BOTH the input and the
+        # label, in the same log_zscore space, so a composed rollout can
+        # feed its own output straight back in. Carried in the HR group at
+        # 256 px because the label is HR — an autoregressive step must not
+        # change resolution between output and input.
+        return {
+            "past_hr": ({"opera_rainfall_rate_hr":
+                         (transform_opera_rainfall_rate, None)}, 256, "HR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_logz,
+            "label_suffix": "HR",
+            "label_type": "radar_logz",
+        }
+    elif mode == "opera_radar_only_rainfall":
+        # RECONVECT radar-only ablation: identical architecture and
+        # training to the full model, OPERA alone as input, same 5-class
+        # head. This is the modality-value comparator, so it must differ
+        # from the full model ONLY in which channels it receives.
+        return {
+            "past_mr": (mr_opera, 128, "LR"),
+            "label_var": "opera_rainfall_rate_hr",
+            "label_transform": label_transform_opera_rainfall_multiclass,
+            "label_suffix": "HR",
+            "label_type": "radar",
+        }
 
     # --- Rainfall track: OPERA rainfall_rate 5-class -------------------
     if mode == "mtg_opera_radar_only_rainfall":
@@ -542,8 +647,9 @@ N_INPUT: int | None = None
 N_LABEL: int | None = None
 
 
-def init_sequence_config(data_root, source: str = SOURCE) -> None:
-    """Load `sequence_meta_<source>.json` and populate module globals.
+def init_sequence_config(data_root, source: str = SOURCE,
+                         period=None) -> None:
+    """Load `sequence_meta_<source>[_<period>].json` and populate globals.
 
     Must be called exactly once before any function that depends on
     `STEP_MINUTES`, `INPUT_COLS`, `LABEL_COLS`, `T_OFFSETS`, `N_INPUT`,
@@ -558,13 +664,17 @@ def init_sequence_config(data_root, source: str = SOURCE) -> None:
     global INPUT_COLS, LABEL_COLS, T_OFFSETS, N_INPUT, N_LABEL
 
     data_root = Path(data_root)
-    SEQUENCE_META_PATH = data_root / f"sequence_meta_{source}.json"
+    SEQUENCE_META_PATH = data_root / sequence_meta_name(source, period)
     if not SEQUENCE_META_PATH.exists():
+        label = period.label if isinstance(period, Period) else period
+        hint = (f"    python extract_patch_seq_for_datasets.py "
+                f"--period {label}" if label else
+                f"    python extract_patch_seq_for_datasets.py")
         print(
             f"ERROR: {SEQUENCE_META_PATH} not found.\n"
             f"Run from the project root:\n"
             f"    python validate_timestep.py --step_minutes <N>\n"
-            f"    python extract_patch_seq_for_datasets.py --source {source}",
+            f"{hint}",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -779,8 +889,12 @@ def generate_samples(csv_path, patches_dir, mode_config):
 
             stacked_label = np.stack(label_frames, axis=0)
 
+            # The patch number rides along so the writer can record which
+            # of the 18 grid slots a sample came from. Per-patch ensemble
+            # scoring needs that identity, and it is unrecoverable from the
+            # tensors alone.
             n_yielded += 1
-            yield stacked_inputs, stacked_label
+            yield stacked_inputs, stacked_label, int(patch_numbers[p_pos])
 
     print(f"  Generated {n_yielded} samples, skipped {n_skipped}")
 
@@ -846,8 +960,14 @@ def build_dataset(csv_path, patches_dir, mode_config):
 TFRECORD_SAMPLES_PER_SHARD = 500
 
 
-def _serialize_sample(stacked_inputs, stacked_label):
-    """Serialize one (inputs_dict, label) sample as a tf.train.Example."""
+def _serialize_sample(stacked_inputs, stacked_label, patch_number=-1):
+    """Serialize one (inputs_dict, label) sample as a tf.train.Example.
+
+    `patch_number` identifies which of the 18 grid slots the sample came
+    from. Training ignores it; the per-patch ensemble scorer reads it via
+    `load_tfrecord_with_patch`. Shards written before this field existed
+    parse back as -1 rather than failing.
+    """
     feature: dict[str, tf.train.Feature] = {}
     for key, tensor in stacked_inputs.items():
         # tf.io.serialize_tensor preserves dtype + shape inside the
@@ -866,6 +986,9 @@ def _serialize_sample(stacked_inputs, stacked_label):
                 tf.convert_to_tensor(stacked_label)
             ).numpy()],
         )
+    )
+    feature["patch_number"] = tf.train.Feature(
+        int64_list=tf.train.Int64List(value=[int(patch_number)])
     )
     example = tf.train.Example(features=tf.train.Features(feature=feature))
     return example.SerializeToString()
@@ -890,7 +1013,7 @@ def write_tfrecord_shards(csv_path, patches_dir, mode_config,
         return str(out_dir / f"shard_{i:05d}.tfrecord")
 
     try:
-        for stacked_inputs, stacked_label in generate_samples(
+        for stacked_inputs, stacked_label, patch_number in generate_samples(
                 csv_path, patches_dir, mode_config):
             if writer is None or n_samples % samples_per_shard == 0:
                 if writer is not None:
@@ -899,7 +1022,9 @@ def write_tfrecord_shards(csv_path, patches_dir, mode_config,
                 writer = tf.io.TFRecordWriter(_shard_path(shard_idx))
                 if n_samples == 0:
                     print(f"    -> shard 0: {_shard_path(0)}")
-            writer.write(_serialize_sample(stacked_inputs, stacked_label))
+            writer.write(
+                _serialize_sample(stacked_inputs, stacked_label, patch_number)
+            )
             n_samples += 1
             if n_samples % 100 == 0:
                 print(f"    written {n_samples:,} samples "
@@ -939,6 +1064,50 @@ def _make_parse_fn(input_specs, label_spec):
     return parse
 
 
+def _make_parse_fn_with_patch(input_specs, label_spec):
+    """Like `_make_parse_fn`, but also returns the sample's patch number.
+
+    Kept separate so the training path's element structure stays exactly
+    (inputs, label) — only the ensemble scorer wants the third element.
+    `default_value=-1` makes shards written before the field existed parse
+    cleanly instead of raising, so an old dataset degrades to "unknown
+    patch" rather than being unreadable.
+    """
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string)
+        for key in input_specs
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+    feature_description["patch_number"] = tf.io.FixedLenFeature(
+        [], tf.int64, default_value=-1)
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, spec in input_specs.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=spec.dtype)
+            t.set_shape(spec.shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=label_spec.dtype)
+        label.set_shape(label_spec.shape)
+        return inputs, label, parsed["patch_number"]
+
+    return parse
+
+
+def load_tfrecord_with_patch(shard_dir: Path,
+                             mode_config: dict) -> tf.data.Dataset:
+    """Load a split yielding (inputs, label, patch_number) triples."""
+    shard_paths = sorted(str(p) for p in shard_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No shard_*.tfrecord files in {shard_dir}")
+    input_specs, label_spec = get_output_signature(mode_config)
+    ds = tf.data.TFRecordDataset(shard_paths, num_parallel_reads=tf.data.AUTOTUNE)
+    return ds.map(_make_parse_fn_with_patch(input_specs, label_spec),
+                  num_parallel_calls=tf.data.AUTOTUNE)
+
+
 def load_tfrecord_dataset(shard_dir: Path,
                            mode_config: dict) -> tf.data.Dataset:
     """Load a split's TFRecord shards into a tf.data.Dataset whose
@@ -961,7 +1130,8 @@ def load_tfrecord_dataset(shard_dir: Path,
     return ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
 
-def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
+def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None,
+                             period=None, stats_period=_UNSET):
     """Create and save train, validation, and test datasets.
 
     Args:
@@ -988,8 +1158,19 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     # from worker threads later.
     # Per-source normalization: stats are computed from the matching
     # train_data_<source>.csv, so the file is suffixed too.
+    # With a period, every input defaults to the member-scoped variant:
+    # its own split CSVs and its own statistics. Mixing a member's samples
+    # with whole-archive statistics would leak dates the member never saw.
+    #
+    # `stats_period` decouples the two, because the default is wrong for
+    # the baseline comparison. There the period tag names a sequence
+    # WINDOW (`w48`), not a date range, and RECONVECT and SepConv-ens must
+    # share one normalization or their outputs are not in the same space —
+    # which would make the physical-space calibration meaningless.
+    if stats_period is _UNSET:
+        stats_period = period
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, stats_period)
     )
 
     mode_config = get_mode_config(mode)
@@ -1000,7 +1181,8 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     # `datasets/mtg_lightning_opera_rainfall_dbscan/` is self-describing.
     # See train_models.build_run_tag for the single source of truth.
     from train_models import build_run_tag
-    save_dir = output_root / build_run_tag(mode, source)
+    period_label = period.label if isinstance(period, Period) else period
+    save_dir = output_root / build_run_tag(mode, source, period_label)
 
     # Print configuration summary
     print("=" * 70)
@@ -1008,7 +1190,11 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     print("=" * 70)
     print(f"Data root:    {data_root}")
     print(f"Patches dir:  {patches_dir}")
-    print(f"Stats file:   {data_root / f'normalization_stats_{source}.json'}")
+    _stats_file = normalization_stats_name(source, stats_period)
+    _stats_note = ("" if stats_period == period
+                   else "   <- overridden, decoupled from --period")
+    print(f"Stats file:   {data_root / _stats_file}{_stats_note}")
+    print(f"Period:       {period if period else 'none (whole archive)'}")
     print(f"Output dir:   {save_dir}")
     print(f"Label:        {mode_config['label_var']}")
     print()
@@ -1023,9 +1209,8 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     # Process each split. CSVs are suffixed by source to match
     # extract_patch_seq_for_datasets.py's output convention.
     splits = {
-        "train":      f"train_data_{source}.csv",
-        "validation": f"validation_data_{source}.csv",
-        "test":       f"test_data_{source}.csv",
+        split: split_csv_name(split, source, period)
+        for split in ("train", "validation", "test")
     }
 
     for split_name, csv_name in splits.items():
@@ -1062,7 +1247,10 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
             "mode": mode,
             "source": source,
             "track": _track,
-            "run_tag": build_run_tag(mode, source),
+            "run_tag": build_run_tag(mode, source, period_label),
+            # Bounds, not just the label: the feature-extractor overlap
+            # check compares dates and must never have to trust a filename.
+            "period": period.to_dict() if isinstance(period, Period) else None,
             "split": split_name,
             "csv": csv_name,
             "format": "tfrecord",
@@ -1091,6 +1279,7 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None):
     print("Dataset creation complete.")
     print(f"Saved to: {save_dir}")
     print("=" * 70)
+    return save_dir
 
 
 # ============================================================================
@@ -1115,18 +1304,166 @@ def main():
         "--output_root", type=str, default=None,
         help="Output root for saved datasets (default: data_root/datasets/)"
     )
+    parser.add_argument(
+        "--ensemble", action="store_true",
+        help="Enumerate the seasonal ensemble from the [seasons] block of "
+             "training.config crossed with the years present in "
+             "patch_index.csv, report each member's period and coverage "
+             "plus any discrepancy, and register the plan in "
+             "our_data/ensemble_registry.json. Builds nothing — build each "
+             "member afterwards with --period <label>."
+    )
+    parser.add_argument(
+        "--config", type=str, default="training.config",
+        help="Config file holding the [seasons] block, read by --ensemble "
+             "(default: training.config)."
+    )
+    parser.add_argument(
+        "--period", type=str, default=None,
+        help="Build one registered ensemble member, e.g. --period 2025warm. "
+             "The label must appear in the registry's most recent state; "
+             "its bounds come from there. Omit to build the unscoped, "
+             "whole-archive dataset."
+    )
+    parser.add_argument(
+        "--global_stats", action="store_true",
+        help="Normalise with the unsuffixed whole-archive statistics even "
+             "when --period is given, instead of the period-suffixed "
+             "file. For a period tag that names a sequence WINDOW rather "
+             "than a date range, where the model belongs in the "
+             "whole-archive space. The SepConv-ens baseline does NOT use "
+             "this: it is normalised by its own split (w48), because "
+             "RECONVECT's training split contains 36 of the baseline's "
+             "test timestamps, so RECONVECT's constants would be defined "
+             "partly by data the baseline is tested on. What has to match "
+             "is training and inversion, not the two models."
+    )
+    parser.add_argument(
+        "--no-archive", action="store_true",
+        help="Do not spawn the background 7-Zip job after building. By "
+             "default a finished dataset is archived immediately (~4.8%% "
+             "of its size) and the shards deleted once verified."
+    )
+    parser.add_argument(
+        "--archive_level", type=int, default=_ARCHIVE_LEVEL,
+        choices=[0, 1, 3, 5, 7, 9],
+        help=f"7-Zip -mx level for the background archive job "
+             f"(default: {_ARCHIVE_LEVEL})."
+    )
+    parser.add_argument(
+        "--archive_workers", type=int, default=_ARCHIVE_WORKERS,
+        help=f"7-Zip threads for the background archive job (default: "
+             f"{_ARCHIVE_WORKERS} = half the logical cores)."
+    )
+    parser.add_argument(
+        "--max_concurrent", type=int, default=_ARCHIVE_MAX_CONCURRENT,
+        help=f"Maximum simultaneous background archive jobs "
+             f"(default: {_ARCHIVE_MAX_CONCURRENT})."
+    )
     args = parser.parse_args()
+
+    # --- Plan mode: register the ensemble and stop -----------------------
+    if args.ensemble:
+        if args.period:
+            parser.error("--ensemble registers the plan; --period builds a "
+                         "member from it. Use one or the other.")
+        seasons = load_seasons(args.config)
+        counts = load_index_dates(
+            Path(args.data_root) / "patch_index" / "patch_index.csv"
+        )
+        plan = enumerate_members(counts, seasons)
+        print(format_plan(plan, mode=args.mode, source=SOURCE))
+
+        # An overlap means two members would train on shared dates, which
+        # defeats the entire point of the split. Refuse to register it.
+        if plan.overlaps:
+            raise SystemExit(
+                "\nERROR: members overlap — fix the [seasons] block before "
+                "registering. Nothing was written."
+            )
+
+        state = append_state(args.data_root, plan,
+                             mode=args.mode, source=SOURCE)
+        print(f"\nRegistered {state['n_members']} member(s) "
+              f"({state['n_buildable']} buildable) in "
+              f"{registry_path(args.data_root)}")
+        buildable = [m.label for m in plan.buildable]
+        if buildable:
+            print("\nBuild them one at a time:")
+            for label in buildable:
+                print(f"    python create_datasets.py --mode {args.mode} "
+                      f"--period {label}")
+        return
+
+    # --- Build mode ------------------------------------------------------
+    # A period must come from the registry, so a member can never be built
+    # over bounds that differ from the ones the plan recorded.
+    period = None
+    if args.period:
+        # Two ways a label can resolve, checked in this order:
+        #
+        #  1. The sequence metadata on disk. Whatever
+        #     extract_patch_seq_for_datasets.py actually wrote is the
+        #     authority on what exists, and it records the bounds it used.
+        #     This also covers window tags such as `w48`, which name a
+        #     sequence window rather than an ensemble member and so never
+        #     appear in the registry.
+        #  2. The registered ensemble plan, for genuine members.
+        seq_meta = Path(args.data_root) / sequence_meta_name(SOURCE,
+                                                             args.period)
+        if seq_meta.is_file():
+            blob = json.loads(seq_meta.read_text()).get("period")
+            period = Period.from_dict(blob)
+            if period is None:
+                parser.error(
+                    f"{seq_meta} exists but records no period block, so "
+                    f"{args.period!r} cannot be resolved. Rebuild it with "
+                    f"--period {args.period}."
+                )
+        else:
+            state = require_last_state(args.data_root)
+            period = state_period(state, args.period)
+            if period is None:
+                known = [m["label"] for m in state.get("members", [])]
+                parser.error(
+                    f"Period {args.period!r} has neither a sequence "
+                    f"metadata file at {seq_meta} nor an entry in the "
+                    f"registered ensemble plan (members: "
+                    f"{known or '(none)'})."
+                )
+            member = state_member(state, args.period)
+            if member and member.get("status") == "no-data":
+                raise SystemExit(
+                    f"ERROR: member {args.period!r} was registered with no "
+                    f"data ({member['start']} .. {member['end']}). Download "
+                    f"those dates and re-register before building it."
+                )
 
     # Populate the module-level schema constants from the sequence
     # metadata before any sample-generating function is called.
-    init_sequence_config(args.data_root, SOURCE)
+    init_sequence_config(args.data_root, SOURCE, period=period)
 
-    create_and_save_datasets(
+    save_dir = create_and_save_datasets(
         data_root=args.data_root,
         mode=args.mode,
         source=SOURCE,
-        output_root=args.output_root
+        output_root=args.output_root,
+        period=period,
+        stats_period=None if args.global_stats else _UNSET,
     )
+
+    # Compression happens once, here, and only here: training never
+    # modifies a dataset, so this archive stays valid for its lifetime.
+    # Detached so the next member can start building immediately - a
+    # 66 GB member takes ~20 min to compress at -mx=5.
+    if not args.no_archive and save_dir is not None:
+        from compress_datasets import spawn_job
+        print("\nArchiving in the background ...")
+        spawn_job("compress", save_dir.name, save_dir.parent,
+                  level=args.archive_level, workers=args.archive_workers,
+                  max_concurrent=args.max_concurrent)
+        print("  Dataset creation is done; you can start the next member "
+              "or begin training now.")
 
 
 if __name__ == "__main__":

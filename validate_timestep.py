@@ -111,6 +111,7 @@ def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
         )
 
     cadences: dict[str, int | None] = {}
+    aliases: dict[str, str] = {}
     for key, raw_value in parser.items(CADENCES_SECTION):
         if raw_value is None:
             cadences[key] = None
@@ -119,12 +120,19 @@ def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
         if value_str == "" or value_str.lower() == "null":
             cadences[key] = None
             continue
+        # A product name instead of a number means "track that product".
+        # Deferred until every literal is read, so order in the file does
+        # not matter.
+        if not value_str.lstrip("+-").isdigit():
+            aliases[key] = value_str
+            continue
         try:
             value = int(value_str)
         except ValueError:
             raise ValueError(
                 f"{cadences_path}: product '{key}' has invalid cadence "
-                f"{raw_value!r} (expected positive integer, null, or empty)"
+                f"{raw_value!r} (expected positive integer, null, empty, "
+                f"or the name of another product to track)"
             )
         if value <= 0:
             raise ValueError(
@@ -132,6 +140,23 @@ def load_product_cadences(cadences_path: Path) -> dict[str, int | None]:
                 f"cadence {value} (expected positive integer)"
             )
         cadences[key] = value
+
+    # Resolve `product = other_product` references. One hop only: a chain
+    # would be ambiguous to read and there is no use case for it.
+    for key, target in aliases.items():
+        if target not in cadences:
+            raise ValueError(
+                f"{cadences_path}: product '{key}' tracks '{target}', which "
+                f"is not defined in [{CADENCES_SECTION}]. Known products: "
+                f"{sorted(cadences)}"
+            )
+        if target in aliases:
+            raise ValueError(
+                f"{cadences_path}: '{key}' tracks '{target}', which is "
+                f"itself a reference. Point it at a literal cadence."
+            )
+        cadences[key] = cadences[target]
+        print(f"  cadence: {key} tracks {target} -> {cadences[key]} min")
 
     if not cadences:
         raise ValueError(f"{cadences_path}: no products defined")

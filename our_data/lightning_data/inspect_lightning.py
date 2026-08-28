@@ -5,7 +5,7 @@ lightning `.npy`.
 Combines a reprojected lightning `.npy` file (`density` / `current` /
 `occurrence`) with the Romania grid lat/lon arrays to produce a
 CF-compliant NetCDF that opens cleanly in QGIS, Panoply or any
-xarray-based workflow. Mirrors the `inspect_mtg.py --reprojected` and
+xarray-based workflow. Mirrors the
 `identify_patches.write_diagnostic_nc` pattern.
 
 Reconstruction only — no plotting. The point of the `.nc` is to feed it
@@ -92,7 +92,7 @@ def discover_grid_dir(npy_path: Path) -> Path:
 
     The reproject pipeline writes the shared lat/lon arrays once at the
     `reprojected_data/` root, so we walk up the tree from the npy until
-    we find them. Mirrors the auto-detect logic in inspect_mtg.py.
+    we find them.
     """
     for parent in npy_path.resolve().parents:
         if (parent / "romania_grid_lats.npy").is_file():

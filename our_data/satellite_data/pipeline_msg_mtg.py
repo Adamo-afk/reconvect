@@ -564,7 +564,8 @@ def save_mtg_constants(body_files, variables, output_path):
 # FCI chunk processing (direct netCDF4 reading)
 # =============================================================================
 
-def process_repeat_cycle(files, base_dir, variables, group_key=None):
+def process_repeat_cycle(files, base_dir, variables, group_key=None,
+                          overwrite=False):
     """
     Process one repeat cycle of FCI chunk files.
 
@@ -586,13 +587,25 @@ def process_repeat_cycle(files, base_dir, variables, group_key=None):
         variables (list): FCI channel names to extract.
         group_key (str): Repeat cycle key 'YYYYMMDD_RRRR' for computing
             the nominal time.
+        overwrite (bool): Re-extract variables whose .npy already exists.
+        provenance_source (str or None): origin recorded for every
+            cycle extracted here. None disables recording.
+        delete_only (bool): Skip download AND extraction, deleting the
+            raw chunks in the window immediately. For when the
+            summary has already confirmed coverage, which makes the
+            re-extraction pass redundant.
+        delete_raw (bool): Remove the raw .nc chunks once every cycle
+            has been extracted without error. Irreversible.
+            Default False, so a re-run over _raw_chunks/ only fills in
+            what is genuinely absent.
 
     Returns:
-        dict with keys: 'key', 'ok' (list), 'failed' (list of (var, error))
+        dict with keys: 'key', 'ok' (list), 'skipped' (list),
+        'failed' (list of (var, error))
     """
     from netCDF4 import Dataset as NC4Dataset
 
-    result = {'key': group_key, 'ok': [], 'failed': []}
+    result = {'key': group_key, 'ok': [], 'skipped': [], 'failed': []}
 
     body_files = sorted([f for f in files if 'TRAIL' not in f])
     if not body_files:
@@ -616,6 +629,27 @@ def process_repeat_cycle(files, base_dir, variables, group_key=None):
 
     dir_name = f"nc4_{nominal_start.strftime('%Y-%m-%d')}-Romania"
     time_str = nominal_start.strftime('%H%M')
+
+    # --- Skip variables already extracted ---
+    # Deliberately checked BEFORE the first netCDF4 open: the output path
+    # is fully determined by the nominal time, so an already-processed
+    # cycle costs one stat() per variable instead of decompressing both
+    # CharLS chunks again. This is what makes a --skip_download pass over
+    # a full _raw_chunks/ cheap enough to run after every backfill.
+    if not overwrite:
+        pending = []
+        for variable in variables:
+            existing = os.path.join(
+                base_dir, variable, f"{dir_name}_{variable}",
+                f"{dir_name}_{time_str}_{variable}.npy",
+            )
+            if os.path.exists(existing):
+                result['skipped'].append(variable)
+            else:
+                pending.append(variable)
+        variables = pending
+        if not variables:
+            return result
 
     # --- Process each variable ---
     for variable in variables:
@@ -666,6 +700,75 @@ def process_repeat_cycle(files, base_dir, variables, group_key=None):
 # Main pipeline
 # =============================================================================
 
+def month_windows(start, end, n_months):
+    """Split [start, end] into consecutive windows of `n_months` months.
+
+    Windows are aligned to calendar months and clipped to the requested
+    range, so the first and last may be shorter. Returns a list of
+    (window_start, window_end) datetimes, both inclusive.
+
+    Calendar-aligned rather than fixed 30-day steps so a window maps onto
+    something a person can reason about - "2025-04 to 2025-06" - and onto
+    the monthly coverage chart the summary produces.
+    """
+    if n_months < 1:
+        raise ValueError(f"--batch_months must be >= 1, got {n_months}")
+    if end < start:
+        raise ValueError("--end precedes --start")
+
+    windows = []
+    cur = start
+    while cur <= end:
+        y, m = cur.year, cur.month
+        m0 = (m - 1) + n_months
+        ny, nm = y + m0 // 12, m0 % 12 + 1
+        nxt = datetime.datetime(ny, nm, 1)
+        stop = min(nxt - datetime.timedelta(minutes=1), end)
+        windows.append((cur, stop))
+        cur = nxt
+    return windows
+
+
+def run_batched(args, windows, run_window):
+    """Drive `run_window` over each window, reporting and continuing on error.
+
+    One window failing must not abandon the rest: a transient SFTP drop in
+    month three should not cost months four onward. Failures are collected
+    and reported at the end, and the exit code reflects them.
+    """
+    failures = []
+    total = len(windows)
+    for i, (ws, we) in enumerate(windows, start=1):
+        label = f"{ws:%Y-%m-%d} .. {we:%Y-%m-%d}"
+        print("\n" + "=" * 70 + "\n"
+              f"[window {i}/{total}]  {label}\n"
+              + "=" * 70)
+        try:
+            run_window(ws, we)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if code:
+                failures.append((label, f"exit {code}"))
+                print(f"  WINDOW FAILED: {label}: {failures[-1][1]}", file=sys.stderr)
+        except Exception as exc:                          # noqa: BLE001
+            failures.append((label, str(exc)))
+            print(f"  WINDOW FAILED: {label}: {failures[-1][1]}", file=sys.stderr)
+            if args.stop_on_error:
+                break
+
+    print("\n" + "=" * 70 + "\n"
+          + "Batched run complete\n"
+          + "=" * 70)
+    print(f"  windows : {total}")
+    print(f"  failed  : {len(failures)}")
+    for label, why in failures:
+        print(f"    {label}  {why}")
+    if failures:
+        print("\n  Re-run the same command to retry only the "
+          "failed windows: completed cycles are skipped.")
+    return 1 if failures else 0
+
+
 def fetch_and_process_mtg(
     start_str,
     end_str,
@@ -676,6 +779,10 @@ def fetch_and_process_mtg(
     minute_filter=None,
     skip_download=False,
     workers=10,
+    overwrite=False,
+    delete_raw=False,
+    delete_only=False,
+    provenance_source="nma",
 ):
     """
     End-to-end MTG FCI pipeline: SFTP download → netCDF4 processing.
@@ -688,8 +795,13 @@ def fetch_and_process_mtg(
         chunk_filter (set): Allowed chunk numbers (default: ROMANIA_CHUNKS).
         minute_filter (set or None): Allowed minutes within the hour.
         skip_download (bool): If True, skip SFTP and use files already in
-            <base_dir>/_raw_chunks/.
+            <base_dir>/_raw_chunks/. This is what --source local sets.
         workers (int): Number of parallel workers for repeat cycle processing.
+        overwrite (bool): Re-extract variables whose .npy already exists.
+        provenance_source (str or None): Stamped on each cycle as it is
+            extracted. None records nothing, which is the honest default
+            for a local pass: raw already on disk carries no evidence of
+            where it came from.
     """
     start, end = parse_date_range(start_str, end_str)
     if start is None:
@@ -719,6 +831,19 @@ def fetch_and_process_mtg(
         print("No files to process.")
         return
 
+    # ---- Delete-only: nothing to extract, nothing to record ----------
+    # The summary already measured coverage from the .npy output, so a
+    # re-extraction pass here would only re-confirm what it established.
+    # Grouping still runs: it is what restricts deletion to the requested
+    # window instead of emptying _raw_chunks wholesale.
+    if delete_only:
+        print(f"\nDelete-only: skipping extraction for {len(groups)} "
+              f"cycle(s) in this window.")
+        print("  Coverage was NOT re-verified here - rely on the summary "
+              "you ran beforehand.")
+        delete_raw_chunks(groups, base_dir, None)
+        return
+
     # ---- Step 2: Save grid constants (once) ----
     constants_path = os.path.join(base_dir, CONSTANTS_FILENAME)
     if not os.path.exists(constants_path):
@@ -736,61 +861,282 @@ def fetch_and_process_mtg(
     else:
         print(f"\nGrid constants already exist: {constants_path}")
 
-    # ---- Step 3: Process repeat cycles in parallel ----
+    # ---- Step 3: Extract, recording and reclaiming as it goes --------
+    # Provenance is written per wave rather than at the end: the NMA
+    # server and the Data Store share filenames, so an interrupted run
+    # that lost the ledger would leave its own output unattributable.
+    #
+    # Deletion is folded into the same loop, download run or not. Doing
+    # it after the whole range would need room for every raw chunk at once,
+    # which is the situation --delete_raw exists to avoid - and on a local
+    # pass over an archive that is already on disk, deferring it frees
+    # nothing until the run ends, which is when the space is least useful.
+    #
+    # Cycles that failed keep their raw either way; --delete_only is the
+    # unconditional sweep for whatever is left after the summary has judged
+    # it.
+    process_groups(
+        groups, base_dir, variables, workers=workers, overwrite=overwrite,
+        delete_after=delete_raw, provenance_source=provenance_source,
+    )
+    if provenance_source:
+        print(f"Provenance      : recorded as '{provenance_source}' "
+              f"(per wave)")
+
+
+def record_existing_provenance(base_dir, variables, source):
+    """Stamp cycles already on disk with a source you know out-of-band.
+
+    The ledger can only be written when a cycle is downloaded. Anything
+    that arrived before the ledger existed reports as `unrecorded`, and no
+    amount of re-summarising changes that - the summary reads, it does not
+    write, and the two sources share filenames so origin is not
+    recoverable from the data.
+
+    This is the escape hatch for the one case where the information does
+    exist: you know the current archive came from a particular source.
+    Recording that is not guesswork, it is entering knowledge the system
+    never had.
+
+    Only cycles with NO existing entry are stamped. A cycle already
+    recorded as `datastore` is left alone - overwriting it here would
+    destroy a fact with an assumption.
+    """
+    from datastore_fill import load_provenance, provenance_of, record_provenance
+
+    base = Path(base_dir)
+    blob = load_provenance(base)
+
+    # Enumerate what the .npy tree actually holds, at cycle granularity.
+    found = set()
+    for channel in variables:
+        ch_root = base / channel
+        if not ch_root.is_dir():
+            continue
+        for day_dir in ch_root.iterdir():
+            if not day_dir.is_dir():
+                continue
+            for filename in os.listdir(day_dir):
+                m = re.match(
+                    r'^nc4_(\d{4}-\d{2}-\d{2})-Romania_(\d{4})_', filename)
+                if m:
+                    hhmm = m.group(2)
+                    found.add((m.group(1), f"{hhmm[:2]}:{hhmm[2:]}"))
+
+    if not found:
+        print("\nNo .npy cycles found - nothing to record.")
+        return 0
+
+    already = {(d, t) for d, t in found if provenance_of(blob, d, t)}
+    fresh = sorted(found - already)
+
+    print("\nRecording provenance for existing data")
+    print(f"  cycles on disk    : {len(found):,}")
+    print(f"  already recorded  : {len(already):,} (left untouched)")
+    print(f"  to stamp as {source:<9}: {len(fresh):,}")
+
+    if not fresh:
+        print("  nothing to do")
+        return 0
+
+    n = record_provenance(base, fresh, source)
+    print(f"  recorded {n:,} cycle(s)")
+    return n
+
+
+def delete_raw_chunks(groups, base_dir, counts=None):
+    """Delete the raw .nc chunks for every cycle in this run.
+
+    Unconditional by design. Deciding what is missing - including cycles
+    that failed to extract - is the summary's job, and the summary is run
+    BEFORE deletion, recording the gaps in mtg_missing_timesteps.json.
+    Re-deriving that judgement here would duplicate it, and a partial
+    deletion is worse than none: it leaves the archive in a state that
+    neither the raw nor the .npy scan describes.
+
+    Irreversible. Recovering a chunk means downloading it again, and it
+    removes the --skip_download reprocessing path - which is why it is
+    opt-in via --delete_raw and never happens as a side effect.
+
+    `counts` is accepted and ignored so callers need not know whether a
+    guard exists.
+    """
+    files = [f for paths in groups.values() for f in paths]
+    if not files:
+        print("\nNo raw chunks to delete.")
+        return 0
+
+    total = len(files)
+    print(f"\nDeleting {total:,} raw chunk file(s) ...")
+
+    width = 40
+    freed = removed = failed = 0
+    for i, path in enumerate(files, start=1):
+        try:
+            freed += os.path.getsize(path)
+            os.remove(path)
+            removed += 1
+        except OSError as exc:
+            failed += 1
+            if failed <= 5:
+                print(f"\n  WARNING: could not remove {path}: {exc}", file=sys.stderr)
+
+        # Redraw at most ~200 times: a bar that flushes on every file is
+        # slower than the deletion it is measuring.
+        if i % max(1, total // 200) == 0 or i == total:
+            done = int(width * i / total)
+            bar = "#" * done + "." * (width - done)
+            sys.stdout.write(
+                f"\r  [{bar}] {i / total * 100:5.1f}%  "
+                f"{i:,}/{total:,}  {freed / (1024 ** 3):.1f} GB freed")
+            sys.stdout.flush()
+    sys.stdout.write("\n")
+
+    print(f"  Removed {removed:,} file(s), freed "
+          f"{freed / (1024 ** 3):.1f} GB")
+    if failed:
+        print(f"  {failed} file(s) could not be removed")
+    print("  Coverage is now measured from the .npy output "
+          "(summarize_mtg.py, --scan npy is the default).")
+    return removed
+
+
+def cycle_from_key(group_key):
+    """'YYYYMMDD_RRRR' -> ('YYYY-MM-DD', 'HH:MM') nominal, or None."""
+    try:
+        date_part, rc_part = group_key.split("_")
+        ref = datetime.datetime.strptime(date_part, "%Y%m%d")
+        nominal = nominal_time_from_repeat_cycle(ref, int(rc_part))
+        return nominal.strftime("%Y-%m-%d"), nominal.strftime("%H:%M")
+    except (ValueError, IndexError):
+        return None
+
+
+def process_groups(groups, base_dir, variables, workers=10,
+                   overwrite=False, delete_after=False,
+                   provenance_source=None):
+    """Extract every variable of every repeat cycle in `groups` to .npy.
+
+    Work is dispatched in waves of `workers` cycles. After each wave the
+    cycles that extracted cleanly have their provenance recorded and, with
+    `delete_after`, their raw chunks deleted before the next wave starts.
+
+    That bound is the point: peak raw-on-disk is one wave, not the whole
+    download. Extracting a full archive and only then deleting would
+    require room for every chunk at once, which is exactly the situation
+    the deletion exists to avoid.
+
+    Cycles that FAILED keep their raw chunks. Deleting those would destroy
+    the only copy before any summary has seen them, and would remove the
+    `--skip_download --reprocess` retry path for the one case that needs
+    it. This is not the same judgement as the standalone
+    `delete_raw_chunks()`: there, the summary has already run and recorded
+    the gaps, so there is nothing left to preserve.
+
+    Args:
+        delete_after: delete raw chunks of successful cycles, wave by wave.
+        provenance_source: 'nma' or 'datastore'; recorded per wave so an
+            interrupted run keeps what it already did.
+
+    Returns:
+        dict with 'processed', 'skipped', 'errors', 'deleted', 'freed_bytes'.
+    """
     sorted_items = sorted(groups.items())
     total = len(sorted_items)
+    if not total:
+        print("No repeat cycles to process.")
+        return {"processed": 0, "skipped": 0, "errors": 0,
+                "deleted": 0, "freed_bytes": 0}
+
     n_workers = min(workers, total)
     print(f"\nProcessing {total} repeat cycles "
-          f"({len(variables)} variables, {n_workers} workers)...\n")
+              f"({len(variables)} variables, waves of {n_workers})...")
+    if delete_after:
+        print(f"  Raw chunks are deleted after each wave; peak raw on "
+              f"disk is {n_workers} cycle(s).")
 
-    success_count = 0
-    error_count = 0
-    errors = []  # collect errors for summary
+    success = skipped_count = error_count = 0
+    deleted = freed = 0
+    errors = []
+    failed_keys = []
+    done = 0
 
     with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = {}
-        for key, files in sorted_items:
-            future = executor.submit(
-                process_repeat_cycle,
-                files, base_dir, variables, group_key=key
-            )
-            futures[future] = key
+        for wave_start in range(0, total, n_workers):
+            wave = sorted_items[wave_start:wave_start + n_workers]
+            futures = {
+                executor.submit(process_repeat_cycle, files, base_dir,
+                                variables, group_key=key,
+                                overwrite=overwrite): key
+                for key, files in wave
+            }
 
-        completed = 0
-        for future in as_completed(futures):
-            key = futures[future]
-            completed += 1
-
-            try:
-                result = future.result()
-                if result['failed']:
+            clean = []
+            for future in as_completed(futures):
+                key = futures[future]
+                done += 1
+                try:
+                    result = future.result()
+                    if result["failed"]:
+                        error_count += 1
+                        failed_keys.append(key)
+                        for var, err in result["failed"]:
+                            errors.append(f"  {key} / {var}: {err}")
+                    else:
+                        if result["ok"]:
+                            success += 1
+                        elif result["skipped"]:
+                            skipped_count += 1
+                        clean.append(key)
+                except Exception as e:                    # noqa: BLE001
                     error_count += 1
-                    for var, err in result['failed']:
-                        errors.append(f"  {key} / {var}: {err}")
-                if result['ok']:
-                    success_count += 1
-            except Exception as e:
-                error_count += 1
-                errors.append(f"  {key}: {e}")
+                    failed_keys.append(key)
+                    errors.append(f"  {key}: {e}")
 
-            # Progress update every n_workers completions (or at the end)
-            if completed % n_workers == 0 or completed == total:
-                pct = completed / total * 100
-                print(f"  [{completed}/{total}] ({pct:.0f}%) — "
-                      f"{success_count} OK, {error_count} errors")
+            # ---- per-wave: record, then reclaim -------------------------
+            if clean and provenance_source:
+                pairs = [c for c in (cycle_from_key(k) for k in clean) if c]
+                if pairs:
+                    try:
+                        from datastore_fill import record_provenance
+                        record_provenance(base_dir, pairs, provenance_source)
+                    except Exception as exc:              # noqa: BLE001
+                        print(f"  WARNING: provenance not recorded for this wave: {exc}", file=sys.stderr)
 
-    # Error summary
+            if clean and delete_after:
+                wave_files = [f for k, f in wave if k in set(clean)]
+                for paths in wave_files:
+                    for path in paths:
+                        try:
+                            freed += os.path.getsize(path)
+                            os.remove(path)
+                            deleted += 1
+                        except OSError:
+                            pass
+
+            pct = done / total * 100
+            tail = f"  {freed / (1024 ** 3):.1f} GB freed" if delete_after else ""
+            print(f"  [{done}/{total}] ({pct:.0f}%) - {success} OK, "
+                  f"{skipped_count} present, {error_count} "
+                  f"errors{tail}", flush=True)
+
     if errors:
         print(f"\n{len(errors)} error(s):")
-        for e in errors[:20]:  # cap at 20 to avoid flooding
+        for e in errors[:20]:
             print(e)
         if len(errors) > 20:
             print(f"  ... and {len(errors) - 20} more")
+        if delete_after:
+            print(f"  Raw chunks kept for {len(failed_keys)} failed cycle(s) - "
+                  f"retry with --skip_download --reprocess")
 
-    print(
-        f"\nDone. Successfully processed {success_count}/{len(groups)} "
-        f"repeat cycles."
-    )
+    print(f"\nDone. Newly processed {success}/{total} repeat "
+          f"cycles" + (f", {skipped_count} already present" if skipped_count else "") + ".")
+    if delete_after:
+        print(f"  Deleted {deleted:,} raw chunk file(s), freed "
+              f"{freed / (1024 ** 3):.1f} GB")
+    return {"processed": success, "skipped": skipped_count,
+            "errors": error_count, "deleted": deleted, "freed_bytes": freed}
 
 
 def group_local_files(local_dir, start_dt, end_dt,
@@ -851,6 +1197,174 @@ def group_local_files(local_dir, start_dt, end_dt,
     return dict(groups)
 
 
+def split_gaps_by_window(gaps, n_months):
+    """Split {date: [HH:MM]} into consecutive n-month windows.
+
+    Returns [(label, gaps_subset), ...] ordered in time. With n_months
+    None the whole gap list comes back as a single window, which is the
+    unbatched behaviour.
+
+    Windows are cut on the gap dates themselves rather than on a
+    contiguous calendar range: an archive with a hole from October to
+    February should not spend windows on months that have nothing to
+    fetch.
+    """
+    if not gaps:
+        return []
+    if not n_months:
+        days = sorted(gaps)
+        return [(f"{days[0]} .. {days[-1]}", gaps)]
+    if n_months < 1:
+        raise ValueError(f"--batch_months must be >= 1, got {n_months}")
+
+    buckets = {}
+    for date_str in sorted(gaps):
+        y, m = int(date_str[:4]), int(date_str[5:7])
+        idx = (y * 12 + (m - 1)) // n_months
+        buckets.setdefault(idx, {})[date_str] = gaps[date_str]
+
+    out = []
+    for idx in sorted(buckets):
+        sub = buckets[idx]
+        days = sorted(sub)
+        out.append((f"{days[0]} .. {days[-1]}", sub))
+    return out
+
+
+def datastore_window(gaps_subset, data_dir, variables, chunk_filter,
+                     minute_filter, credentials_file, workers,
+                     overwrite=False, delete_after=False):
+    """Fetch one window's gaps, extract them, and reclaim their raw.
+
+    The whole point of doing this per window: fill_gaps writes raw .nc and
+    nothing else, so fetching the entire gap list before extracting any of
+    it would need room for every chunk at once. On a wide range that is
+    terabytes. Interleaving bounds peak raw to one window.
+
+    Returns (files_downloaded, exit_code).
+    """
+    from datastore_fill import fill_gaps, print_report
+
+    raw_dir = os.path.join(data_dir, '_raw_chunks')
+    report = fill_gaps(gaps_subset, raw_dir=raw_dir,
+                       credentials_file=credentials_file, dry_run=False)
+    print_report(report)
+
+    if not report['files_downloaded']:
+        return 0, 0
+
+    # Extract only the dates this window touched.
+    dates = sorted(report['timesteps_filled'])
+    if not dates:
+        return report['files_downloaded'], 0
+
+    span_start = datetime.datetime.strptime(min(dates), '%Y-%m-%d')
+    span_end = (datetime.datetime.strptime(max(dates), '%Y-%m-%d')
+                + datetime.timedelta(days=1) - datetime.timedelta(seconds=1))
+    groups = group_local_files(raw_dir, span_start, span_end,
+                              chunk_filter=chunk_filter,
+                              minute_filter=minute_filter)
+    day_keys = {d.replace('-', '') for d in dates}
+    groups = {k: v for k, v in groups.items() if k.split('_')[0] in day_keys}
+
+    counts = process_groups(groups, data_dir, variables, workers=workers,
+                            overwrite=overwrite, delete_after=delete_after,
+                            provenance_source='datastore')
+    return report['files_downloaded'], (1 if counts['errors'] else 0)
+
+
+def process_datastore_fill(missing_json_path, base_dir, variables,
+                            chunk_filter=ROMANIA_CHUNKS,
+                            minute_filter=None, workers=10,
+                            overwrite=False, delete_after=False):
+    """
+    Extract .npy for the cycles a Data Store backfill just recovered.
+
+    datastore_fill.fill_gaps() writes raw .nc into _raw_chunks/ and stops.
+    The coverage summary counts those .nc directly, so without this step
+    the reported percentage rises while no .npy is produced and
+    reproject.py still finds nothing. Called after --source
+    close that gap.
+
+    Scoped to the dates the fill touched rather than the whole archive,
+    and paired with the skip-existing check in process_repeat_cycle, so
+    the already-processed cycles on those dates cost a stat() each.
+
+    Args:
+        missing_json_path (Path or str): mtg_missing_timesteps.json, which
+            carries the `datastore_fill` report block.
+        base_dir (str): Root output directory (holds _raw_chunks/).
+        variables (list): FCI channel names to extract.
+        chunk_filter (set): Allowed chunk numbers.
+        minute_filter (set or None): Allowed minutes within the hour.
+        workers (int): Process pool size.
+        overwrite (bool): Re-extract even when the .npy is already there.
+
+    Returns:
+        int: process exit code — 0 on success, 1 if any cycle failed.
+    """
+    path = Path(missing_json_path)
+    if not path.is_file():
+        print(f"\nWARNING: {path} not found — cannot tell which cycles the "
+              f"backfill recovered. Run the pipeline again with "
+              f"--skip_download to process them.")
+        return 1
+
+    with open(path, 'r', encoding='utf-8') as fh:
+        report = json.load(fh).get('datastore_fill', {})
+
+    if not report:
+        print("\nNo datastore_fill block in the summary — nothing to "
+              "process.")
+        return 0
+    if report.get('dry_run'):
+        print("\nBackfill was a dry run — no files to process.")
+        return 0
+    if not report.get('files_downloaded'):
+        print("\nBackfill downloaded nothing — no cycles to process.")
+        return 0
+
+    # Which dates gained files. `timesteps_filled` is the authoritative
+    # record; fall back to parsing the filenames when the cycle mapping
+    # came back empty, so a partial report still gets processed.
+    dates = set(report.get('timesteps_filled', {}))
+    if not dates:
+        for name in report.get('files', []):
+            info = parse_fci_filename(name)
+            if info['sensing_start']:
+                dates.add(info['sensing_start'].strftime('%Y-%m-%d'))
+    if not dates:
+        print("\nBackfill report lists no recoverable dates — skipping.")
+        return 1
+
+    print("\n" + "=" * 70)
+    print(f"Processing backfilled cycles on {len(dates)} date(s)")
+    print("=" * 70)
+
+    day_keys = {d.replace('-', '') for d in dates}
+    span_start = datetime.datetime.strptime(min(dates), '%Y-%m-%d')
+    span_end = (datetime.datetime.strptime(max(dates), '%Y-%m-%d')
+                + datetime.timedelta(days=1)
+                - datetime.timedelta(seconds=1))
+
+    groups = group_local_files(
+        os.path.join(base_dir, '_raw_chunks'), span_start, span_end,
+        chunk_filter=chunk_filter, minute_filter=minute_filter,
+    )
+    # group_local_files spans min..max, which may cover untouched dates in
+    # between — keep only the days the fill actually wrote to.
+    groups = {k: v for k, v in groups.items()
+              if k.split('_')[0] in day_keys}
+
+    # 'datastore' per wave, so an interrupted extraction still leaves the
+    # cycles it finished correctly attributed.
+    counts = process_groups(groups, base_dir, variables,
+                            workers=workers, overwrite=overwrite,
+                            delete_after=delete_after,
+                            provenance_source="datastore")
+    return 1 if counts['errors'] else 0
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -867,16 +1381,20 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        '--start', '-s', type=str, required=True,
-        help='Start datetime (format: yyyy/mm/dd-hhmm)',
+        '--start', '-s', type=str, default=None,
+        help='Start datetime (format: yyyy/mm/dd-hhmm). Required except '
+             'with --record_existing, which acts on whatever is already '
+             'on disk and so has no window.',
     )
     parser.add_argument(
-        '--end', '-e', type=str, required=True,
-        help='End datetime (format: yyyy/mm/dd-hhmm)',
+        '--end', '-e', type=str, default=None,
+        help='End datetime (format: yyyy/mm/dd-hhmm). See --start.',
     )
     parser.add_argument(
-        '--password_file', '-pw', type=str, required=True,
-        help='Path to text file containing the SSH password',
+        '--password_file', '-pw', type=str, default=None,
+        help='Path to text file containing the SSH password. Required only '
+             'when actually reaching the NMA server: not needed with '
+             '--skip_download or --source datastore.',
     )
     parser.add_argument(
         '--products_file', '-pf', type=str,
@@ -897,20 +1415,100 @@ if __name__ == "__main__":
         help='Download all 40 chunks instead of Romania-only',
     )
     parser.add_argument(
-        '--fill-gaps', action='store_true',
-        help='After downloading, summarise coverage and pull any missing '
-             'or single-chunk repeat cycles from the EUMETSAT Data Store, '
-             'then re-summarise. Requires `eumdac` and EUMDAC credentials.',
+        '--source', type=str, default='nma',
+        choices=['nma', 'datastore', 'both', 'local'],
+        help="Where to pull from. 'nma' (default) is the internal server "
+             "over SFTP. 'datastore' fetches ONLY the cycles listed as "
+             "missing in mtg_missing_timesteps.json, so run "
+             "summarize_mtg.py first - that file is how this knows what "
+             "to ask for. 'both' does NMA then fills whatever is still "
+             "missing from the Data Store. 'local' downloads nothing at "
+             "all: it extracts the raw chunks already in _raw_chunks/ to "
+             ".npy and, with --delete_raw, reclaims each wave as it "
+             "finishes - for raw left behind by an interrupted run, or an "
+             "archive fetched before extraction was wired in. Whichever "
+             "is used is recorded per cycle in provenance.json and "
+             "reported by the summary.",
+    )
+    parser.add_argument(
+        '--batch_months', type=int, default=None, metavar='N',
+        help="Split the range into N-month windows and run them one after "
+             "another, each downloading, extracting and (with "
+             "--delete_raw) reclaiming before the next begins. Bounds peak "
+             "raw-on-disk to one window instead of the whole range. "
+             "Calendar-aligned, so windows match the monthly coverage "
+             "chart. A failed window is reported and the rest continue "
+             "unless --stop_on_error.",
+    )
+    parser.add_argument(
+        '--stop_on_error', action='store_true',
+        help="With --batch_months, abort at the first failed window "
+             "instead of carrying on.",
+    )
+    parser.add_argument(
+        '--record_existing', type=str, default=None,
+        choices=['nma', 'datastore'],
+        help="Stamp every cycle already on disk as having come from this "
+             "source, then exit. For data downloaded before the ledger "
+             "existed, where you know the origin but the files do not "
+             "record it. Cycles already recorded are left untouched. Run "
+             "this BEFORE pulling from a second source, or the two become "
+             "indistinguishable.",
+    )
+    parser.add_argument(
+        '--provenance', type=str, default=None,
+        choices=['nma', 'datastore'],
+        help="With --source local, stamp the cycles this run extracts as "
+             "having come from this source. Omitted, nothing is recorded: "
+             "raw sitting in _raw_chunks/ carries no evidence of its "
+             "origin, and guessing would make the ledger worthless. "
+             "Cycles already recorded are never overwritten.",
+    )
+    parser.add_argument(
+        '--missing_json', type=str, default=None,
+        help="Gap list driving --source datastore (default: "
+             "mtg_missing_timesteps.json at the project root).",
+    )
+    parser.add_argument(
+        '--fill_dry_run', action='store_true',
+        help="With --source datastore, list what would be fetched and "
+             "stop. No credentials are spent, nothing is written.",
+    )
+    parser.add_argument(
+        '--no_fill_incomplete', action='store_true',
+        help="With --source datastore, recover only fully-absent cycles, "
+             "skipping those missing just one of the two Romania chunks.",
     )
     parser.add_argument(
         '--eumdac_credentials', type=str, default=None,
         help='Two-line EUMDAC credentials file (key, then secret) used by '
-             '--fill-gaps. Falls back to EUMDAC_KEY / EUMDAC_SECRET.',
+             '--source datastore. Falls back to EUMDAC_KEY / EUMDAC_SECRET.',
     )
     parser.add_argument(
         '--skip_download', action='store_true',
         help='Skip SFTP download; process files already in '
              '<output_dir>/_raw_chunks/',
+    )
+    parser.add_argument(
+        '--delete_raw', action='store_true',
+        help='After extracting every cycle to .npy, delete the raw .nc '
+             'chunks. Irreversible, and it removes the --skip_download '
+             'reprocessing path, so it is opt-in and never fires on its '
+             'own. Skipped entirely if any cycle reported an error. '
+             'Coverage is then measured from the .npy output.',
+    )
+    parser.add_argument(
+        '--delete_only', action='store_true',
+        help="Delete the raw chunks in the window without re-extracting "
+             "first. Implies --skip_download. Use after a summary has "
+             "confirmed coverage: the extraction pass would just re-check "
+             "the same .npy files, which on a full archive is 100k+ stat "
+             "calls. Nothing is verified here, so run the summary first.",
+    )
+    parser.add_argument(
+        '--reprocess', action='store_true',
+        help='Re-extract cycles whose .npy already exist. Off by default, '
+             'so a --skip_download pass only fills in what is missing.',
     )
     parser.add_argument(
         '--timesteps', type=str, nargs='+', default=None,
@@ -925,6 +1523,35 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # The password is only ever read to open the SFTP session, so demand it
+    # for download runs only. Enforced here rather than via required=True so
+    # a --skip_download pass over _raw_chunks/ needs no credential at all.
+    # --record_existing only writes the ledger for data already present:
+    # no window to download over, and no server to authenticate to.
+    if not args.record_existing and not (args.start and args.end):
+        parser.error('--start and --end are required (except with '
+                     '--record_existing)')
+
+    if args.delete_only:
+        args.skip_download = True
+
+    # 'local' is exactly "the nma path with the download removed", so it is
+    # expressed as such rather than as a second copy of the same stage.
+    if args.source == 'local':
+        args.skip_download = True
+    elif args.provenance:
+        parser.error('--provenance applies to --source local; the other '
+                     'sources already know where their data came from.')
+
+    needs_sftp = (args.source in ('nma', 'both')
+                  and not args.skip_download
+                  and not args.record_existing)
+    if needs_sftp and not args.password_file:
+        parser.error(
+            '--password_file is required to reach the NMA server. '
+            'Not needed with --skip_download, nor with --source datastore, '
+            'which authenticates to EUMETSAT via --eumdac_credentials.')
 
     # Resolve output directory. Anchor to the script's OWN location
     # (our_data/satellite_data/) rather than the caller's cwd, so
@@ -947,6 +1574,7 @@ if __name__ == "__main__":
     print(f"Date range     : {args.start} to {args.end}")
     print(f"Output dir     : {data_dir}")
     print(f"Products file  : {products_file}")
+    print(f"Source         : {args.source}")
     print(f"Skip download  : {args.skip_download}")
     print(f"Workers        : {args.workers}")
 
@@ -978,28 +1606,138 @@ if __name__ == "__main__":
         )
 
     # Run
-    fetch_and_process_mtg(
-        args.start, args.end,
-        data_dir, mtg_variables,
-        password_file=args.password_file,
-        chunk_filter=chunk_filter,
-        minute_filter=minute_filter,
-        skip_download=args.skip_download,
-        workers=args.workers,
-    )
+    if args.record_existing:
+        raise SystemExit(
+            0 if record_existing_provenance(
+                data_dir, mtg_variables, args.record_existing) >= 0 else 1)
 
-    if args.fill_gaps:
-        # The NMA server is the primary source; whatever never arrived
-        # there is recovered from the EUMETSAT Data Store. Delegated to
-        # summarize_mtg so there is exactly one implementation of the
-        # summarise -> fill -> re-summarise cycle.
-        import subprocess
-        cmd = [sys.executable,
-               str(Path(__file__).resolve().parent / 'summarize_mtg.py'),
-               '--fill-from-datastore']
-        if args.eumdac_credentials:
-            cmd += ['--eumdac_credentials', args.eumdac_credentials]
-        print("\n" + "=" * 70)
-        print("Download phase complete - checking coverage and backfilling")
+    # The NMA server is the primary source; --source datastore skips
+    # it entirely and pulls only the gaps the summary already found.
+    if args.source in ('nma', 'both', 'local'):
+        # A local pass has no server to attribute to, so it records only
+        # what --provenance was explicitly told.
+        prov = args.provenance if args.source == 'local' else 'nma'
+
+        def _window(ws, we):
+            fetch_and_process_mtg(
+                ws.strftime('%Y/%m/%d-%H%M'), we.strftime('%Y/%m/%d-%H%M'),
+                data_dir, mtg_variables,
+                password_file=args.password_file,
+                chunk_filter=chunk_filter,
+                minute_filter=minute_filter,
+                skip_download=args.skip_download,
+                workers=args.workers,
+                overwrite=args.reprocess,
+                delete_raw=args.delete_raw or args.delete_only,
+                delete_only=args.delete_only,
+                provenance_source=prov,
+            )
+
+        start_dt, end_dt = parse_date_range(args.start, args.end)
+        if start_dt is None:
+            sys.exit(2)
+
+        if args.batch_months is not None:
+            # One window at a time, so peak raw-on-disk is a window rather
+            # than the whole range: each downloads, extracts and (with
+            # --delete_raw) reclaims before the next begins.
+            try:
+                windows = month_windows(start_dt, end_dt, args.batch_months)
+            except ValueError as exc:
+                parser.error(str(exc))
+            print(f"Batching       : {len(windows)} window(s) of "
+                  f"{args.batch_months} month(s)")
+            rc = run_batched(args, windows, _window)
+            if rc:
+                raise SystemExit(rc)
+        else:
+            _window(start_dt, end_dt)
+
+    # ---- Data Store stage -------------------------------------------
+    # Lives here rather than in the summariser: downloading is the
+    # pipeline's job, and the choice of source belongs to whoever runs it.
+    # The summary's role is to say what is missing; this acts on that.
+    if args.source in ('datastore', 'both'):
+        import json as _json
+        from datastore_fill import (collect_gaps, fill_gaps, print_report,
+                                    record_provenance)
+
+        missing_json = Path(args.missing_json) if args.missing_json else (
+            PROJECT_ROOT / 'mtg_missing_timesteps.json')
+        if not missing_json.is_file():
+            raise SystemExit(
+                f"Gap list not found: {missing_json}" + chr(10) +
+                "--source datastore fetches only what the summary reports "
+                "as missing, so run it first:" + chr(10) +
+                "    python our_data/satellite_data/summarize_mtg.py "
+                "--start <YYYY-MM-DD> --end <YYYY-MM-DD>")
+
+        with open(missing_json, encoding='utf-8') as fh:
+            gaps = collect_gaps(_json.load(fh),
+                                include_incomplete=not args.no_fill_incomplete)
+
+        print(chr(10) + "=" * 70)
+        print("EUMETSAT Data Store")
         print("=" * 70)
-        raise SystemExit(subprocess.call(cmd))
+        print(f"  Gap list : {missing_json}")
+        print(f"  Cycles   : {sum(len(v) for v in gaps.values())} "
+              f"across {len(gaps)} date(s)")
+
+        if args.fill_dry_run:
+            # Dry run stays whole-list: it downloads nothing, and seeing
+            # the complete set is the point of asking.
+            report = fill_gaps(
+                gaps, raw_dir=os.path.join(data_dir, '_raw_chunks'),
+                credentials_file=args.eumdac_credentials, dry_run=True)
+            print_report(report)
+            raise SystemExit(0)
+
+        # Download -> extract -> reclaim, one window at a time. Fetching
+        # the whole gap list first would need room for every raw chunk
+        # simultaneously; on a wide range that is terabytes.
+        try:
+            windows = split_gaps_by_window(gaps, args.batch_months)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+        if args.batch_months:
+            print(f"  Windows  : {len(windows)} of {args.batch_months} "
+                  f"month(s), reclaimed as each completes")
+
+        total_files = 0
+        failures = []
+        for i, (label, subset) in enumerate(windows, start=1):
+            n_cycles = sum(len(v) for v in subset.values())
+            print(chr(10) + "=" * 70)
+            print(f"[window {i}/{len(windows)}]  {label}  "
+                  f"({n_cycles} cycle(s), {len(subset)} date(s))")
+            print("=" * 70)
+            try:
+                got, rc = datastore_window(
+                    subset, data_dir, mtg_variables, chunk_filter,
+                    minute_filter, args.eumdac_credentials, args.workers,
+                    overwrite=args.reprocess,
+                    delete_after=args.delete_raw,
+                )
+                total_files += got
+                if rc:
+                    failures.append((label, "extraction errors"))
+            except Exception as exc:                      # noqa: BLE001
+                failures.append((label, str(exc)))
+                print(f"  WINDOW FAILED: {exc}", file=sys.stderr)
+                if args.stop_on_error:
+                    break
+
+        print(chr(10) + "=" * 70)
+        print("Data Store run complete")
+        print("=" * 70)
+        print(f"  windows        : {len(windows)}")
+        print(f"  files fetched  : {total_files:,}")
+        print(f"  failed windows : {len(failures)}")
+        for label, why in failures:
+            print(f"    {label}  {why}")
+        if failures:
+            print(chr(10) + "  Re-run the same command to retry: cycles "
+                  "already present are skipped.")
+            raise SystemExit(1)
+        raise SystemExit(0)

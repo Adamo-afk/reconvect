@@ -140,9 +140,44 @@ def rc_to_hhmm(rc):
 # Summarise
 # =============================================================================
 
-def summarize(raw_dir, filter_minutes):
+def date_range(start: str | None, end: str | None) -> list[str]:
+    """Every YYYY-MM-DD from start to end inclusive, or [] if unbounded.
+
+    This is what turns "no files for this date" into a reported gap. Without
+    an explicit range the scan can only describe dates it found files for,
+    so a date absent from disk entirely is silently not missing — it simply
+    does not exist as far as the summary is concerned, and the Data Store
+    backfill therefore never asks for it.
+    """
+    if not start or not end:
+        return []
+    from datetime import datetime, timedelta
+    try:
+        d0 = datetime.strptime(start, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"ERROR: --start/--end must be YYYY-MM-DD "
+              f"(got {start!r}, {end!r})", file=sys.stderr)
+        sys.exit(2)
+    if d1 < d0:
+        print(f"ERROR: --end {end} precedes --start {start}", file=sys.stderr)
+        sys.exit(2)
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def summarize(raw_dir, filter_minutes, start=None, end=None,
+              required_parts=2):
     """
     Scan _raw_chunks and build a per-date summary.
+
+    `start`/`end` (YYYY-MM-DD, inclusive) declare the range the archive is
+    EXPECTED to cover. Dates in that range with no files on disk are
+    reported as fully missing rather than omitted. Without them the range
+    is inferred from what was found, which cannot see an absent date.
 
     Returns (rows, dates) where:
         rows: list of per-date dicts ready for CSV / printing
@@ -185,13 +220,33 @@ def summarize(raw_dir, filter_minutes):
                         info['chunk_number']
                     )
 
+    # Seed every expected date so one with no files on disk still produces
+    # a row — the defaultdict gives it zero counts and an empty rc set, so
+    # the whole day comes out as missing rather than absent.
+    expected_dates = date_range(start, end)
+    if expected_dates:
+        found = set(dates.keys())
+        for date_str in expected_dates:
+            dates[date_str]  # touch: instantiates the defaultdict entry
+        empty = [d for d in expected_dates if d not in found]
+        outside = sorted(found - set(expected_dates))
+        print(f"Expected range : {expected_dates[0]} .. {expected_dates[-1]} "
+              f"({len(expected_dates)} dates)")
+        if empty:
+            print(f"  {len(empty)} date(s) in range have NO files at all "
+                  f"— reported as fully missing")
+        if outside:
+            print(f"  WARNING: {len(outside)} date(s) on disk fall OUTSIDE "
+                  f"the range and are still reported: {outside[:5]}"
+                  + (" ..." if len(outside) > 5 else ""))
+
     rows = []
     for date_str in sorted(dates.keys()):
         d = dates[date_str]
         complete = 0
         incomplete = 0
         for rc, chunks in d['chunks_seen'].items():
-            if len(chunks) >= 2:
+            if len(chunks) >= required_parts:
                 complete += 1
             else:
                 incomplete += 1
@@ -221,7 +276,7 @@ def summarize(raw_dir, filter_minutes):
     return rows, dates
 
 
-def build_missing_timesteps(dates, filter_minutes):
+def build_missing_timesteps(dates, filter_minutes, required_parts=2):
     """
     Compute the exact missing on-grid timesteps for each date.
 
@@ -253,7 +308,7 @@ def build_missing_timesteps(dates, filter_minutes):
         incomplete_times = []
         for rc in sorted(on_grid_present):
             chunks = d['chunks_seen'].get(rc, set())
-            if len(chunks) < 2:
+            if len(chunks) < required_parts:
                 incomplete_times.append(rc_to_hhmm(rc))
 
         n_present = len(on_grid_present)
@@ -291,9 +346,10 @@ def build_missing_timesteps(dates, filter_minutes):
     return result
 
 
-def save_missing_json(dates, filter_minutes, output_path):
+def save_missing_json(dates, filter_minutes, output_path,
+                      required_parts=2):
     """Build and save the missing timesteps JSON."""
-    missing = build_missing_timesteps(dates, filter_minutes)
+    missing = build_missing_timesteps(dates, filter_minutes, required_parts)
     with open(output_path, 'w') as f:
         json.dump(missing, f, indent=2)
 
@@ -308,6 +364,284 @@ def save_missing_json(dates, filter_minutes, output_path):
 # Output
 # =============================================================================
 
+# =============================================================================
+# Scanning the processed .npy output
+# =============================================================================
+# Once --delete_raw removes the chunks, the extracted arrays are the only
+# evidence a cycle exists, so coverage has to be measured from them. The
+# per-date structure produced here is deliberately identical to the raw
+# scan's, with one substitution: `chunks_seen[rc]` holds the set of
+# CHANNELS extracted rather than the set of chunk numbers present.
+#
+# That changes what "incomplete" means. On raw it was "one of the two
+# Romania chunks arrived". On .npy it is "some channels extracted but not
+# all" — the same shape of failure one stage later, which is why
+# `required_parts` is a parameter rather than a hard-coded 2.
+
+NPY_FILE_PATTERN = re.compile(
+    r'^nc4_(?P<date>\d{4}-\d{2}-\d{2})-Romania_(?P<hhmm>\d{4})_'
+    r'(?P<channel>[a-z]+_\d+)\.npy$'
+)
+
+
+def expected_channels(products_file=None):
+    """Channels a complete cycle must have, from satellite_products.json.
+
+    Read from the products file rather than discovered from the directory
+    tree on purpose: a channel that was never downloaded has no directory,
+    so discovery would quietly redefine "complete" as "whatever is here".
+    """
+    path = Path(products_file) if products_file else (
+        Path(__file__).resolve().parent / 'satellite_products.json')
+    if not path.is_file():
+        print(f"ERROR: products file not found: {path}", file=sys.stderr)
+        sys.exit(2)
+    blob = json.loads(path.read_text())
+    channels = blob.get('mtg') or []
+    if not channels:
+        print(f"ERROR: no 'mtg' channels listed in {path}", file=sys.stderr)
+        sys.exit(2)
+    return sorted(set(channels))
+
+
+def hhmm_to_rc(hhmm):
+    """'HHMM' -> 1-indexed repeat cycle. Inverse of rc_to_hhmm."""
+    h, m = int(hhmm[:2]), int(hhmm[2:])
+    return (h * 60 + m) // NATIVE_CADENCE_MINUTES + 1
+
+
+def summarize_npy(base_dir, filter_minutes, channels,
+                  start=None, end=None):
+    """Scan MTG/<channel>/nc4_<date>-Romania_<channel>/*.npy.
+
+    Returns (rows, dates) in the same shape as summarize(), so every
+    downstream consumer — the table, the CSV, the missing JSON, the chart —
+    works unchanged.
+    """
+    base = Path(base_dir)
+    if not base.is_dir():
+        print(f"ERROR: directory not found: {base}", file=sys.stderr)
+        sys.exit(1)
+
+    expected_rcs = expected_rc_set(filter_minutes)
+    expected_per_day = len(expected_rcs)
+
+    dates = defaultdict(lambda: {
+        'body_files':     0,
+        'trailer_files':  0,
+        'repeat_cycles':  set(),
+        'chunks_seen':    defaultdict(set),   # rc -> set of CHANNELS
+    })
+
+    n_files = 0
+    for channel in channels:
+        ch_root = base / channel
+        if not ch_root.is_dir():
+            print(f"  NOTE: no directory for channel {channel} — every "
+                  f"cycle will count as incomplete")
+            continue
+        for day_dir in sorted(ch_root.iterdir()):
+            if not day_dir.is_dir():
+                continue
+            for filename in os.listdir(day_dir):
+                m = NPY_FILE_PATTERN.match(filename)
+                if not m or m.group('channel') != channel:
+                    continue
+                date_str = m.group('date')
+                rc = hhmm_to_rc(m.group('hhmm'))
+                d = dates[date_str]
+                d['body_files'] += 1
+                d['repeat_cycles'].add(rc)
+                d['chunks_seen'][rc].add(channel)
+                n_files += 1
+
+    print(f"Found {n_files} .npy files across {len(channels)} channel(s) "
+          f"in {base}")
+
+    expected_dates = date_range(start, end)
+    if expected_dates:
+        found = set(dates.keys())
+        for date_str in expected_dates:
+            dates[date_str]
+        empty = [d for d in expected_dates if d not in found]
+        outside = sorted(found - set(expected_dates))
+        print(f"Expected range : {expected_dates[0]} .. {expected_dates[-1]} "
+              f"({len(expected_dates)} dates)")
+        if empty:
+            print(f"  {len(empty)} date(s) in range have NO files at all "
+                  f"— reported as fully missing")
+        if outside:
+            print(f"  WARNING: {len(outside)} date(s) on disk fall OUTSIDE "
+                  f"the range and are still reported: {outside[:5]}"
+                  + (" ..." if len(outside) > 5 else ""))
+
+    rows = []
+    for date_str in sorted(dates.keys()):
+        d = dates[date_str]
+        complete = incomplete = 0
+        for rc, chans in d['chunks_seen'].items():
+            if len(chans) >= len(channels):
+                complete += 1
+            else:
+                incomplete += 1
+        present_rcs = d['repeat_cycles']
+        on_grid_present = present_rcs & expected_rcs
+        off_grid_present = present_rcs - expected_rcs
+        coverage_pct = (len(on_grid_present) / expected_per_day * 100
+                        if expected_per_day else 0)
+        rows.append({
+            'date':          date_str,
+            'body_files':    d['body_files'],
+            'trailer_files': 0,
+            'repeat_cycles': len(present_rcs),
+            'on_grid':       len(on_grid_present),
+            'off_grid':      len(off_grid_present),
+            'expected':      expected_per_day,
+            # Same keys as the raw scan so the table, CSV and chart are
+            # shared. On .npy "complete" means every channel extracted,
+            # not two chunks present — see summarize_npy's header note.
+            'complete_2chunk':   complete,
+            'incomplete_1chunk': incomplete,
+            'coverage_pct':      round(coverage_pct, 1),
+        })
+    return rows, dates
+
+
+def report_provenance(dates, base_dir):
+    """Print the NMA / Data Store split across the scanned cycles."""
+    from datastore_fill import load_provenance, provenance_of
+    blob = load_provenance(base_dir)
+
+    if not blob.get("cycles"):
+        print("\nProvenance     : no ledger yet - origin is unrecorded for "
+              "every cycle.\n                 It is written from now on by "
+              "pipeline_msg_mtg.py, whichever --source is used.")
+        return {}
+
+    tally = defaultdict(int)
+    for date_str, d in dates.items():
+        for rc in d["repeat_cycles"]:
+            src = provenance_of(blob, date_str, rc_to_hhmm(rc))
+            tally[src or "unrecorded"] += 1
+
+    total = sum(tally.values())
+    if total:
+        parts = ", ".join(f"{k}={v:,} ({v / total * 100:.1f}%)"
+                          for k, v in sorted(tally.items()))
+        print(f"\nProvenance     : {parts}")
+    if tally.get("unrecorded"):
+        print("                 'unrecorded' predates the ledger - the two "
+              "sources share filenames, so origin is unrecoverable for "
+              "those.")
+    return dict(tally)
+
+
+# =============================================================================
+# Monthly coverage chart
+# =============================================================================
+# Lives here rather than in a module of its own: summarize_mtg is the
+# canonical summariser the OPERA and lightning reports already mirror, and
+# they import `plot_monthly` from it so all three charts stay identical.
+# Three copies of this would drift, and the point of the chart is that the
+# products can be read side by side.
+
+BAR_COLOR = "#9db8d6"
+BAR_ALPHA = 0.45
+LINE_COLOR = "#1f4e79"
+EXPECTED_COLOR = "#b0b0b0"
+SHORTFALL_COLOR = "#c25450"
+
+
+def monthly_counts(per_date):
+    """Collapse {'YYYY-MM-DD': n} into {'YYYY-MM': total}."""
+    out = defaultdict(int)
+    for date_str, n in per_date.items():
+        out[date_str[:7]] += int(n)
+    return dict(out)
+
+
+def plot_monthly(per_date_found, output_path, title,
+                 per_date_expected=None, ylabel="files"):
+    """Faded bars carrying magnitude, a line through their tops carrying shape.
+
+    `per_date_expected` is drawn as a dashed reference. Without it a month
+    that is uniformly half-empty looks identical to a complete one, which
+    is the failure this chart exists to make visible.
+    """
+    if not per_date_found:
+        print("  (no dates - chart skipped)")
+        return None
+
+    # Agg: these run headless, and on Windows a missing display would
+    # otherwise kill the whole summary at its very last step.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
+    found = monthly_counts(per_date_found)
+    expected = monthly_counts(per_date_expected) if per_date_expected else {}
+    months = sorted(set(found) | set(expected))
+    y_found = [found.get(m, 0) for m in months]
+    x = range(len(months))
+
+    fig, ax = plt.subplots(figsize=(max(8, len(months) * 0.62), 4.6))
+    if expected:
+        ax.bar(x, [expected.get(m, 0) for m in months], color="none",
+               edgecolor=EXPECTED_COLOR, linewidth=1.0, linestyle="--",
+               zorder=1, label="expected")
+    ax.bar(x, y_found, color=BAR_COLOR, alpha=BAR_ALPHA, zorder=2,
+           label=ylabel)
+    ax.plot(x, y_found, color=LINE_COLOR, linewidth=1.8, marker="o",
+            markersize=4, zorder=3)
+
+    if expected:
+        for xi, m in enumerate(months):
+            exp, got = expected.get(m, 0), found.get(m, 0)
+            if exp and got < exp * 0.99:
+                ax.annotate(f"-{(1 - got / exp) * 100:.0f}%", (xi, got),
+                            textcoords="offset points", xytext=(0, -14),
+                            ha="center", fontsize=7, color=SHORTFALL_COLOR)
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(months, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    if expected:
+        ax.legend(frameon=False, fontsize=8, loc="upper right")
+
+    fig.tight_layout()
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=140)
+    plt.close(fig)
+
+    total = sum(y_found)
+    msg = f"  Chart saved: {out}  ({len(months)} months, {total:,} {ylabel})"
+    if expected:
+        total_exp = sum(expected.get(m, 0) for m in months)
+        if total_exp:
+            msg += f", {total / total_exp * 100:.1f}% of expected"
+    print(msg)
+    return out
+
+
+def render_chart(rows, output_path):
+    """Monthly coverage chart from the per-date rows."""
+    found = {r['date']: r['on_grid'] for r in rows}
+    expected = {r['date']: r['expected'] for r in rows}
+    span = f"{min(found)} .. {max(found)}" if found else ""
+    return plot_monthly(found, output_path,
+                        title=f"MTG FCI on-grid coverage  {span}",
+                        per_date_expected=expected,
+                        ylabel="repeat cycles")
+
+
 def print_table(rows):
     """Print a formatted table to stdout."""
     if not rows:
@@ -317,7 +651,7 @@ def print_table(rows):
     header = (
         f"{'Date':<12} {'Body':>6} {'Trail':>6} {'Cycles':>7} "
         f"{'OnGrid':>7} {'OffGrid':>8} {'Exp':>5} "
-        f"{'OK(2ch)':>8} {'Partial':>8} {'Coverage':>9}"
+        f"{'OK(all)':>8} {'Partial':>8} {'Coverage':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -412,29 +746,38 @@ if __name__ == "__main__":
              "Default: read from timestep_config.json.",
     )
     parser.add_argument(
-        '--fill-from-datastore', action='store_true',
-        help="After summarising, fetch every missing / incomplete repeat "
-             "cycle from the EUMETSAT Data Store (FDHSI) into --raw_dir, "
-             "then re-summarise and record what was obtained. Requires "
-             "the `eumdac` package and EUMDAC credentials.",
+        '--start', type=str, default=None,
+        help="First date the archive is EXPECTED to cover (YYYY-MM-DD). "
+             "Dates in range with no files on disk are reported as fully "
+             "missing instead of being omitted — which is the only way "
+             "--fill-from-datastore can be asked for them. Without this "
+             "the range is inferred from the files found, so an entirely "
+             "absent date is invisible.",
     )
     parser.add_argument(
-        '--eumdac_credentials', type=str, default=None,
-        help="Two-line text file for --fill-from-datastore: EUMDAC key on "
-             "line 1, secret on line 2. Falls back to the EUMDAC_KEY and "
-             "EUMDAC_SECRET environment variables.",
+        '--end', type=str, default=None,
+        help="Last expected date, inclusive (YYYY-MM-DD). See --start.",
     )
     parser.add_argument(
-        '--fill-dry-run', action='store_true',
-        help="With --fill-from-datastore, list what would be fetched "
-             "without downloading anything.",
+        '--scan', type=str, default='npy', choices=['npy', 'raw'],
+        help="What to measure coverage from. 'npy' (default) reads the "
+             "extracted per-channel arrays, which is the only option once "
+             "pipeline_msg_mtg.py --delete_raw has removed the chunks. "
+             "'raw' reads _raw_chunks/*.nc, the pre-extraction view: use "
+             "it to see what arrived but failed to extract.",
     )
     parser.add_argument(
-        '--no-fill-incomplete', action='store_true',
-        help="With --fill-from-datastore, recover only fully-missing "
-             "cycles and leave one-chunk cycles alone.",
+        '--npy_dir', type=str, default=None,
+        help="MTG root holding the per-channel .npy directories "
+             "(default: the parent of --raw_dir).",
     )
-
+    parser.add_argument(
+        '--chart', type=str, nargs='?', const='mtg_coverage.png', default=None,
+        help="Render a monthly coverage chart (faded bars + line through "
+             "the bar tops, with the cadence expectation as a dashed "
+             "reference). Optional PNG path; defaults to "
+             "mtg_coverage.png at the project root.",
+    )
     args = parser.parse_args()
 
     if args.timesteps is not None:
@@ -453,51 +796,23 @@ if __name__ == "__main__":
           f"(of {NATIVE_CYCLES_PER_DAY} native cycles)")
     print()
 
-    rows, dates = summarize(args.raw_dir, filter_minutes)
+    npy_dir = args.npy_dir or str(Path(args.raw_dir).parent)
+    channels = expected_channels() if args.scan == 'npy' else []
+    required_parts = len(channels) if args.scan == 'npy' else 2
+
+    def run_scan():
+        if args.scan == 'npy':
+            return summarize_npy(npy_dir, filter_minutes, channels,
+                                 start=args.start, end=args.end)
+        return summarize(args.raw_dir, filter_minutes,
+                         start=args.start, end=args.end,
+                         required_parts=required_parts)
+
+    rows, dates = run_scan()
     print_table(rows)
     save_csv(rows, args.output)
-    save_missing_json(dates, filter_minutes, args.missing)
-
-    if not args.fill_from_datastore:
-        sys.exit(0)
-
-    # ---- Backfill pass -------------------------------------------------
-    # The first summary above located the gaps. Fetch them from the Data
-    # Store, then summarise a SECOND time so the CSV / JSON on disk
-    # describe the post-backfill state, and record what was obtained.
-    from datastore_fill import collect_gaps, fill_gaps, print_report
-
-    before_json = build_missing_timesteps(dates, filter_minutes)
-    before = before_json['summary']
-    gaps = collect_gaps(before_json,
-                        include_incomplete=not args.no_fill_incomplete)
-
-    report = fill_gaps(
-        gaps,
-        raw_dir=args.raw_dir,
-        credentials_file=args.eumdac_credentials,
-        dry_run=args.fill_dry_run,
-    )
-    print_report(report)
-
-    if report['files_downloaded'] and not args.fill_dry_run:
-        print("\nRe-summarising after backfill ...\n")
-        rows, dates = summarize(args.raw_dir, filter_minutes)
-        print_table(rows)
-        save_csv(rows, args.output)
-
-    after = build_missing_timesteps(dates, filter_minutes)
-    report['coverage_before_pct'] = before['overall_coverage_pct']
-    report['coverage_after_pct'] = after['summary']['overall_coverage_pct']
-    report['missing_before'] = before['total_missing']
-    report['missing_after'] = after['summary']['total_missing']
-    after['datastore_fill'] = report
-
-    with open(args.missing, 'w') as f:
-        json.dump(after, f, indent=2)
-
-    print(f"\nCoverage {report['coverage_before_pct']}% -> "
-          f"{report['coverage_after_pct']}%  "
-          f"({report['missing_before']} -> {report['missing_after']} missing)")
-    print(f"Backfill record written into {args.missing} "
-          f"under `datastore_fill`.")
+    save_missing_json(dates, filter_minutes, args.missing,
+                      required_parts=required_parts)
+    report_provenance(dates, npy_dir)
+    if args.chart:
+        render_chart(rows, args.chart)
