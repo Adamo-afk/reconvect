@@ -41,6 +41,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from pipeline_config import SOURCE
+from periods import (
+    Period,
+    data_tag,
+    parse_date,
+    sequence_meta_name,
+    split_csv_name,
+)
+from ensemble_plan import require_last_state, state_period
 
 
 # =============================================================================
@@ -558,8 +566,49 @@ def main():
              "debugging where you want sequences before the cross-product "
              "intersection is applied."
     )
+    parser.add_argument(
+        "--period", type=str, default=None,
+        help="Ensemble member label to build sequences for (e.g. 2025warm). "
+             "Bounds are read from the registered plan in "
+             "ensemble_registry.json, and every output is suffixed with the "
+             "label so members coexist on disk. Omit for the unscoped, "
+             "whole-archive behaviour."
+    )
+    parser.add_argument(
+        "--start", type=str, default=None,
+        help="Inclusive start date YYYY-MM-DD. Use with --end and --period "
+             "to define a period ad hoc instead of reading the registry."
+    )
+    parser.add_argument(
+        "--end", type=str, default=None,
+        help="Inclusive end date YYYY-MM-DD. See --start."
+    )
 
     args = parser.parse_args()
+
+    # Resolve the period, if any. Two routes: a label alone looks the
+    # bounds up in the registered plan (the normal path, keeping every
+    # member consistent with what was registered), or explicit --start/
+    # --end define one ad hoc for a one-off experiment.
+    period = None
+    if args.start or args.end:
+        if not (args.start and args.end and args.period):
+            parser.error(
+                "--start/--end must be given together, and with --period "
+                "to name the resulting slice."
+            )
+        period = Period.parse(args.period, args.start, args.end)
+    elif args.period:
+        state = require_last_state(args.data_root)
+        period = state_period(state, args.period)
+        if period is None:
+            known = [m["label"] for m in state.get("members", [])]
+            parser.error(
+                f"Period {args.period!r} is not in the registered ensemble "
+                f"plan. Registered members: {known or '(none)'}. "
+                f"Re-register with `create_datasets.py --ensemble`, or pass "
+                f"--start/--end to define it ad hoc."
+            )
 
     # Resolve effective cadence + index path from the chosen source
     _, effective_step_minutes = resolve_index_source(args.data_root, SOURCE)
@@ -572,6 +621,7 @@ def main():
     print("=" * 70)
     print(f"Data root        : {args.data_root}")
     print(f"Activity source  : {SOURCE}")
+    print(f"Period           : {period if period else 'none (whole archive)'}")
     print(f"Step interval    : {effective_step_minutes} min")
     print(f"Window           : {args.past} past + current + {args.future} future "
           f"= {args.past + 1 + args.future} steps "
@@ -590,6 +640,23 @@ def main():
     dates = sorted(set(d for d, _ in index.keys()))
     print(f"  {len(index)} active timestamps across {len(dates)} dates")
 
+    # Period gate. Applied before continuity analysis so a sequence can
+    # never straddle the boundary - a member must not see a single frame
+    # from outside its own slice, or the disjointness the whole period
+    # machinery rests on is already broken at the input.
+    if period is not None:
+        kept = {k: v for k, v in index.items()
+                if period.contains(parse_date(k[0]))}
+        dropped_dates = len(dates) - len(set(d for d, _ in kept.keys()))
+        print(f"  Period gate: {len(kept)} timestamps kept, "
+              f"{len(index) - len(kept)} dropped "
+              f"({dropped_dates} dates outside {period.label})")
+        index = kept
+        if not index:
+            print(f"\nNo timestamps fall inside {period}. Nothing to do.")
+            return
+        dates = sorted(set(d for d, _ in index.keys()))
+
     # Apply the cross-product manifest gate. This is the final filter -
     # extract_patches.py reads the same manifest, so any (date, time) we
     # surface in train/val/test_data.csv has guaranteed coverage from
@@ -604,7 +671,8 @@ def main():
     manifest_set = (load_manifest_timesteps(manifest_path)
                     if manifest_path else None)
     drops_csv_path = os.path.join(
-        args.data_root, f'extract_patch_seq_drops_{SOURCE}.csv'
+        args.data_root,
+        f'extract_patch_seq_drops_{data_tag(SOURCE, period)}.csv'
     )
     index = apply_manifest_gate(index, manifest_set, drops_csv_path)
     if not index:
@@ -634,23 +702,19 @@ def main():
     # DBSCAN-driven and lightning-driven tracks can coexist on disk
     # (domain-adaptation pipeline trains both and uses them as separate
     # feature extractors).
+    # With a period the tag gains its label, so members never overwrite
+    # each other. Without one the filenames are unchanged, keeping every
+    # artefact produced before period support readable.
     print("\nSaving results...")
     src = SOURCE
-    save_sequences(
-        train,
-        os.path.join(args.data_root, f'train_data_{src}.csv'),
-        args.past, args.future
-    )
-    save_sequences(
-        val,
-        os.path.join(args.data_root, f'validation_data_{src}.csv'),
-        args.past, args.future
-    )
-    save_sequences(
-        test,
-        os.path.join(args.data_root, f'test_data_{src}.csv'),
-        args.past, args.future
-    )
+    for split, rows in (("train", train), ("validation", val),
+                        ("test", test)):
+        save_sequences(
+            rows,
+            os.path.join(args.data_root,
+                         split_csv_name(split, src, period)),
+            args.past, args.future
+        )
 
     # Drop a sidecar metadata file so create_datasets.py can recover step
     # minutes and window length without re-parsing column names.
@@ -660,8 +724,11 @@ def main():
     # the configured cadence from timestep_config.json - preserved for
     # traceability. Suffixed by source so the two tracks don't clobber
     # each other's metadata.
+    # `period` carries the bounds, not just the label, so a downstream
+    # overlap check never has to trust the filename.
     seq_meta = {
         "source": SOURCE,
+        "period": period.to_dict() if period else None,
         "step_minutes": effective_step_minutes,
         "source_step_minutes_native": STEP_MINUTES,
         "past_steps": args.past,
@@ -670,7 +737,7 @@ def main():
                          for o in range(-args.past, args.future + 1)],
     }
     seq_meta_path = os.path.join(
-        args.data_root, f'sequence_meta_{src}.json'
+        args.data_root, sequence_meta_name(src, period)
     )
     with open(seq_meta_path, 'w') as f:
         json.dump(seq_meta, f, indent=2)

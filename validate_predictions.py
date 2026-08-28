@@ -145,6 +145,89 @@ N_RAINFALL_CLASSES = 5
 # lists in the JSON.
 HIGH_COVERAGE_PCT = 90.0
 
+# ---------------------------------------------------------------------------
+# Rainfall hysteresis sweep
+# ---------------------------------------------------------------------------
+# The rainfall track is post-processed with the same connected-component
+# hysteresis as lightning, but on p(argmax) rather than a single sigmoid.
+# The LOW threshold is held fixed and HIGH is swept upward from it in
+# `RAINFALL_SWEEP_STEP` increments until `RAINFALL_HIGH_MARGIN` above it,
+# picking the per-lead value that maximises aggregate CSI - mirroring what
+# the lightning track already does with its 0.91..0.99 grid.
+#
+# The margin default spans the operational DEFAULT_RAIN_HIGH (0.55) so the
+# current shipped setting is always inside the swept range and the sweep can
+# only ever improve on it.
+RAINFALL_SWEEP_STEP = 0.01
+RAINFALL_HIGH_MARGIN = 0.30
+
+# The 18-patch grid the ensemble scorer accumulates over.
+N_PATCHES = 18
+
+
+def rainfall_high_grid(low: float,
+                       margin: float = RAINFALL_HIGH_MARGIN,
+                       step: float = RAINFALL_SWEEP_STEP) -> list[float]:
+    """Candidate HIGH thresholds: low+step .. low+margin, inclusive.
+
+    HIGH must exceed LOW for hysteresis to mean anything - at equality the
+    connected-component seeding degenerates to a plain threshold - so the
+    grid starts one step above.
+    """
+    n = int(round(margin / step))
+    return [round(low + step * k, 4) for k in range(1, n + 1)]
+
+
+def _accumulate_per_patch(gt_bin: np.ndarray, pred_bin: np.ndarray,
+                          acc: dict, lead_idx: int) -> None:
+    """Pool contingency counts per patch for one lead time.
+
+    Scored on the POST-PROCESSED canvases, so a member is judged on the
+    product actually shipped rather than on raw model output. Counts are
+    pooled rather than averaged because CSI is not additive.
+    """
+    from predict_full_domain import get_patch_bounds
+
+    for patch in range(1, N_PATCHES + 1):
+        r0, r1, c0, c1 = get_patch_bounds(patch)
+        g = gt_bin[r0:r1, c0:c1]
+        p = pred_bin[r0:r1, c0:c1]
+        valid = g >= 0                      # -1 marks an unfilled patch slot
+        if not np.any(valid):
+            continue
+        g_pos = (g > 0) & valid
+        p_pos = (p > 0) & valid
+        cell = acc.setdefault(patch, {}).setdefault(
+            lead_idx, {"TP": 0, "FP": 0, "FN": 0, "TN": 0, "n": 0})
+        cell["TP"] += int(np.count_nonzero(g_pos & p_pos))
+        cell["FP"] += int(np.count_nonzero(~g_pos & p_pos & valid))
+        cell["FN"] += int(np.count_nonzero(g_pos & ~p_pos))
+        cell["TN"] += int(np.count_nonzero(~g_pos & ~p_pos & valid))
+        cell["n"] += 1
+
+
+def per_patch_scores(acc: dict) -> dict:
+    """Collapse pooled per-patch counts into CSI, POD and FAR."""
+    eps = 1e-7
+    out: dict[str, dict] = {}
+    for patch, leads in sorted(acc.items()):
+        tp = sum(c["TP"] for c in leads.values())
+        fp = sum(c["FP"] for c in leads.values())
+        fn = sum(c["FN"] for c in leads.values())
+        per_lead = {
+            str(i): round(c["TP"] / (c["TP"] + c["FP"] + c["FN"] + eps), 6)
+            for i, c in sorted(leads.items())
+        }
+        out[str(patch)] = {
+            "csi": round(tp / (tp + fp + fn + eps), 6),
+            "pod": round(tp / (tp + fn + eps), 6),
+            "far": round(fp / (tp + fp + eps), 6),
+            "csi_per_lead": per_lead,
+            "n_samples": max((c["n"] for c in leads.values()), default=0),
+            "TP": tp, "FP": fp, "FN": fn,
+        }
+    return out
+
 
 # ============================================================================
 # OPERA sample selection
@@ -327,11 +410,19 @@ def _write_json(track: str, year: int, month: int,
                 step_minutes: int, path: Path,
                 *,
                 rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
-                high_coverage_pct: float = HIGH_COVERAGE_PCT):
+                high_coverage_pct: float = HIGH_COVERAGE_PCT,
+                post_processing: dict | None = None,
+                per_patch: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
     lists of (date, reference_utc) that met the high-coverage threshold.
     Both thresholds are recorded in the JSON so a run's outputs are
-    self-documenting when the CLI overrides the defaults."""
+    self-documenting when the CLI overrides the defaults.
+
+    `post_processing` mirrors the lightning track's block: the swept
+    hysteresis grid and the per-lead winner. `per_patch` carries the
+    per-patch CSI table that build_patch_ensemble.py selects members
+    from - scored on the post-processed canvases, so it describes the
+    shipped product rather than raw argmax."""
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
     total = len(rows)
     above = {lt: {"iou_mask": 0, "class_wt": 0} for lt in lead_titles}
@@ -378,6 +469,10 @@ def _write_json(track: str, year: int, month: int,
         "metrics_per_lead": metrics,
         "high_coverage_samples_per_lead": high_cov_lists,
     }
+    if post_processing is not None:
+        doc["post_processing"] = post_processing
+    if per_patch is not None:
+        doc["per_patch"] = per_patch
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
@@ -460,7 +555,9 @@ def run_extraction(track: str, year: int, month: int,
                    data_root: Path, model_dir: Path, output_dir: Path,
                    *,
                    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
-                   high_coverage_pct: float = HIGH_COVERAGE_PCT):
+                   high_coverage_pct: float = HIGH_COVERAGE_PCT,
+                   rainfall_low: float | None = None,
+                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN):
     """Extraction mode for the rainfall track.
 
     IMPORTANT scope note for `rainfall_threshold_mmh`: this override
@@ -508,6 +605,23 @@ def run_extraction(track: str, year: int, month: int,
     }
     n_skipped = 0
 
+    # Hysteresis sweep state. `tuning` holds confusion counts per
+    # (lead, candidate high); `patch_acc` pools per-patch counts on the
+    # post-processed canvases so the ensemble scorer judges the shipped
+    # product, not raw argmax.
+    from visualize_gt_vs_pred import (
+        build_full_soft_pred, rainfall_hysteresis, DEFAULT_RAIN_LOW,
+    )
+    rain_low = (rainfall_low if rainfall_low is not None
+                else DEFAULT_RAIN_LOW)
+    high_grid = rainfall_high_grid(rain_low, rainfall_high_margin)
+    print(f"  Hysteresis sweep: low={rain_low:.2f} fixed, high "
+          f"{high_grid[0]:.2f}..{high_grid[-1]:.2f} "
+          f"step {RAINFALL_SWEEP_STEP:.2f} ({len(high_grid)} candidates)")
+    tuning = {i: {h: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for h in high_grid}
+              for i in range(len(LEAD_STEP_OFFSETS))}
+    patch_acc: dict = {}
+
     print(f"\nRunning inference on {len(selected)} samples ...")
     for k, (date_str, hhmm) in enumerate(selected, 1):
         ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
@@ -523,6 +637,11 @@ def run_extraction(track: str, year: int, month: int,
         preds = model.predict(inputs, batch_size=18, verbose=0)
         pred_canvases = paste_predictions_to_canvas(
             preds, valid_patches, label_type="radar",
+        )
+        # Soft canvases keep p(argmax), which the hysteresis needs; the
+        # argmax canvases above have already discarded it.
+        soft_canvases = build_full_soft_pred(
+            preds, valid_patches, n_classes=preds.shape[-1],
         )
 
         row = {"date": date_str, "reference_utc": ref_utc}
@@ -543,17 +662,84 @@ def run_extraction(track: str, year: int, month: int,
             confusion_per_lead[i]["FP"] += fp
             confusion_per_lead[i]["FN"] += fn
             confusion_per_lead[i]["TN"] += tn
+
+            # Sweep every candidate HIGH on this sample, so the choice is
+            # made once at the end over pooled counts rather than per
+            # sample.
+            for h in high_grid:
+                hyst = rainfall_hysteresis(soft_canvases[i],
+                                           low=rain_low, high=h)
+                hyst = np.where(gt_canvas < 0, -1, hyst)  # keep empty slots
+                htp, hfp, hfn, htn = _binary_confusion(gt_canvas, hyst)
+                cell = tuning[i][h]
+                cell["TP"] += htp
+                cell["FP"] += hfp
+                cell["FN"] += hfn
+                cell["TN"] += htn
+                # Per-patch counts are pooled for EVERY candidate, so the
+                # winning threshold's per-patch table is already available
+                # once the sweep picks it - no second inference pass.
+                _accumulate_per_patch(gt_canvas, hyst,
+                                      patch_acc.setdefault(h, {}), i)
         rows.append(row)
 
     print(f"\nDone. {len(rows)} samples processed, {n_skipped} skipped "
           f"(missing inputs).")
+
+    # ---- Pick the per-lead HIGH that maximises aggregate CSI -----------
+    eps = 1e-7
+    best_high: dict[int, float] = {}
+    print("\nHysteresis tuning (rainfall):")
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        scored = {
+            h: c["TP"] / (c["TP"] + c["FP"] + c["FN"] + eps)
+            for h, c in tuning[i].items()
+        }
+        # max() on ties returns the first; sorting by (-csi, high) makes
+        # the lower threshold win, which is the conservative choice.
+        chosen = sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        best_high[i] = chosen
+        raw_csi = (confusion_per_lead[i]["TP"]
+                   / (confusion_per_lead[i]["TP"]
+                      + confusion_per_lead[i]["FP"]
+                      + confusion_per_lead[i]["FN"] + eps))
+        print(f"  t+{offset}: high={chosen:.2f}  CSI={scored[chosen]:.4f}  "
+              f"(raw argmax CSI={raw_csi:.4f})")
+
+    # Per-patch table assembled from each lead's winning threshold.
+    chosen_patch_acc: dict = {}
+    for i in range(len(LEAD_STEP_OFFSETS)):
+        for patch, leads in patch_acc.get(best_high[i], {}).items():
+            if i in leads:
+                chosen_patch_acc.setdefault(patch, {})[i] = leads[i]
+
+    post_processing = {
+        "method": "rainfall_hysteresis on p(argmax)",
+        "low_threshold": rain_low,
+        "high_grid": high_grid,
+        "sweep_step": RAINFALL_SWEEP_STEP,
+        "high_margin": rainfall_high_margin,
+        "high_threshold_per_lead": {
+            f"t+{off}": best_high[i]
+            for i, off in enumerate(LEAD_STEP_OFFSETS)
+        },
+        "tuning_scores": {
+            f"t+{off}": {
+                f"{h:.2f}": _summarise_confusion(tuning[i][h])
+                for h in high_grid
+            }
+            for i, off in enumerate(LEAD_STEP_OFFSETS)
+        },
+    }
 
     stem = f"{track}_{year:04d}_{month:02d}"
     _write_csv(rows, output_dir / f"{stem}_samples.csv")
     _write_json(track, year, month, selected, rows, confusion_per_lead,
                 step_minutes, output_dir / f"{stem}_summary.json",
                 rainfall_threshold_mmh=rainfall_threshold_mmh,
-                high_coverage_pct=high_coverage_pct)
+                high_coverage_pct=high_coverage_pct,
+                post_processing=post_processing,
+                per_patch=per_patch_scores(chosen_patch_acc))
     _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
                          step_minutes, output_dir / f"{stem}_metrics.png",
                          rainfall_threshold_mmh=rainfall_threshold_mmh,
@@ -1421,6 +1607,7 @@ def _write_json_lightning(
     *,
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
+    per_patch: dict | None = None,
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
@@ -1488,6 +1675,8 @@ def _write_json_lightning(
             "tuning_metric": "csi",
         },
     }
+    if per_patch is not None:
+        doc["per_patch"] = per_patch
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
@@ -1635,6 +1824,8 @@ def run_extraction_lightning(
     # dicts. Aggregate (lead_idx, high) counts are computed by summing.
     # Memory footprint: N_samples * 3 leads * 9 highs * 4 ints -> tiny.
     per_sample_confusion: list[dict] = []  # each dict: {(lead_idx, high): (tp, fp, fn, tn)}
+    # {candidate_high: {patch: {lead: counts}}} on post-processed canvases.
+    patch_acc: dict = {}
     n_skipped = 0
 
     print(f"\nRunning inference on {len(selected)} samples "
@@ -1671,6 +1862,11 @@ def run_extraction_lightning(
                     prob_canvases[i], low=low_threshold, high=float(h),
                 )
                 sample_confusion[(i, h)] = _binary_confusion_lightning(gt_bin, pred_bin)
+                # Per-patch counts on the POST-PROCESSED (Hann-blended +
+                # hysteresis) canvas, pooled for every candidate so the
+                # winning threshold's table needs no second inference pass.
+                _accumulate_per_patch(gt_bin, pred_bin,
+                                      patch_acc.setdefault(float(h), {}), i)
         per_sample_confusion.append({
             "date": date_str,
             "reference_utc": ref_utc,
@@ -1712,6 +1908,15 @@ def run_extraction_lightning(
               f"(CSI={agg['CSI']:.3f}, POD={agg['POD']:.3f}, "
               f"FAR={agg['FAR']:.3f})")
 
+    # Per-patch table assembled from each lead's winning threshold, so the
+    # ensemble scorer sees exactly the operating point this run selected.
+    chosen_patch_acc: dict = {}
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        for patch, leads in patch_acc.get(
+                float(best_high_per_lead[offset]), {}).items():
+            if i in leads:
+                chosen_patch_acc.setdefault(patch, {})[i] = leads[i]
+
     # ---- Emit per-sample rows at chosen best_high per lead ----
     rows: list[dict] = []
     for s in per_sample_confusion:
@@ -1742,6 +1947,7 @@ def run_extraction_lightning(
         output_dir / f"{stem}_summary.json",
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
+        per_patch=per_patch_scores(chosen_patch_acc),
     )
     _plot_metrics_figure_lightning(
         year, month, rows,
@@ -2591,6 +2797,18 @@ def main() -> int:
                              f"suptitle is coloured green. Default "
                              f"{HIGH_COVERAGE_PCT:g}. Lowering makes the "
                              f"grading more lenient; raising is stricter.")
+    parser.add_argument("--rainfall_low_threshold", type=float, default=None,
+                        help="LOW hysteresis threshold for the rainfall "
+                             "track, held fixed during the sweep. Default: "
+                             "visualize_gt_vs_pred.DEFAULT_RAIN_LOW (0.35).")
+    parser.add_argument("--rainfall_high_margin", type=float,
+                        default=RAINFALL_HIGH_MARGIN,
+                        help=f"How far above LOW the HIGH sweep runs, in "
+                             f"{RAINFALL_SWEEP_STEP:g} steps. Default "
+                             f"{RAINFALL_HIGH_MARGIN:g}, i.e. low+0.01 .. "
+                             f"low+{RAINFALL_HIGH_MARGIN:g}, which spans the "
+                             f"operational 0.55 so the sweep can only "
+                             f"improve on it.")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
@@ -2632,6 +2850,8 @@ def main() -> int:
                 data_root, model_dir, output_dir,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
+                rainfall_low=args.rainfall_low_threshold,
+                rainfall_high_margin=args.rainfall_high_margin,
             )
         else:
             # Visualization mode reads high-coverage lists from the JSON

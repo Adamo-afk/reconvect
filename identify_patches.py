@@ -390,7 +390,7 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     _ensure_borders_cached()
     c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
 
-    field_title = 'OPERA instantaneous rain rate (reprojected)'
+    field_title = 'OPERA instantaneous rain rate'
     field_cbar  = 'OPERA rain rate (mm/h)'
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 8),
@@ -401,7 +401,11 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     for ax_idx, (ax, data, title_suffix) in enumerate(zip(
         axes,
         [reprojected, binary_mask],
-        [field_title, 'DBSCAN binary mask']
+        # The right panel is named for what it shows, which is the
+        # selection: the mask underneath is often only a few dozen
+        # pixels, while the translucent red tiles and the numbering are
+        # what the reader actually reads it for.
+        [field_title, 'DBSCAN patch selection']
     )):
         if ax_idx == 0:
             im = ax.imshow(data, cmap='viridis', aspect='equal',
@@ -474,116 +478,13 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     return save_path
 
 
-def plot_binary_mask_selection(binary_mask, active_patches,
-                               date_str, time_str, output_dir):
-    """Single-panel view of the DBSCAN binary mask + the 18-patch
-    "polygon" of candidate 256x256 tiles that feed the model.
-
-    Separate from `plot_patch_grid` on purpose: that function is the
-    2-panel operational figure (OPERA rain rate + binary mask, red-
-    highlighted selection) and stays untouched. This one focuses on
-    the SELECTION step:
-
-      - Binary mask underneath (gray / red).
-      - Orange dashed rectangles outlining EVERY one of the 18
-        256x256 candidate patches — together they form the full
-        6x3 polygon of positions the pipeline can pick from.
-      - Each patch labelled with its 1..18 number (upper-left = 1,
-        row-major) coloured green when the patch was selected by
-        DBSCAN (`in active_patches`) and red when it was rejected.
-        Matches the green/red numbering convention already used by
-        the full-domain training/inference plots so a viewer switching
-        between the two sets of figures reads them the same way.
-
-    Args:
-        binary_mask: (768, 1536) uint8 — the DBSCAN binary mask.
-        active_patches: list of 1-indexed patch numbers selected by
-            `identify_active_patches`.
-        date_str: 'YYYY-MM-DD'
-        time_str: 'HH:MM'
-        output_dir: directory to save the PNG.
-
-    Returns:
-        Absolute path to the written PNG.
-    """
-    _ensure_borders_cached()
-    c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
-
-    fig, ax = plt.subplots(1, 1, figsize=(14, 7), constrained_layout=True)
-
-    # Binary mask: dry = light gray so the orange grid + red mask pixels
-    # pop; DBSCAN cluster pixels stay in the operational red.
-    mask_cmap = ListedColormap(['#e6e6e6', '#d32f2f'])
-    ax.imshow(binary_mask, cmap=mask_cmap, vmin=0, vmax=1,
-              aspect='equal', interpolation='nearest')
-
-    active_set = set(active_patches)
-
-    # Orange dashed grid — one rectangle per candidate 256x256 patch.
-    # The 18 rectangles together outline the "selection polygon" the
-    # pipeline picks from.
-    for p in range(1, N_PATCHES + 1):
-        r0, _, c0, _ = get_patch_bounds(p)
-        ax.add_patch(Rectangle(
-            (c0, r0), PATCH_SIZE, PATCH_SIZE,
-            linewidth=1.4, edgecolor='#ff8c00',
-            linestyle=(0, (4, 3)), facecolor='none',
-            zorder=4,
-        ))
-
-    # Green (active) / red (inactive) numbering — same colour codes as
-    # visualize_gt_vs_pred._plot_patch_grid so the two figure families
-    # read identically.
-    for p in range(1, N_PATCHES + 1):
-        r0, _, c0, _ = get_patch_bounds(p)
-        is_active = p in active_set
-        ax.text(
-            c0 + 6, r0 + 6, str(p),
-            color='#1b7a1b' if is_active else '#c11515',
-            fontsize=10, fontweight='bold',
-            ha='left', va='top', zorder=6,
-            bbox=dict(boxstyle='round,pad=0.18',
-                      facecolor='white', alpha=0.85,
-                      edgecolor='#888888', linewidth=0.4),
-        )
-
-    try:
-        _overlay_borders(ax)
-    except Exception:
-        pass
-
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_xlim(c_lo, c_hi)
-    ax.set_ylim(r_hi, r_lo)  # image y is flipped
-    ax.set_aspect('equal')
-    ax.set_title('DBSCAN binary mask + 18-patch candidate polygon',
-                 fontsize=11)
-
-    n_active = len(active_patches)
-    patches_str = ', '.join(str(p) for p in active_patches) if active_patches else 'none'
-    fig.suptitle(
-        f'Patch selection  |  {date_str}  {time_str} UTC  |  '
-        f'active: {n_active}/{N_PATCHES}  → [{patches_str}]',
-        fontsize=12, fontweight='bold',
-    )
-
-    os.makedirs(output_dir, exist_ok=True)
-    safe_time = time_str.replace(':', '')
-    filename = f"patches_{date_str}_{safe_time}_selection.png"
-    save_path = os.path.join(output_dir, filename)
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    return save_path
-
-
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                         date_str, time_str, output_dir,
                         data_root):
     """
     Write a CF-compliant NetCDF mirroring `plot_patch_grid()`.
 
-    Mirrors the `inspect_mtg.py --reprojected` pattern: load the shared
+    Loads the shared
     Romania-grid lat/lon arrays from
     `<data_root>/reprojected_data/romania_grid_{lats,lons}.npy` and
     package the reprojected field + DBSCAN binary mask + per-patch
@@ -613,7 +514,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
     try:
         import xarray as xr
     except ImportError:
-        print("    [nc] xarray not installed — skipping .nc output")
+        print("    [nc] xarray not installed - skipping .nc output")
         return None
 
     grid_dir = os.path.join(data_root, "reprojected_data")
@@ -621,7 +522,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
     lons_path = os.path.join(grid_dir, "romania_grid_lons.npy")
     if not (os.path.isfile(lats_path) and os.path.isfile(lons_path)):
         print(f"    [nc] romania_grid_{{lats,lons}}.npy not found under "
-              f"{grid_dir} — skipping .nc output")
+              f"{grid_dir} - skipping .nc output")
         return None
 
     lats = np.load(lats_path)
@@ -692,7 +593,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
     }
 
     ds.attrs = {
-        "title":         f"COALITION-4 patch index diagnostic — "
+        "title":         f"COALITION-4 patch index diagnostic - "
                          f"{date_str} {time_str} UTC",
         "active_patches": ",".join(str(p) for p in active_patches)
                           if active_patches else "",
@@ -847,6 +748,66 @@ def process_single_opera_file(filepath):
     return date_str, time_str, iso_str, active_patches, reprojected, binary_mask
 
 
+def purge_plots(output_dir):
+    """Delete every .png and .nc under <output_dir>/plots, with progress.
+
+    These are diagnostics, not pipeline inputs: nothing reads them, and
+    `--date <d> --plot` regenerates them. The .nc files are the reason
+    this exists - at ~28 MB each a single day costs ~2.5 GB, which
+    dwarfs the PNGs beside them.
+
+    Returns the number of files removed.
+    """
+    plot_dir = os.path.join(output_dir, 'plots')
+    if not os.path.isdir(plot_dir):
+        print(f"Nothing to purge: {plot_dir} does not exist.")
+        return 0
+
+    targets = []
+    for dirpath, _dirnames, filenames in os.walk(plot_dir):
+        for name in filenames:
+            if name.endswith(('.png', '.nc')):
+                targets.append(os.path.join(dirpath, name))
+
+    total = len(targets)
+    if not total:
+        print(f"Nothing to purge: no .png or .nc files under {plot_dir}.")
+        return 0
+
+    print(f"Deleting {total:,} diagnostic file(s) under {plot_dir} ...")
+
+    width = 40
+    freed = removed = failed = 0
+    for i, path in enumerate(targets, start=1):
+        try:
+            freed += os.path.getsize(path)
+            os.remove(path)
+            removed += 1
+        except OSError as exc:
+            failed += 1
+            if failed <= 5:
+                print(f"{chr(10)}  WARNING: could not remove {path}: {exc}",
+                      file=sys.stderr)
+
+        # Redraw at most ~200 times: a bar that flushes on every file is
+        # slower than the deletion it is measuring.
+        if i % max(1, total // 200) == 0 or i == total:
+            done = int(width * i / total)
+            bar = "#" * done + "." * (width - done)
+            sys.stdout.write(
+                f"\r  [{bar}] {i / total * 100:5.1f}%  "
+                f"{i:,}/{total:,}  {freed / (1024 ** 3):.2f} GB freed")
+            sys.stdout.flush()
+    sys.stdout.write(chr(10))
+
+    print(f"  Removed {removed:,} file(s), freed "
+          f"{freed / (1024 ** 3):.2f} GB")
+    if failed:
+        print(f"  {failed} file(s) could not be removed")
+    print("  Regenerate with: identify_patches.py --date <YYYY-MM-DD> --plot")
+    return removed
+
+
 def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                  start_date=None, end_date=None):
     """
@@ -866,7 +827,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     print("Source     : OPERA rainfall_rate (pre-reprojected)")
     print(f"Data root  : {data_root}")
     print(f"Output dir : {output_dir}")
-    print(f"Grid       : {GRID_WIDTH}×{GRID_HEIGHT} → {N_COLS}×{N_ROWS} patches of {PATCH_SIZE}×{PATCH_SIZE}")
+    print(f"Grid       : {GRID_WIDTH}x{GRID_HEIGHT} -> {N_COLS}x{N_ROWS} patches of {PATCH_SIZE}x{PATCH_SIZE}")
     print(f"DBSCAN     : threshold={DBSCAN_THRESHOLD}, eps={DBSCAN_EPS}, min_samples={DBSCAN_MIN_SAMPLES}")
     if save_plots:
         print(f"Plots      : enabled")
@@ -916,7 +877,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
 
             if active:
                 patches_str = ','.join(str(p) for p in active)
-                print(f"  [{i+1}/{total}] {d} {t} → patches: [{patches_str}]")
+                print(f"  [{i+1}/{total}] {d} {t} -> patches: [{patches_str}]")
 
                 # Save plot + companion .nc for active timestamps. The
                 # .nc carries the same arrays the plot renders plus the
@@ -927,20 +888,13 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                     plot_patch_grid(
                         reprojected, binary_mask, active, d, t, plot_dir,
                     )
-                    # Sibling `_selection.png` file — binary mask +
-                    # orange 6x3 candidate polygon + green/red patch
-                    # numbering. Companion to plot_patch_grid, not a
-                    # replacement (the 2-panel figure stays untouched).
-                    plot_binary_mask_selection(
-                        binary_mask, active, d, t, plot_dir,
-                    )
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
                         d, t, plot_dir,
                         data_root=data_root,
                     )
             else:
-                print(f"  [{i+1}/{total}] {d} {t} → no active patches")
+                print(f"  [{i+1}/{total}] {d} {t} -> no active patches")
 
         except Exception as e:
             print(f"  [{i+1}/{total}] ERROR processing {filepath}: {e}")
@@ -955,14 +909,14 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     # day's worth of rows - clobbering the upstream activity record the
     # downstream pipeline (extract_patch_seq, data_statistics, ...)
     # depends on. Skip the master write in that case; the per-date PNGs
-    # (and a date-suffixed CSV/JSON if save_plots is on) still land in
-    # the per-date plot directory below.
+    # and .nc files still land in the plot directory, which is the whole
+    # point of a --date run.
     os.makedirs(output_dir, exist_ok=True)
     if date_filter is None:
         save_csv(results, output_dir)
         save_json(results, output_dir)
     else:
-        print(f"\nSingle-date run (--date {date_filter}) — NOT overwriting "
+        print(f"\nSingle-date run (--date {date_filter}) - NOT overwriting "
               f"the master patch_index.csv / patch_index.json. Use a "
               f"--start/--end range (or drop --date) to refresh those.")
 
@@ -1110,8 +1064,21 @@ if __name__ == "__main__":
         "--plot", action="store_true",
         help="Save a PNG for each active timestamp (requires --date)"
     )
+    parser.add_argument(
+        "--purge_plots", action="store_true",
+        help="Delete every .png and .nc under <output_dir>/plots, then "
+             "exit. They are diagnostics that nothing reads, and --plot "
+             "regenerates them; the .nc files run ~28 MB each, so one "
+             "plotted day costs ~2.5 GB."
+    )
 
     args = parser.parse_args()
+
+    # Purge is a standalone action: no data is read and nothing is
+    # recomputed, so it runs before every other argument is considered.
+    if args.purge_plots:
+        output_dir = args.output_dir or DEFAULT_OUTPUT_DIR
+        raise SystemExit(0 if purge_plots(output_dir) >= 0 else 1)
 
     # Validate: --plot requires --date
     if args.plot and args.date is None:

@@ -5,14 +5,17 @@ maps used for training and emit the class-imbalance prior
 
 Formula: fraction = ones_pixels / total_pixels  (0.0 if total_pixels == 0)
 
-The scope is per-source by default: `--source dbscan` scopes the scan
-to `train_data_dbscan.csv` and writes
-`lightning_fraction_dbscan.json`; `--source lightning` mirrors that
-for `train_data_lightning.csv` and
-`lightning_fraction_lightning.json`. The two tracks need separate
-priors because their training distributions differ - the
-OPERA-driven track samples many more "no lightning" timesteps than
-the lightning-driven track, so the prior is meaningfully different.
+The scope follows the split the prior will be used with. By default
+that is `train_data_<source>.csv`, writing
+`lightning_fraction_<source>.json`; `--period LABEL` moves both to the
+labelled variants without either path being typed out.
+
+A prior must always be scoped to the model's OWN training split.
+Computed over a different window it describes a class balance that
+model never trained on, and the focal loss it feeds would then correct
+for an imbalance that is not the one present. Every window differs
+here: how many "no lightning" timesteps a split contains is exactly
+what this measures.
 
 Pass `--scope_csv path/to/file.csv` to override the auto-resolved
 training CSV (e.g. `lightning_active_steps.csv` for the broader
@@ -20,14 +23,13 @@ active-step scope, or any other (date, HH:MM)-keyed CSV). Pass
 `--scope_csv none` to scan every `.npy` on disk (legacy behaviour).
 
 Usage:
-    # Typical: per-source prior from the training split
-    python lightning_fraction.py --source dbscan
-    python lightning_fraction.py --source lightning
+    # Typical: prior from the training split
+    python lightning_fraction.py
+    python lightning_fraction.py --period w48
 
     # Broader / legacy scopes
-    python lightning_fraction.py --source dbscan \\
-        --scope_csv lightning_active_steps.csv
-    python lightning_fraction.py --source dbscan --scope_csv none
+    python lightning_fraction.py --scope_csv lightning_active_steps.csv
+    python lightning_fraction.py --scope_csv none
 """
 
 import argparse
@@ -39,6 +41,7 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime, timedelta
 
+from periods import data_tag, split_csv_name
 from pipeline_config import SOURCE
 
 
@@ -60,9 +63,10 @@ def _load_step_minutes(data_root, source):
         raise FileNotFoundError(
             f"{meta_path} not found - needed to expand sequence rows "
             f"into per-timestep keys. Run "
-            f"`python extract_patch_seq_for_datasets.py --source {source}` "
-            f"first, or pass --scope_csv pointing at a per-timestep CSV "
-            f"such as lightning_active_steps.csv."
+            f"`python extract_patch_seq_for_datasets.py` first (with "
+            f"--period <label> for a labelled split), or pass --scope_csv "
+            f"pointing at a per-timestep CSV such as "
+            f"lightning_active_steps.csv."
         )
     meta = json.loads(meta_path.read_text())
     return int(meta["step_minutes"])
@@ -171,8 +175,8 @@ def load_scope_set(csv_path, data_root=None, source=None):
         raise FileNotFoundError(
             f"Scope CSV not found: {p}.\n"
             f"Pass --scope_csv none to scan every .npy on disk instead, or "
-            f"run extract_patch_seq_for_datasets.py --source <s> to "
-            f"produce the per-source train_data CSV."
+            f"run extract_patch_seq_for_datasets.py (with --period <label> "
+            f"for a labelled split) to produce the train_data CSV."
         )
 
     with open(p, 'r', newline='') as f:
@@ -358,34 +362,46 @@ def main():
         help="Path to our_data directory"
     )
     parser.add_argument(
+        "--period", "-p", type=str, default=None, metavar="LABEL",
+        help="Scope the prior to a period's training split and name the "
+             "output to match: --period w48 reads train_data_<source>_w48"
+             ".csv and writes lightning_fraction_<source>_w48.json. Omit "
+             "for the unsuffixed whole-archive split. --scope_csv and "
+             "--output still override either path individually."
+    )
+    parser.add_argument(
         "--output", "-o", type=str, default=None,
         help="Output JSON path (default: "
-             "our_data/lightning_fraction_<source>.json)."
+             "our_data/lightning_fraction_<source>[_<period>].json)."
     )
     parser.add_argument(
         "--scope_csv", "-s", type=str, default=None,
         help="Scope the scan by (date, HH:MM) pairs read from this CSV. "
-             "Defaults to our_data/train_data_<source>.csv so the prior "
-             "matches the training distribution exactly. Pass 'none' to "
-             "scan every `.npy` on disk (legacy behaviour). "
+             "Defaults to our_data/train_data_<source>[_<period>].csv so "
+             "the prior matches the training distribution exactly. Pass "
+             "'none' to scan every `.npy` on disk (legacy behaviour). "
              "lightning_active_steps.csv at project root is also a "
              "useful broader scope when no train CSV exists yet."
     )
 
     args = parser.parse_args()
 
-    # Per-source default paths. Explicit --scope_csv / --output flags
-    # override either.
+    # Both defaults come from the same tag, so the prior cannot end up
+    # scoped to one split and named after another - which is silent, and
+    # produces a plausible-looking file describing the wrong distribution.
+    # Explicit --scope_csv / --output flags override either.
+    tag = data_tag(SOURCE, args.period)
     scope_csv = (
         args.scope_csv
         if args.scope_csv is not None
-        else os.path.join(args.data_root, f"train_data_{SOURCE}.csv")
+        else os.path.join(args.data_root,
+                          split_csv_name("train", SOURCE, args.period))
     )
     output_path = (
         args.output
         if args.output
         else os.path.join(
-            args.data_root, f"lightning_fraction_{SOURCE}.json"
+            args.data_root, f"lightning_fraction_{tag}.json"
         )
     )
 
@@ -394,11 +410,12 @@ def main():
     print("=" * 60)
     print(f"  data_root  : {args.data_root}")
     print(f"  source     : {SOURCE}")
+    print(f"  period     : {args.period or 'none (whole archive)'}")
     print(f"  scope_csv  : {scope_csv}")
     print(f"  output     : {output_path}")
 
     scope_keys = load_scope_set(
-        scope_csv, data_root=args.data_root, source=SOURCE,
+        scope_csv, data_root=args.data_root, source=tag,
     )
     if scope_keys is None:
         print(f"  scope size : (none - scanning every .npy on disk)")

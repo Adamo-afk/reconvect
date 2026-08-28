@@ -156,11 +156,45 @@ def discover_files(product_root: Path) -> dict[str, set[str]]:
     return out
 
 
+def date_range(start: str | None, end: str | None) -> list[str]:
+    """Every YYYY-MM-DD from start to end inclusive, or [] if unbounded.
+
+    Declaring the expected range is what turns "no files for this date"
+    into a reported gap. Inferring it from the files found cannot see a
+    date that is absent from disk entirely — such a date is simply not
+    described, so nothing downstream ever asks for it.
+    """
+    if not start or not end:
+        return []
+    from datetime import datetime, timedelta
+    try:
+        d0 = datetime.strptime(start, "%Y-%m-%d").date()
+        d1 = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        print(f"ERROR: --start/--end must be YYYY-MM-DD "
+              f"(got {start!r}, {end!r})", file=sys.stderr)
+        sys.exit(2)
+    if d1 < d0:
+        print(f"ERROR: --end {end} precedes --start {start}", file=sys.stderr)
+        sys.exit(2)
+    out, cur = [], d0
+    while cur <= d1:
+        out.append(cur.strftime("%Y-%m-%d"))
+        cur += timedelta(days=1)
+    return out
+
+
 def summarize(data_dir: Path,
               products: list[str],
-              minute_filters: dict[str, set[int]]):
+              minute_filters: dict[str, set[int]],
+              start: str | None = None,
+              end: str | None = None):
     """
     Returns (rows, per_date_detail).
+
+    `start`/`end` (YYYY-MM-DD, inclusive) declare the range the archive is
+    EXPECTED to cover; dates in range with no files are reported as fully
+    missing rather than omitted.
 
     rows: list of per-date dicts ready for CSV / table
     per_date_detail: {date: {product: {'present': set, 'missing': list}}}
@@ -181,6 +215,23 @@ def summarize(data_dir: Path,
     all_dates: set[str] = set()
     for p in products:
         all_dates.update(present_by_product[p].keys())
+
+    # Add every expected date, so one absent from disk still gets a row
+    # with zero present timesteps instead of vanishing from the report.
+    expected_dates = date_range(start, end)
+    if expected_dates:
+        empty = [d for d in expected_dates if d not in all_dates]
+        outside = sorted(all_dates - set(expected_dates))
+        all_dates.update(expected_dates)
+        print(f"Expected range : {expected_dates[0]} .. {expected_dates[-1]} "
+              f"({len(expected_dates)} dates)")
+        if empty:
+            print(f"  {len(empty)} date(s) in range have NO files at all "
+                  f"— reported as fully missing")
+        if outside:
+            print(f"  WARNING: {len(outside)} date(s) on disk fall OUTSIDE "
+                  f"the range and are still reported: {outside[:5]}"
+                  + (" ..." if len(outside) > 5 else ""))
 
     rows = []
     detail: dict = {}
@@ -382,6 +433,21 @@ def save_missing_json(rows: list[dict], detail: dict,
 # CLI
 # =============================================================================
 
+def render_chart(rows, output_path):
+    """Monthly coverage chart from the per-date rows."""
+    # One implementation, in the canonical summariser, so the
+    # three product charts cannot drift apart.
+    sys.path.insert(0, str(PROJECT_ROOT / 'our_data' / 'satellite_data'))
+    from summarize_mtg import plot_monthly
+    found = {r['date']: r['complete_intersection'] for r in rows}
+    expected = {r['date']: r['expected_intersection'] for r in rows}
+    span = f"{min(found)} .. {max(found)}" if found else ""
+    return plot_monthly(found, output_path,
+                        title=f"OPERA coverage  {span}",
+                        per_date_expected=expected,
+                        ylabel="timesteps (both products)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Summarise downloaded OPERA radar files by date and "
@@ -396,6 +462,25 @@ def main() -> int:
         default=list(PRODUCTS.keys()),
         choices=list(PRODUCTS.keys()),
         help='Products to include (default: both)',
+    )
+    parser.add_argument(
+        '--chart', type=str, nargs='?', const='opera_coverage.png', default=None,
+        help="Render a monthly coverage chart (faded bars + line through "
+             "the bar tops, with the cadence expectation as a dashed "
+             "reference). Optional PNG path; defaults to "
+             "opera_coverage.png at the project root.",
+    )
+    parser.add_argument(
+        '--start', type=str, default=None,
+        help="First date the archive is EXPECTED to cover (YYYY-MM-DD). "
+             "Dates in range with no files on disk are reported as fully "
+             "missing instead of being omitted. Without this the range is "
+             "inferred from the files found, so an entirely absent date is "
+             "invisible to the report.",
+    )
+    parser.add_argument(
+        '--end', type=str, default=None,
+        help="Last expected date, inclusive (YYYY-MM-DD). See --start.",
     )
     parser.add_argument(
         '--timesteps', type=str, nargs='+', default=None,
@@ -446,9 +531,12 @@ def main() -> int:
         print(f"  {p:22s}: filter={sorted(minute_filters[p])} ({step_src_msgs[p]})")
     print()
 
-    rows, detail = summarize(data_dir, args.products, minute_filters)
+    rows, detail = summarize(data_dir, args.products, minute_filters,
+                             start=args.start, end=args.end)
     print_table(rows, args.products)
     save_csv(rows, args.products, args.output)
+    if args.chart:
+        render_chart(rows, args.chart)
     save_missing_json(rows, detail, args.products,
                       minute_filters, args.missing)
 

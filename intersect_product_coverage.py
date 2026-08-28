@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as _dt
 import json
 import os
 import re
@@ -75,6 +76,7 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")  # non-interactive
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -429,10 +431,21 @@ def write_manifest(kept, product_keys, out_path: Path) -> None:
     print(f"Manifest:     {out_path}  ({len(kept)} surviving timesteps)")
 
 
-def write_plot(kept, dropped, dates, step_minutes, product_keys,
-               out_path: Path) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    n_slots_per_day = 24 * 60 // step_minutes
+CATEGORY_COLOURS = {
+    "kept":            "#4caf50",
+    "unscanned_date":  "#bdbdbd",
+    "mtg":             "#42a5f5",
+    "opera":           "#ef5350",
+    "lightning":       "#ffd54f",
+    "error_log":       "#212121",
+}
+
+
+def per_date_counts(kept, dropped, dates, product_keys):
+    """Per-date timestep counts for `kept` and for each drop reason.
+
+    Returns (kept_count, drop_count, drop_reasons).
+    """
     date_idx = {d: i for i, d in enumerate(dates)}
 
     kept_count = np.zeros(len(dates), dtype=int)
@@ -446,50 +459,105 @@ def write_plot(kept, dropped, dates, step_minutes, product_keys,
             di = date_idx.get(date_str)
             if di is not None:
                 drop_count[r][di] += 1
+    return kept_count, drop_count, drop_reasons
 
-    fig, ax = plt.subplots(figsize=(max(10, len(dates) * 0.18), 5))
-    x = np.arange(len(dates))
 
-    colours = {
-        "kept":            "#4caf50",
-        "unscanned_date":  "#bdbdbd",
-        "mtg":             "#42a5f5",
-        "opera":           "#ef5350",
-        "lightning":       "#ffd54f",
-        "error_log":       "#212121",
-    }
+def _calendar(dates: list[str]) -> list[_dt.date]:
+    """Every day from the first to the last, including ones with no data."""
+    first = _dt.date.fromisoformat(dates[0])
+    last = _dt.date.fromisoformat(dates[-1])
+    return [first + _dt.timedelta(days=i)
+            for i in range((last - first).days + 1)]
 
-    ax.bar(x, kept_count, label=f"Kept ({int(kept_count.sum())})",
-           color=colours["kept"], zorder=3)
-    bottom = kept_count.astype(float).copy()
-    for r in drop_reasons:
-        total = int(drop_count[r].sum())
-        if total == 0:
-            continue
-        ax.bar(x, drop_count[r], bottom=bottom,
-               label=f"Dropped: {r} ({total})",
-               color=colours.get(r, "#9e9e9e"), zorder=3, alpha=0.9)
-        bottom += drop_count[r]
 
-    ax.axhline(n_slots_per_day, color="#333", linestyle="--", linewidth=0.8,
-               alpha=0.6, label=f"Master grid: {n_slots_per_day}/day")
+def _months(cal: list[_dt.date]) -> list[_dt.date]:
+    """First-of-month for every month the calendar touches."""
+    out, seen = [], set()
+    for day in cal:
+        key = (day.year, day.month)
+        if key not in seen:
+            seen.add(key)
+            out.append(_dt.date(day.year, day.month, 1))
+    return out
 
-    # Tick every 3 dates if there are many, otherwise every date
-    step = max(1, len(dates) // 40)
-    ax.set_xticks(x[::step])
-    ax.set_xticklabels([dates[i] for i in range(0, len(dates), step)],
-                       rotation=90, fontsize=7)
-    ax.set_xlabel("Date", fontsize=11)
-    ax.set_ylabel("Timesteps per day", fontsize=11)
-    ax.set_title("Per-date timestep accounting "
-                 "(kept after product intersection vs. drop reason)",
-                 fontsize=12, fontweight="bold")
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.95)
-    ax.grid(axis="y", alpha=0.3)
+
+def write_plot(kept, dropped, dates, step_minutes, product_keys,
+               out_path: Path) -> None:
+    """Monthly line graph: timesteps kept, and timesteps omitted by reason.
+
+    Aggregated to months rather than days on purpose. At 15-minute cadence
+    a daily series over a year and a half is ~590 points per line, which
+    renders as noise - the month is the smallest unit at which the shape
+    of the archive is actually readable, and it matches the monthly
+    coverage charts the summarisers produce.
+
+    Every category is its own line of the same quantity, and they sum to
+    the grid capacity, so kept and omitted are directly comparable rather
+    than being segments of one stack where a small reason is squeezed
+    into invisibility beside a large one.
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_slots_per_day = 24 * 60 // step_minutes
+    kept_count, drop_count, drop_reasons = per_date_counts(
+        kept, dropped, dates, product_keys)
+
+    cal = _calendar(dates)
+    idx = {d: i for i, d in enumerate(dates)}
+    months = _months(cal)
+    month_of = {m: k for k, m in enumerate(months)}
+
+    def monthly(counts) -> np.ndarray:
+        totals = np.zeros(len(months))
+        for day in cal:
+            i = idx.get(day.isoformat())
+            if i is not None:
+                totals[month_of[_dt.date(day.year, day.month, 1)]] += counts[i]
+        return totals
+
+    # Grid capacity per month: how many slots the master grid defines for
+    # the days this run actually covers. Without it a short month reads as
+    # a dip that is really just February.
+    capacity = np.zeros(len(months))
+    for day in cal:
+        capacity[month_of[_dt.date(day.year, day.month, 1)]] += n_slots_per_day
+
+    series = [("kept", kept_count)]
+    series += [(r, drop_count[r]) for r in drop_reasons
+               if int(drop_count[r].sum()) > 0]
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+
+    ax.plot(months, capacity, linestyle="--", linewidth=1.2,
+            color="#bdbdbd", zorder=1,
+            label=f"Grid capacity ({n_slots_per_day}/day)")
+
+    for name, counts in series:
+        label = "Kept" if name == "kept" else f"Omitted: {name}"
+        ax.plot(months, monthly(counts), marker="o", markersize=4,
+                linewidth=2.2, solid_capstyle="round",
+                color=CATEGORY_COLOURS.get(name, "#9e9e9e"),
+                label=f"{label} ({int(counts.sum()):,})", zorder=3)
+
+    ax.xaxis.set_major_locator(mdates.MonthLocator())
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(
+        ax.xaxis.get_major_locator()))
+    ax.set_ylim(bottom=0)
+    ax.set_ylabel("Timesteps per month", fontsize=11)
+    ax.set_title("Timestep accounting by month", fontsize=13, pad=14,
+                 color="#444")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.spines["left"].set_color("#cccccc")
+    ax.spines["bottom"].set_color("#cccccc")
+    ax.tick_params(colors="#666", labelsize=9)
+    ax.grid(axis="y", alpha=0.25, zorder=0)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12),
+              ncol=3, frameon=False, fontsize=9)
+
     plt.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"Plot:         {out_path}")
+    print(f"Plot:         {out_path}  ({len(months)} month(s))")
 
 
 # =============================================================================

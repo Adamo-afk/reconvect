@@ -42,10 +42,11 @@ script runs normally when the backfill is not requested.
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # FDHSI — full-disk high spectral resolution imagery. See module docstring
@@ -58,6 +59,96 @@ ROMANIA_CHUNKS = (35, 36)
 
 # MTG native repeat cycle, in minutes.
 NATIVE_CADENCE_MINUTES = 10
+
+
+# =============================================================================
+# Provenance ledger
+# =============================================================================
+# The NMA server and the Data Store deliver products under the SAME native
+# FCI naming convention — deliberately, it is why no renaming step exists
+# above. The consequence is that once a cycle is processed to .npy, nothing
+# on disk says where it came from.
+#
+# So origin is recorded at write time by whoever wrote it:
+#     pipeline_msg_mtg.py  -> record_provenance(..., "nma")
+#     fill_gaps() below    -> record_provenance(..., "datastore")
+#
+# This matters far more once raw chunks are deleted after processing: the
+# .npy files then become the only evidence a cycle exists, and without the
+# ledger a coverage report can say WHAT is present but never HOW it got
+# there — which is the question you ask when deciding whether a gap is a
+# transfer problem or a source problem.
+#
+# Keyed by date and nominal HH:MM (how summarize_mtg reports), not by
+# filename — the filename is precisely the thing carrying no origin.
+
+PROVENANCE_NAME = "provenance.json"
+PROVENANCE_SOURCES = ("nma", "datastore")
+
+
+def provenance_path(base_dir) -> Path:
+    """Ledger lives beside the data it describes, in the MTG root."""
+    return Path(base_dir) / PROVENANCE_NAME
+
+
+def load_provenance(base_dir) -> dict:
+    path = provenance_path(base_dir)
+    if not path.is_file():
+        return {"updated_utc": None, "sources": {}, "cycles": {}}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"WARNING: provenance ledger unreadable ({exc}); starting fresh")
+        return {"updated_utc": None, "sources": {}, "cycles": {}}
+    blob.setdefault("cycles", {})
+    blob.setdefault("sources", {})
+    return blob
+
+
+def record_provenance(base_dir, entries, source: str) -> int:
+    """Record (date, 'HH:MM') pairs as having come from `source`.
+
+    Existing entries are overwritten: a cycle backfilled from the Data
+    Store after an incomplete NMA transfer genuinely originates from the
+    Data Store now, and the ledger should say so.
+
+    Written via a temp file and os.replace so an interrupted run can never
+    leave a half-written ledger — the ledger is the only copy of this
+    information.
+    """
+    if source not in PROVENANCE_SOURCES:
+        raise ValueError(
+            f"unknown source {source!r}; expected {PROVENANCE_SOURCES}")
+
+    entries = list(entries)
+    if not entries:
+        return 0
+
+    blob = load_provenance(base_dir)
+    for date_str, hhmm in entries:
+        blob["cycles"].setdefault(date_str, {})[hhmm] = source
+
+    tally: dict[str, int] = {}
+    for per_date in blob["cycles"].values():
+        for src in per_date.values():
+            tally[src] = tally.get(src, 0) + 1
+    blob["sources"] = dict(sorted(tally.items()))
+    blob["updated_utc"] = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+    path = provenance_path(base_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(blob, fh, indent=2)
+    os.replace(tmp, path)
+    return len(entries)
+
+
+def provenance_of(blob: dict, date_str: str, hhmm: str):
+    """Origin of one cycle, or None when it predates the ledger."""
+    return blob.get("cycles", {}).get(date_str, {}).get(hhmm)
 
 
 # =============================================================================
@@ -263,6 +354,22 @@ def fill_gaps(gaps: dict[str, list[str]],
                 {t for t in gaps[date_str]
                  if any(_rc_of(f) == rc_from_hhmm(t) for f in filled_here)}
             )
+
+    # Record origin while it is still known. After this returns, nothing on
+    # disk distinguishes these files from NMA ones.
+    if not dry_run and report["timesteps_filled"]:
+        try:
+            pairs = [(d, t) for d, times in report["timesteps_filled"].items()
+                     for t in times]
+            n = record_provenance(raw_path.parent, pairs, "datastore")
+            report["provenance_recorded"] = n
+            if verbose:
+                print(f"\nProvenance: {n} cycle(s) recorded as 'datastore'")
+        except Exception as exc:                         # noqa: BLE001
+            # A ledger failure must not discard a download that succeeded.
+            report["errors"].append(f"provenance ledger: {exc}")
+            print(f"WARNING: could not record provenance: {exc}",
+                  file=sys.stderr)
 
     return report
 

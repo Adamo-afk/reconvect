@@ -66,7 +66,8 @@ of that file for the editable fields.
 Requires:
     - TensorFlow 2.x with GPU support
     - Pre-built TF datasets from create_datasets.py
-    - our_data/lightning_fraction_dbscan.json (for `_occurrence` modes only)
+    - our_data/lightning_fraction_<source>[_<period>].json
+      (for `_occurrence` modes only)
 """
 
 import argparse
@@ -76,10 +77,26 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pipeline_config import SOURCE
+from periods import Period, require_no_overlap
+from compress_datasets import (
+    DEFAULT_LEVEL as _ARCHIVE_LEVEL,
+    DEFAULT_MAX_CONCURRENT as _ARCHIVE_MAX_CONCURRENT,
+    default_workers as _default_archive_workers,
+    ensure_available,
+    inuse_for,
+    spawn_job as _spawn_archive_job,
+)
+from ensemble_plan import (
+    check_member_datasets,
+    format_dataset_check,
+    require_last_state,
+    state_period,
+)
+from periods import sequence_meta_name
 
 
 # =============================================================================
@@ -134,11 +151,74 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
 # tracks never overwrite each other's weights, history, or datasets.
 
 
-def build_run_tag(mode: str, source: str) -> str:
+def build_run_tag(mode: str, source: str,
+                  period: str | None = None) -> str:
     """Return the filename tag used for saved model artefacts, checkpoints,
     and dataset directories. Single source of truth for the convention —
-    every script that reads or writes an artefact routes through here."""
-    return f"{mode}_{source}"
+    every script that reads or writes an artefact routes through here.
+
+    `period` is an ensemble member label (e.g. '2025warm'). Omitting it
+    yields the original two-part tag, so every artefact produced before
+    period support keeps its name and stays loadable — there are trained
+    models on disk under that convention.
+
+        build_run_tag('mtg_opera_mtgmr_rainfall', 'dbscan')
+            -> 'mtg_opera_mtgmr_rainfall_dbscan'
+        build_run_tag('mtg_opera_mtgmr_rainfall', 'dbscan', '2025warm')
+            -> 'mtg_opera_mtgmr_rainfall_dbscan_2025warm'
+    """
+    tag = f"{mode}_{source}"
+    if period:
+        tag = f"{tag}_{period}"
+    return tag
+
+
+def model_sidecar_path(model_path) -> Path:
+    """`coalition_<tag>.keras` -> `coalition_<tag>.meta.json`."""
+    return Path(model_path).with_suffix(".meta.json")
+
+
+def save_model_period(model_path, period, mode=None, source=None,
+                      stage=None, dataset_dir=None) -> Path:
+    """Record what a saved model was trained on, next to the weights.
+
+    A `.keras` file carries no provenance, so the period a model was
+    trained over would otherwise live only in its filename — and a
+    filename is not something a leakage check should trust. This sidecar
+    is what `load_model_period` reads when the model is later reused as a
+    frozen feature extractor.
+    """
+    path = model_sidecar_path(model_path)
+    payload = {
+        "model": Path(model_path).name,
+        "mode": mode,
+        "source": source,
+        "stage": stage,
+        "period": period.to_dict() if isinstance(period, Period) else None,
+        "dataset_dir": str(dataset_dir) if dataset_dir else None,
+        "saved_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    return path
+
+
+def load_model_period(model_path) -> "Period | None":
+    """Read a model's training period from its sidecar.
+
+    Returns None when the sidecar is absent — which is the honest answer
+    for every model trained before period support existed, and is treated
+    by the overlap gate as "unknown", not "safe".
+    """
+    path = model_sidecar_path(model_path)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return Period.from_dict(json.load(fh).get("period"))
+    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+        print(f"WARNING: could not read period from {path}: {exc}")
+        return None
 
 
 # =============================================================================
@@ -814,8 +894,9 @@ def _build_radar_loss(class_fractions, radar_loss_cfg):
     if weighting != "none" and class_fractions is None:
         raise ValueError(
             "[radar_loss].weighting != 'none' requires class_fractions. "
-            "Run `python opera_rainfall_fraction.py --source <s>` and "
-            "make sure the radar mode loads the prior."
+            "Run `python opera_rainfall_fraction.py` (with --period "
+            "<label> for a labelled split) and make sure the radar mode "
+            "loads the prior."
         )
     fractions = class_fractions if class_fractions is not None else [0.2] * 5
     return WeightedFocalCategoricalCrossentropy(
@@ -835,6 +916,64 @@ def _build_radar_loss(class_fractions, radar_loss_cfg):
 # same objective — otherwise an architecture comparison is confounded by a
 # loss change. sepconv_ensemble_training.py imports this function rather
 # than keeping its own copy, so the two cannot drift apart.
+# ---------------------------------------------------------------------------
+# SepConv baseline: inverse-frequency weights in log_zscore space
+# ---------------------------------------------------------------------------
+# The paper's own weighting ("modified MSE ... more weight to higher
+# values") is unpublished, so this is ours and is documented as ours.
+#
+# It has to exist at all: on this training split 99.815% of pixels are
+# class 0, and in log_zscore space the dry point mass sits at z = -0.291
+# while 10-40 mm/h spans z = +5.55..+6.72. Plain MSE is minimised by
+# emitting -0.291 everywhere — a worse failure than the smoothing the
+# paper reports.
+#
+# Weights are derived from the measured class fractions rather than
+# hard-coded, so they follow the data instead of a guess. The cap keeps
+# the rarest class from dominating the gradient: without it the >=40 mm/h
+# bin alone would carry a weight near 4600.
+SEPCONV_WEIGHT_CAP = 1000.0
+
+
+def sepconv_class_weights(fractions, cap: float = SEPCONV_WEIGHT_CAP):
+    """Inverse-frequency weights per rainfall class, normalised and capped.
+
+    Args:
+        fractions: per-class pixel fractions, class 0 first, as written by
+            opera_rainfall_fraction.py.
+        cap: maximum weight relative to the most common class.
+
+    Returns:
+        list[float] — one weight per class, class 0 normalised to 1.0.
+    """
+    eps = 1e-12
+    inv = [1.0 / max(f, eps) for f in fractions]
+    base = inv[0]                      # class 0 is always the most common
+    return [min(w / base, cap) for w in inv]
+
+
+def load_sepconv_class_weights(data_root, source, period=None,
+                               cap: float = SEPCONV_WEIGHT_CAP):
+    """Read opera_rainfall_fraction_<tag>.json and derive the weights.
+
+    Fails loudly rather than falling back to a constant: training the
+    baseline with the wrong weighting silently produces the dry-collapse
+    this whole mechanism exists to prevent.
+    """
+    from periods import data_tag
+    path = (Path(data_root)
+            / f"opera_rainfall_fraction_{data_tag(source, period)}.json")
+    if not path.is_file():
+        raise SystemExit(
+            f"Class fractions not found: {path}\n"
+            f"The SepConv baseline's loss weighting is derived from them.\n"
+            f"    python opera_rainfall_fraction.py"
+        )
+    with open(path, encoding="utf-8") as fh:
+        fractions = json.load(fh)["fractions"]
+    return sepconv_class_weights(fractions, cap=cap)
+
+
 RAINFALL_MSE_WEIGHTS = [15, 1, 2, 7, 15, 30, 1000]
 
 
@@ -1403,34 +1542,39 @@ def _load_tfrecord_split(split_dir: Path, meta: dict) -> tf.data.Dataset:
 # ones_fraction from pre-computed JSON
 # ============================================================================
 
-def load_ones_fraction(data_root, source):
-    """Load lightning occurrence fraction from the per-source prior JSON.
+def load_ones_fraction(data_root, source, period=None):
+    """Load lightning occurrence fraction from the prior JSON for this tag.
 
-    Reads `our_data/lightning_fraction_<source>.json` (produced by
-    `lightning_fraction.py --source <source>`) and returns the
-    'occurrence' fraction. Scoping by source means the focal-loss prior
-    matches the actual training distribution that `--source <source>`
-    selects - the DBSCAN-driven and lightning-driven tracks land on
-    different `(date, time)` sets and therefore have different
-    class balances.
+    Reads `our_data/lightning_fraction_<source>[_<period>].json` (produced
+    by `lightning_fraction.py [--period <label>]`) and returns the
+    'occurrence' fraction.
+
+    The tag has to match the split the model trains on, exactly as the
+    radar prior does: a prior computed over a different window describes a
+    class balance this model never sees, and the focal loss would then
+    correct for an imbalance that is not the one present. Windows differ
+    sharply here - how many "no lightning" timesteps a split contains is
+    precisely what this measures.
 
     Args:
         data_root: path to our_data/ directory
-        source:    'dbscan' or 'lightning' (selects which JSON to read)
+        source:    sample-selection source (pipeline_config.SOURCE)
+        period:    period label, or None for the whole-archive split
 
     Returns:
-        float: occurrence fraction scoped to train_data_<source>.csv
+        float: occurrence fraction scoped to that split's train CSV
 
     Raises:
-        FileNotFoundError: if lightning_fraction_<source>.json does
-            not exist
+        FileNotFoundError: if the prior JSON does not exist
         KeyError: if 'occurrence' key is missing from the JSON
     """
-    json_path = Path(data_root) / f"lightning_fraction_{source}.json"
+    tag = data_tag(source, period)
+    json_path = Path(data_root) / f"lightning_fraction_{tag}.json"
     if not json_path.is_file():
         raise FileNotFoundError(
             f"Lightning fraction file not found: {json_path}\n"
-            f"Run `python lightning_fraction.py --source {source}` first."
+            f"Run `python lightning_fraction.py"
+            + (f" --period {period}" if period else "") + "` first."
         )
 
     with open(json_path) as f:
@@ -1558,7 +1702,8 @@ def train(mode, data_root, epochs, batch_size, output_dir,
           early_stopping_cfg=None,
           checkpoint_cfg=None,
           radar_loss_cfg=None,
-          resume=True):
+          resume=True,
+          period=None):
     """Main training function (base stage).
 
     Args:
@@ -1599,12 +1744,17 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     # mode name already states its own track, so the tag names saved
     # artefacts (weights + history + checkpoints) AND dataset directories
     # self-describingly. See build_run_tag at the top of this module.
-    run_tag = build_run_tag(mode, source)
+    run_tag = build_run_tag(mode, source, period)
 
     if dataset_dir is not None:
         dataset_dir = Path(dataset_dir)
     else:
         dataset_dir = data_root / "datasets" / run_tag
+        # An archived dataset is extracted first. Blocking on purpose:
+        # training cannot start without the bytes, so there is nothing
+        # useful to overlap with. The archive is kept, which makes the
+        # post-training reclaim a delete rather than a recompression.
+        ensure_available(run_tag, data_root / "datasets")
 
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
@@ -1661,7 +1811,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     # train_data_<source>.csv, so the focal-loss prior matches what the
     # model actually sees during training.
     if label_type == "lightning":
-        ones_fraction = load_ones_fraction(data_root, source)
+        ones_fraction = load_ones_fraction(data_root, source, period)
         class_fractions = None
     else:
         ones_fraction = 0.0106  # unused for radar
@@ -1803,6 +1953,15 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     model.save(str(model_path))
     print(f"\nModel saved to: {model_path}")
 
+    # Provenance sidecar. Read back by the leakage gate whenever this
+    # model is later frozen and reused as a feature extractor.
+    ds_period = Period.from_dict(meta.get("period"))
+    sidecar = save_model_period(model_path, ds_period, mode=mode,
+                               source=source, stage="base",
+                               dataset_dir=dataset_dir)
+    print(f"Period sidecar  : {sidecar} "
+          f"({ds_period or 'no period declared'})")
+
     # Save history
     history_data = {
         "mode": mode,
@@ -1839,7 +1998,9 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                    early_stopping_cfg=None,
                    checkpoint_cfg=None,
                    radar_loss_cfg=None,
-                   resume=True):
+                   resume=True,
+                   period=None,
+                   allow_period_overlap=False):
     """Domain-adaptation fine-tune: freeze base, attach Swin head, train.
 
     Args:
@@ -1862,7 +2023,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     data_root = Path(data_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    run_tag = build_run_tag(mode, source)
+    run_tag = build_run_tag(mode, source, period)
 
     dataset_dir = data_root / "datasets" / run_tag
     train_dir = dataset_dir / "train"
@@ -1877,6 +2038,24 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     label_type = meta.get(
         "label_type", "lightning" if "lightning" in mode else "radar",
     )
+
+    # ---- Feature-extractor leakage gate ------------------------------
+    # The base model is about to be frozen and used as a feature
+    # extractor. If it was trained on dates this dataset also covers, the
+    # backbone has already seen the answers and every score measured here
+    # is optimistic. Compare the recorded periods, not the filenames.
+    fe_period = load_model_period(base_model_path)
+    ds_period = Period.from_dict(meta.get("period"))
+    print(f"Feature extractor : {base_model_path}")
+    print(f"  FE period       : {fe_period or 'UNDECLARED (pre-period artefact)'}")
+    print(f"  dataset period  : {ds_period or 'UNDECLARED (whole archive)'}")
+    if fe_period is None or ds_period is None:
+        print(
+            "  WARNING: at least one side declares no period, so overlap "
+            "cannot be checked. Rebuild with --period on both sides to "
+            "make this verifiable."
+        )
+    require_no_overlap(fe_period, ds_period, allow=allow_period_overlap)
 
     epochs = finetune_cfg["epochs"]
 
@@ -1902,7 +2081,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     configure_tf_runtime(use_mixed_precision=mixed_precision)
 
     if label_type == "lightning":
-        ones_fraction = load_ones_fraction(data_root, source)
+        ones_fraction = load_ones_fraction(data_root, source, period)
         class_fractions = None
     else:
         ones_fraction = 0.0106  # unused for radar
@@ -2072,6 +2251,25 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     model.save(str(model_path))
     print(f"\nFine-tuned model saved to: {model_path}")
 
+    # The fine-tuned model's period is the dataset it was tuned on, not
+    # the feature extractor's. `feature_extractor` records the backbone's
+    # provenance so the chain stays traceable if this model is itself
+    # frozen and reused later.
+    sidecar = save_model_period(model_path, ds_period, mode=mode,
+                               source=source, stage="finetune",
+                               dataset_dir=dataset_dir)
+    with open(sidecar, encoding="utf-8") as fh:
+        blob = json.load(fh)
+    blob["feature_extractor"] = {
+        "model": str(base_model_path),
+        "period": fe_period.to_dict() if fe_period else None,
+        "overlap_allowed": bool(allow_period_overlap),
+    }
+    with open(sidecar, "w", encoding="utf-8") as fh:
+        json.dump(blob, fh, indent=2)
+    print(f"Period sidecar  : {sidecar} "
+          f"({ds_period or 'no period declared'})")
+
     history_data = {
         "mode": mode,
         "source": source,
@@ -2181,8 +2379,92 @@ def main():
         help="Print the available training modes with their descriptions "
              "and exit. No training is performed.",
     )
+    parser.add_argument(
+        "--period", type=str, default=None,
+        help="Train one ensemble member, e.g. --period 2025warm. The label "
+             "must appear in the registered plan; artefacts are suffixed "
+             "with it. Omit to train the unscoped, whole-archive model.",
+    )
+    parser.add_argument(
+        "--check-ensemble", action="store_true",
+        help="Read the registry's most recent plan, report which member "
+             "datasets exist for this mode and which are missing, then "
+             "exit without training.",
+    )
+    parser.add_argument(
+        "--no-archive", dest="no_archive", action="store_true",
+        help="Do not spawn the background reclaim job after training. By "
+             "default the on-disk copy is dropped once its archive is "
+             "verified, since training does not modify the dataset.",
+    )
+    parser.add_argument(
+        "--archive_level", type=int, default=_ARCHIVE_LEVEL,
+        choices=[0, 1, 3, 5, 7, 9],
+        help=f"7-Zip -mx level used if the reclaim job has to compress "
+             f"from scratch (default: {_ARCHIVE_LEVEL}).",
+    )
+    parser.add_argument(
+        "--archive_workers", type=int, default=_default_archive_workers(),
+        help=f"7-Zip threads for the background job (default: "
+             f"{_default_archive_workers()} = half the logical cores).",
+    )
+    parser.add_argument(
+        "--max_concurrent", type=int, default=_ARCHIVE_MAX_CONCURRENT,
+        help=f"Maximum simultaneous background archive jobs "
+             f"(default: {_ARCHIVE_MAX_CONCURRENT}).",
+    )
+    parser.add_argument(
+        "--allow_period_overlap", action="store_true",
+        help="Proceed with the finetune stage even when the frozen feature "
+             "extractor was trained on dates the dataset also covers. "
+             "Scores measured under this flag are optimistic — the "
+             "backbone has already seen those dates.",
+    )
 
     args = parser.parse_args()
+
+    # --- Ensemble availability check (no training) -----------------------
+    # The registry says what the ensemble is supposed to contain; this
+    # reports what has actually been built for the requested mode.
+    if args.check_ensemble:
+        if not args.mode:
+            parser.error("--check-ensemble needs --mode to know which "
+                         "dataset directories to look for.")
+        state = require_last_state(args.data_root)
+        print(f"Plan registered {state['registered_utc']} — "
+              f"{state['n_members']} member(s), "
+              f"{state['n_buildable']} buildable\n")
+        check = check_member_datasets(
+            state, args.mode, SOURCE, Path(args.data_root) / "datasets")
+        print(format_dataset_check(check, args.mode, SOURCE))
+        sys.exit(1 if check["missing"] else 0)
+
+    # A period must resolve to bounds somebody recorded, so a model can
+    # never be trained under a label whose meaning is unknown. Two ways it
+    # can, checked in the same order as create_datasets.py - the two must
+    # agree, or a dataset would build under a label training then rejects.
+    #
+    #  1. Sequence metadata on disk. What extract_patch_seq_for_datasets.py
+    #     actually wrote is the authority on what exists. This covers window
+    #     tags such as `w48`, which name a sequence WINDOW (past=4/future=8)
+    #     rather than an ensemble member, and so never appear in the registry.
+    #  2. The registered ensemble plan, for genuine members.
+    if args.period:
+        seq_meta = Path(args.data_root) / sequence_meta_name(SOURCE,
+                                                             args.period)
+        if not seq_meta.is_file():
+            state = require_last_state(args.data_root)
+            if state_period(state, args.period) is None:
+                known = [m["label"] for m in state.get("members", [])]
+                parser.error(
+                    f"Period {args.period!r} has neither sequence metadata "
+                    f"at {seq_meta} nor an entry in the registered ensemble "
+                    f"plan. Registered members: {known or '(none)'}. Build "
+                    f"the window with `extract_patch_seq_for_datasets.py "
+                    f"--period {args.period} --start ... --end ...`, or "
+                    f"register a member with `create_datasets.py --mode "
+                    f"<mode> --ensemble`."
+                )
 
     if args.list_modes:
         _print_modes_and_exit()
@@ -2240,50 +2522,79 @@ def main():
         print(f"  Effective hyperparameters: {params}")
 
         base_model_path = None
+        datasets_root = Path(args.data_root) / "datasets"
+        run_tag_for_mode = build_run_tag(mode, SOURCE, args.period)
 
-        # --- Base stage ---
-        if args.stage in ("base", "both"):
-            base_model_path, _ = train(
-                mode=mode,
-                data_root=args.data_root,
-                epochs=params["epochs"],
-                batch_size=params["batch_size"],
-                output_dir=args.output_dir,
-                dropout=params["dropout"],
-                norm=params["norm"],
-                dataset_dir=args.dataset_dir,
-                source=SOURCE,
-                shuffle_buffer=params["shuffle_buffer"],
-                mixed_precision=params["mixed_precision"],
-                lr_schedule_cfg=cfg["lr_schedule"],
-                early_stopping_cfg=cfg["early_stopping"],
-                checkpoint_cfg=cfg["checkpointing"],
-                radar_loss_cfg=cfg["radar_loss"],
-                resume=cfg["checkpointing"].get("resume", True)
-                       and not args.fresh,
-            )
+        # Claim the dataset for the duration. A background archive job
+        # started right after creation checks this marker before its
+        # delete step, so "build a member then immediately train it" does
+        # not pull the shards out from under the run.
+        inuse = inuse_for(datasets_root, run_tag_for_mode)
+        if not inuse.acquire():
+            print(f"  NOTE: {run_tag_for_mode} is already marked in use by "
+                  f"pid {inuse.held_by()}; proceeding without the marker.")
+        try:
 
-        # --- Finetune stage ---
-        if args.stage in ("finetune", "both"):
-            ft_base = (
-                base_model_path if args.stage == "both"
-                else Path(args.base_checkpoint)
-            )
-            train_finetune(
-                mode=mode,
-                data_root=args.data_root,
-                base_model_path=ft_base,
-                output_dir=args.output_dir,
-                source=SOURCE,
-                batch_size=params["batch_size"],
-                finetune_cfg=cfg["finetune"],
-                shuffle_buffer=params["shuffle_buffer"],
-                mixed_precision=params["mixed_precision"],
-                early_stopping_cfg=cfg["early_stopping"],
-                checkpoint_cfg=cfg["checkpointing"],
-                radar_loss_cfg=cfg["radar_loss"],
-                resume=cfg["checkpointing"].get("resume", True)
-                       and not args.fresh,
+            # --- Base stage ---
+            if args.stage in ("base", "both"):
+                base_model_path, _ = train(
+                    mode=mode,
+                    data_root=args.data_root,
+                    epochs=params["epochs"],
+                    batch_size=params["batch_size"],
+                    output_dir=args.output_dir,
+                    dropout=params["dropout"],
+                    norm=params["norm"],
+                    dataset_dir=args.dataset_dir,
+                    source=SOURCE,
+                    shuffle_buffer=params["shuffle_buffer"],
+                    mixed_precision=params["mixed_precision"],
+                    lr_schedule_cfg=cfg["lr_schedule"],
+                    early_stopping_cfg=cfg["early_stopping"],
+                    checkpoint_cfg=cfg["checkpointing"],
+                    radar_loss_cfg=cfg["radar_loss"],
+                    resume=cfg["checkpointing"].get("resume", True)
+                           and not args.fresh,
+                    period=args.period,
+                )
+
+            # --- Finetune stage ---
+            if args.stage in ("finetune", "both"):
+                ft_base = (
+                    base_model_path if args.stage == "both"
+                    else Path(args.base_checkpoint)
+                )
+                train_finetune(
+                    mode=mode,
+                    data_root=args.data_root,
+                    base_model_path=ft_base,
+                    output_dir=args.output_dir,
+                    source=SOURCE,
+                    batch_size=params["batch_size"],
+                    finetune_cfg=cfg["finetune"],
+                    shuffle_buffer=params["shuffle_buffer"],
+                    mixed_precision=params["mixed_precision"],
+                    early_stopping_cfg=cfg["early_stopping"],
+                    checkpoint_cfg=cfg["checkpointing"],
+                    radar_loss_cfg=cfg["radar_loss"],
+                    resume=cfg["checkpointing"].get("resume", True)
+                           and not args.fresh,
+                    period=args.period,
+                    allow_period_overlap=args.allow_period_overlap,
+                )
+        finally:
+            # Released before the reclaim job starts, or the job would see
+            # its own caller as the holder and refuse to delete.
+            inuse.release()
+
+        # Reclaim: with an archive already on disk this is a verify plus a
+        # delete, not another compression pass. Detached so the next mode
+        # starts straight away.
+        if not args.no_archive and args.dataset_dir is None:
+            _spawn_archive_job(
+                "reclaim", run_tag_for_mode, datasets_root,
+                level=args.archive_level, workers=args.archive_workers,
+                max_concurrent=args.max_concurrent,
             )
 
     print("\nAll requested training runs completed.")
