@@ -218,6 +218,30 @@ Opt out of the automatic jobs with `--no-archive` on either `create_datasets.py`
 
 One consequence worth planning around: between the archive job finishing and the reclaim completing you hold the uncompressed dataset *and* its archive. That peak is unavoidable if you want the archive built while training proceeds.
 
+### Period-tagged artefacts
+
+`--period LABEL` selects a window's artefacts as a set — the split CSVs, the
+sequence metadata, the normalization statistics, the class priors, the
+dataset, the weights and the evaluation output all carry the same tag.
+Omitting it means the untagged whole-archive run.
+
+**Every script that reads a tagged artefact takes the flag**, and that had to
+be swept: `evaluate_coalition`, `predict_full_domain`, `validate_predictions`,
+`visualize_gt_vs_pred` and `data_statistics` were resolving tagged artefacts
+to the *untagged* name, and `train_models.load_class_fractions` did the same
+for the class priors while its two sibling loaders were already correct.
+
+That class of bug is worth understanding because only one of its symptoms is
+loud. A missing file raises. **Mismatched normalization statistics do not** —
+a z-value only means something against the mean/std that produced it, so
+inverting with another window's constants returns plausible mm/h biased
+monotonically with intensity, and calibration absorbs the bias into its
+thresholds. It surfaces as a skill difference that is not real.
+
+Two scripts stay period-less by design: `verification_keys.py` spans *two*
+windows and so takes `--reconvect_tag` / `--sepconv_tag`, and
+`build_patch_ensemble.py` reads its periods from the ensemble registry.
+
 ### Where the data lives
 
 Every default path resolves against **the repository**, not the working
@@ -267,6 +291,21 @@ checkpoints where evaluation will not look.
 **Pass the same roots to every stage of a run.** A dataset built under one
 `--datasets_root` and trained under another fails loudly (`FileNotFoundError`),
 not silently — but exporting the environment variable avoids the question.
+
+### Bounding the MTG store across disks
+
+The store outgrows one disk at ~47 MB per repeat cycle. `--spill_dir PATH [PATH …]` gives `pipeline_msg_mtg.py` further stores to rotate into, and `--min_free_gb` (default 50) is the threshold: the active store is re-evaluated **before every window and in both directions**, because `--delete_raw` returns space to the disk it is reading from, so a disk that filled up can become the right choice again later. Requires `--batch_months`. `--raw_dir` pins the raw chunks in place while the output store moves, and `mtg_constants.json` is carried into a newly-opened store so it stays reprojectable on its own.
+
+`our_data/satellite_data/store_registry.py` records which date landed where, in `mtg_store_index.json`:
+
+```bash
+python our_data/satellite_data/store_registry.py              # summary
+python our_data/satellite_data/store_registry.py --verify     # index vs disk
+python our_data/satellite_data/store_registry.py --chart      # per-month volume by disk
+python our_data/satellite_data/store_registry.py --scan ROOT… # rebuild from disk
+```
+
+The index is a claim; disk is the authority, so `resolve` checks the file exists before trusting it. `reproject.py` walks **every registered root** when `--mtg_dir` is absent, rebuilding the KD-tree per store from that store's own constants and writing into the single canonical `reprojected_data/` — so the split is invisible downstream. `summarize_mtg.py --npy_dir` likewise takes several roots and scans them as one archive.
 
 ### Compressing the `.npy` stores
 
@@ -634,7 +673,7 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 | **1c** | `our_data/lightning_data/linet_export.py` | `--start` `--end` `YYYY-MM-DD` period, **end EXCLUSIVE** · `--format` txt point list, kml, or asc · `--out PATH` destination root for the exported strokes · `--bbox` lon/lat rectangle limiting the export area · `--password_file PATH` text file holding the LINET password · `--lightning-type` 0 all, 1 cloud-to-ground, 2 intracloud · `--amp-threshold` minimum stroke amplitude to keep · `--daily-window` split the request into per-day windows · `--pause` seconds to wait between successive requests · `--force` re-download even when the output exists · `--dry-run` plan the fetch without downloading anything | Downloads LINET strokes. Use `--format kml`: it writes `{out}/kml_data/YYYY-MM-DD/…` which the rasteriser reads directly. | `python our_data/lightning_data/linet_export.py --start 2025-05-01 --end 2025-06-01 --format kml --out our_data/lightning_data --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$<br>*(`--end 2025-06-01` to cover all of May — the bound is exclusive)* |
 | **1d** | `our_data/lightning_data/read_kml_version2.py` | `--data_root PATH` root holding the downloaded KML files · `--output_root PATH` destination for the rasterised grid arrays · `--date YYYY-MM-DD` process one date instead of all · `--force` reprocess and overwrite the existing outputs | Rasterises strokes onto the 1 km Romania grid → `density`, `current`, `occurrence`. | `python our_data/lightning_data/read_kml_version2.py --data_root our_data` |
 | **2** | `reproject.py` | `--satellite MTG` \| `--lightning` \| `--opera` \| `--all` product family; mutually exclusive, one required · `--data_root PATH` root containing the raw product folders · `--date YYYY-MM-DD` process a single date only · `--workers N` parallel day-folder worker processes | Regrids everything onto the 1536 × 768 EPSG:31700 canvas as `.npy`. Also writes the shared `romania_grid_{lats,lons}.npy` and per-source projection constants so the arrays stay self-recoverable. | `python reproject.py --all`<br>`python reproject.py --opera --workers 6`<br>`python reproject.py --satellite MTG --date 2025-05-14` |
-| **2a** | `our_data/satellite_data/summarize_mtg.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--scan npy\|raw` measure from extracted arrays or raw chunks · `--npy_dir PATH` MTG root holding the per-channel arrays · `--raw_dir PATH` directory of downloaded FCI chunk files · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--timesteps` override the cadence minute filter · `--chart [PATH]` monthly coverage chart PNG | Per-date MTG coverage → `mtg_summary.csv` + `mtg_missing_timesteps.json`, consumed by step 3 **and** by `--source datastore` as its shopping list. Also reports the NMA / Data Store split from `provenance.json`. **Give `--start` and `--end`** — without them the range is inferred from the files found, so a date absent from disk is not reported missing and can never be requested. | `python our_data/satellite_data/summarize_mtg.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/satellite_data/summarize_mtg.py --scan raw` |
+| **2a** | `our_data/satellite_data/summarize_mtg.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--scan npy\|raw\|reprojected` measure from the extracted store, the raw chunks, or the reprojected arrays `extract_patches` actually reads · `--npy_dir PATH` MTG root holding the per-channel arrays · `--raw_dir PATH` directory of downloaded FCI chunk files · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--timesteps` override the cadence minute filter · `--chart [PATH]` monthly coverage chart PNG | Per-date MTG coverage → `mtg_summary.csv` + `mtg_missing_timesteps.json`, consumed by step 3 **and** by `--source datastore` as its shopping list. Also reports the NMA / Data Store split from `provenance.json`. **Give `--start` and `--end`** — without them the range is inferred from the files found, so a date absent from disk is not reported missing and can never be requested. | `python our_data/satellite_data/summarize_mtg.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/satellite_data/summarize_mtg.py --scan raw` |
 | **2b** | `our_data/opera_data/summarize_opera_data.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--data_dir PATH` local OPERA download root to scan · `--products` reflectivity, rainfall_rate, or both · `--timesteps` override the per-product minute filter · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--chart [PATH]` monthly coverage chart PNG | Same for OPERA → `opera_summary.csv` + `opera_missing_timesteps.json`. | `python our_data/opera_data/summarize_opera_data.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/opera_data/summarize_opera_data.py --products opera_rainfall_rate` |
 | **2c** | `our_data/lightning_data/summarize_lightning_data.py` | `--start` `--end` `YYYY-MM-DD` range the cache should cover · `--data_dir PATH` rasterised lightning `.npy` root to scan · `--workers N` parallel workers for the per-date scan · `--output PATH` per-date coverage summary CSV destination · `--active PATH` per-timestep activity index CSV destination · `--chart [PATH]` monthly coverage chart PNG | Same for LINET → `lightning_summary.csv` + `lightning_active_steps.csv`. Every array is read in full to test for a non-zero pixel, so the scan is disk-bound and parallel by default. The activity index also feeds `lightning_fraction.py --scope_csv` and `visualize_lightning_stats.py`. | `python our_data/lightning_data/summarize_lightning_data.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/lightning_data/summarize_lightning_data.py -w 12` |
 | **3** | `intersect_product_coverage.py` | `--summary name=PATH` per-product coverage summary CSV; `name` is `mtg`, `lightning`, `opera_rainfall_rate` or `opera_reflectivity` (`opera` is an alias for the former) · `--missing name=PATH` per-product missing-timestep JSON · `--active name=PATH` per-timestep activity index CSV · `--errors_log PATH` reprojection error log to subtract · `--timestep_config PATH` master cadence config to validate against · `--output_csv PATH` where the timestep manifest is written · `--output_plot PATH` destination for the coverage bar chart | Intersects per-product coverage into `timestep_manifest.csv` — the timesteps where *all* requested products exist. Gates step 5. **The requested set is your choice**, and OPERA's two fields are named separately so a manifest requires only what its modes read: both OPERA keys draw on the same summary CSV and missing JSON, selecting different blocks. | `python intersect_product_coverage.py --summary mtg=our_data/satellite_data/mtg_summary.csv --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv --summary opera_reflectivity=our_data/opera_data/opera_summary.csv`<br>`python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv --output_csv our_data/timestep_manifest_rain.csv` |
@@ -1056,9 +1095,9 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
-| `our_data/satellite_data/summarize_mtg.py` | `mtg_summary.csv` · `mtg_missing_timesteps.json` · `mtg_coverage.png` (`--chart`) | `intersect_product_coverage` · `pipeline_msg_mtg --source datastore` · chart is **terminal** | Per-date coverage measured from the `.npy` output. The missing-timestep JSON is **the Data Store shopping list** — the backfill fetches exactly what it names. Pass `--start`/`--end`, or a date with no files at all is never reported missing and can never be requested. |
-| `our_data/opera_data/summarize_opera_data.py` | `opera_summary.csv` · `opera_missing_timesteps.json` · `opera_coverage.png` (`--chart`) | `intersect_product_coverage` · chart is **terminal** | The same accounting for the radar composites. The only summary needed when gating on radar alone. |
-| `our_data/lightning_data/summarize_lightning_data.py` | `lightning_summary.csv` · `lightning_active_steps.csv` · `lightning_coverage.png` (`--chart`) | `intersect --active` · `lightning_fraction` · chart is **terminal** | Lightning is sparse, so presence is the wrong gate: `lightning_active_steps.csv` lists the timesteps that actually **carry strokes**, and the intersection uses it in place of a missing-file test. |
+| `our_data/satellite_data/summarize_mtg.py` | `our_data/satellite_data/`: `mtg_summary.csv` · `mtg_missing_timesteps.json` · `mtg_coverage.png` (`--chart`) | `intersect_product_coverage` · `pipeline_msg_mtg --source datastore` · chart is **terminal** | Per-date coverage measured from the `.npy` output. The missing-timestep JSON is **the Data Store shopping list** — the backfill fetches exactly what it names. Pass `--start`/`--end`, or a date with no files at all is never reported missing and can never be requested. |
+| `our_data/opera_data/summarize_opera_data.py` | `our_data/opera_data/`: `opera_summary.csv` · `opera_missing_timesteps.json` · `opera_coverage.png` (`--chart`) | `intersect_product_coverage` · chart is **terminal** | The same accounting for the radar composites. The only summary needed when gating on radar alone. |
+| `our_data/lightning_data/summarize_lightning_data.py` | `our_data/lightning_data/`: `lightning_summary.csv` · `lightning_active_steps.csv` · `lightning_coverage.png` (`--chart`) | `intersect --active` · `lightning_fraction` · chart is **terminal** | Lightning is sparse, so presence is the wrong gate: `lightning_active_steps.csv` lists the timesteps that actually **carry strokes**, and the intersection uses it in place of a missing-file test. |
 | `intersect_product_coverage.py` | `our_data/timestep_manifest.csv` · `our_data/intersect_summary.png` | `extract_patch_seq_for_datasets` · plot is **terminal** | The timesteps where *every requested product* exists — `date,hhmm` plus each product's snapped time. **The product set is your choice**: passing only `--summary opera_rainfall_rate=…` gates on radar alone, so MTG gaps stop constraining radar-only work. OPERA's two fields are separate keys, so a rainfall-only model keeps samples that reflectivity happens to be missing, and a model that reads reflectivity is never handed a timestep without it. |
 
 ### Stage 4 — sample selection

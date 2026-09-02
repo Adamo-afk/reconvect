@@ -258,10 +258,10 @@ python reproject.py --all --workers 6
 python our_data/<product>/summarize_<product>.py --start 2025-01-01 --end 2026-08-13 --chart
 ```
 - **Does** — measures per-date coverage from the **extracted** output, not the raw downloads: a reprojection that failed after a successful download is invisible to a raw scan.
-- **Writes** — `<product>_summary.csv`, `<product>_missing_timesteps.json` **CRITICAL**
-- **Graph** — `<product>_coverage.png` with `--chart`. Monthly bars with a line through the tops. Presentational; nothing reads it.
+- **Writes** — `our_data/<product>_data/<product>_summary.csv` and `<product>_missing_timesteps.json` **CRITICAL** — beside the product they describe, not at the repository root, and anchored to the script rather than the working directory.
+- **Graph** — `<product>_coverage.png` with `--chart`, in the same folder. Monthly bars with a line through the tops. Presentational; nothing reads it.
 - **Note** — the MTG missing-JSON is the Data Store shopping list. Pass `--start`/`--end`, or a date with no files at all is never reported missing and can never be requested.
-- **Alone** — `summarize_mtg --npy_dir` accepts several roots and scans them as one archive, for a store split across drives.
+- **Alone** — `summarize_mtg --npy_dir` accepts several roots and scans them as one archive, for a store split across drives. `--scan {npy,raw,reprojected}` picks which question is answered: `npy` (default) is the extracted store and drives the Data Store backfill, `raw` is what arrived before extraction, `reprojected` is what `extract_patches` will actually read. A `reprojected` scan's missing-list describes reprojection gaps and must **not** be fed to `--source datastore`.
 - **Read by** — `intersect_product_coverage`; `pipeline_msg_mtg --source datastore`
 
 ### 4. Cross-product coverage gate
@@ -301,7 +301,9 @@ python extract_patches.py [--period LABEL] [--products opera ...]
 ```
 - **Does** — slices 256 × 256 tiles from the full canvases; MR products are average-pooled to 128 px. Always down, never up.
 - **Writes** — `our_data/patches/<date>/<var>_<HHMM>_{HR|LR}.npy` **CRITICAL**
-- **Note** — output is **not** period-suffixed: every period writes into one shared tree, so a second period is largely a no-op over the overlap.
+- **Note** — output is **not** period-suffixed: every period writes into one shared tree, so a second period is largely a no-op over the overlap. The pool is invalidated by a rebuilt `patch_index.csv`, never by a new period.
+- **Also writes** — `our_data/patches/<date>/_patch_index.json`, the active-patch lists each date was built from. Any timestep whose list has since moved is re-extracted instead of skipped, because a patch that becomes active inserts mid-list and shifts every later slot. **CRITICAL**
+- **Alone** — `--audit_pool` reports which dates drifted and extracts nothing.
 - **Read by** — `create_datasets`
 
 ### 8. Normalization statistics
@@ -420,6 +422,9 @@ python train_models.py --config training.config --mode opera_radar_only_rainfall
 ```
 - **Does** — trains Bm1/Bm3/Bm5 (t+1, t+3, t+5 = 15/45/75 min) for the baseline, and the RECONVECT-architecture ablation.
 - **Writes** — `models/sepconv_<run_tag>_bm{1,3,5}.keras`, `history_sepconv_<run_tag>.json` **CRITICAL**
+- **Also writes** — `models/checkpoints/<name>_latest.keras` after every epoch, with a `.json` sidecar carrying the next-epoch index. Both models resume from it; `--fresh` ignores it. So each run leaves **two** states: best weights in the final save, last epoch in the checkpoint.
+- **Note** — both read the same `training.config`: `[defaults]` supplies `epochs` and `batch_size` to each, and the optional `[sepconv]` section overrides them, inheriting `learning_rate` from `[lr_schedule].initial_lr` and `es_patience` from `[early_stopping].patience`. A gap between the two models therefore cannot be a gap in training budget. The learning-rate *schedule* is deliberately not unified — RECONVECT uses cosine warmup, the baseline reproduces the paper's `ReduceLROnPlateau`.
+- **Alone** — `--datasets_root` / `--output_dir` place the dataset and the checkpoints on another disk.
 
 ### B5. Evaluate
 ```bash
@@ -429,6 +434,7 @@ python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34
 - **Does** — composes t+1…t+4 through `sepconv_compose`, denormalises with the window's own statistics, and bins in mm/h at the same class edges RECONVECT uses — so the two cannot be told apart by their thresholds.
 - **Writes** — `evaluation/eval_sepconv_<run_tag>/evaluation_results.json`
 - **Graph** — `metrics_per_leadtime.png`; `--plot_samples N` renders observed vs predicted class and predicted mm/h.
+- **Alone** — `--weights best|latest` chooses which of the two saved states to score. `best` is the final save; `latest` is the per-epoch checkpoint. Comparing them shows whether the epochs after the best one were overfitting, or whether early stopping cut a run that was still improving.
 
 
 **Both evaluators must be given the same frozen key set.** **CRITICAL**
