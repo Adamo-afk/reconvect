@@ -61,10 +61,23 @@ DEFAULT_WORKERS = 6
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+# Summaries, the missing-timestep JSON and the coverage chart belong with
+# the product they describe, not at the repository root. This file already
+# lives in that folder, so anchor to it - and to the file, not the working
+# directory, so the defaults hold from anywhere.
+PRODUCT_DIR = Path(__file__).resolve().parent
+
+
+# The .npy stores may be zstd-compressed in place (see
+# compress_datasets.py --compress-npy); list_arrays yields logical
+# .npy names either way, so the filename patterns below still match.
+sys.path.insert(0, str(PROJECT_ROOT))
+from compress_datasets import list_arrays, load_array  # noqa: E402
+
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent  # our_data/lightning_data
-DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "lightning_summary.csv"
-DEFAULT_ACTIVE_CSV = PROJECT_ROOT / "lightning_active_steps.csv"
+DEFAULT_OUTPUT_CSV = PRODUCT_DIR / "lightning_summary.csv"
+DEFAULT_ACTIVE_CSV = PRODUCT_DIR / "lightning_active_steps.csv"
 
 # Lightning sub-products + their on-disk subdir + .npy filename prefix.
 PRODUCTS: dict[str, dict[str, str]] = {
@@ -129,7 +142,7 @@ def load_minute_filter():
 def has_activity(npy_path: Path) -> bool:
     """Return True iff the .npy contains at least one non-zero pixel."""
     try:
-        data = np.load(npy_path)
+        data = load_array(npy_path)
     except Exception as e:
         print(f"  WARNING: could not read {npy_path}: {e}", file=sys.stderr)
         return False
@@ -154,7 +167,7 @@ def scan_day(args: tuple[str, str, str]) -> tuple[str, dict[str, bool]]:
     expected_date_compact = date_str.replace('-', '')
     result: dict[str, bool] = {}
 
-    for filename in sorted(os.listdir(day_dir)):
+    for filename in list_arrays(day_dir):
         fm = FILE_PATTERN.match(filename)
         if not fm or fm.group('product') != product:
             continue
@@ -532,7 +545,7 @@ def main() -> int:
              f'(default: {DEFAULT_ACTIVE_CSV})',
     )
     parser.add_argument(
-        '--chart', type=str, nargs='?', const='lightning_coverage.png', default=None,
+        '--chart', type=str, nargs='?', const=str(PRODUCT_DIR / 'lightning_coverage.png'), default=None,
         help="Render a monthly coverage chart (faded bars + line through "
              "the bar tops, with the cadence expectation as a dashed "
              "reference). Optional PNG path; defaults to "

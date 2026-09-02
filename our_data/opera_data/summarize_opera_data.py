@@ -37,8 +37,23 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
+# Summaries, the missing-timestep JSON and the coverage chart belong with
+# the product they describe, not at the repository root. This file already
+# lives in that folder, so anchor to it - and to the file, not the working
+# directory, so the defaults hold from anywhere.
+PRODUCT_DIR = Path(__file__).resolve().parent
+
+
+# The .npy stores may be zstd-compressed in place (see
+# compress_datasets.py --compress-npy); list_arrays yields logical
+# .npy names either way, so the filename patterns below still match.
+sys.path.insert(0, str(PROJECT_ROOT))
+from compress_datasets import list_arrays  # noqa: E402
+
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent  # our_data/opera_data
+DEFAULT_NPY_DIR = (DEFAULT_DATA_DIR.parent / 'reprojected_data'
+                   / 'opera_data')
 
 # product_key -> (local subdirectory, native cadence in minutes if config missing)
 PRODUCTS = {
@@ -156,6 +171,44 @@ def discover_files(product_root: Path) -> dict[str, set[str]]:
     return out
 
 
+def discover_npy(npy_root: Path, short: str) -> dict[str, set[str]]:
+    """Walk the reprojected output and return {date_str: set_of_HH:MM}.
+
+    Layout written by `reproject.py --opera`:
+        {npy_root}/{short}/nc4_{date}-Romania_{short}/
+            nc4_{date}-Romania_{HHMM}_{short}.npy
+
+    This is what `extract_patches.py` reads, which is the point of
+    scanning it: the raw `.h5` answering "was it downloaded" and the
+    `.npy` answering "can the pipeline use it" are different questions,
+    and a reprojection that failed after a successful download is
+    invisible to the first one.
+    """
+    out: dict[str, set[str]] = defaultdict(set)
+    product_root = npy_root / short
+    if not product_root.is_dir():
+        return out
+
+    suffix = f"_{short}.npy"
+    for day_dir in sorted(product_root.iterdir()):
+        if not day_dir.is_dir():
+            continue
+        # nc4_2025-04-01-Romania_rainfall_rate -> 2025-04-01
+        name = day_dir.name
+        if not name.startswith("nc4_") or "-Romania_" not in name:
+            continue
+        date_str = name[4:name.index("-Romania_")]
+        for f in list_arrays(day_dir):
+            if not f.endswith(suffix):
+                continue
+            # nc4_{date}-Romania_{HHMM}_{short}.npy
+            stem = f[:-len(suffix)]
+            hhmm = stem.rsplit("_", 1)[-1]
+            if len(hhmm) == 4 and hhmm.isdigit():
+                out[date_str].add(f"{hhmm[:2]}:{hhmm[2:]}")
+    return out
+
+
 def date_range(start: str | None, end: str | None) -> list[str]:
     """Every YYYY-MM-DD from start to end inclusive, or [] if unbounded.
 
@@ -188,7 +241,9 @@ def summarize(data_dir: Path,
               products: list[str],
               minute_filters: dict[str, set[int]],
               start: str | None = None,
-              end: str | None = None):
+              end: str | None = None,
+              scan: str = 'npy',
+              npy_dir: Path | None = None):
     """
     Returns (rows, per_date_detail).
 
@@ -208,8 +263,12 @@ def summarize(data_dir: Path,
 
     present_by_product: dict[str, dict[str, set[str]]] = {}
     for p in products:
-        root = data_dir / PRODUCTS[p]["subdir"]
-        present_by_product[p] = discover_files(root)
+        short = PRODUCTS[p]["subdir"]
+        if scan == 'npy':
+            present_by_product[p] = discover_npy(
+                npy_dir or DEFAULT_NPY_DIR, short)
+        else:
+            present_by_product[p] = discover_files(data_dir / short)
 
     # Union of all dates seen for any product
     all_dates: set[str] = set()
@@ -458,13 +517,28 @@ def main() -> int:
         help=f'Local OPERA root (default: {DEFAULT_DATA_DIR})',
     )
     parser.add_argument(
+        '--scan', type=str, default='npy', choices=['npy', 'raw'],
+        help="What to measure coverage from. 'npy' (default) reads the "
+             "reprojected arrays that extract_patches actually loads; "
+             "'raw' counts the downloaded .h5 files. They answer "
+             "different questions, and a reprojection that failed after "
+             "a successful download is invisible to 'raw' - which lets a "
+             "timestep into the manifest that the dataset build then "
+             "silently skips.",
+    )
+    parser.add_argument(
+        '--npy_dir', type=str, default=None,
+        help=f'Reprojected OPERA root for --scan npy '
+             f'(default: {DEFAULT_NPY_DIR})',
+    )
+    parser.add_argument(
         '--products', type=str, nargs='+',
         default=list(PRODUCTS.keys()),
         choices=list(PRODUCTS.keys()),
         help='Products to include (default: both)',
     )
     parser.add_argument(
-        '--chart', type=str, nargs='?', const='opera_coverage.png', default=None,
+        '--chart', type=str, nargs='?', const=str(PRODUCT_DIR / 'opera_coverage.png'), default=None,
         help="Render a monthly coverage chart (faded bars + line through "
              "the bar tops, with the cadence expectation as a dashed "
              "reference). Optional PNG path; defaults to "
@@ -492,12 +566,12 @@ def main() -> int:
     )
     parser.add_argument(
         '--output', '-o', type=str,
-        default=str(PROJECT_ROOT / 'opera_summary.csv'),
+        default=str(PRODUCT_DIR / 'opera_summary.csv'),
         help='Output CSV filename (default: opera_summary.csv)',
     )
     parser.add_argument(
         '--missing', '-m', type=str,
-        default=str(PROJECT_ROOT / 'opera_missing_timesteps.json'),
+        default=str(PRODUCT_DIR / 'opera_missing_timesteps.json'),
         help='Output JSON with missing timesteps '
              '(default: opera_missing_timesteps.json)',
     )
@@ -524,15 +598,21 @@ def main() -> int:
 
     print("=" * 70)
     print("OPERA Cache Summary")
+    npy_dir = Path(args.npy_dir) if args.npy_dir else DEFAULT_NPY_DIR
+
     print("=" * 70)
-    print(f"Data dir       : {data_dir}")
+    print(f"Scanning       : {args.scan}"
+          + ("  (reprojected arrays, what extract_patches reads)"
+             if args.scan == 'npy' else "  (downloaded .h5 files)"))
+    print(f"Data dir       : {npy_dir if args.scan == 'npy' else data_dir}")
     print(f"Products       : {args.products}")
     for p in args.products:
         print(f"  {p:22s}: filter={sorted(minute_filters[p])} ({step_src_msgs[p]})")
     print()
 
     rows, detail = summarize(data_dir, args.products, minute_filters,
-                             start=args.start, end=args.end)
+                             start=args.start, end=args.end,
+                             scan=args.scan, npy_dir=npy_dir)
     print_table(rows, args.products)
     save_csv(rows, args.products, args.output)
     if args.chart:

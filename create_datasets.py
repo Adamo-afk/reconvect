@@ -51,7 +51,12 @@ from pathlib import Path
 import numpy as np
 import tensorflow as tf
 
-from pipeline_config import SOURCE
+from pipeline_config import (
+    SOURCE,
+    add_root_arguments,
+    resolve_data_root,
+    resolve_datasets_root,
+)
 
 # Sentinel: `stats_period=None` legitimately means "global statistics", so
 # None cannot double as "not supplied".
@@ -67,7 +72,9 @@ from periods import (
 from compress_datasets import (
     DEFAULT_LEVEL as _ARCHIVE_LEVEL,
     DEFAULT_MAX_CONCURRENT as _ARCHIVE_MAX_CONCURRENT,
+    array_exists,
     default_workers as _default_archive_workers,
+    load_array,
 )
 from ensemble_plan import (
     append_state,
@@ -513,12 +520,51 @@ def get_mode_config(mode):
             "label_type": "radar_logz",
         }
     elif mode == "opera_radar_only_rainfall":
-        # RECONVECT radar-only ablation: identical architecture and
-        # training to the full model, OPERA alone as input, same 5-class
-        # head. This is the modality-value comparator, so it must differ
-        # from the full model ONLY in which channels it receives.
+        # RECONVECT architecture on the baseline's inputs: OPERA
+        # rainfall_rate alone, same 5-class head, same training.
+        #
+        # Input parity with SepConv-ens is what this mode is for. Both
+        # then see one field, so a gap between them is attributable to
+        # the architecture rather than to a channel one of them was
+        # handed. Reflectivity is deliberately absent: including it would
+        # confound the comparison, and the modality question - what MTG
+        # and lightning add - is answered against the full model by
+        # `mtg_opera_radar_only_rainfall`, which keeps both OPERA fields.
+        #
+        # Dropping reflectivity also closes a coverage trap: the manifest
+        # represents OPERA by `opera_rainfall_rate`, so a timestep
+        # carrying rainfall but not reflectivity passes the gate and
+        # would then be dropped at build time. Rainfall-only makes the
+        # gate and the mode agree.
+        #
+        # Carried in the HR group at 256 px, exactly as the baseline
+        # carries it, for two reasons that turn out to be the same
+        # reason. First, parity has to mean the same TENSOR, not just
+        # the same field: the MR form is 2x2 average-pooled, and while
+        # that is near-lossless over the domain as a whole (97% of it is
+        # dry), inside wet blocks 79% are non-constant and 4.3% of their
+        # pixels change class - because the 2 km OPERA cells do not
+        # align with the 1 km grid's 2x2 boundaries. Handing the
+        # baseline that detail and not the ablation would put part of
+        # any gap down to input rather than architecture.
+        #
+        # Second, the model's output resolution is its FINEST INPUT
+        # (encoder halves three times, decoder doubles three times), and
+        # this is the only mode with no HR input to hold it at 256. With
+        # the MR form the head emitted 128x128 against a 256x256 label
+        # and training died on the shape mismatch. At HR the shapes line
+        # up with no model change, and the task stays pure temporal
+        # extrapolation rather than forecasting plus a learned upsample
+        # the baseline never performs.
+        #
+        # Note both sides are 2 km information on a 1 km lattice: OPERA
+        # is 2 km native and reproject.py nearest-neighbours it onto the
+        # grid, so 98% of adjacent label pixels are identical copies.
+        # The 256 is the lattice the HR branch defines, not a claim of
+        # 1 km rainfall.
         return {
-            "past_mr": (mr_opera, 128, "LR"),
+            "past_hr": ({"opera_rainfall_rate_hr":
+                         (transform_opera_rainfall_rate, None)}, 256, "HR"),
             "label_var": "opera_rainfall_rate_hr",
             "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
@@ -702,7 +748,10 @@ def init_sequence_config(data_root, source: str = SOURCE,
 
 def reference_to_hhmm(reference_utc_str, offset_minutes):
     """Convert reference_utc 'HH:MM' + offset to 'HHMM' string.
-    Handles day wrapping (e.g., 23:45 + 30 → 0015).
+
+    Wraps the CLOCK only - 23:45 + 30 gives 0015 - and deliberately says
+    nothing about the date. Anything that opens a file must use
+    `row_to_datetime_list`, which carries the day across midnight.
     """
     parts = reference_utc_str.strip().split(":")
     ref = datetime(2000, 1, 1, int(parts[0]), int(parts[1]))
@@ -710,8 +759,28 @@ def reference_to_hhmm(reference_utc_str, offset_minutes):
     return target.strftime("%H%M")
 
 
+def row_to_datetime_list(row):
+    """(date, HHMM) for every timestep in a sample row.
+
+    The row's `date` column dates the REFERENCE, not the window, so a
+    window through midnight has steps on two different days. Pairing
+    every step with `row["date"]` - as this did until the patch pool
+    guard caught it - reads the previous day's file for every
+    post-midnight step: wrong tiles, wrong time, and silent whenever the
+    index happens to be in range.
+    """
+    base = datetime.strptime(str(row["date"]).strip(), "%Y-%m-%d")
+    parts = str(row["reference_utc"]).strip().split(":")
+    ref = base.replace(hour=int(parts[0]), minute=int(parts[1]))
+    out = []
+    for offset in T_OFFSETS:
+        t = ref + timedelta(minutes=offset)
+        out.append((t.strftime("%Y-%m-%d"), t.strftime("%H%M")))
+    return out
+
+
 def row_to_hhmm_list(row):
-    """Return list of 6 HHMM strings for all timesteps in a sample row."""
+    """Clock times only. Prefer `row_to_datetime_list` for file access."""
     ref = row["reference_utc"]
     return [reference_to_hhmm(ref, offset) for offset in T_OFFSETS]
 
@@ -720,13 +789,52 @@ def row_to_hhmm_list(row):
 # Patch loading
 # ============================================================================
 
+class StalePatchPool(RuntimeError):
+    """The patch pool disagrees with the split CSVs about patch activity.
+
+    `idx_t*` is a POSITION in a timestep's active-patch list, and that
+    list lives only in patch_index.csv. Both the split CSVs and the patch
+    files derive from it, so an out-of-range position is never a data
+    condition - it can only mean the pool was built from a different
+    index than the CSVs were.
+
+    This is raised rather than zero-filled because the out-of-range slot
+    is the *visible* symptom of a problem that is mostly invisible: when
+    a patch becomes active it inserts into the middle of the list and
+    shifts every later slot by one. Those shifted slots stay in range and
+    read cleanly, silently pairing one region's input with another
+    region's label. Padding the one detectable case with zeros would hide
+    the only evidence that the rest are wrong.
+    """
+
+    def __init__(self, patches_dir, date_str, hhmm, var_name, suffix,
+                 patch_idx, n_available):
+        super().__init__(
+            f"Stale patch pool at {patches_dir}\n"
+            f"  {date_str} {hhmm} {var_name} ({suffix}): the split CSV "
+            f"asks for slot {patch_idx}, the file holds {n_available}.\n"
+            f"  The pool and the split CSVs disagree about what was "
+            f"active here. Usually that means the pool was built from a "
+            f"different patch_index.csv - but check the DATE first: a "
+            f"window through midnight whose steps are read under the "
+            f"row's date lands on the wrong day's file, which looks "
+            f"identical to a stale pool.\n"
+            f"  Slots that are still in range are NOT safe either - they "
+            f"may point at the wrong tile.\n"
+            f"  Diagnose : python extract_patches.py --audit_pool "
+            f"[--period TAG]\n"
+            f"  Repair   : delete the affected dates from {patches_dir} "
+            f"and re-run extract_patches.py"
+        )
+
+
 def load_npy(patches_dir, date_str, var_name, hhmm, suffix):
     """Load a .npy patch file. Returns array of shape (N_patches, H, W)."""
     fn = f"{var_name}_{hhmm}_{suffix}.npy"
     path = os.path.join(patches_dir, date_str, fn)
-    if not os.path.isfile(path):
+    if not array_exists(path):
         return None
-    return np.load(path)
+    return load_array(path)
 
 
 def load_and_transform_group(patches_dir, date_str, hhmm, suffix,
@@ -752,14 +860,8 @@ def load_and_transform_group(patches_dir, date_str, hhmm, suffix,
 
         # Extract the specific patch
         if patch_idx >= data.shape[0]:
-            # Index out of range — fill with zeros
-            if extra_ch is not None:
-                channels.append(np.zeros((resolution, resolution, extra_ch),
-                                         dtype=np.float32))
-            else:
-                channels.append(np.zeros((resolution, resolution, 1),
-                                         dtype=np.float32))
-            continue
+            raise StalePatchPool(patches_dir, date_str, hhmm, var_name,
+                                 suffix, patch_idx, data.shape[0])
 
         patch = data[patch_idx].astype(np.float32)
 
@@ -782,8 +884,11 @@ def load_label(patches_dir, date_str, hhmm, label_var, label_transform,
     Returns: np.ndarray of shape (256, 256, n_label_channels), float32.
     """
     data = load_npy(patches_dir, date_str, label_var, hhmm, label_suffix)
-    if data is None or patch_idx >= data.shape[0]:
+    if data is None:
         return np.zeros((256, 256, n_label_channels), dtype=np.float32)
+    if patch_idx >= data.shape[0]:
+        raise StalePatchPool(patches_dir, date_str, hhmm, label_var,
+                             label_suffix, patch_idx, data.shape[0])
 
     patch = data[patch_idx].astype(np.float32)
     transformed = label_transform(patch)
@@ -827,8 +932,9 @@ def generate_samples(csv_path, patches_dir, mode_config):
     n_yielded = 0
 
     for row_idx, row in df.iterrows():
-        date_str = row["date"]
-        hhmm_list = row_to_hhmm_list(row)
+        # Per-step (date, HHMM): a window through midnight spans two
+        # days, and each step must be read from its OWN day's patches.
+        step_keys = row_to_datetime_list(row)
 
         # Parse patch_numbers and index lists
         patch_numbers = ast.literal_eval(row["patch_numbers"])
@@ -848,7 +954,7 @@ def generate_samples(csv_path, patches_dir, mode_config):
 
             for t_idx in range(N_INPUT):
                 col = INPUT_COLS[t_idx]
-                hhmm = hhmm_list[t_idx]
+                date_str, hhmm = step_keys[t_idx]
                 npy_idx = idx_lists[col][p_pos]
 
                 for group_key, (var_config, resolution, suffix) in input_groups.items():
@@ -872,7 +978,7 @@ def generate_samples(csv_path, patches_dir, mode_config):
             label_frames = []
             for t_idx in range(N_LABEL):
                 col = LABEL_COLS[t_idx]
-                hhmm = hhmm_list[N_INPUT + t_idx]
+                date_str, hhmm = step_keys[N_INPUT + t_idx]
                 npy_idx = idx_lists[col][p_pos]
 
                 lbl = load_label(
@@ -894,7 +1000,13 @@ def generate_samples(csv_path, patches_dir, mode_config):
             # scoring needs that identity, and it is unrecoverable from the
             # tensors alone.
             n_yielded += 1
-            yield stacked_inputs, stacked_label, int(patch_numbers[p_pos])
+            # (date, reference_utc, patch) is the verification key. It is
+            # unrecoverable from the tensors, and samples can be skipped
+            # (see n_skipped), so position in the shard identifies
+            # nothing - the key has to ride along with the sample.
+            yield (stacked_inputs, stacked_label,
+                   int(patch_numbers[p_pos]), str(row["date"]),
+                   str(row.get("reference_utc", "")))
 
     print(f"  Generated {n_yielded} samples, skipped {n_skipped}")
 
@@ -960,13 +1072,23 @@ def build_dataset(csv_path, patches_dir, mode_config):
 TFRECORD_SAMPLES_PER_SHARD = 500
 
 
-def _serialize_sample(stacked_inputs, stacked_label, patch_number=-1):
+def _serialize_sample(stacked_inputs, stacked_label, patch_number=-1,
+                      date_str="", reference_utc=""):
     """Serialize one (inputs_dict, label) sample as a tf.train.Example.
 
     `patch_number` identifies which of the 18 grid slots the sample came
     from. Training ignores it; the per-patch ensemble scorer reads it via
-    `load_tfrecord_with_patch`. Shards written before this field existed
-    parse back as -1 rather than failing.
+    `load_tfrecord_with_patch`.
+
+    `date_str` + `reference_utc` complete the verification key
+    `(date, reference_utc, patch)`, which is what verification_keys.py
+    freezes. Without them a shard cannot be restricted to the
+    leakage-free set, and the baseline comparison can only be scored on
+    each model's own test split - different populations, with each
+    model's test keys partly inside the other's training data.
+
+    Shards written before any of these fields existed parse back as the
+    sentinels (-1 / "") rather than failing.
     """
     feature: dict[str, tf.train.Feature] = {}
     for key, tensor in stacked_inputs.items():
@@ -989,6 +1111,12 @@ def _serialize_sample(stacked_inputs, stacked_label, patch_number=-1):
     )
     feature["patch_number"] = tf.train.Feature(
         int64_list=tf.train.Int64List(value=[int(patch_number)])
+    )
+    feature["date"] = tf.train.Feature(
+        bytes_list=tf.train.BytesList(value=[str(date_str).encode()])
+    )
+    feature["reference_utc"] = tf.train.Feature(
+        bytes_list=tf.train.BytesList(value=[str(reference_utc).encode()])
     )
     example = tf.train.Example(features=tf.train.Features(feature=feature))
     return example.SerializeToString()
@@ -1013,7 +1141,8 @@ def write_tfrecord_shards(csv_path, patches_dir, mode_config,
         return str(out_dir / f"shard_{i:05d}.tfrecord")
 
     try:
-        for stacked_inputs, stacked_label, patch_number in generate_samples(
+        for (stacked_inputs, stacked_label, patch_number,
+             date_str, reference_utc) in generate_samples(
                 csv_path, patches_dir, mode_config):
             if writer is None or n_samples % samples_per_shard == 0:
                 if writer is not None:
@@ -1023,7 +1152,8 @@ def write_tfrecord_shards(csv_path, patches_dir, mode_config,
                 if n_samples == 0:
                     print(f"    -> shard 0: {_shard_path(0)}")
             writer.write(
-                _serialize_sample(stacked_inputs, stacked_label, patch_number)
+                _serialize_sample(stacked_inputs, stacked_label,
+                                  patch_number, date_str, reference_utc)
             )
             n_samples += 1
             if n_samples % 100 == 0:
@@ -1095,6 +1225,106 @@ def _make_parse_fn_with_patch(input_specs, label_spec):
     return parse
 
 
+def _make_parse_fn_with_key(input_specs, label_spec):
+    """Like `_make_parse_fn`, but also returns the verification key.
+
+    Yields (inputs, label, date, reference_utc, patch_number) so a split
+    can be restricted to the frozen leakage-free set. Empty-string and
+    -1 defaults mean shards written before these fields existed parse
+    cleanly; they simply match no key, which is the safe direction - an
+    unidentifiable sample is excluded from a leakage-free comparison
+    rather than silently admitted to it.
+    """
+    feature_description = {
+        key: tf.io.FixedLenFeature([], tf.string)
+        for key in input_specs
+    }
+    feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+    feature_description["patch_number"] = tf.io.FixedLenFeature(
+        [], tf.int64, default_value=-1)
+    feature_description["date"] = tf.io.FixedLenFeature(
+        [], tf.string, default_value="")
+    feature_description["reference_utc"] = tf.io.FixedLenFeature(
+        [], tf.string, default_value="")
+
+    def parse(serialised):
+        parsed = tf.io.parse_single_example(serialised, feature_description)
+        inputs = {}
+        for key, spec in input_specs.items():
+            t = tf.io.parse_tensor(parsed[key], out_type=spec.dtype)
+            t.set_shape(spec.shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(parsed["label"], out_type=label_spec.dtype)
+        label.set_shape(label_spec.shape)
+        return (inputs, label, parsed["date"], parsed["reference_utc"],
+                parsed["patch_number"])
+
+    return parse
+
+
+def count_key_matches(shard_dir: Path, keys) -> tuple[int, int]:
+    """(kept, dropped) for `keys` over a split, without reading tensors.
+
+    Parses only date / reference_utc / patch_number, so this is a cheap
+    pre-pass. It exists so an empty match can be reported BEFORE the
+    dataset is handed to tf.data: a raise inside `from_generator` is
+    re-thrown as an opaque UnknownError, burying the one message that
+    tells the user what to do.
+    """
+    shard_paths = sorted(str(p) for p in shard_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(f"No shard_*.tfrecord files in {shard_dir}")
+    desc = {
+        "date": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "reference_utc": tf.io.FixedLenFeature([], tf.string,
+                                               default_value=""),
+        "patch_number": tf.io.FixedLenFeature([], tf.int64,
+                                              default_value=-1),
+    }
+    ds = tf.data.TFRecordDataset(shard_paths,
+                                 num_parallel_reads=tf.data.AUTOTUNE)
+    ds = ds.map(lambda r: tf.io.parse_single_example(r, desc),
+                num_parallel_calls=tf.data.AUTOTUNE)
+    kept = dropped = 0
+    for rec in ds:
+        k = (rec["date"].numpy().decode(),
+             rec["reference_utc"].numpy().decode(),
+             int(rec["patch_number"].numpy()))
+        if k in keys:
+            kept += 1
+        else:
+            dropped += 1
+    return kept, dropped
+
+
+def require_key_matches(shard_dir: Path, keys) -> tuple[int, int]:
+    """count_key_matches, but fail loudly and usefully on zero."""
+    kept, dropped = count_key_matches(shard_dir, keys)
+    if kept == 0:
+        raise SystemExit(
+            f"No sample in {shard_dir} matched the frozen key set "
+            f"({len(keys):,} keys, {dropped:,} samples scanned).\n"
+            f"  Either this dataset predates the date/reference_utc shard "
+            f"fields - rebuild it with create_datasets.py - or the frozen "
+            f"set describes a different pair of windows than this run tag."
+        )
+    return kept, dropped
+
+
+def load_tfrecord_with_key(shard_dir: Path,
+                           mode_config: dict) -> tf.data.Dataset:
+    """Load a split yielding (inputs, label, date, reference_utc, patch)."""
+    shard_paths = sorted(str(p) for p in shard_dir.glob("shard_*.tfrecord"))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"No shard_*.tfrecord files in {shard_dir}")
+    input_specs, label_spec = get_output_signature(mode_config)
+    ds = tf.data.TFRecordDataset(shard_paths,
+                                 num_parallel_reads=tf.data.AUTOTUNE)
+    return ds.map(_make_parse_fn_with_key(input_specs, label_spec),
+                  num_parallel_calls=tf.data.AUTOTUNE)
+
+
 def load_tfrecord_with_patch(shard_dir: Path,
                              mode_config: dict) -> tf.data.Dataset:
     """Load a split yielding (inputs, label, patch_number) triples."""
@@ -1131,6 +1361,7 @@ def load_tfrecord_dataset(shard_dir: Path,
 
 
 def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None,
+                             datasets_root=None,
                              period=None, stats_period=_UNSET):
     """Create and save train, validation, and test datasets.
 
@@ -1145,11 +1376,12 @@ def create_and_save_datasets(data_root, mode, source=SOURCE, output_root=None,
             suffixed by source.
         output_root: where to save datasets (default: data_root/datasets/)
     """
-    data_root = Path(data_root)
+    data_root = resolve_data_root(data_root)
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
     patches_dir = data_root / "patches"
 
     if output_root is None:
-        output_root = data_root / "datasets"
+        output_root = datasets_root
     else:
         output_root = Path(output_root)
 
@@ -1297,7 +1529,14 @@ def main():
              "past_hr sliced — see train_lightning_kd.py."
     )
     parser.add_argument(
-        "--data_root", type=str, default="./our_data",
+        "--datasets_root", type=str, default=None, metavar="PATH",
+        help="Root holding the built TFRecord datasets (default: "
+             "<data_root>/datasets, or $COALITION4_DATASETS_ROOT). Point "
+             "it at another disk to keep the datasets off the one "
+             "holding the patch pool."
+    )
+    parser.add_argument(
+        "--data_root", type=str, default=None,
         help="Root directory containing CSVs and patches/ subfolder"
     )
     parser.add_argument(
@@ -1361,6 +1600,12 @@ def main():
              f"(default: {_ARCHIVE_MAX_CONCURRENT})."
     )
     args = parser.parse_args()
+
+    # Resolve the roots ONCE, so every use below - including the plain
+    # `Path(args.data_root)` ones - sees a real path rather than None.
+    args.data_root = str(resolve_data_root(args.data_root))
+    args.datasets_root = str(resolve_datasets_root(args.data_root,
+                                                  args.datasets_root))
 
     # --- Plan mode: register the ensemble and stop -----------------------
     if args.ensemble:
@@ -1445,6 +1690,7 @@ def main():
 
     save_dir = create_and_save_datasets(
         data_root=args.data_root,
+        datasets_root=args.datasets_root,
         mode=args.mode,
         source=SOURCE,
         output_root=args.output_root,

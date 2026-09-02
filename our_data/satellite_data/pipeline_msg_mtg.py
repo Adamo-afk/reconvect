@@ -57,6 +57,11 @@ except ImportError:
 # =============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# A store may be zstd-compressed in place. Without this the already-extracted
+# check below would miss every .npy.zst and re-extract the whole store.
+sys.path.insert(0, str(PROJECT_ROOT))
+from compress_datasets import array_exists  # noqa: E402
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / "our_data" / "timestep_config.json"
 
 # FCI chunks covering the Romania study area.
@@ -643,7 +648,7 @@ def process_repeat_cycle(files, base_dir, variables, group_key=None,
                 base_dir, variable, f"{dir_name}_{variable}",
                 f"{dir_name}_{time_str}_{variable}.npy",
             )
-            if os.path.exists(existing):
+            if array_exists(existing):
                 result['skipped'].append(variable)
             else:
                 pending.append(variable)
@@ -699,6 +704,100 @@ def process_repeat_cycle(files, base_dir, variables, group_key=None,
 # =============================================================================
 # Main pipeline
 # =============================================================================
+
+def volume_id(path):
+    """Identity of the volume holding `path`, or None.
+
+    `st_dev` rather than the drive letter: the MTG store is usually
+    reached through a junction, so `F:\\...\\MTG` and `E:\\` are the same
+    disk and must not be treated as two places to spill between.
+    """
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        return os.stat(str(probe)).st_dev
+    except OSError:
+        return None
+
+
+def store_candidates(primary, spills):
+    """Stores to rotate between, one per distinct volume, primary first."""
+    out, seen = [], set()
+    for path in [primary] + list(spills or []):
+        vid = volume_id(path)
+        if vid is not None and vid in seen:
+            continue
+        if vid is not None:
+            seen.add(vid)
+        out.append(path)
+    return out
+
+
+def choose_store(current, candidates, min_free_gb):
+    """Where the next window should be written.
+
+    Stay put while the current store has room; otherwise move to whichever
+    candidate has the most. Deliberately re-evaluated every window and in
+    both directions: `--delete_raw` gives space back to the disk it is
+    reading from, so a store that was full earlier in the run is often the
+    emptiest later, and a one-way spill would never return to it.
+    """
+    if free_gb(current) >= min_free_gb:
+        return current
+
+    ranked = sorted(candidates, key=free_gb, reverse=True)
+    best = ranked[0]
+    if free_gb(best) < min_free_gb:
+        lines = "".join(f"{chr(10)}    {free_gb(c):8.0f} GB  {c}"
+                        for c in ranked)
+        raise SystemExit(
+            f"No store has {min_free_gb:.0f} GB free; stopping rather than "
+            f"filling a disk.{lines}{chr(10)}"
+            f"Free space, lower --min_free_gb, or add another "
+            f"--spill_dir.")
+
+    print(chr(10) + f"  {current} is down to {free_gb(current):.0f} GB "
+          f"(threshold {min_free_gb:.0f} GB)")
+    print(f"  -> continuing in {best} ({free_gb(best):.0f} GB free)")
+    os.makedirs(best, exist_ok=True)
+    _carry_constants(current, best)
+    return best
+
+
+def _carry_constants(src_dir, dst_dir):
+    """Copy mtg_constants.json into a newly-opened store.
+
+    Every store needs its own copy: reproject.py builds its KD-tree from
+    the constants beside the arrays, and a store without them is
+    unreprojectable even though the .npy are perfectly good.
+    """
+    import shutil
+    src = os.path.join(src_dir, CONSTANTS_FILENAME)
+    dst = os.path.join(dst_dir, CONSTANTS_FILENAME)
+    if os.path.isfile(src) and not os.path.isfile(dst):
+        shutil.copy2(src, dst)
+        print(f"  Copied {CONSTANTS_FILENAME} -> {dst_dir}")
+
+
+def free_gb(path) -> float:
+    """Free space on the volume holding `path`, in GB."""
+    import shutil
+    probe = Path(path)
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(str(probe)).free / (1024 ** 3)
+
+
+def dates_in_window(window_start, window_end) -> list[str]:
+    """Every YYYY-MM-DD the window covers, for store registration."""
+    out, cur = [], window_start.date()
+    last = window_end.date()
+    while cur <= last:
+        out.append(cur.isoformat())
+        cur += datetime.timedelta(days=1)
+    return out
+
 
 def month_windows(start, end, n_months):
     """Split [start, end] into consecutive windows of `n_months` months.
@@ -783,6 +882,7 @@ def fetch_and_process_mtg(
     delete_raw=False,
     delete_only=False,
     provenance_source="nma",
+    raw_dir=None,
 ):
     """
     End-to-end MTG FCI pipeline: SFTP download → netCDF4 processing.
@@ -807,7 +907,12 @@ def fetch_and_process_mtg(
     if start is None:
         return
 
-    local_download_dir = os.path.join(base_dir, '_raw_chunks')
+    # Raw and output normally share a root, but they need not: the .npy
+    # a cycle produces is ~3.8x the raw it replaces, so a drive can hold
+    # the chunks and still have no room for the arrays. Reading raw from
+    # one disk and writing arrays to another is what makes that archive
+    # recoverable.
+    local_download_dir = raw_dir or os.path.join(base_dir, '_raw_chunks')
 
     # ---- Step 1: Download (or skip) ----
     if skip_download:
@@ -969,9 +1074,8 @@ def delete_raw_chunks(groups, base_dir, counts=None):
     total = len(files)
     print(f"\nDeleting {total:,} raw chunk file(s) ...")
 
-    width = 40
     freed = removed = failed = 0
-    for i, path in enumerate(files, start=1):
+    for path in files:
         try:
             freed += os.path.getsize(path)
             os.remove(path)
@@ -979,18 +1083,8 @@ def delete_raw_chunks(groups, base_dir, counts=None):
         except OSError as exc:
             failed += 1
             if failed <= 5:
-                print(f"\n  WARNING: could not remove {path}: {exc}", file=sys.stderr)
-
-        # Redraw at most ~200 times: a bar that flushes on every file is
-        # slower than the deletion it is measuring.
-        if i % max(1, total // 200) == 0 or i == total:
-            done = int(width * i / total)
-            bar = "#" * done + "." * (width - done)
-            sys.stdout.write(
-                f"\r  [{bar}] {i / total * 100:5.1f}%  "
-                f"{i:,}/{total:,}  {freed / (1024 ** 3):.1f} GB freed")
-            sys.stdout.flush()
-    sys.stdout.write("\n")
+                print(f"  WARNING: could not remove {path}: {exc}",
+                      file=sys.stderr)
 
     print(f"  Removed {removed:,} file(s), freed "
           f"{freed / (1024 ** 3):.1f} GB")
@@ -1195,6 +1289,36 @@ def group_local_files(local_dir, start_dt, end_dt,
 
     print(f"Grouped into {len(groups)} repeat cycles")
     return dict(groups)
+
+
+def clip_gaps_to_range(gaps, start_dt, end_dt):
+    """Drop gap entries outside [start_dt, end_dt].
+
+    The gap list describes the whole archive, because that is what the
+    summary measured. --start/--end say which part of it this run is for,
+    so they have to be applied here as well: without it, asking for
+    October fetches January, which is both surprising and expensive.
+
+    Boundary days are trimmed by time of day, not just by date, so a run
+    starting at 12:00 does not pull that morning.
+    """
+    lo_date = start_dt.strftime("%Y-%m-%d")
+    hi_date = end_dt.strftime("%Y-%m-%d")
+    lo_time = start_dt.strftime("%H:%M")
+    hi_time = end_dt.strftime("%H:%M")
+
+    out = {}
+    for date_str in sorted(gaps):
+        if date_str < lo_date or date_str > hi_date:
+            continue
+        times = list(gaps[date_str])
+        if date_str == lo_date:
+            times = [t for t in times if t >= lo_time]
+        if date_str == hi_date:
+            times = [t for t in times if t <= hi_time]
+        if times:
+            out[date_str] = times
+    return out
 
 
 def split_gaps_by_window(gaps, n_months):
@@ -1485,6 +1609,29 @@ if __name__ == "__main__":
              '--source datastore. Falls back to EUMDAC_KEY / EUMDAC_SECRET.',
     )
     parser.add_argument(
+        '--raw_dir', type=str, default=None, metavar='PATH',
+        help="Read raw .nc chunks from here instead of "
+             "<output_dir>/_raw_chunks. The .npy a cycle produces is "
+             "~3.8x the raw it replaces, so a drive can hold the chunks "
+             "and still have no room for the arrays; this lets the "
+             "extraction read one disk and write another.",
+    )
+    parser.add_argument(
+        '--spill_dir', type=str, nargs='+', default=None, metavar='PATH',
+        help="Further store(s) to rotate through when the active one "
+             "drops below --min_free_gb. Re-evaluated before every "
+             "window and in both directions, so a disk that --delete_raw "
+             "has since emptied is used again rather than abandoned. "
+             "Stores on the same volume are collapsed. Requires "
+             "--batch_months, since the check happens between windows - "
+             "a date is never split across disks.",
+    )
+    parser.add_argument(
+        '--min_free_gb', type=float, default=50.0, metavar='GB',
+        help="Free space below which --spill_dir takes over "
+             "(default: 50).",
+    )
+    parser.add_argument(
         '--skip_download', action='store_true',
         help='Skip SFTP download; process files already in '
              '<output_dir>/_raw_chunks/',
@@ -1536,6 +1683,11 @@ if __name__ == "__main__":
     if args.delete_only:
         args.skip_download = True
 
+    if args.spill_dir and args.batch_months is None:
+        parser.error(
+            '--spill_dir needs --batch_months: the free-space check runs '
+            'between windows, and without batching there is only one.')
+
     # 'local' is exactly "the nma path with the download removed", so it is
     # expressed as such rather than as a second copy of the same stage.
     if args.source == 'local':
@@ -1560,7 +1712,26 @@ if __name__ == "__main__":
     # our_data/satellite_data/MTG/ (matches the tree diagram in
     # README.md) instead of ./MTG at the project root.
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_dir = args.output_dir or os.path.join(script_dir, 'MTG')
+    default_dir = os.path.join(script_dir, 'MTG')
+
+    # Creating a store is only ever done deliberately. The default path is
+    # usually a junction onto whichever drive holds the archive; if that
+    # link is absent - removed, or pointing at a drive that is not mounted
+    # - silently creating a fresh empty directory here would send hundreds
+    # of gigabytes to the wrong disk without a word. Reading an existing
+    # store by default stays free.
+    if args.output_dir is None and not os.path.isdir(default_dir):
+        parser.error(
+            f"no MTG store at {default_dir}, and --output_dir was not "
+            f"given.{chr(10)}"
+            f"Pass --output_dir explicitly to say which disk the store "
+            f"should live on, e.g.{chr(10)}"
+            f"    --output_dir G:{os.sep}nowcasting{os.sep}mtg_store"
+            f"{chr(10)}"
+            f"If the default path is a junction, check that its target "
+            f"drive is mounted rather than creating a second store.")
+
+    data_dir = args.output_dir or default_dir
     os.makedirs(data_dir, exist_ok=True)
 
     # Resolve products file relative to the script dir (anchoring to
@@ -1618,10 +1789,23 @@ if __name__ == "__main__":
         # what --provenance was explicitly told.
         prov = args.provenance if args.source == 'local' else 'nma'
 
+        # The active output store, re-chosen before every window.
+        stores = store_candidates(data_dir, args.spill_dir)
+        store = {"dir": data_dir}
+        if len(stores) > 1:
+            print(f"Stores         : {len(stores)} volume(s), "
+                  f"min free {args.min_free_gb:.0f} GB")
+            for c in stores:
+                print(f"  {free_gb(c):8.0f} GB free  {c}")
+
         def _window(ws, we):
+            if len(stores) > 1:
+                store["dir"] = choose_store(store["dir"], stores,
+                                            args.min_free_gb)
+            out_dir = store["dir"]
             fetch_and_process_mtg(
                 ws.strftime('%Y/%m/%d-%H%M'), we.strftime('%Y/%m/%d-%H%M'),
-                data_dir, mtg_variables,
+                out_dir, mtg_variables,
                 password_file=args.password_file,
                 chunk_filter=chunk_filter,
                 minute_filter=minute_filter,
@@ -1631,7 +1815,19 @@ if __name__ == "__main__":
                 delete_raw=args.delete_raw or args.delete_only,
                 delete_only=args.delete_only,
                 provenance_source=prov,
+                raw_dir=args.raw_dir,
             )
+
+            # Record where this window's dates landed, so reproject.py can
+            # find them without stat-ing every store.
+            if not args.delete_only:
+                try:
+                    from store_registry import register
+                    register(out_dir, dates_in_window(ws, we))
+                except Exception as exc:            # noqa: BLE001
+                    print(f"  WARNING: store index not updated: {exc}",
+                          file=sys.stderr)
+
 
         start_dt, end_dt = parse_date_range(args.start, args.end)
         if start_dt is None:
@@ -1680,8 +1876,24 @@ if __name__ == "__main__":
         print("EUMETSAT Data Store")
         print("=" * 70)
         print(f"  Gap list : {missing_json}")
-        print(f"  Cycles   : {sum(len(v) for v in gaps.values())} "
-              f"across {len(gaps)} date(s)")
+        n_all = sum(len(v) for v in gaps.values())
+        print(f"  Listed   : {n_all:,} cycle(s) across {len(gaps)} date(s)")
+
+        # The gap list spans the whole archive; --start/--end say which
+        # part of it to fetch.
+        ds_start, ds_end = parse_date_range(args.start, args.end)
+        if ds_start is None:
+            sys.exit(2)
+        gaps = clip_gaps_to_range(gaps, ds_start, ds_end)
+        n_win = sum(len(v) for v in gaps.values())
+        print(f"  Window   : {ds_start:%Y-%m-%d %H:%M} .. "
+              f"{ds_end:%Y-%m-%d %H:%M}")
+        print(f"  Selected : {n_win:,} cycle(s) across {len(gaps)} date(s)"
+              + (f"  ({n_all - n_win:,} outside the window)"
+                 if n_all != n_win else ""))
+        if not gaps:
+            raise SystemExit(
+                "Nothing to fetch: no gap in the requested window.")
 
         if args.fill_dry_run:
             # Dry run stays whole-list: it downloads nothing, and seeing

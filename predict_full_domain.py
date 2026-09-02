@@ -87,7 +87,8 @@ from visualize_gt_vs_pred import (
 import visualize_gt_vs_pred as _vf
 from train_models import build_run_tag
 
-from pipeline_config import SOURCE
+from periods import normalization_stats_name
+from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 
 _MODE_CHOICES = [
     "mtg_lightning",
@@ -983,8 +984,14 @@ def main() -> int:
                                  "00:00 / 23:59.")
     parser.add_argument("--end-time", type=str, default=None,
                         help="Range mode: inclusive upper HH:MM.")
-    parser.add_argument("--data_root", type=str, default="./our_data")
-    parser.add_argument("--model_dir", type=str, default="./models")
+    parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
+    parser.add_argument("--period", type=str, default=None, metavar="LABEL",
+                        help="Period label the model was trained under, "
+                             "e.g. --period w34. Selects the weights, the "
+                             "normalization statistics and the sequence "
+                             "metadata together. Omit for an untagged "
+                             "whole-archive run.")
+    parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     parser.add_argument("--output_dir", type=str, default="./inference")
     parser.add_argument("--finetuned", action="store_true",
                         help="Load coalition_<run_tag>_finetuned.keras "
@@ -1069,7 +1076,7 @@ def main() -> int:
     variant_suffix = ("_finetuned" if args.finetuned
                       else "_kd" if args.kd
                       else "")
-    run_tag = build_run_tag(args.mode, SOURCE)
+    run_tag = build_run_tag(args.mode, SOURCE, args.period)
     output_dir = Path(args.output_dir) / (
         f"predict_{run_tag}{variant_suffix}"
     )
@@ -1081,9 +1088,9 @@ def main() -> int:
                                if x.strip()]
 
     # 1. Init sequence config + normalization stats (per-source paths)
-    init_sequence_config(str(data_root), SOURCE)
+    init_sequence_config(str(data_root), SOURCE, period=args.period)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{SOURCE}.json"
+        data_root / normalization_stats_name(SOURCE, args.period)
     )
 
     mode_config = get_mode_config(args.mode)

@@ -93,7 +93,8 @@ from create_datasets import (
     LABEL_CHANNELS,
 )
 
-from pipeline_config import SOURCE
+from periods import normalization_stats_name
+from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 
 # ============================================================================
 # Geometry constants (must mirror identify_patches / extract_patches)
@@ -1978,7 +1979,8 @@ def _custom_objects():
 
 
 def load_model_artifact(model_dir: Path, mode: str, source: str,
-                        finetuned: bool, kd: bool = False) -> tf.keras.Model:
+                        finetuned: bool, kd: bool = False,
+                        period=None) -> tf.keras.Model:
     """Load a saved model checkpoint. Three variants, mutually exclusive:
 
       kd=True                 -> coalition_<run_tag>_kd.keras
@@ -2000,7 +2002,7 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
     # Central naming helper. Deferred import so this module doesn't
     # depend on train_models at import time.
     from train_models import build_run_tag
-    run_tag = build_run_tag(mode, source)
+    run_tag = build_run_tag(mode, source, period)
 
     def _resolve(kind_suffix: str) -> Path:
         """Artefact path for this run tag. `kind_suffix` is "" for base,
@@ -2104,7 +2106,7 @@ def resolve_threshold(label_type: str, mode: str, source: str,
 
     from train_models import build_run_tag  # local import: keep viz-only path clean
     if eval_results_path is None:
-        run_tag = build_run_tag(mode, source)
+        run_tag = build_run_tag(mode, source, period)
         if finetuned:
             run_tag = f"{run_tag}_finetuned"
         elif kd:
@@ -2155,8 +2157,14 @@ def main() -> int:
     parser.add_argument("--top_n", type=int, default=5,
                         help="How many of the highest-patch-count rows to "
                              "plot (default 5).")
-    parser.add_argument("--data_root", type=str, default="./our_data")
-    parser.add_argument("--model_dir", type=str, default="./models")
+    parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
+    parser.add_argument("--period", type=str, default=None, metavar="LABEL",
+                        help="Period label the model was trained under, "
+                             "e.g. --period w34. Selects the weights, the "
+                             "normalization statistics and the sequence "
+                             "metadata together. Omit for an untagged "
+                             "whole-archive run.")
+    parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     parser.add_argument("--output_dir", type=str, default="./full_domain_plots")
     parser.add_argument("--finetuned", action="store_true",
                         help="Use coalition_<run_tag>_finetuned.keras "
@@ -2250,7 +2258,7 @@ def main() -> int:
     # (required - the transforms in create_datasets read those stats).
     init_sequence_config(str(data_root), SOURCE)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{SOURCE}.json"
+        data_root / normalization_stats_name(SOURCE, args.period)
     )
 
     mode_config = get_mode_config(args.mode)
@@ -2258,7 +2266,7 @@ def main() -> int:
     step_minutes = _load_step_minutes(data_root)
 
     from train_models import build_run_tag  # local import: keep TF-heavy load lazy
-    run_tag = build_run_tag(args.mode, SOURCE)
+    run_tag = build_run_tag(args.mode, SOURCE, args.period)
     variant_suffix = ("_finetuned" if args.finetuned
                       else "_kd" if args.kd
                       else "")

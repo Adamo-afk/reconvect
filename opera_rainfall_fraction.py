@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
+from compress_datasets import list_arrays, load_array
 from lightning_fraction import load_scope_set
 
 from periods import data_tag, split_csv_name
@@ -136,9 +137,7 @@ def compute_class_fractions(data_root: str, scope_keys):
         day_path = os.path.join(root, day_folder)
         if not os.path.isdir(day_path):
             continue
-        for npy_file in sorted(os.listdir(day_path)):
-            if not npy_file.endswith('.npy'):
-                continue
+        for npy_file in list_arrays(day_path):
             if scope_keys is not None:
                 key = parse_filename(npy_file)
                 if key is None or key not in scope_keys:
@@ -146,7 +145,7 @@ def compute_class_fractions(data_root: str, scope_keys):
                     continue
             filepath = os.path.join(day_path, npy_file)
             try:
-                data = np.load(filepath)
+                data = load_array(filepath)
                 if data.ndim == 3:
                     data = np.squeeze(data, axis=0)
                 counts += _bin_counts(data)

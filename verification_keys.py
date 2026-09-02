@@ -2,15 +2,23 @@
 verification_keys.py — the leakage-free key set for the baseline comparison
 ===========================================================================
 RECONVECT and the SepConv-ens baseline need different sequence windows
-(past=2/future=3 vs past=4/future=8), so they cannot share one split.
-They are split independently, which creates a hazard: the Czibula
-splitter assigns sequences to train/validation/test by position inside
-each 6-hour block, and the same (date, reference_utc, patch) lands in
-different splits under different window lengths.
+(w34 = past=3/future=4 vs w44 = past=4/future=4), so they cannot share
+one split. They are split independently, which creates a hazard: the
+Czibula splitter assigns sequences to train/validation/test by position
+inside each 6-hour block, and the same (date, reference_utc, patch)
+lands in different splits under different window lengths.
 
-Measured on the current data, 41 keys in the SepConv test split sit
-inside RECONVECT's *training* split. Scoring both models on SepConv's
-test set would therefore hand RECONVECT 41 samples it had trained on.
+Measured on w34 vs w44: the two test splits hold 5420 and 5125 keys but
+share only 4745, so scoring each model on its own split compares them on
+different populations. Worse, 380 of the baseline's test keys (7 train +
+373 validation) were seen by RECONVECT during fitting.
+
+The frozen set is not advisory. Pass it to the evaluator:
+
+    python evaluate_sepconv_ensemble.py --period w44         --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
+
+Without it each model is scored on its full own split, and the
+difference between them is partly a difference in test population.
 
 The fix is not to trust the intersection but to prove it:
 
@@ -40,15 +48,27 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from pipeline_config import SOURCE
+from pipeline_config import SOURCE, resolve_data_root
 from periods import split_csv_name
 
 # The two windows under comparison. `None` = RECONVECT's unsuffixed
 # whole-archive split; "w48" = the past=4/future=8 set the baseline needs.
-RECONVECT_TAG = None
-SEPCONV_TAG = "w48"
+# Both windows are named on the command line. Hardcoding either one
+# means the frozen key set silently describes a pair of splits that
+# may not be the pair being compared.
+RECONVECT_TAG = None   # None = the unsuffixed whole-archive split
 
-FROZEN_NAME = "verification_keys_{source}.json"
+# The frozen name carries BOTH window tags: a key set describes one
+# specific pair of splits, and two pairs writing to one filename would
+# leave a file that silently claims to cover a comparison it does not.
+FROZEN_NAME = "verification_keys_{source}_{reconvect}_vs_{sepconv}.json"
+
+
+def frozen_name(source: str, reconvect_tag, sepconv_tag) -> str:
+    """Filename for a frozen key set, naming the pair it was built from."""
+    return FROZEN_NAME.format(source=source,
+                              reconvect=reconvect_tag or "base",
+                              sepconv=sepconv_tag)
 
 
 def load_keys(csv_path: Path) -> set[tuple[str, str, int]]:
@@ -75,7 +95,7 @@ def _splits(data_root: Path, tag) -> dict[str, set]:
 
 
 def build(data_root: Path, reconvect_tag=RECONVECT_TAG,
-          sepconv_tag=SEPCONV_TAG) -> dict:
+          sepconv_tag=None) -> dict:
     """Compute the verification key set and everything worth reporting."""
     r = _splits(data_root, reconvect_tag)
     s = _splits(data_root, sepconv_tag)
@@ -154,10 +174,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build the leakage-free verification key set shared by "
                     "RECONVECT and the SepConv-ens baseline.")
-    parser.add_argument("--data_root", default="./our_data")
-    parser.add_argument("--sepconv_tag", default=SEPCONV_TAG,
-                        help=f"Window tag of the baseline split "
-                             f"(default: {SEPCONV_TAG}).")
+    parser.add_argument("--data_root", default=str(resolve_data_root()))
+    parser.add_argument("--reconvect_tag", default=None,
+                        help="Window tag of the RECONVECT split. "
+                             "Omit for the unsuffixed split.")
+    parser.add_argument("--sepconv_tag", required=True,
+                        help="Window tag of the baseline split, e.g. "
+                             "w44. Required: with several windows on "
+                             "disk there is no safe default.")
     parser.add_argument("--write", action="store_true",
                         help="Freeze the key set to JSON. Do this BEFORE "
                              "the test data is scored, and read from the "
@@ -166,12 +190,14 @@ def main() -> int:
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
-    blob = build(data_root, sepconv_tag=args.sepconv_tag)
+    blob = build(data_root, reconvect_tag=args.reconvect_tag,
+                 sepconv_tag=args.sepconv_tag)
     print(format_report(blob))
 
     if args.write:
         out = Path(args.output) if args.output else (
-            data_root / FROZEN_NAME.format(source=SOURCE))
+            data_root / frozen_name(SOURCE, args.reconvect_tag,
+                                    args.sepconv_tag))
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(blob, fh, indent=2)
         print(f"\n  Frozen -> {out}  ({blob['counts']['clean']} keys)")

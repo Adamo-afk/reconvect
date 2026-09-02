@@ -58,6 +58,7 @@ tensorflow<2.11
 numpy<2,>=1.23
 scipy
 scikit-learn
+numba            # c4dl/features/batch.py JIT-compiles the patch samplers
 
 # Geospatial / meteorological
 # NOTE: on Windows the following must have been installed via
@@ -74,6 +75,9 @@ pyproj
 netCDF4
 xarray
 geopandas        # read_kml_version2.py reads LINET KMLs via GeoPandas
+
+# LINET lightning export (our_data/lightning_data/linet_export.py)
+requests         # HTTP download of the LINET KML archives
 
 # MTG FCI L1C data pipeline (pipeline_msg_mtg.py, inspect_mtg.py)
 paramiko         # SFTP transfer from anm@192.168.11.223 — required by pipeline_msg_mtg.py
@@ -99,9 +103,28 @@ plotly           # feature_importance_analysis.py — interactive Xi heatmap / b
 #     conda install -c conda-forge cartopy
 cartopy
 
+# Array store compression (compress_datasets.py --compress-npy)
+# The .npy stores are the bulk of the project (~5.3 TB across 1.1 M
+# files); zstd level 10 shrinks them ~8.5x IN PLACE, and every reader
+# resolves `foo.npy` to `foo.npy.zst` through compress_datasets.
+# load_array(). Required to READ a compressed store, not only to make
+# one - imported lazily, so a store left uncompressed still runs
+# without it.
+zstandard
+
 # Data processing
 pandas
 
 # EUMETSAT Data Store client. Optional - only needed for
 # summarize_mtg.py --fill-from-datastore (MTG gap backfill).
 eumdac
+
+# Optional: the PDF deliverable from generate_report.py. Both are
+# imported inside the report functions, so everything else runs without
+# them; only report generation fails.
+fpdf2            # validation/report_<Y>_<M>.pdf
+pillow           # embeds the figures into that PDF
+
+# Optional: generate_report.py writes its narrative through a local
+# Ollama server. Absent, the report is produced without the prose.
+ollama

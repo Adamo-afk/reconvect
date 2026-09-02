@@ -47,15 +47,39 @@ from sepconv_compose import (
 # sequence WINDOW (past=4/future=8), not a date range. Every consumer must
 # denormalise with these statistics: the invariant is that training and
 # inversion agree, not that the baseline matches RECONVECT.
-SEPCONV_STATS_PERIOD = "w48"
+# No default window tag on purpose. Several windows coexist on disk
+# (past=4/future=4, past=3/future=4, ...), each with its own
+# normalization statistics, and a default would silently pick one.
+# Denormalising with the wrong constants returns plausible mm/h that
+# is biased with intensity and raises nothing, so the caller has to
+# name the window it trained on.
 
 
-def load_base_models(model_dir, run_tag, leads=BASE_LEADS):
+def base_model_path(model_dir, run_tag, lead, weights="best"):
+    """Path to one base model in the requested state.
+
+    "best"   -> the final save, whose weights early stopping restored to
+                the best epoch.
+    "latest" -> the rolling per-epoch checkpoint under checkpoints/,
+                i.e. the last epoch actually run.
+    """
+    if weights not in ("best", "latest"):
+        raise ValueError(f"weights must be 'best' or 'latest', got "
+                         f"{weights!r}")
+    if weights == "latest":
+        return (Path(model_dir) / "checkpoints"
+                / f"sepconv_{run_tag}_bm{lead}_latest.keras")
+    return Path(model_dir) / f"sepconv_{run_tag}_bm{lead}.keras"
+
+
+def load_base_models(model_dir, run_tag, leads=BASE_LEADS, weights="best"):
     """Load Bm1 / Bm3 / Bm5 for one run tag.
 
     Fails loudly on a missing member: a composition silently short of a
     base model would fall back on nothing and produce forecasts for the
-    wrong lead times.
+    wrong lead times. That matters more for "latest" than for "best":
+    the three base models are trained in sequence, so a run interrupted
+    part-way leaves checkpoints for some leads and not others.
     """
     import tensorflow as tf
     from sepconv_ensemble_training import WeightedMSELogZ
@@ -63,7 +87,7 @@ def load_base_models(model_dir, run_tag, leads=BASE_LEADS):
     models = {}
     missing = []
     for lead in leads:
-        path = Path(model_dir) / f"sepconv_{run_tag}_bm{lead}.keras"
+        path = base_model_path(model_dir, run_tag, lead, weights)
         if not path.is_file():
             missing.append(str(path))
             continue
@@ -74,49 +98,66 @@ def load_base_models(model_dir, run_tag, leads=BASE_LEADS):
         )
     if missing:
         raise SystemExit(
-            "Missing SepConv base model(s):\n  " + "\n  ".join(missing) +
+            f"Missing SepConv base model(s) for weights={weights!r}:\n  "
+            + "\n  ".join(missing) +
             "\nTrain them with:\n"
             "    python sepconv_ensemble_training.py --period <tag>"
+            + ("\nOr drop --weights latest to score the final saves."
+               if weights == "latest" else "")
         )
     return models
 
 
-def make_predict_fn(models, batch_size: int = 8):
+def make_predict_fn(models, batch_size: int = 8, batched: bool = False):
     """Adapter from `sepconv_compose.compose` to the loaded Keras models.
 
     `compose` hands over (lead, four frames oldest-first); the models take
     four named inputs. Frames stay in log_zscore throughout.
+
+    With `batched=True` each frame is (N, H, W) and the result is (N, H, W).
+    `compose` itself is shape-agnostic — it only ever indexes frames by
+    offset — so batching is entirely a property of this adapter. It exists
+    because a per-sample rollout over a test split is four model calls per
+    sample at batch size one, which is the difference between minutes and
+    hours.
     """
     def predict_fn(lead, frames):
         model = models[lead]
-        batched = {}
+        inputs = {}
         for i, f in enumerate(frames):
             arr = np.asarray(f, dtype=np.float32)
-            if arr.ndim == 2:                      # (H, W) -> (1, H, W, 1)
-                arr = arr[None, ..., None]
-            elif arr.ndim == 3:                    # (H, W, 1) -> (1, H, W, 1)
-                arr = arr[None, ...]
-            batched[f"past_t{i}"] = arr
-        out = model.predict(batched, batch_size=batch_size, verbose=0)
-        return np.asarray(out)[0, ..., 0]          # back to (H, W)
+            if batched:
+                if arr.ndim == 3:                  # (N, H, W) -> (N, H, W, 1)
+                    arr = arr[..., None]
+            else:
+                if arr.ndim == 2:                  # (H, W) -> (1, H, W, 1)
+                    arr = arr[None, ..., None]
+                elif arr.ndim == 3:                # (H, W, 1) -> (1, H, W, 1)
+                    arr = arr[None, ...]
+            inputs[f"past_t{i}"] = arr
+        out = np.asarray(model.predict(inputs, batch_size=batch_size,
+                                       verbose=0))
+        return out[..., 0] if batched else out[0, ..., 0]
 
     return predict_fn
 
 
 def predict_sequence(models, past_frames, max_step: int = MAX_STEP,
-                     batch_size: int = 8) -> dict[int, np.ndarray]:
+                     batch_size: int = 8,
+                     batched: bool = False) -> dict[int, np.ndarray]:
     """Compose t+1..t+max_step. Output stays in log_zscore space."""
-    return compose(make_predict_fn(models, batch_size), past_frames,
+    return compose(make_predict_fn(models, batch_size, batched), past_frames,
                    max_step=max_step)
 
 
-def to_mmh(z, data_root="./our_data", source=SOURCE,
-           stats_period=SEPCONV_STATS_PERIOD):
+def to_mmh(z, stats_period, data_root="./our_data", source=SOURCE):
     """Denormalise log_zscore -> mm/h.
 
     `stats_period` MUST be the period the models were trained under —
-    the same value `build_sepconv_loss` received. It defaults to
-    `SEPCONV_STATS_PERIOD` for that reason.
+    the same value `build_sepconv_loss` received. It is required rather
+    than defaulted: several windows coexist on disk, each with its own
+    statistics, and picking one for the caller is how the wrong constants
+    get used.
 
     Getting this wrong is the silent-corruption case: nothing raises, the
     numbers stay plausible, and the recovered rain rates are biased
@@ -162,10 +203,15 @@ def bin_to_classes(mmh, edges=None) -> np.ndarray:
     return cls
 
 
-def predict_classes(models, past_frames, max_step: int = MAX_STEP,
-                    data_root="./our_data", source=SOURCE,
-                    stats_period=SEPCONV_STATS_PERIOD, batch_size: int = 8):
+def predict_classes(models, past_frames, stats_period,
+                    max_step: int = MAX_STEP, data_root="./our_data",
+                    source=SOURCE, batch_size: int = 8,
+                    batched: bool = False):
     """Full path: compose -> denormalise -> bin.
+
+    `stats_period` is positional for the same reason `to_mmh` requires it:
+    the window a rollout is denormalised with has to be stated, never
+    inferred.
 
     Returns:
         (classes, mmh) — each a dict {step: array}. The continuous mm/h
@@ -173,8 +219,8 @@ def predict_classes(models, past_frames, max_step: int = MAX_STEP,
         threshold sweep operates on rain rate, not on class indices.
     """
     z = predict_sequence(models, past_frames, max_step=max_step,
-                         batch_size=batch_size)
-    mmh = {k: to_mmh(v, data_root, source, stats_period)
+                         batch_size=batch_size, batched=batched)
+    mmh = {k: to_mmh(v, stats_period, data_root=data_root, source=source)
            for k, v in z.items()}
     classes = {k: bin_to_classes(v) for k, v in mmh.items()}
     return classes, mmh

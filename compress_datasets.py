@@ -52,11 +52,28 @@ Usage
 -----
     python compress_datasets.py                          # list everything
     python compress_datasets.py --compress TAG           # archive + delete
+    python compress_datasets.py --npy-stats DIR          # project the saving
+    python compress_datasets.py --compress-npy DIR       # zstd the .npy tree
+    python compress_datasets.py --restore-npy DIR        # and back again
     python compress_datasets.py --compress TAG --background
     python compress_datasets.py --restore  TAG           # extract back
     python compress_datasets.py --reclaim  TAG           # drop the copy on disk
     python compress_datasets.py --reclaim-all            # sweep leftovers
     python compress_datasets.py --jobs                   # background job state
+
+Two different jobs
+------------------
+Datasets are archived WHOLE, with 7-Zip, because training streams them
+start to finish and a restore is cheap relative to a training run.
+
+The .npy stores cannot work that way: the pipeline opens them one frame at
+a time, by name, from a dozen scripts. They are compressed IN PLACE
+instead - `foo.npy` becomes `foo.npy.zst` - and every reader goes through
+`load_array()`, so nothing needs restoring before a run. Solid bundling
+was measured and rejected: over a full day of frames it buys 3% (11.3x ->
+11.7x) and costs random access, while a frame-to-frame temporal delta is
+actually worse (10.8x) because the inter-scan sensor noise compresses
+less well than the frames do.
 """
 
 from __future__ import annotations
@@ -70,6 +87,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from pipeline_config import resolve_data_root, resolve_datasets_root
 
 # Usual install locations; `--sevenzip` overrides. 7-Zip is not on PATH in a
 # default Windows install, so looking only at PATH would fail for most users.
@@ -485,9 +504,13 @@ def _period_from_tag(run_tag: str, labels: set[str]) -> str | None:
 # Listing
 # =============================================================================
 
-def print_listing(infos: list[DatasetInfo]) -> None:
+def print_listing(infos: list[DatasetInfo],
+                  datasets_root: Path | None = None) -> None:
     if not infos:
-        print("No datasets found under our_data/datasets/.")
+        # Name the root actually searched: with --datasets_root or
+        # $COALITION4_DATASETS_ROOT it is often not our_data/datasets.
+        where = datasets_root if datasets_root else "our_data/datasets/"
+        print(f"No datasets found under {where}.")
         return
 
     width = max(len(i.run_tag) for i in infos)
@@ -823,13 +846,470 @@ def ensure_available(run_tag: str, datasets_root, exe: Path | None = None,
 # CLI
 # =============================================================================
 
+# =============================================================================
+# .npy compression (zstd)
+# =============================================================================
+# TFRecord datasets are archived whole with 7-Zip above. The .npy that feed
+# them cannot be: they are read one file at a time, by name, from a dozen
+# scripts, so they have to stay individually addressable. They are instead
+# compressed in place - one frame per file - and read back through
+# `load_array` below, which resolves a logical `foo.npy` to whichever of
+# `foo.npy` / `foo.npy.zst` is actually on disk.
+#
+# What gets stored is the ENTIRE .npy file, header included, not the array
+# buffer. A restore is then byte-identical by construction, and the verify
+# step before any delete is a plain byte comparison - dtype, shape, byte
+# order and fill values cannot drift.
+#
+# Level 10 on the float32 exactly as stored: no dtype change, no requant,
+# no byte shuffle, so the numerical base is untouched. Measured across
+# every folder this tool targets (1.10 M files, 5292 GB) it reaches 8.5x
+# overall: 5.7x on the raw MTG store, 8.8x on reprojected MTG, 37.6x on
+# OPERA, >7000x on lightning, whose grids are nearly empty. Higher levels
+# cost far more than they return - 19 reaches 10.7x at 3 MB/s against 10's
+# ~35 MB/s, which is days of extra CPU over a store this size.
+
+NPY_EXT = ".npy"
+ZST_EXT = ".zst"
+NPY_ZST_EXT = NPY_EXT + ZST_EXT
+DEFAULT_ZSTD_LEVEL = 10
+
+# Below this gain the plain file is kept: the read-side indirection is not
+# worth it, and a file that will not compress is usually already dense.
+MIN_ZSTD_GAIN = 1.05
+
+# The two grid files are read by nearly every script in the repo, including
+# ad-hoc notebooks that will never go through `load_array`. They are ~9 MB
+# in total, so leaving them plain costs nothing and removes a whole class
+# of "why is this one path broken" failure.
+NPY_NEVER_COMPRESS = ("romania_grid_lats.npy", "romania_grid_lons.npy")
+
+_DATE_IN_NAME = __import__("re").compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
+
+
+def _zstd():
+    """Import zstandard with an actionable message if it is missing."""
+    try:
+        import zstandard
+    except ImportError:
+        raise SystemExit(
+            "The `zstandard` package is required for .npy compression.\n"
+            "    pip install zstandard"
+        )
+    return zstandard
+
+
+# ---------------------------------------------------------------- read side
+
+def array_path(path) -> Path:
+    """Resolve a logical array path to the file that actually exists.
+
+    Accepts either `foo.npy` or `foo.npy.zst` and returns whichever is on
+    disk, preferring the uncompressed copy. Raises FileNotFoundError if
+    neither is, so a genuinely missing frame still fails loudly.
+    """
+    p = Path(path)
+    plain = Path(str(p)[:-len(ZST_EXT)]) if p.name.endswith(NPY_ZST_EXT) else p
+    packed = plain.with_name(plain.name + ZST_EXT)
+    if plain.is_file():
+        return plain
+    if packed.is_file():
+        return packed
+    raise FileNotFoundError(f"neither {plain} nor {packed} exists")
+
+
+def array_exists(path) -> bool:
+    """True if the frame is on disk in either form."""
+    try:
+        array_path(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def load_array(path, mmap_mode=None):
+    """np.load that transparently reads `.npy.zst`.
+
+    Drop-in for `np.load(path)` at every call site in the pipeline: pass
+    the same logical `.npy` path whether or not the frame has been
+    compressed.
+    """
+    import numpy as np
+
+    resolved = array_path(path)
+    if resolved.suffix != ZST_EXT:
+        return np.load(resolved, mmap_mode=mmap_mode, allow_pickle=False)
+    if mmap_mode is not None:
+        raise ValueError(
+            f"{resolved} is zstd-compressed and cannot be memory-mapped. "
+            f"Restore it first: python compress_datasets.py --restore-npy "
+            f"{resolved.parent}"
+        )
+    import io
+    with open(resolved, "rb") as fh:
+        raw = _zstd().ZstdDecompressor().decompress(fh.read())
+    return np.load(io.BytesIO(raw), allow_pickle=False)
+
+
+def save_array(path, arr, compress: bool = False, level: int = DEFAULT_ZSTD_LEVEL):
+    """np.save that can write the compressed form directly.
+
+    Writers stay on the plain form by default; compression is a separate,
+    verifiable pass rather than something that happens silently mid-run.
+    """
+    import io
+
+    import numpy as np
+
+    p = Path(path)
+    if p.name.endswith(NPY_ZST_EXT):
+        p = Path(str(p)[:-len(ZST_EXT)])
+    if not compress:
+        np.save(p, arr, allow_pickle=False)
+        return p
+    buf = io.BytesIO()
+    np.save(buf, arr, allow_pickle=False)
+    out = p.with_name(p.name + ZST_EXT)
+    with open(out, "wb") as fh:
+        fh.write(_zstd().ZstdCompressor(level=level).compress(buf.getvalue()))
+    return out
+
+
+def list_arrays(directory) -> list[str]:
+    """Sorted LOGICAL array names in one directory.
+
+    Always returns `*.npy` names with any `.zst` stripped, so the callers
+    that parse the filename (`base = name[:-len('.npy')]`, timestamp
+    slicing, channel suffix matching) keep working untouched whether the
+    directory is compressed or not. Deduplicates when both forms exist.
+    """
+    d = Path(directory)
+    if not d.is_dir():
+        return []
+    names = set()
+    for entry in os.scandir(d):
+        if not entry.is_file():
+            continue
+        n = entry.name
+        if n.endswith(NPY_ZST_EXT):
+            names.add(n[:-len(ZST_EXT)])
+        elif n.endswith(NPY_EXT):
+            names.add(n)
+    return sorted(names)
+
+
+def find_arrays(root, compressed=None):
+    """Walk `root` yielding real array paths.
+
+    compressed=None  -> both forms
+    compressed=False -> only plain .npy   (what --compress-npy consumes)
+    compressed=True  -> only .npy.zst     (what --restore-npy consumes)
+    """
+    for dirpath, _, filenames in os.walk(root):
+        for name in sorted(filenames):
+            if name.endswith(NPY_ZST_EXT):
+                if compressed is not False:
+                    yield Path(dirpath) / name
+            elif name.endswith(NPY_EXT):
+                if compressed is not True:
+                    yield Path(dirpath) / name
+
+
+# ------------------------------------------------------------- write side
+
+def _date_key(path: Path, root: Path) -> str:
+    """Group files by the dated folder they sit under.
+
+    Both layouts in this project carry the date in a directory name -
+    `nc4_2025-01-01-Romania_ir_105/` for the product and reprojected
+    stores, `2025-01-03/` for the patches - so the same walk batches
+    either one without being told which it is looking at.
+    """
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    for part in reversed(parts[:-1]):
+        m = _DATE_IN_NAME.search(part)
+        if m:
+            d = m.group(1)
+            return d if "-" in d else f"{d[:4]}-{d[4:6]}-{d[6:]}"
+    return "(undated)"
+
+
+def _compress_one(task):
+    """Compress one .npy, verify it round-trips, then drop the original.
+
+    Runs in a worker process. The original is unlinked only after the
+    freshly written file has been read back and compared byte for byte,
+    so an interrupted or corrupt write can never cost data.
+    """
+    src_s, level, keep = task
+    src = Path(src_s)
+    dst = src.with_name(src.name + ZST_EXT)
+    try:
+        if dst.is_file():
+            return ("exists", src_s, 0, 0, "")
+        original = src.read_bytes()
+        packed = _zstd().ZstdCompressor(level=level).compress(original)
+        if len(original) / max(len(packed), 1) < MIN_ZSTD_GAIN:
+            return ("nogain", src_s, len(original), len(original), "")
+
+        tmp = dst.with_name(dst.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(packed)
+        # Read back from disk, not from the buffer in memory: this is the
+        # step that catches a short write or a bad sector.
+        with open(tmp, "rb") as fh:
+            if _zstd().ZstdDecompressor().decompress(fh.read()) != original:
+                tmp.unlink(missing_ok=True)
+                return ("error", src_s, 0, 0, "round-trip mismatch")
+        os.replace(tmp, dst)
+        if not keep:
+            src.unlink()
+        return ("done", src_s, len(original), len(packed), "")
+    except Exception as exc:
+        return ("error", src_s, 0, 0, f"{type(exc).__name__}: {exc}")
+
+
+def _restore_one(task):
+    """Decompress one .npy.zst back to a plain .npy and drop the archive."""
+    src_s, keep = task
+    src = Path(src_s)
+    dst = Path(str(src)[:-len(ZST_EXT)])
+    try:
+        if dst.is_file():
+            return ("exists", src_s, 0, 0, "")
+        packed_size = src.stat().st_size          # before it is unlinked
+        with open(src, "rb") as fh:
+            raw = _zstd().ZstdDecompressor().decompress(fh.read())
+        tmp = dst.with_name(dst.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+        if tmp.stat().st_size != len(raw):
+            tmp.unlink(missing_ok=True)
+            return ("error", src_s, 0, 0, "short write")
+        os.replace(tmp, dst)
+        if not keep:
+            src.unlink()
+        return ("done", src_s, packed_size, len(raw), "")
+    except Exception as exc:
+        return ("error", src_s, 0, 0, f"{type(exc).__name__}: {exc}")
+
+
+def _verify_one(src_s):
+    """Decompress and discard: proves the archive is readable."""
+    try:
+        with open(src_s, "rb") as fh:
+            raw = _zstd().ZstdDecompressor().decompress(fh.read())
+        import io
+
+        import numpy as np
+        np.load(io.BytesIO(raw), allow_pickle=False)
+        return ("done", src_s, os.path.getsize(src_s), len(raw), "")
+    except Exception as exc:
+        return ("error", src_s, 0, 0, f"{type(exc).__name__}: {exc}")
+
+
+# Windows caps a ProcessPoolExecutor at 61 workers, and each worker holds a
+# whole frame in memory anyway, so there is nothing to gain past that.
+MAX_NPY_WORKERS = 61
+
+
+def npy_default_workers() -> int:
+    """Half the cores: this runs for hours, often alongside a training job."""
+    return max(1, min((os.cpu_count() or 4) // 2, MAX_NPY_WORKERS))
+
+
+def run_npy_pass(roots: list[Path], action: str, level: int, workers: int,
+                 keep: bool, dry_run: bool, limit: int | None = None) -> int:
+    """Compress / restore / verify every array under `roots`, by date.
+
+    Returns the number of failures. Progress is reported one line per
+    dated folder, because that is the unit the pipeline itself is
+    organised in and the unit a resumed run picks up from.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
+    workers = max(1, min(workers, MAX_NPY_WORKERS))
+    want_compressed = {"compress": False, "restore": True,
+                       "verify": True}[action]
+    files: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            print(f"ERROR: no such path: {root}")
+            return 1
+        files.extend(find_arrays(root, compressed=want_compressed))
+    files = [f for f in files if f.name not in NPY_NEVER_COMPRESS
+             and not f.name.endswith(".tmp")]
+    if limit:
+        files = files[:limit]
+
+    if not files:
+        print(f"Nothing to {action}: no matching arrays under "
+              f"{', '.join(str(r) for r in roots)}")
+        return 0
+
+    root0 = roots[0]
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        groups.setdefault(_date_key(f, root0), []).append(f)
+
+    total_bytes = sum(f.stat().st_size for f in files)
+    print(f"Action     : {action}")
+    print(f"Roots      : {', '.join(str(r) for r in roots)}")
+    print(f"Arrays     : {len(files):,} across {len(groups):,} dated folder(s)")
+    print(f"On disk    : {human(total_bytes)}")
+    if action == "compress":
+        print(f"Level      : zstd-{level}   (float32 kept exactly as stored)")
+    print(f"Workers    : {workers}")
+    if action == "verify":
+        print("Source     : untouched (read-only pass)")
+    elif keep:
+        print("Source     : KEPT alongside the output")
+    else:
+        print(f"Source     : {'.npy' if action == 'compress' else '.npy.zst'}"
+              f" deleted, but only once the round-trip is verified")
+    if dry_run:
+        print("\n[dry run] nothing will be written.")
+        for date in sorted(groups)[:10]:
+            g = groups[date]
+            print(f"  {date}  {len(g):5,} file(s)  "
+                  f"{human(sum(p.stat().st_size for p in g))}")
+        if len(groups) > 10:
+            print(f"  ... and {len(groups)-10:,} more dated folder(s)")
+        return 0
+    print()
+
+    src_total = dst_total = 0
+    counts = {"done": 0, "exists": 0, "nogain": 0, "error": 0}
+    errors: list[str] = []
+    t0 = time.perf_counter()
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for i, date in enumerate(sorted(groups), 1):
+            batch = groups[date]
+            if action == "compress":
+                tasks = [(str(p), level, keep) for p in batch]
+                results = pool.map(_compress_one, tasks, chunksize=8)
+            elif action == "restore":
+                tasks = [(str(p), keep) for p in batch]
+                results = pool.map(_restore_one, tasks, chunksize=8)
+            else:
+                results = pool.map(_verify_one, [str(p) for p in batch],
+                                   chunksize=8)
+
+            g_src = g_dst = 0
+            for status, path_s, s_bytes, d_bytes, msg in results:
+                counts[status] = counts.get(status, 0) + 1
+                g_src += s_bytes
+                g_dst += d_bytes
+                if status == "error":
+                    errors.append(f"{path_s}: {msg}")
+            src_total += g_src
+            dst_total += g_dst
+
+            # Always quote the ratio the same way round - packed against
+            # plain - so compress and restore lines read alike instead of
+            # one of them showing a confusing "0.1x".
+            plain, packed = ((g_src, g_dst) if action == "compress"
+                             else (g_dst, g_src))
+            ratio = plain / packed if packed else 0.0
+            elapsed = time.perf_counter() - t0
+            rate = max(g_src, g_dst) and (
+                (src_total if action == "compress" else dst_total)
+                / 1e6 / elapsed if elapsed else 0)
+            print(f"  [{i:>5}/{len(groups)}] {date}  {len(batch):5,} file(s)  "
+                  f"{human(g_src):>9} -> {human(g_dst):>9}  "
+                  f"{ratio:5.1f}x   {rate:5.0f} MB/s", flush=True)
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n{'-'*66}")
+    print(f"  processed : {counts['done']:,}")
+    if counts["exists"]:
+        print(f"  skipped   : {counts['exists']:,} (target already present)")
+    if counts["nogain"]:
+        print(f"  left plain: {counts['nogain']:,} "
+              f"(gain below {MIN_ZSTD_GAIN:.2f}x)")
+    if src_total and dst_total:
+        plain, packed = ((src_total, dst_total) if action == "compress"
+                         else (dst_total, src_total))
+        verb = {"compress": "reclaimed", "restore": "given back to disk",
+                "verify": "would be given back"}[action]
+        print(f"  {human(src_total)} -> {human(dst_total)}  "
+              f"({plain/packed:.1f}x, {human(plain - packed)} {verb})")
+    print(f"  elapsed   : {elapsed/60:.1f} min")
+    if errors:
+        print(f"\n  FAILURES  : {len(errors)}")
+        for e in errors[:20]:
+            print(f"    {e}")
+        if len(errors) > 20:
+            print(f"    ... and {len(errors)-20} more")
+        print("  Sources for failed files were NOT deleted.")
+    return len(errors)
+
+
+def npy_stats(roots: list[Path], level: int, sample: int = 40) -> int:
+    """Project the saving without writing anything.
+
+    Samples `sample` arrays per root and scales the measured ratio by the
+    real byte count on disk, which is what makes the estimate worth
+    reading before committing hours of CPU.
+    """
+    import random
+
+    import numpy as np
+
+    cctx = _zstd().ZstdCompressor(level=level)
+    dctx = _zstd().ZstdDecompressor()
+    random.seed(7)
+
+    print(f"{'root':44} {'files':>9} {'on disk':>10} {'ratio':>7} "
+          f"{'after':>10}")
+    grand_raw = grand_after = 0
+    for root in roots:
+        files = [f for f in find_arrays(root, compressed=False)
+                 if f.name not in NPY_NEVER_COMPRESS]
+        if not files:
+            print(f"{str(root)[-44:]:44} {'-- no plain .npy':>9}")
+            continue
+        on_disk = sum(f.stat().st_size for f in files)
+        picks = random.sample(files, min(sample, len(files)))
+        raw = comp = 0
+        for f in picks:
+            b = f.read_bytes()
+            c = cctx.compress(b)
+            if dctx.decompress(c) != b:
+                print(f"  ROUND-TRIP FAILED on {f}")
+                return 1
+            raw += len(b)
+            comp += len(c)
+        ratio = raw / comp
+        after = on_disk / ratio
+        grand_raw += on_disk
+        grand_after += after
+        print(f"{str(root)[-44:]:44} {len(files):9,} {human(on_disk):>10} "
+              f"{ratio:6.1f}x {human(after):>10}")
+    if grand_after:
+        print(f"\n{'TOTAL':44} {'':9} {human(grand_raw):>10} "
+              f"{grand_raw/grand_after:6.1f}x {human(grand_after):>10}")
+        print(f"reclaimed: {human(grand_raw - grand_after)}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="List, compress, restore and reclaim TFRecord datasets."
+        description="List, compress, restore and reclaim TFRecord datasets, "
+                    "and compress the .npy stores that feed them."
     )
-    parser.add_argument("--data_root", default="./our_data")
-    parser.add_argument("--datasets_root", default=None,
-                        help="Default: <data_root>/datasets")
+    parser.add_argument("--data_root", default=None, metavar="PATH",
+                        help="Root holding patches/, split CSVs and "
+                             "statistics (default: the our_data/ beside "
+                             "this script, or $COALITION4_DATA_ROOT).")
+    parser.add_argument("--datasets_root", default=None, metavar="PATH",
+                        help="Root holding the built TFRecord datasets "
+                             "(default: <data_root>/datasets, or "
+                             "$COALITION4_DATASETS_ROOT).")
     parser.add_argument("--compress", nargs="+", metavar="DATASET",
                         help="Archive, verify, then delete the uncompressed "
                              "shards.")
@@ -869,11 +1349,57 @@ def main() -> int:
                         help="Show what would happen; change nothing.")
     parser.add_argument("--sevenzip", default=None,
                         help="Path to 7z.exe (default: autodetect).")
+
+    npy = parser.add_argument_group(
+        ".npy stores",
+        "Compress the raw arrays in place with zstd, one file per frame, "
+        "so they stay individually addressable. Works on any folder tree "
+        "containing .npy - patches, reprojected_data, and the satellite "
+        "and lightning product folders - and batches by dated subfolder. "
+        "The float32 is stored exactly as it is: no dtype change, no "
+        "requantisation. Readers go through load_array() and need no "
+        "restore.")
+    npy.add_argument("--compress-npy", nargs="+", metavar="PATH",
+                     help="Compress every .npy under PATH to .npy.zst, "
+                          "verifying each round-trip before deleting the "
+                          "original.")
+    npy.add_argument("--restore-npy", nargs="+", metavar="PATH",
+                     help="Decompress every .npy.zst under PATH back to "
+                          ".npy.")
+    npy.add_argument("--verify-npy", nargs="+", metavar="PATH",
+                     help="Decompress every .npy.zst under PATH and parse "
+                          "the array, without writing anything.")
+    npy.add_argument("--npy-stats", nargs="+", metavar="PATH",
+                     help="Sample PATH and project the saving. Changes "
+                          "nothing.")
+    npy.add_argument("--zstd-level", type=int, default=DEFAULT_ZSTD_LEVEL,
+                     help=f"zstd level (default: {DEFAULT_ZSTD_LEVEL}). "
+                          f"Measured on this project: 10 gives 8.5x at "
+                          f"~35 MB/s per worker; 19 gives 10.7x at 3 MB/s.")
+    npy.add_argument("--npy-workers", type=int, default=npy_default_workers(),
+                     help=f"Worker processes (default: "
+                          f"{npy_default_workers()} = cores minus one).")
+    npy.add_argument("--npy-limit", type=int, default=None,
+                     help="Stop after N files. For trying it on a small "
+                          "sample first.")
     args = parser.parse_args()
 
-    data_root = Path(args.data_root)
-    datasets_root = (Path(args.datasets_root) if args.datasets_root
-                     else data_root / "datasets")
+    npy_roots = (args.compress_npy or args.restore_npy or args.verify_npy
+                 or args.npy_stats)
+    if npy_roots:
+        roots = [Path(p) for p in npy_roots]
+        if args.npy_stats:
+            return npy_stats(roots, args.zstd_level)
+        action = ("compress" if args.compress_npy else
+                  "restore" if args.restore_npy else "verify")
+        return 1 if run_npy_pass(
+            roots, action, args.zstd_level, args.npy_workers,
+            keep=args.keep or action == "verify",
+            dry_run=args.dry_run, limit=args.npy_limit) else 0
+
+    data_root = resolve_data_root(args.data_root)
+    datasets_root = resolve_datasets_root(args.data_root,
+                                          args.datasets_root)
 
     if args.jobs:
         print_jobs(datasets_root)
@@ -893,7 +1419,7 @@ def main() -> int:
         reclaim_tags.extend(t for t in sweep if t not in reclaim_tags)
 
     if not args.compress and not args.restore and not reclaim_tags:
-        print_listing(infos)
+        print_listing(infos, datasets_root)
         return 0
 
     requested = (args.compress or []) + (args.restore or []) + reclaim_tags
@@ -939,7 +1465,7 @@ def main() -> int:
         print()
 
     if not args.dry_run:
-        print_listing(discover(datasets_root, data_root))
+        print_listing(discover(datasets_root, data_root), datasets_root)
     return 1 if failures else 0
 
 

@@ -61,7 +61,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline_config import SOURCE
+from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 from periods import Period
 from ensemble_plan import require_last_state, state_period
 
@@ -166,8 +166,8 @@ def main():
                         help="Validation year the summaries cover.")
     parser.add_argument("--month", type=int, required=True,
                         help="Validation month the summaries cover.")
-    parser.add_argument("--data_root", default="./our_data")
-    parser.add_argument("--model_dir", default="./models")
+    parser.add_argument("--data_root", default=str(resolve_data_root()))
+    parser.add_argument("--model_dir", default=str(resolve_model_dir()))
     parser.add_argument("--validation_dir", default="./validation",
                         help="Where validate_predictions.py wrote its "
                              "summaries (default: ./validation).")

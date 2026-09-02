@@ -43,14 +43,43 @@ from tensorflow.keras.layers import (
     LayerNormalization
 )
 
-from pipeline_config import SOURCE
+from periods import normalization_stats_name, split_csv_name
+from pipeline_config import (
+    SOURCE,
+    resolve_data_root,
+    resolve_datasets_root,
+    resolve_model_dir,
+)
 
 
 # ============================================================================
 # Custom Layers — embedded for standalone model loading
 # ============================================================================
 
-def _load_split(split_dir: Path) -> tf.data.Dataset:
+from create_datasets import require_key_matches  # noqa: E402
+
+
+def load_verification_keys(path):
+    """Read the frozen leakage-free key set as {(date, ref, patch)}.
+
+    Written by verification_keys.py. RECONVECT and the SepConv-ens
+    baseline sit on different windows and are split independently, so
+    each model's own test split is a different population from the
+    other's AND overlaps the other's training data. Restricting both
+    scores to this set is what makes the comparison mean anything.
+    """
+    blob = json.loads(Path(path).read_text())
+    keys = blob.get("keys")
+    if not keys:
+        raise ValueError(
+            f"{path} holds no 'keys' array. Rebuild it with:\n"
+            f"    python verification_keys.py --write "
+            f"--reconvect_tag <tag> --sepconv_tag <tag>")
+    return {(str(d), str(r), int(p)) for d, r, p in keys}
+
+
+def _load_split(split_dir: Path,
+                verification_keys: set | None = None) -> tf.data.Dataset:
     """Auto-detect the on-disk format of a saved dataset split and load it.
 
     Supports two layouts, distinguished by `metadata.json["format"]`:
@@ -58,6 +87,11 @@ def _load_split(split_dir: Path) -> tf.data.Dataset:
         `input_shapes` + `label_shape` from metadata.
       - "tf_dataset_save" (legacy): monolithic `tf.data.Dataset.save`
         snapshot. Kept so older datasets keep working.
+
+    With `verification_keys`, only samples whose
+    `(date, reference_utc, patch)` is in that set are kept. Those fields
+    live in the shard, so this is exact rather than positional -
+    generate_samples can skip samples, which makes position meaningless.
     """
     metadata_path = split_dir / "metadata.json"
     if metadata_path.is_file():
@@ -69,6 +103,12 @@ def _load_split(split_dir: Path) -> tf.data.Dataset:
         fmt = "tf_dataset_save"
 
     if fmt != "tfrecord":
+        if verification_keys is not None:
+            raise SystemExit(
+                f"{split_dir} is a legacy tf_dataset_save snapshot, which "
+                f"carries no (date, reference_utc, patch) per sample, so it "
+                f"cannot be restricted to a verification key set. Rebuild "
+                f"it with create_datasets.py.")
         return tf.data.Dataset.load(str(split_dir))
 
     shard_paths = sorted(str(p) for p in split_dir.glob("shard_*.tfrecord"))
@@ -84,6 +124,16 @@ def _load_split(split_dir: Path) -> tf.data.Dataset:
         key: tf.io.FixedLenFeature([], tf.string) for key in input_shapes
     }
     feature_description["label"] = tf.io.FixedLenFeature([], tf.string)
+    if verification_keys is not None:
+        # Defaults, so a dataset built before these fields existed parses
+        # rather than raising - it then matches no key and is rejected
+        # below with an instruction, instead of being scored on nothing.
+        feature_description["date"] = tf.io.FixedLenFeature(
+            [], tf.string, default_value="")
+        feature_description["reference_utc"] = tf.io.FixedLenFeature(
+            [], tf.string, default_value="")
+        feature_description["patch_number"] = tf.io.FixedLenFeature(
+            [], tf.int64, default_value=-1)
 
     def parse(serialised):
         parsed = tf.io.parse_single_example(serialised, feature_description)
@@ -94,6 +144,9 @@ def _load_split(split_dir: Path) -> tf.data.Dataset:
             inputs[key] = t
         label = tf.io.parse_tensor(parsed["label"], out_type=tf.float32)
         label.set_shape(label_shape)
+        if verification_keys is not None:
+            return (inputs, label, parsed["date"],
+                    parsed["reference_utc"], parsed["patch_number"])
         return inputs, label
 
     files_ds = tf.data.Dataset.from_tensor_slices(shard_paths)
@@ -104,6 +157,30 @@ def _load_split(split_dir: Path) -> tf.data.Dataset:
         deterministic=False,
     )
     ds = ds.map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if verification_keys is not None:
+        keyed = ds
+
+        # Checked up front, not inside the generator: a raise in there
+        # comes back as an opaque tf UnknownError.
+        kept, dropped = require_key_matches(split_dir, verification_keys)
+        print(f"  verification filter: keeps {kept:,}, drops {dropped:,}")
+
+        def _filtered():
+            for inputs, label, date, ref, patch in keyed:
+                k = (date.numpy().decode(), ref.numpy().decode(),
+                     int(patch.numpy()))
+                if k in verification_keys:
+                    yield inputs, label
+
+        sig = ({k: tf.TensorSpec(shape=tuple(v), dtype=tf.float32)
+                for k, v in input_shapes.items()},
+               tf.TensorSpec(shape=tuple(label_shape), dtype=tf.float32))
+        # No assert_cardinality here: metadata counts the FULL split, and
+        # the filter removes the keys the other window does not share.
+        return tf.data.Dataset.from_generator(_filtered,
+                                              output_signature=sig)
+
     n_samples = int(meta.get("n_samples", 0))
     if n_samples > 0:
         ds = ds.apply(tf.data.experimental.assert_cardinality(n_samples))
@@ -1165,8 +1242,12 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
     # `normalization_stats.json` at the project root; the per-source
     # pipeline writes `normalization_stats_<source>.json`. Point the
     # loader at the right file before any input transform fires.
+    # Must match the constants the model was TRAINED with: a z-value
+    # only means something relative to the mean/std that produced it, and
+    # inverting with another period's constants returns plausible mm/h
+    # biased monotonically with intensity, raising nothing.
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1524,7 +1605,9 @@ def plot_training_history(history_path, output_dir):
 def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
              threshold=None, plot_threshold=0.5,
              plot_date=None, plot_hour=None, split="test",
-             source="dbscan", finetuned=False, kd=False):
+             source="dbscan", finetuned=False, kd=False,
+             verification_keys=None, datasets_root=None,
+             weights="best", period=None):
     """Run full evaluation pipeline.
 
     Args:
@@ -1561,12 +1644,16 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             "student is trained fresh (no swin head), so there is no "
             "'finetuned KD' variant. Pass one or neither."
         )
-    data_root = Path(data_root)
+    data_root = resolve_data_root(data_root)
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
     model_dir = Path(model_dir)
     # Central naming: `<mode>_<source>` (+ variant suffix). See
     # train_models.build_run_tag.
     from train_models import build_run_tag
-    run_tag = build_run_tag(mode, source)
+    # The period belongs in the tag: weights, statistics and splits are
+    # all written per period, and resolving any of them to the untagged
+    # name reads another model's artefacts.
+    run_tag = build_run_tag(mode, source, period)
     variant_suffix = ("_finetuned" if finetuned
                       else "_kd" if kd
                       else "")
@@ -1598,11 +1685,11 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
                 f"writes teacher_mode into the history JSON."
             )
         kd_student_hr_channels = int(kd_hist.get("student_hr_channels", 1))
-        kd_teacher_run_tag = build_run_tag(teacher_mode, source)
+        kd_teacher_run_tag = build_run_tag(teacher_mode, source, period)
         # Datasets dir points at the TEACHER, not the student.
-        dataset_root = data_root / "datasets" / kd_teacher_run_tag
+        dataset_root = datasets_root / kd_teacher_run_tag
     else:
-        dataset_root = data_root / "datasets" / run_tag
+        dataset_root = datasets_root / run_tag
 
     # Authoritative label_type comes from the dataset's metadata.json
     # (written by create_datasets.py). Mode-name heuristics misclassify
@@ -1635,9 +1722,8 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         print(f"  KD student HR channels: {kd_student_hr_channels}")
 
     SPLIT_CSV = {
-        "train":      f"train_data_{source}.csv",
-        "validation": f"validation_data_{source}.csv",
-        "test":       f"test_data_{source}.csv",
+        split_name: split_csv_name(split_name, source, period)
+        for split_name in ("train", "validation", "test")
     }
     csv_name = SPLIT_CSV[split]
 
@@ -1650,11 +1736,29 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         print(f"\n1. WARNING: History file not found: {history_path}")
 
     # ---- 2. Load model (with mixed precision matching training) ----
-    model_path = model_dir / f"coalition_{artifact_tag}.keras"
+    # Two states exist per run: the final save (best epoch, restored by
+    # early stopping) and the rolling per-epoch checkpoint (last epoch).
+    # The finetune stage writes its own checkpoint under a different
+    # name, so the variant has to pick the matching one.
+    if weights == "latest":
+        ckpt_stem = (f"{run_tag}_finetune_latest" if finetuned
+                     else f"{run_tag}_latest")
+        model_path = model_dir / "checkpoints" / f"{ckpt_stem}.keras"
+    else:
+        model_path = model_dir / f"coalition_{artifact_tag}.keras"
     if not model_path.is_file():
-        raise FileNotFoundError(f"Model not found: {model_path}")
+        raise FileNotFoundError(
+            f"Model not found: {model_path}\n"
+            + (f"  No per-epoch checkpoint for weights='latest'. Either the "
+               f"run predates checkpointing, [checkpointing].enabled is "
+               f"false, or it was trained with --fresh and finished "
+               f"cleanly.\n  Drop --weights latest to score the final save."
+               if weights == "latest" else ""))
 
     print(f"\n2. Loading model from {model_path}")
+    print(f"   Weights: {weights}"
+          + ("  (last epoch run, not the best)" if weights == "latest"
+             else "  (best epoch, restored by early stopping)"))
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
     # Custom objects for deserialization (all defined above). SwinBlock
@@ -1764,7 +1868,19 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             return new_inputs, y
 
     print(f"\n3. Loading {split} dataset from {eval_dir}")
-    eval_ds = _load_split(eval_dir)
+    vkeys = None
+    if verification_keys:
+        vkeys = load_verification_keys(verification_keys)
+        print(f"  Scoring restricted to the frozen verification set: "
+              f"{len(vkeys):,} key(s)")
+        print(f"    {verification_keys}")
+    elif split == "test":
+        print("  Scoring the FULL split. For the baseline-vs-ablation "
+              "comparison pass --verification_keys: the two windows are "
+              "split independently, so this split is a different "
+              "population from the baseline's and overlaps its training "
+              "data.")
+    eval_ds = _load_split(eval_dir, verification_keys=vkeys)
     if kd:
         eval_ds = eval_ds.map(_kd_adapt_inputs,
                               num_parallel_calls=tf.data.AUTOTUNE)
@@ -1776,6 +1892,9 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         val_dir = dataset_root / "validation"
         if val_dir.exists():
             print(f"  Loading validation dataset for threshold optimization...")
+            # Deliberately unfiltered: the verification set is the
+            # leakage-free TEST intersection, and threshold tuning reads
+            # validation. Filtering here would tune on a few keys.
             val_ds = _load_split(val_dir)
             if kd:
                 val_ds = val_ds.map(_kd_adapt_inputs,
@@ -1885,24 +2004,42 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
 # CLI
 # ============================================================================
 
+def _evaluable_modes():
+    """Every mode that has trained weights to evaluate.
+
+    Derived from the registries rather than restated: the hardcoded list
+    this replaces had drifted to include three retired names and omit
+    opera_radar_only_rainfall, so the ablation could be trained and then
+    not evaluated. The KD student is trained by train_lightning_kd.py
+    and so is absent from TRAINING_MODES.
+    """
+    from train_lightning_kd import STUDENT_MODE
+    from train_models import TRAINING_MODES
+    return sorted(set(TRAINING_MODES) | {STUDENT_MODE})
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate trained COALITION-4 model on test set."
     )
     parser.add_argument(
         "--mode", type=str, required=True,
-        choices=[
-            "mtg_lightning",
-            "mtg_radar_rainfall", "mtg_radar_continuous_rainfall",
-            "mtg_opera_radar_only_rainfall", "mtg_opera_mtgmr_rainfall",
-            "mtg_lightning_opera_rainfall",
-            "mtg_lightning_opera_occurrence",
-            "mtg_opera_occurrence",
-        ],
-        help="Model variant to evaluate. Matches the modes registered "
-             "in train_models.TRAINING_MODES and create_datasets. For "
-             "the KD student, pass its student mode (e.g. "
-             "mtg_opera_occurrence) together with --kd."
+        # Derived, not restated. This list used to be a hardcoded literal
+        # claiming to mirror TRAINING_MODES; it had drifted to include
+        # three retired names and omit opera_radar_only_rainfall, so the
+        # ablation could be trained and then not evaluated.
+        choices=_evaluable_modes(),
+        help="Model variant to evaluate, from "
+             "train_models.TRAINING_MODES, plus the KD student "
+             "(train_lightning_kd.STUDENT_MODE) which is trained by its "
+             "own script. For the student, pass it together with --kd."
+    )
+    parser.add_argument(
+        "--period", type=str, default=None, metavar="LABEL",
+        help="Period label the model was trained under, e.g. --period "
+             "w34. Selects the weights, the normalization statistics and "
+             "the split CSVs together. Omit for an untagged "
+             "whole-archive run."
     )
     parser.add_argument(
         "--finetuned", action="store_true",
@@ -1922,11 +2059,40 @@ def main():
              "before batching. Mutually exclusive with --finetuned."
     )
     parser.add_argument(
-        "--data_root", type=str, default="./our_data",
-        help="Root directory containing datasets/ subfolder"
+        "--weights", type=str, default="best", choices=["best", "latest"],
+        help="Which of the two saved states to score. 'best' is the final "
+             "save, whose weights early stopping restored to the best "
+             "epoch. 'latest' is the rolling per-epoch checkpoint under "
+             "<model_dir>/checkpoints/ - the last epoch actually run. "
+             "Comparing them shows whether the epochs after the best one "
+             "were overfitting."
     )
     parser.add_argument(
-        "--model_dir", type=str, default="./models",
+        "--verification_keys", type=str, default=None, metavar="PATH",
+        help="Frozen key set from verification_keys.py --write. "
+             "Restricts scoring to the leakage-free intersection of "
+             "this model's test split with the baseline's. REQUIRED for "
+             "a legitimate baseline-vs-ablation comparison: the two "
+             "windows are split independently, so each model's own test "
+             "split is a different population from the other's and "
+             "overlaps the other's training data. Pass the SAME file to "
+             "evaluate_sepconv_ensemble.py."
+    )
+    parser.add_argument(
+        "--data_root", type=str, default=None,
+        help="Root holding patches/, split CSVs and statistics "
+             "(default: the our_data/ beside this script, or "
+             "$COALITION4_DATA_ROOT)."
+    )
+    parser.add_argument(
+        "--datasets_root", type=str, default=None, metavar="PATH",
+        help="Root holding the built TFRecord datasets (default: "
+             "<data_root>/datasets, or $COALITION4_DATASETS_ROOT). Point "
+             "it at another disk to keep datasets off the one holding "
+             "the patch pool."
+    )
+    parser.add_argument(
+        "--model_dir", type=str, default=str(resolve_model_dir()),
         help="Directory containing trained model and history"
     )
     parser.add_argument(
@@ -1953,7 +2119,7 @@ def main():
     )
     parser.add_argument(
         "--hour", type=int, default=None,
-        help="Reference hour for visualization (0-23), e.g. 5 → 5:00..5:45"
+        help="Reference hour for visualization (0-23), e.g. 5 -> 5:00..5:45"
     )
     parser.add_argument(
         "--split", type=str, default="test",
@@ -1979,6 +2145,10 @@ def main():
         source=SOURCE,
         finetuned=args.finetuned,
         kd=args.kd,
+        verification_keys=args.verification_keys,
+        datasets_root=args.datasets_root,
+        weights=args.weights,
+        period=args.period,
     )
 
 

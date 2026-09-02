@@ -56,10 +56,10 @@ Outputs (only two, by design)
 Example
 -------
     python intersect_product_coverage.py \
-        --summary mtg=mtg_summary.csv \
-        --summary opera=opera_summary.csv \
-        --summary lightning=lightning_summary.csv \
-        --active lightning=lightning_active_steps.csv \
+        --summary mtg=our_data/satellite_data/mtg_summary.csv \
+        --summary opera=our_data/opera_data/opera_summary.csv \
+        --summary lightning=our_data/lightning_data/lightning_summary.csv \
+        --active lightning=our_data/lightning_data/lightning_active_steps.csv \
         --errors_log our_data/reprojected_data/reproject_satellite_MTG.log
 """
 
@@ -97,10 +97,31 @@ DEFAULT_TIMESTEP_CONFIG = DEFAULT_DATA_ROOT / "timestep_config.json"
 PRODUCT_LAYOUT: dict[str, dict[str, str]] = {
     "mtg":       {"tsconfig_product": "mtg",
                   "missing_name":     "mtg_missing_timesteps.json"},
+    # OPERA ships two independent fields. Name them separately so a
+    # manifest can require exactly the ones its modes consume: a
+    # rainfall-only model should not lose a sample because reflectivity
+    # was absent that timestep, and a model that reads reflectivity must
+    # not be handed a timestep lacking it. Both keys read the same
+    # summary CSV and the same missing JSON, selecting different blocks.
+    "opera_rainfall_rate": {
+        "tsconfig_product": "opera_rainfall_rate",
+        "missing_name":     "opera_missing_timesteps.json"},
+    "opera_reflectivity": {
+        "tsconfig_product": "opera_reflectivity",
+        "missing_name":     "opera_missing_timesteps.json"},
+    # Backwards-compatible alias: `opera` has always meant rainfall_rate,
+    # the DBSCAN driver and label source.
     "opera":     {"tsconfig_product": "opera_rainfall_rate",
                   "missing_name":     "opera_missing_timesteps.json"},
     "lightning": {"tsconfig_product": "lightning",
                   "missing_name":     "lightning_missing_timesteps.json"},
+}
+
+# Which block inside our_data/opera_data/opera_missing_timesteps.json each key reads.
+OPERA_SUBPRODUCT: dict[str, str] = {
+    "opera":               "opera_rainfall_rate",
+    "opera_rainfall_rate": "opera_rainfall_rate",
+    "opera_reflectivity":  "opera_reflectivity",
 }
 
 
@@ -190,14 +211,13 @@ def load_missing(product: str, json_path: Path) -> set[tuple[str, str]]:
         if not isinstance(block, dict):
             continue
 
-        if product == "opera":
-            # opera_missing_timesteps.json nests per sub-product. Use
-            # rainfall_rate (the DBSCAN driver + label source) as the
-            # canonical "is OPERA present" signal.
-            inner = block.get("opera_rainfall_rate", {})
+        if product in OPERA_SUBPRODUCT:
+            # our_data/opera_data/opera_missing_timesteps.json nests per sub-product; take the
+            # one this key stands for.
+            inner = block.get(OPERA_SUBPRODUCT[product], {})
             times = inner.get("missing_times", []) or []
         elif product == "mtg":
-            # mtg_missing_timesteps.json: per-date block with
+            # our_data/satellite_data/mtg_missing_timesteps.json: per-date block with
             # 'missing_times' at the top level (single product).
             times = block.get("missing_times", []) or []
             # MTG also tracks 'incomplete_times' (only 1 of 2 chunks);
@@ -593,7 +613,7 @@ def main() -> int:
              "active-steps CSV (`date,time_utc,<flag1>,<flag2>,...`). A "
              "slot survives iff its snapped HHMM is IN this set. "
              "Mutually exclusive with --missing for the same product. "
-             "Typical use: `--active lightning=lightning_active_steps.csv`.",
+             "Typical use: `--active lightning=our_data/lightning_data/lightning_active_steps.csv`.",
     )
     parser.add_argument(
         "--errors_log", action="append", default=[], metavar="PATH",

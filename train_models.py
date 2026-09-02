@@ -80,7 +80,12 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from pipeline_config import SOURCE
+from pipeline_config import (
+    SOURCE,
+    resolve_data_root,
+    resolve_datasets_root,
+    resolve_model_dir,
+)
 from periods import Period, require_no_overlap
 from compress_datasets import (
     DEFAULT_LEVEL as _ARCHIVE_LEVEL,
@@ -131,6 +136,17 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
         "target":  "lightning binary occurrence",
         "summary": "Same inputs as mtg_lightning_opera_rainfall; target is "
                    "lightning occurrence instead of OPERA rainfall.",
+    },
+    # The ablation half of the SepConv-ens comparison. It was buildable by
+    # create_datasets (BUILDABLE_MODES) but missing here, so the dataset
+    # could be created and then not trained. Nothing else was needed: this
+    # table is descriptive - used for validation and --list-modes - while
+    # the architecture is read from the dataset's metadata.json.
+    "opera_radar_only_rainfall": {
+        "target":  "opera_rainfall_rate 5-class",
+        "summary": "Ablation for the SepConv-ens comparison: OPERA "
+                   "rainfall_rate only, no MTG and no lightning, so it "
+                   "consumes exactly what the baseline does.",
     },
 }
 
@@ -329,6 +345,28 @@ def load_training_config(path: Path) -> dict:
         "restore_best_weights": _coerce(e.get("restore_best_weights", "true"), bool),
     }
 
+    # [sepconv]
+    # The baseline is a different architecture trained by a different
+    # script, so it gets its own section rather than a [mode.*] override
+    # (which would also have to be registered in TRAINING_MODES, implying
+    # train_models can train it - it cannot). Anything omitted here falls
+    # back to the shared values, which is what keeps the two halves of the
+    # comparison on the same footing.
+    sp = parser["sepconv"] if parser.has_section("sepconv") else {}
+    sepconv = {
+        "epochs":        _coerce(sp.get("epochs",
+                                        str(defaults["epochs"])), int),
+        "batch_size":    _coerce(sp.get("batch_size",
+                                        str(defaults["batch_size"])), int),
+        "learning_rate": _coerce(sp.get("learning_rate",
+                                        str(lr_schedule["initial_lr"])), float),
+        "es_patience":   _coerce(sp.get("es_patience",
+                                        str(early_stopping["patience"])), int),
+        # ReduceLROnPlateau is the paper's schedule; RECONVECT uses cosine
+        # warmup. This one has no counterpart to inherit from.
+        "lr_patience":   _coerce(sp.get("lr_patience", "5"), int),
+    }
+
     # [checkpointing]
     c = parser["checkpointing"] if parser.has_section("checkpointing") else {}
     checkpointing = {
@@ -411,6 +449,7 @@ def load_training_config(path: Path) -> dict:
         "early_stopping": early_stopping,
         "checkpointing":  checkpointing,
         "radar_loss":     radar_loss,
+        "sepconv":        sepconv,
         "finetune":       finetune,
         "mode_overrides": mode_overrides,
     }
@@ -1593,21 +1632,29 @@ def load_ones_fraction(data_root, source, period=None):
     return ones_fraction
 
 
-def load_class_fractions(data_root, source):
+def load_class_fractions(data_root, source, period=None):
     """Load OPERA rainfall-rate per-class pixel fractions from the prior JSON.
 
-    Reads `our_data/opera_rainfall_fraction_<source>.json` (produced by
-    `opera_rainfall_fraction.py --source <source>`) and returns the
-    5-element fractions list used by
-    WeightedFocalCategoricalCrossentropy. Per-source like the lightning
-    prior, because the dbscan / lightning tracks pull different timesteps
-    and therefore see different rainfall distributions.
+    Reads `our_data/opera_rainfall_fraction_<source>[_<period>].json`
+    (produced by `opera_rainfall_fraction.py [--period <label>]`) and
+    returns the 5-element fractions list used by
+    WeightedFocalCategoricalCrossentropy.
+
+    Tagged per period for the same reason the lightning prior and the
+    normalization statistics are: the prior has to describe the split the
+    model actually trains on. One computed over a different window
+    measures a class balance this model never sees, and the focal loss
+    would then correct for an imbalance that is not present - silently,
+    because a fractions list from any window is structurally valid.
     """
-    json_path = Path(data_root) / f"opera_rainfall_fraction_{source}.json"
+    from periods import data_tag
+    tag = data_tag(source, period)
+    json_path = Path(data_root) / f"opera_rainfall_fraction_{tag}.json"
     if not json_path.is_file():
         raise FileNotFoundError(
             f"OPERA class-fraction file not found: {json_path}\n"
-            f"Run `python opera_rainfall_fraction.py --source {source}` first."
+            f"Run `python opera_rainfall_fraction.py"
+            + (f" --period {period}" if period else "") + "` first."
         )
     with open(json_path) as f:
         stats = json.load(f)
@@ -1703,7 +1750,7 @@ def train(mode, data_root, epochs, batch_size, output_dir,
           checkpoint_cfg=None,
           radar_loss_cfg=None,
           resume=True,
-          period=None):
+          period=None, datasets_root=None):
     """Main training function (base stage).
 
     Args:
@@ -1737,7 +1784,8 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     pointing at the saved base model and its history JSON. The
     finetune stage reads `model_path` to graft the Swin head onto.
     """
-    data_root = Path(data_root)
+    data_root = resolve_data_root(data_root)
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     # Mode + source together are the unique experiment identifier, and the
@@ -1749,12 +1797,12 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     if dataset_dir is not None:
         dataset_dir = Path(dataset_dir)
     else:
-        dataset_dir = data_root / "datasets" / run_tag
+        dataset_dir = datasets_root / run_tag
         # An archived dataset is extracted first. Blocking on purpose:
         # training cannot start without the bytes, so there is nothing
         # useful to overlap with. The archive is kept, which makes the
         # post-training reclaim a delete rather than a recompression.
-        ensure_available(run_tag, data_root / "datasets")
+        ensure_available(run_tag, datasets_root)
 
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
@@ -1823,7 +1871,8 @@ def train(mode, data_root, epochs, batch_size, output_dir,
                        (radar_loss_cfg or {}).get("weighting", "none")
                        != "none")
         class_fractions = (
-            load_class_fractions(data_root, source) if needs_prior else None
+            load_class_fractions(data_root, source, period)
+            if needs_prior else None
         )
 
     # Load datasets
@@ -2000,7 +2049,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                    radar_loss_cfg=None,
                    resume=True,
                    period=None,
-                   allow_period_overlap=False):
+                   allow_period_overlap=False, datasets_root=None):
     """Domain-adaptation fine-tune: freeze base, attach Swin head, train.
 
     Args:
@@ -2020,12 +2069,13 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     if finetune_cfg is None:
         raise ValueError("finetune_cfg is required for train_finetune()")
 
-    data_root = Path(data_root)
+    data_root = resolve_data_root(data_root)
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     run_tag = build_run_tag(mode, source, period)
 
-    dataset_dir = data_root / "datasets" / run_tag
+    dataset_dir = datasets_root / run_tag
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
     for d in [train_dir, val_dir]:
@@ -2091,7 +2141,8 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
                        (radar_loss_cfg or {}).get("weighting", "none")
                        != "none")
         class_fractions = (
-            load_class_fractions(data_root, source) if needs_prior else None
+            load_class_fractions(data_root, source, period)
+            if needs_prior else None
         )
 
     print("\nLoading datasets...")
@@ -2339,8 +2390,18 @@ def main():
              f"{sorted(TRAINING_MODES)}.",
     )
     parser.add_argument(
-        "--data_root", type=str, default="./our_data",
-        help="Root directory containing datasets/ and lightning_fraction_<source>.json.",
+        "--data_root", type=str, default=None,
+        help="Root holding patches/, split CSVs, statistics and "
+             "lightning_fraction_<source>.json (default: the our_data/ "
+             "beside this script, or $COALITION4_DATA_ROOT).",
+    )
+    parser.add_argument(
+        "--datasets_root", type=str, default=None, metavar="PATH",
+        help="Root holding the built TFRecord datasets (default: "
+             "<data_root>/datasets, or $COALITION4_DATASETS_ROOT). Point "
+             "it at another disk to keep datasets off the one holding "
+             "the patch pool. Archive locks and in-use markers follow it, "
+             "so restore and reclaim stay consistent with training.",
     )
     parser.add_argument(
         "--stage", type=str, default="base",
@@ -2365,8 +2426,12 @@ def main():
              "--mode only and only with --stage base.",
     )
     parser.add_argument(
-        "--output_dir", type=str, default="./models",
-        help="Directory to save trained model and history.",
+        "--output_dir", type=str, default=str(resolve_model_dir()),
+        help="Directory to save trained model and history. Defaults to "
+             "the same place the evaluators read from ($COALITION4_MODEL_DIR "
+             "or the models/ beside this script), so training from a "
+             "different working directory does not strand the checkpoints "
+             "somewhere evaluation will not look.",
     )
     parser.add_argument(
         "--fresh", action="store_true",
@@ -2423,6 +2488,12 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve the roots ONCE, so every use below - including the plain
+    # `Path(args.data_root)` ones - sees a real path rather than None.
+    args.data_root = str(resolve_data_root(args.data_root))
+    args.datasets_root = str(resolve_datasets_root(args.data_root,
+                                                  args.datasets_root))
+
     # --- Ensemble availability check (no training) -----------------------
     # The registry says what the ensemble is supposed to contain; this
     # reports what has actually been built for the requested mode.
@@ -2435,7 +2506,8 @@ def main():
               f"{state['n_members']} member(s), "
               f"{state['n_buildable']} buildable\n")
         check = check_member_datasets(
-            state, args.mode, SOURCE, Path(args.data_root) / "datasets")
+            state, args.mode, SOURCE,
+            resolve_datasets_root(args.data_root, args.datasets_root))
         print(format_dataset_check(check, args.mode, SOURCE))
         sys.exit(1 if check["missing"] else 0)
 
@@ -2522,7 +2594,8 @@ def main():
         print(f"  Effective hyperparameters: {params}")
 
         base_model_path = None
-        datasets_root = Path(args.data_root) / "datasets"
+        datasets_root = resolve_datasets_root(args.data_root,
+                                              args.datasets_root)
         run_tag_for_mode = build_run_tag(mode, SOURCE, args.period)
 
         # Claim the dataset for the duration. A background archive job
@@ -2540,6 +2613,7 @@ def main():
                 base_model_path, _ = train(
                     mode=mode,
                     data_root=args.data_root,
+                    datasets_root=args.datasets_root,
                     epochs=params["epochs"],
                     batch_size=params["batch_size"],
                     output_dir=args.output_dir,
@@ -2567,6 +2641,7 @@ def main():
                 train_finetune(
                     mode=mode,
                     data_root=args.data_root,
+                    datasets_root=args.datasets_root,
                     base_model_path=ft_base,
                     output_dir=args.output_dir,
                     source=SOURCE,
