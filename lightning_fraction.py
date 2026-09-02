@@ -28,7 +28,7 @@ Usage:
     python lightning_fraction.py --period w48
 
     # Broader / legacy scopes
-    python lightning_fraction.py --scope_csv lightning_active_steps.csv
+    python lightning_fraction.py --scope_csv our_data/lightning_data/lightning_active_steps.csv
     python lightning_fraction.py --scope_csv none
 """
 
@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime, timedelta
 
+from compress_datasets import list_arrays, load_array
 from periods import data_tag, split_csv_name
 from pipeline_config import SOURCE
 
@@ -116,6 +117,15 @@ def _expand_sequence_rows(reader, step_minutes, filter_minutes):
     `step_minutes` spacing, snapped to the lightning filter so the
     HHMMs match the .npy filenames on disk (master grid :15 / :45
     snap to lightning :10 / :40 etc.).
+
+    `start_utc` / `end_utc` are clock times with no date of their own,
+    so a window running through midnight arrives with `end_utc`
+    numerically BEFORE `start_utc`. Those rows used to be dropped as
+    malformed, which silently excluded every 22:00-01:00 timestep from
+    the class priors while compute_normalization_stats.py - which
+    expands from `reference_utc` with real date arithmetic - kept them.
+    The two files then disagreed on scope by ~1.2% of timesteps, all
+    of them at night.
     """
     step = timedelta(minutes=step_minutes)
     for row in reader:
@@ -130,16 +140,52 @@ def _expand_sequence_rows(reader, step_minutes, filter_minutes):
             eh, em = (int(x) for x in end_str.split(':'))
         except ValueError:
             continue
-        t = base.replace(hour=sh, minute=sm)
-        t_end = base.replace(hour=eh, minute=em)
-        # Windows don't cross midnight today; broken row -> skip.
-        if t_end < t:
+        # `date` dates the REFERENCE, not the start. For a window
+        # through midnight that distinction decides which side moves:
+        # ref 23:45 puts end_utc on the next day, ref 00:15 puts
+        # start_utc on the previous one. Anchoring on reference_utc and
+        # walking outwards resolves both, and matches how
+        # compute_normalization_stats.expand_training_window does it.
+        ref_str = (row.get('reference_utc') or '').strip()
+        day = 24 * 60
+        try:
+            rh, rm = (int(x) for x in ref_str.split(':')) if ref_str                 else (None, None)
+        except ValueError:
+            rh = rm = None
+        if rh is not None:
+            ref = base.replace(hour=rh, minute=rm)
+            r_min, s_min, e_min = rh * 60 + rm, sh * 60 + sm, eh * 60 + em
+            t = ref - timedelta(minutes=(r_min - s_min) % day)
+            t_end = ref + timedelta(minutes=(e_min - r_min) % day)
+        else:
+            # No reference column: assume the window opens on `date`.
+            t = base.replace(hour=sh, minute=sm)
+            t_end = base.replace(hour=eh, minute=em)
+            if t_end < t:
+                t_end += timedelta(days=1)
+        # A window spanning more than a day is malformed, not a
+        # rollover: skip it rather than emitting thousands of keys.
+        if t_end - t > timedelta(days=1):
             continue
         while t <= t_end:
-            hhmm = t.strftime('%H%M')
-            if filter_minutes is not None:
-                hhmm = _snap_hhmm_to_filter(hhmm, filter_minutes)
-            yield date_str, hhmm
+            if filter_minutes is None:
+                snapped = t
+            else:
+                # Snap as a signed offset, not a string: the snap
+                # itself can wrap (23:55 -> 00:00), and only moving
+                # the datetime carries the date across with it.
+                hhmm = _snap_hhmm_to_filter(t.strftime('%H%M'),
+                                            filter_minutes)
+                delta = ((int(hhmm[:2]) * 60 + int(hhmm[2:]))
+                         - (t.hour * 60 + t.minute))
+                if delta > 12 * 60:
+                    delta -= 24 * 60
+                elif delta < -12 * 60:
+                    delta += 24 * 60
+                snapped = t + timedelta(minutes=delta)
+            # Each timestep carries ITS OWN date, so the post-midnight
+            # part of a window resolves against the next day's files.
+            yield snapped.strftime('%Y-%m-%d'), snapped.strftime('%H%M')
             t += step
 
 
@@ -193,7 +239,7 @@ def load_scope_set(csv_path, data_root=None, source=None):
         # Resolve the lightning filter once. The per-sequence branch
         # snaps every expanded HHMM; the per-timestep branch leaves
         # already-listed HHMMs alone (they're typically already on
-        # the filter, e.g. lightning_active_steps.csv).
+        # the filter, e.g. our_data/lightning_data/lightning_active_steps.csv).
         eff_data_root = (
             data_root if data_root else str(p.parent)
         )
@@ -295,10 +341,7 @@ def compute_fraction(data_root, scope_keys):
             if not os.path.isdir(day_path):
                 continue
 
-            for npy_file in sorted(os.listdir(day_path)):
-                if not npy_file.endswith('.npy'):
-                    continue
-
+            for npy_file in list_arrays(day_path):
                 if scope_keys is not None:
                     key = parse_filename(npy_file, product)
                     if key is None or key not in scope_keys:
@@ -307,7 +350,7 @@ def compute_fraction(data_root, scope_keys):
 
                 filepath = os.path.join(day_path, npy_file)
                 try:
-                    data = np.load(filepath)
+                    data = load_array(filepath)
                     if data.ndim == 3:
                         data = np.squeeze(data, axis=0)
                     ones += int(np.count_nonzero(data))

@@ -35,6 +35,7 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from compress_datasets import array_exists, load_array
 from pipeline_config import SOURCE
 
 
@@ -134,6 +135,124 @@ def average_pool(data, factor):
 # =============================================================================
 # Patch index reader
 # =============================================================================
+
+# =============================================================================
+# Pool staleness stamp
+# =============================================================================
+# A patch file is an ARRAY OF TILES with nothing recording which tile sits
+# in which slot: slot k means "the k-th active patch at this timestep",
+# and that mapping lives only in patch_index.csv. Re-run identify_patches
+# and a patch that becomes active inserts into the middle of the list,
+# shifting every slot after it. The split CSVs' idx_t* columns then point
+# at the wrong tile - and because the shapes still line up, nothing
+# raises. A model trained on it learns to predict one region from another
+# a thousand kilometres away.
+#
+# Since extract_patches skips files that already exist, that stale state
+# is sticky: nothing regenerates them. So each date carries a stamp of
+# the active-patch lists it was built from, and any timestep whose list
+# has since changed is re-extracted instead of skipped.
+
+STAMP_NAME = "_patch_index.json"
+
+
+def _read_stamp(out_dir):
+    """Active-patch lists this date's files were built from, or None."""
+    path = os.path.join(out_dir, STAMP_NAME)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+        return blob.get("active") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_stamp(out_dir, active_by_hhmm, index_digest):
+    """Record what the files in `out_dir` were built from."""
+    path = os.path.join(out_dir, STAMP_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({
+            "patch_index_sha256": index_digest,
+            "written_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "active": active_by_hhmm,
+        }, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _index_digest(data_root, source):
+    """SHA-256 of the patch index, recorded for provenance."""
+    import hashlib
+
+    try:
+        csv_path = _resolve_index_csv(data_root, source)
+    except ValueError:
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(csv_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def audit_pool(data_root, source):
+    """Report timesteps whose files disagree with the current index.
+
+    Answers the question the stamp exists to prevent, for a pool built
+    before stamping: which dates would silently feed the wrong tile?
+    """
+    index = read_patch_index(data_root, source=source)
+    if not index:
+        return 1
+    output_root = os.path.join(data_root, 'patches')
+    by_date: dict[str, dict[str, list[int]]] = {}
+    for (date_str, time_str), active in index.items():
+        by_date.setdefault(date_str, {})[time_str.replace(':', '')] = active
+
+    stamped = unstamped = drifted = 0
+    drift_dates: list[str] = []
+    unstamped_dates: list[str] = []
+    for date_str in sorted(by_date):
+        out_dir = os.path.join(output_root, date_str)
+        if not os.path.isdir(out_dir):
+            continue
+        stamp = _read_stamp(out_dir)
+        if stamp is None:
+            unstamped += 1
+            unstamped_dates.append(date_str)
+            continue
+        stamped += 1
+        bad = [h for h, act in by_date[date_str].items()
+               if h in stamp and list(stamp[h]) != list(act)]
+        if bad:
+            drifted += 1
+            drift_dates.append(f"{date_str} ({len(bad)} timestep(s))")
+
+    print(f"Pool audit  : {output_root}")
+    print(f"  stamped dates       : {stamped}")
+    print(f"  drifted dates       : {drifted}")
+    print(f"  UNSTAMPED dates     : {unstamped}")
+    if drift_dates:
+        print("\n  These dates were built from a different active set and "
+              "MUST be re-extracted:")
+        for d in drift_dates[:40]:
+            print(f"    {d}")
+        if len(drift_dates) > 40:
+            print(f"    ... and {len(drift_dates)-40} more")
+    if unstamped_dates:
+        print(f"\n  Unstamped dates predate stamping, so their slot order "
+              f"cannot be verified from the pool alone.")
+        print(f"  Compare file mtimes against patch_index.csv, or "
+              f"re-extract them to be sure.")
+    if not drifted and not unstamped:
+        print("\n  Every date agrees with the current patch index.")
+    return 1 if (drifted or unstamped) else 0
+
 
 def _resolve_index_csv(data_root, source):
     """Path to the patch-activity index CSV.
@@ -245,14 +364,33 @@ def load_sequence_timesteps(data_root, source):
                 if not (date_str and start_str and end_str):
                     continue
                 base = datetime.strptime(date_str, '%Y-%m-%d')
-                # start/end_utc are HH:MM relative to the same calendar
-                # day. We don't carry sequences across midnight today.
+                # start/end_utc are clock times with no date of their
+                # own, and `date` dates the REFERENCE. A window through
+                # midnight therefore arrives with end_utc numerically
+                # BEFORE start_utc; anchoring on reference_utc and
+                # walking outwards resolves which side moves, and every
+                # step then carries its own date.
                 start_h, start_m = (int(x) for x in start_str.split(':'))
                 end_h, end_m = (int(x) for x in end_str.split(':'))
-                t = base.replace(hour=start_h, minute=start_m)
-                t_end = base.replace(hour=end_h, minute=end_m)
+                ref_str = (row.get('reference_utc') or '').strip()
+                day = 24 * 60
+                if ref_str:
+                    rh, rm = (int(x) for x in ref_str.split(':'))
+                    ref = base.replace(hour=rh, minute=rm)
+                    r_min = rh * 60 + rm
+                    s_min = start_h * 60 + start_m
+                    e_min = end_h * 60 + end_m
+                    t = ref - timedelta(minutes=(r_min - s_min) % day)
+                    t_end = ref + timedelta(minutes=(e_min - r_min) % day)
+                else:
+                    t = base.replace(hour=start_h, minute=start_m)
+                    t_end = base.replace(hour=end_h, minute=end_m)
+                    if t_end < t:
+                        t_end += timedelta(days=1)
+                if t_end - t > timedelta(days=1):
+                    continue
                 while t <= t_end:
-                    needed.add((date_str, t.strftime('%H:%M')))
+                    needed.add((t.strftime('%Y-%m-%d'), t.strftime('%H:%M')))
                     t += step
                 n_rows += 1
 
@@ -389,7 +527,7 @@ def find_reprojected_file_satellite(data_root, instrument, channel,
         data_root, 'reprojected_data', 'satellite_data', instrument,
         channel, day_folder, filename
     )
-    return path if os.path.isfile(path) else None
+    return path if array_exists(path) else None
 
 
 def find_reprojected_file_lightning(data_root, product, date_str, time_str):
@@ -415,7 +553,7 @@ def find_reprojected_file_lightning(data_root, product, date_str, time_str):
         data_root, 'reprojected_data', 'lightning_data',
         product, day_folder, filename,
     )
-    if os.path.isfile(legacy_path):
+    if array_exists(legacy_path):
         return legacy_path
 
     # 2. Canonical path: read_kml_version2.py writes here directly.
@@ -423,7 +561,7 @@ def find_reprojected_file_lightning(data_root, product, date_str, time_str):
         data_root, 'lightning_data',
         product, day_folder, filename,
     )
-    return native_path if os.path.isfile(native_path) else None
+    return native_path if array_exists(native_path) else None
 
 
 
@@ -448,7 +586,7 @@ def find_reprojected_file_opera(data_root, variable, date_str, time_str):
         data_root, 'reprojected_data', 'opera_data',
         short, day_folder, filename
     )
-    return path if os.path.isfile(path) else None
+    return path if array_exists(path) else None
 
 
 def find_reprojected_file(data_root, variable, group, date_str, time_str):
@@ -485,9 +623,9 @@ def load_reprojected(filepath, variable=None, group=None):
     Returns:
         np.ndarray: 2D array (768×1536) as float32.
     """
-    if not filepath.endswith('.npy'):
+    if not filepath.endswith(('.npy', '.npy.zst')):
         raise ValueError(f"Unknown file format: {filepath}")
-    data = np.load(filepath)
+    data = load_array(filepath)
     return np.asarray(data, dtype=np.float32)
 
 
@@ -614,10 +752,30 @@ def run_extraction(data_root, output_root, source='dbscan',
     total_files_saved = 0
     total_files_missing = 0
 
+    # Provenance for the stamps written below, and the running record of
+    # what each date was actually built from.
+    index_digest = _index_digest(data_root, source)
+    stamps_seen: dict[str, dict] = {}
+    stamp_updates: dict[str, dict[str, list[int]]] = {}
+    n_stale_refreshed = 0
+    stale_dates: set[str] = set()
+
     for idx, (date_str, time_str, active_patches) in enumerate(index):
         hhmm = time_str.replace(':', '')
         out_dir = os.path.join(output_root, date_str)
         os.makedirs(out_dir, exist_ok=True)
+
+        # Has this timestep's active set changed since its files were
+        # written? If so the slot order in them is wrong, and skipping
+        # would keep it wrong forever.
+        if date_str not in stamps_seen:
+            stamps_seen[date_str] = _read_stamp(out_dir) or {}
+        prior = stamps_seen[date_str].get(hhmm)
+        stale = prior is not None and list(prior) != list(active_patches)
+        if stale:
+            n_stale_refreshed += 1
+            stale_dates.add(date_str)
+        stamp_updates.setdefault(date_str, {})[hhmm] = list(active_patches)
 
         n_saved = 0
         n_missing = 0
@@ -627,8 +785,10 @@ def run_extraction(data_root, output_root, source='dbscan',
             out_filename = f"{var_name}_{hhmm}_{res_tag}.npy"
             out_path = os.path.join(out_dir, out_filename)
 
-            # Skip if already extracted
-            if os.path.isfile(out_path):
+            # Skip if already extracted, in either form on disk - unless
+            # the active set moved under it, in which case the cached
+            # file's slot order is wrong and must be overwritten.
+            if array_exists(out_path) and not stale:
                 n_saved += 1
                 continue
 
@@ -648,7 +808,14 @@ def run_extraction(data_root, output_root, source='dbscan',
                 # Extract patches and apply pooling
                 patches = extract_and_pool(data, active_patches, pool_factor)
 
-                # Save
+                # Save. Overwriting a stale entry must also drop its
+                # compressed twin, or load_array would keep resolving to
+                # the old tiles the moment the fresh .npy is compressed
+                # away again.
+                if stale:
+                    twin = out_path + '.zst'
+                    if os.path.isfile(twin):
+                        os.remove(twin)
                 np.save(out_path, patches)
                 n_saved += 1
 
@@ -665,6 +832,15 @@ def run_extraction(data_root, output_root, source='dbscan',
                   f"patches=[{patches_str}] -> {n_saved} saved, "
                   f"{n_missing} missing")
 
+    # Stamp each date with the active sets its files were built from, so
+    # a later identify_patches run can tell what moved. Merged with any
+    # existing stamp: a --date filtered run must not erase the rest.
+    for date_str, active_by_hhmm in stamp_updates.items():
+        out_dir = os.path.join(output_root, date_str)
+        merged = dict(stamps_seen.get(date_str) or {})
+        merged.update(active_by_hhmm)
+        _write_stamp(out_dir, merged, index_digest)
+
     # Summary
     print(f"\n{'='*70}")
     print(f"Summary")
@@ -672,6 +848,12 @@ def run_extraction(data_root, output_root, source='dbscan',
     print(f"  Timestamps processed : {len(index)}")
     print(f"  Files saved/cached   : {total_files_saved}")
     print(f"  Files missing        : {total_files_missing}")
+    if n_stale_refreshed:
+        print(f"  STALE re-extracted   : {n_stale_refreshed} timestep(s) "
+              f"across {len(stale_dates)} date(s)")
+        print(f"                         (their active set changed since "
+              f"the files were written)")
+    print(f"  Dates stamped        : {len(stamp_updates)}")
     print(f"  Output directory     : {output_root}")
 
     # Print resolution summary
@@ -720,6 +902,15 @@ if __name__ == "__main__":
              "subset of it.",
     )
 
+    parser.add_argument(
+        "--audit_pool", action="store_true",
+        help="Report which dates in our_data/patches/ were built from a "
+             "different active-patch set than the current patch index, "
+             "then exit. Extracts nothing. A drifted date silently feeds "
+             "the wrong tile into training, so check this after every "
+             "identify_patches re-run.",
+    )
+
     args = parser.parse_args()
 
     output_root = args.output_dir or os.path.join(args.data_root, 'patches')
@@ -728,6 +919,9 @@ if __name__ == "__main__":
     # keyed by this tag, so it has to be assembled once and threaded
     # through rather than re-derived at each call site.
     source = f"{SOURCE}_{args.period}" if args.period else SOURCE
+
+    if args.audit_pool:
+        sys.exit(audit_pool(args.data_root, source))
 
     run_extraction(
         data_root=args.data_root,

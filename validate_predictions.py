@@ -83,6 +83,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+
+from compress_datasets import list_arrays, load_array
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Rectangle
@@ -126,7 +128,8 @@ from lightning_postproc import (
     hysteresis_binary,
 )
 
-from pipeline_config import SOURCE
+from periods import normalization_stats_name
+from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 
 
 # Threshold above which a rainfall pixel is considered "active" convection.
@@ -251,11 +254,11 @@ def _iter_opera_files(data_root: Path, year: int, month: int):
     for day_folder in sorted(root.iterdir()):
         if not day_folder.is_dir() or not day_folder.name.startswith(date_prefix):
             continue
-        for f in sorted(day_folder.iterdir()):
-            m = _OPERA_FILENAME_RE.match(f.name)
+        for name in list_arrays(day_folder):
+            m = _OPERA_FILENAME_RE.match(name)
             if m is None:
                 continue
-            yield m.group(1), m.group(2), f
+            yield m.group(1), m.group(2), day_folder / name
 
 
 def select_samples(data_root: Path, year: int, month: int,
@@ -268,7 +271,7 @@ def select_samples(data_root: Path, year: int, month: int,
     scanned = 0
     for date_str, hhmm, path in _iter_opera_files(data_root, year, month):
         scanned += 1
-        data = np.load(path)
+        data = load_array(path)
         if data.ndim == 3:
             data = np.squeeze(data, axis=0)
         # NaN -> 0 to mirror the label transform in create_datasets.
@@ -557,7 +560,7 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                    high_coverage_pct: float = HIGH_COVERAGE_PCT,
                    rainfall_low: float | None = None,
-                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN):
+                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN, period=None):
     """Extraction mode for the rainfall track.
 
     IMPORTANT scope note for `rainfall_threshold_mmh`: this override
@@ -581,7 +584,7 @@ def run_extraction(track: str, year: int, month: int,
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     mode_config = get_mode_config(mode)
     step_minutes = _load_step_minutes(data_root)
@@ -595,7 +598,8 @@ def run_extraction(track: str, year: int, month: int,
         return
 
     print(f"\nLoading model ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned)
+    model = load_model_artifact(model_dir, mode, source, finetuned,
+                                period=period)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     rows: list[dict] = []
@@ -1307,7 +1311,7 @@ def _plot_zoom_axis(ax, gt_cls: np.ndarray, pred_cls: np.ndarray,
 
 def run_visualization(track: str, year: int, month: int, date_str: str,
                       mode: str, source: str, finetuned: bool,
-                      data_root: Path, model_dir: Path, output_dir: Path):
+                      data_root: Path, model_dir: Path, output_dir: Path, period=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{track}_{year:04d}_{month:02d}"
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
@@ -1324,7 +1328,7 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
     # Load prediction pipeline the same way extraction does.
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     mode_config = get_mode_config(mode)
     step_minutes = _load_step_minutes(data_root)
@@ -1337,7 +1341,8 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
         raise SystemExit(f"Selection has no references for {date_str}.")
 
     print(f"Loading model ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned)
+    model = load_model_artifact(model_dir, mode, source, finetuned,
+                                period=period)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
@@ -1525,10 +1530,11 @@ def _iter_lightning_files(data_root: Path, year: int, month: int):
     for day_folder in sorted(root.iterdir()):
         if not day_folder.is_dir() or not day_folder.name.startswith(date_prefix):
             continue
-        for f in sorted(day_folder.iterdir()):
-            m = _LIGHTNING_FILENAME_RE.match(f.name)
+        for name in list_arrays(day_folder):
+            m = _LIGHTNING_FILENAME_RE.match(name)
             if m is None:
                 continue
+            f = day_folder / name
             ymd = m.group(1)
             date_str = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}"
             yield date_str, m.group(2), f
@@ -1544,7 +1550,7 @@ def select_samples_lightning(data_root: Path, year: int, month: int,
     scanned = 0
     for date_str, hhmm, path in _iter_lightning_files(data_root, year, month):
         scanned += 1
-        data = np.load(path)
+        data = load_array(path)
         if data.ndim == 3:
             data = np.squeeze(data, axis=0)
         n_active = int((data > 0).sum())
@@ -1762,6 +1768,7 @@ def run_extraction_lightning(
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
     kd: bool = False,
+    period=None,
 ):
     """Extraction mode for the lightning track. Two-phase:
     Phase 1 - loop selected samples, run Hann-blended inference (raw prob
@@ -1794,7 +1801,7 @@ def run_extraction_lightning(
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     mode_config = get_mode_config(mode)
     if mode_config["label_type"] != "lightning":
@@ -1816,7 +1823,8 @@ def run_extraction_lightning(
                      else "KD student" if kd
                      else "base")
     print(f"\nLoading model ({variant_label}) ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned, kd=kd)
+    model = load_model_artifact(model_dir, mode, source, finetuned,
+                                kd=kd, period=period)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     # Per-(sample, lead_idx, high) confusion tuples: we need them at
@@ -1966,6 +1974,7 @@ def run_visualization_lightning(
     low_threshold: float = LIGHTNING_LOW_THRESHOLD,
     batch_size: int = 32,
     kd: bool = False,
+    period=None,
 ):
     """One figure per selected reference on the given date. Layout:
       Row 1 (columns = t+15/+30/+45): GT lightning occurrence
@@ -2008,7 +2017,7 @@ def run_visualization_lightning(
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     mode_config = get_mode_config(mode)
     if mode_config["label_type"] != "lightning":
@@ -2027,7 +2036,8 @@ def run_visualization_lightning(
                      else "KD student" if kd
                      else "base")
     print(f"Loading model ({variant_label}) ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned, kd=kd)
+    model = load_model_artifact(model_dir, mode, source, finetuned,
+                                kd=kd, period=period)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
@@ -2427,6 +2437,7 @@ def run_extraction_kd(
     batch_size: int = 32,
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
+    period=None,
 ):
     """KD extraction: load both models, run each on the same OPERA-selected
     samples with the same Hann-overlapped inputs (student sees only the
@@ -2448,7 +2459,7 @@ def run_extraction_kd(
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     teacher_cfg = get_mode_config(teacher_mode)
     student_cfg = get_mode_config(student_mode)
@@ -2610,6 +2621,7 @@ def run_visualization_kd(
     stride: int = DEFAULT_STRIDE,
     low_threshold: float = LIGHTNING_LOW_THRESHOLD,
     batch_size: int = 32,
+    period=None,
 ):
     """One 3x3 figure per selected reference on `date_str`:
        Row 1 GT / Row 2 GT+teacher red / Row 3 GT+student red, cols = leads.
@@ -2648,7 +2660,7 @@ def run_visualization_kd(
 
     init_sequence_config(str(data_root), source)
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{source}.json"
+        data_root / normalization_stats_name(source, period)
     )
     teacher_cfg = get_mode_config(teacher_mode)
 
@@ -2764,8 +2776,14 @@ def main() -> int:
                              "--track lightning (evaluates the student "
                              "standalone) and --mode mtg_opera_occurrence. "
                              "Mutually exclusive with --finetuned.")
-    parser.add_argument("--data_root", type=str, default="./our_data")
-    parser.add_argument("--model_dir", type=str, default="./models")
+    parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
+    parser.add_argument("--period", type=str, default=None, metavar="LABEL",
+                        help="Period label the model was trained under, "
+                             "e.g. --period w34. Selects the weights, the "
+                             "normalization statistics and the sequence "
+                             "metadata together. Omit for an untagged "
+                             "whole-archive run.")
+    parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     parser.add_argument("--output_dir", type=str, default="./validation")
     # --- Lightning-only knobs (ignored when --track rainfall) ---
     parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
@@ -2852,6 +2870,7 @@ def main() -> int:
                 high_coverage_pct=args.high_coverage_pct,
                 rainfall_low=args.rainfall_low_threshold,
                 rainfall_high_margin=args.rainfall_high_margin,
+                period=args.period,
             )
         else:
             # Visualization mode reads high-coverage lists from the JSON
@@ -2862,6 +2881,7 @@ def main() -> int:
                 args.track, args.year, args.month, args.date,
                 args.mode, SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
+                period=args.period,
             )
     elif args.track == "lightning":
         if args.date is None:
@@ -2875,6 +2895,7 @@ def main() -> int:
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
                 kd=args.kd,
+                period=args.period,
             )
         else:
             run_visualization_lightning(
@@ -2885,6 +2906,7 @@ def main() -> int:
                 low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
                 kd=args.kd,
+                period=args.period,
             )
     else:  # kd
         if args.date is None:
@@ -2899,6 +2921,7 @@ def main() -> int:
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
+                period=args.period,
             )
         else:
             run_visualization_kd(
@@ -2910,6 +2933,7 @@ def main() -> int:
                 output_dir=output_dir,
                 stride=args.stride, low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
+                period=args.period,
             )
     return 0
 

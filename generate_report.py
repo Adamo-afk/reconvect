@@ -40,6 +40,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from pipeline_config import resolve_data_root, resolve_model_dir
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -3065,7 +3067,7 @@ def main() -> int:
     parser.add_argument("--output", type=str, default=None,
                         help="Output PDF path. Default: "
                              "{validation_dir}/report_{yyyy}_{mm}.pdf")
-    parser.add_argument("--data_root", type=str, default="./our_data",
+    parser.add_argument("--data_root", type=str, default=str(resolve_data_root()),
                         help="Project data root - needed by the cardinal + "
                              "peak-values extractor to load GT canvases and "
                              "translate pixel coords to lat/lon via "
@@ -3128,7 +3130,7 @@ def main() -> int:
                              "class). Loads the operational rainfall + "
                              "lightning checkpoints from --model_dir. "
                              "Adds ~10-30s to the run.")
-    parser.add_argument("--model_dir", type=str, default="./models",
+    parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()),
                         help="Directory with the model checkpoints "
                              "(only used when --pred_coupling is set).")
 

@@ -77,7 +77,12 @@ from train_models import (
     WallTimeCallback,
 )
 
-from pipeline_config import SOURCE
+from pipeline_config import (
+    SOURCE,
+    resolve_data_root,
+    resolve_datasets_root,
+    resolve_model_dir,
+)
 
 
 # ============================================================================
@@ -477,8 +482,15 @@ def main() -> int:
             "from satellite-only inputs (no LINET at student inference time)."
         ),
     )
-    p.add_argument("--data_root", type=str, default="./our_data")
-    p.add_argument("--model_dir", type=str, default="./models")
+    p.add_argument("--data_root", type=str, default=None, metavar="PATH",
+                   help="Root holding patches/, split CSVs and statistics "
+                        "(default: the our_data/ beside this script, or "
+                        "$COALITION4_DATA_ROOT).")
+    p.add_argument("--datasets_root", type=str, default=None, metavar="PATH",
+                   help="Root holding the built TFRecord datasets (default: "
+                        "<data_root>/datasets, or "
+                        "$COALITION4_DATASETS_ROOT).")
+    p.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     p.add_argument("--teacher_finetuned", action="store_true",
                    help="Distil from coalition_..._finetuned.keras instead "
                         "of the base teacher.")
@@ -505,6 +517,12 @@ def main() -> int:
                    help="Disable mixed_float16 (use float32 everywhere). "
                         "Slower but sometimes helpful for debugging.")
     args = p.parse_args()
+
+    # Resolve the roots ONCE, so every use below - including the plain
+    # `Path(args.data_root)` ones - sees a real path rather than None.
+    args.data_root = str(resolve_data_root(args.data_root))
+    args.datasets_root = str(resolve_datasets_root(args.data_root,
+                                                  args.datasets_root))
 
     if not (0.0 <= args.kd_alpha <= 1.0):
         raise SystemExit(f"--kd_alpha must be in [0, 1]; got {args.kd_alpha}")

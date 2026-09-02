@@ -31,7 +31,22 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = str(PROJECT_ROOT / 'our_data' / 'satellite_data'
                       / 'MTG' / '_raw_chunks')
+DEFAULT_REPROJ_DIR = (PROJECT_ROOT / 'our_data' / 'reprojected_data'
+                      / 'satellite_data' / 'MTG')
 TIMESTEP_CONFIG_PATH = PROJECT_ROOT / 'our_data' / 'timestep_config.json'
+# Summaries, the missing-timestep JSON and the coverage chart belong with
+# the product they describe, not at the repository root. This file already
+# lives in that folder, so anchor to it - and to the file, not the working
+# directory, so the defaults hold from anywhere.
+PRODUCT_DIR = Path(__file__).resolve().parent
+
+
+# The .npy stores may be zstd-compressed in place (see
+# compress_datasets.py --compress-npy); list_arrays yields logical
+# .npy names either way, so the filename patterns below still match.
+sys.path.insert(0, str(PROJECT_ROOT))
+from compress_datasets import list_arrays  # noqa: E402
+
 
 # MTG native cadence (repeat cycle = 10 min); the file has 144 cycles
 # per 24h day. The filter from timestep_config.json picks a subset of
@@ -410,17 +425,29 @@ def hhmm_to_rc(hhmm):
     return (h * 60 + m) // NATIVE_CADENCE_MINUTES + 1
 
 
-def summarize_npy(base_dir, filter_minutes, channels,
+def summarize_npy(base_dirs, filter_minutes, channels,
                   start=None, end=None):
     """Scan MTG/<channel>/nc4_<date>-Romania_<channel>/*.npy.
+
+    `base_dirs` is one path or several. The MTG store is the one product
+    large enough to outgrow a disk - ~47 MB of .npy per repeat cycle - so
+    it can legitimately be split across drives. Several roots are scanned
+    as ONE archive: coverage is a property of the data, not of where it
+    happens to sit, and reporting per drive would call a date missing
+    that is simply on the other one.
 
     Returns (rows, dates) in the same shape as summarize(), so every
     downstream consumer — the table, the CSV, the missing JSON, the chart —
     works unchanged.
     """
-    base = Path(base_dir)
-    if not base.is_dir():
-        print(f"ERROR: directory not found: {base}", file=sys.stderr)
+    if isinstance(base_dirs, (str, Path)):
+        base_dirs = [base_dirs]
+    bases = [Path(b) for b in base_dirs]
+
+    missing_roots = [b for b in bases if not b.is_dir()]
+    if missing_roots:
+        for b in missing_roots:
+            print(f"ERROR: directory not found: {b}", file=sys.stderr)
         sys.exit(1)
 
     expected_rcs = expected_rc_set(filter_minutes)
@@ -434,29 +461,53 @@ def summarize_npy(base_dir, filter_minutes, channels,
     })
 
     n_files = 0
-    for channel in channels:
-        ch_root = base / channel
-        if not ch_root.is_dir():
-            print(f"  NOTE: no directory for channel {channel} — every "
-                  f"cycle will count as incomplete")
-            continue
-        for day_dir in sorted(ch_root.iterdir()):
-            if not day_dir.is_dir():
+    per_root: dict[str, int] = {}
+    # A (date, rc, channel) seen in two roots is one cycle, not two, so
+    # the file tally is deduplicated as well as the cycle set.
+    seen: set[tuple[str, int, str]] = set()
+    for base in bases:
+        root_files = 0
+        for channel in channels:
+            ch_root = base / channel
+            if not ch_root.is_dir():
+                print(f"  NOTE: no directory for channel {channel} in "
+                      f"{base} — cycles held only there count as "
+                      f"incomplete")
                 continue
-            for filename in os.listdir(day_dir):
-                m = NPY_FILE_PATTERN.match(filename)
-                if not m or m.group('channel') != channel:
+            for day_dir in sorted(ch_root.iterdir()):
+                if not day_dir.is_dir():
                     continue
-                date_str = m.group('date')
-                rc = hhmm_to_rc(m.group('hhmm'))
-                d = dates[date_str]
-                d['body_files'] += 1
-                d['repeat_cycles'].add(rc)
-                d['chunks_seen'][rc].add(channel)
-                n_files += 1
+                for filename in list_arrays(day_dir):
+                    m = NPY_FILE_PATTERN.match(filename)
+                    if not m or m.group('channel') != channel:
+                        continue
+                    date_str = m.group('date')
+                    rc = hhmm_to_rc(m.group('hhmm'))
+                    # root_files counts what this store physically
+                    # holds; n_files counts the archive once, so the two
+                    # differ exactly by what is duplicated across stores.
+                    root_files += 1
+                    if (date_str, rc, channel) in seen:
+                        continue
+                    seen.add((date_str, rc, channel))
+                    d = dates[date_str]
+                    d['body_files'] += 1
+                    d['repeat_cycles'].add(rc)
+                    d['chunks_seen'][rc].add(channel)
+                    n_files += 1
+        per_root[str(base)] = root_files
 
-    print(f"Found {n_files} .npy files across {len(channels)} channel(s) "
-          f"in {base}")
+    if len(bases) > 1:
+        print(f"Found {n_files} .npy files across {len(channels)} "
+              f"channel(s) in {len(bases)} store(s):")
+        for root, count in per_root.items():
+            print(f"  {count:>9,}  {root}")
+        dup = sum(per_root.values()) - n_files
+        if dup:
+            print(f"  {dup:>9,}  duplicated across stores (counted once)")
+    else:
+        print(f"Found {n_files} .npy files across {len(channels)} "
+              f"channel(s) in {bases[0]}")
 
     expected_dates = date_range(start, end)
     if expected_dates:
@@ -507,10 +558,25 @@ def summarize_npy(base_dir, filter_minutes, channels,
     return rows, dates
 
 
-def report_provenance(dates, base_dir):
-    """Print the NMA / Data Store split across the scanned cycles."""
+def report_provenance(dates, base_dirs):
+    """Print the NMA / Data Store split across the scanned cycles.
+
+    Each store carries its own ledger, so they are merged the same way
+    the scan is. Where two stores record the same cycle the first root
+    wins - they should agree, and disagreeing would mean the cycle was
+    fetched twice from different sources.
+    """
     from datastore_fill import load_provenance, provenance_of
-    blob = load_provenance(base_dir)
+    if isinstance(base_dirs, (str, Path)):
+        base_dirs = [base_dirs]
+
+    blob = {"cycles": {}}
+    for base in base_dirs:
+        part = load_provenance(base)
+        for date_str, cycles in (part.get("cycles") or {}).items():
+            merged = blob["cycles"].setdefault(date_str, {})
+            for hhmm, src in cycles.items():
+                merged.setdefault(hhmm, src)
 
     if not blob.get("cycles"):
         print("\nProvenance     : no ledger yet - origin is unrecorded for "
@@ -722,20 +788,20 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         '--output', '-o', type=str,
-        default=str(PROJECT_ROOT / 'mtg_summary.csv'),
+        default=str(PRODUCT_DIR / 'mtg_summary.csv'),
         help=(
             f'Output CSV path. Default lands at the project root '
-            f'({PROJECT_ROOT / "mtg_summary.csv"}) so '
+            f'({PRODUCT_DIR / "mtg_summary.csv"}) so '
             f'intersect_product_coverage.py finds it regardless of '
             f'where the script is invoked from.'
         ),
     )
     parser.add_argument(
         '--missing', '-m', type=str,
-        default=str(PROJECT_ROOT / 'mtg_missing_timesteps.json'),
+        default=str(PRODUCT_DIR / 'mtg_missing_timesteps.json'),
         help=(
             f'Output JSON with missing timesteps '
-            f'(default: {PROJECT_ROOT / "mtg_missing_timesteps.json"} - '
+            f'(default: {PRODUCT_DIR / "mtg_missing_timesteps.json"} - '
             f'anchored to the project root, matching the nwcsaf / opera '
             f'naming convention).'
         ),
@@ -759,20 +825,30 @@ if __name__ == "__main__":
         help="Last expected date, inclusive (YYYY-MM-DD). See --start.",
     )
     parser.add_argument(
-        '--scan', type=str, default='npy', choices=['npy', 'raw'],
-        help="What to measure coverage from. 'npy' (default) reads the "
-             "extracted per-channel arrays, which is the only option once "
-             "pipeline_msg_mtg.py --delete_raw has removed the chunks. "
-             "'raw' reads _raw_chunks/*.nc, the pre-extraction view: use "
-             "it to see what arrived but failed to extract.",
+        '--scan', type=str, default='npy',
+        choices=['npy', 'raw', 'reprojected'],
+        help="Which question to answer. The three views disagree by "
+             "design. 'npy' (default) reads the extracted MTG store - "
+             "what the Data Store backfill needs, since a cycle absent "
+             "there has to be re-fetched. 'reprojected' reads "
+             "reprojected_data/satellite_data/MTG - what extract_patches "
+             "actually loads, and therefore what the coverage manifest "
+             "must gate on: a cycle extracted but never reprojected is "
+             "invisible to the store view and would be dropped at build "
+             "time without an error. 'raw' reads _raw_chunks/*.nc, the "
+             "pre-extraction view: use it to see what arrived but failed "
+             "to extract.",
     )
     parser.add_argument(
-        '--npy_dir', type=str, default=None,
-        help="MTG root holding the per-channel .npy directories "
-             "(default: the parent of --raw_dir).",
+        '--npy_dir', type=str, nargs='+', default=None, metavar='PATH',
+        help="MTG root(s) holding the per-channel .npy directories "
+             "(default: the parent of --raw_dir). Several may be given: "
+             "the store can span drives, and they are scanned as one "
+             "archive so a date held on another drive is not reported "
+             "missing. Provenance ledgers are merged the same way.",
     )
     parser.add_argument(
-        '--chart', type=str, nargs='?', const='mtg_coverage.png', default=None,
+        '--chart', type=str, nargs='?', const=str(PRODUCT_DIR / 'mtg_coverage.png'), default=None,
         help="Render a monthly coverage chart (faded bars + line through "
              "the bar tops, with the cadence expectation as a dashed "
              "reference). Optional PNG path; defaults to "
@@ -796,13 +872,37 @@ if __name__ == "__main__":
           f"(of {NATIVE_CYCLES_PER_DAY} native cycles)")
     print()
 
-    npy_dir = args.npy_dir or str(Path(args.raw_dir).parent)
-    channels = expected_channels() if args.scan == 'npy' else []
-    required_parts = len(channels) if args.scan == 'npy' else 2
+    if args.npy_dir:
+        npy_dirs = args.npy_dir
+    elif args.scan == 'reprojected':
+        npy_dirs = [str(DEFAULT_REPROJ_DIR)]
+    else:
+        npy_dirs = [str(Path(args.raw_dir).parent)]
+    scans_npy = args.scan in ('npy', 'reprojected')
+    channels = expected_channels() if scans_npy else []
+    required_parts = len(channels) if scans_npy else 2
+
+    # Say which question is being answered, because the three views
+    # disagree by design and the missing-JSON they write means different
+    # things.
+    print(f"Scanning       : {args.scan}")
+    if args.scan == 'reprojected':
+        print("                 reprojected arrays - what extract_patches "
+              "reads")
+        print("                 NOTE: the missing list this writes "
+              "describes reprojection")
+        print("                 gaps, NOT downloads. Do not feed it to "
+              "--source datastore.")
+    elif args.scan == 'npy':
+        print("                 extracted MTG store - what the Data Store "
+              "backfill needs")
+    else:
+        print("                 raw chunks - what arrived before "
+              "extraction")
 
     def run_scan():
-        if args.scan == 'npy':
-            return summarize_npy(npy_dir, filter_minutes, channels,
+        if scans_npy:
+            return summarize_npy(npy_dirs, filter_minutes, channels,
                                  start=args.start, end=args.end)
         return summarize(args.raw_dir, filter_minutes,
                          start=args.start, end=args.end,
@@ -813,6 +913,6 @@ if __name__ == "__main__":
     save_csv(rows, args.output)
     save_missing_json(dates, filter_minutes, args.missing,
                       required_parts=required_parts)
-    report_provenance(dates, npy_dir)
+    report_provenance(dates, npy_dirs)
     if args.chart:
         render_chart(rows, args.chart)

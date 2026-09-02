@@ -98,6 +98,8 @@ from pathlib import Path
 
 import numpy as np
 
+from compress_datasets import list_arrays
+from compress_datasets import load_array as read_array
 from pipeline_config import SOURCE
 from periods import (
     normalization_stats_name,
@@ -515,8 +517,9 @@ def _walk_mtg(root: Path, var: str,
     for day_dir in sorted(var_root.iterdir()):
         if not day_dir.is_dir():
             continue
-        for f in sorted(day_dir.iterdir()):
-            m = _NPY_NAME_PATTERN.match(f.name)
+        for name in list_arrays(day_dir):
+            f = day_dir / name
+            m = _NPY_NAME_PATTERN.match(name)
             if not m:
                 continue
             date_str = m.group(1)
@@ -540,8 +543,9 @@ def _walk_lightning(root: Path, var: str,
     for day_dir in sorted(var_root.iterdir()):
         if not day_dir.is_dir():
             continue
-        for f in sorted(day_dir.iterdir()):
-            m = _LIGHTNING_NAME_PATTERN.match(f.name)
+        for name in list_arrays(day_dir):
+            f = day_dir / name
+            m = _LIGHTNING_NAME_PATTERN.match(name)
             if not m:
                 continue
             d = m.group("date")
@@ -581,8 +585,9 @@ def _walk_opera(root: Path, var: str,
     for day_dir in sorted(var_root.iterdir()):
         if not day_dir.is_dir():
             continue
-        for f in sorted(day_dir.iterdir()):
-            m = pattern.match(f.name)
+        for name in list_arrays(day_dir):
+            f = day_dir / name
+            m = pattern.match(name)
             if not m:
                 continue
             date_str = m.group(1)
@@ -655,7 +660,7 @@ def load_array(item, source: str) -> np.ndarray | None:
     (variable, timestep), so the loader is the same everywhere.
     """
     try:
-        arr = np.load(item, allow_pickle=False)
+        arr = read_array(item)
         if arr.ndim == 3 and arr.shape[0] == 1:
             arr = arr[0]
         if arr.ndim != 2:

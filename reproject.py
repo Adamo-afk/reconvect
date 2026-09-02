@@ -42,6 +42,7 @@ import json
 import numpy as np
 import os
 import re
+import sys
 import argparse
 import threading
 import time as timer_module
@@ -58,6 +59,7 @@ except ImportError:
     h5py = None  # only required by the OPERA path; checked at call time
 
 from c4dl.projection import GridProjection, romania_grid_area
+from compress_datasets import array_exists, list_arrays, load_array
 
 # Global lock for netCDF4/HDF5 reads (C library is not thread-safe)
 _nc_lock = threading.Lock()
@@ -278,7 +280,9 @@ def ensure_dir(path):
 
 
 def output_exists(path):
-    return os.path.isfile(path)
+    # Counts a zstd-compressed output as present, so a re-run does not
+    # redo every day whose outputs have already been compressed.
+    return array_exists(path)
 
 
 def find_data_variable(ds, channel_name):
@@ -422,7 +426,7 @@ def _mtg_day_worker(job):
             continue
         try:
             filepath = os.path.join(day_path, npy_file)
-            sat_data = np.load(filepath)
+            sat_data = load_array(filepath)
             if isinstance(sat_data, np.ma.MaskedArray):
                 sat_data = sat_data.filled(np.nan)
             sat_data = np.asarray(sat_data, dtype=np.float32)
@@ -457,7 +461,7 @@ def _lightning_day_worker(job):
             continue
         try:
             filepath = os.path.join(day_path, npy_file)
-            datamap = np.load(filepath)
+            datamap = load_array(filepath)
             if isinstance(datamap, np.ma.MaskedArray):
                 datamap = datamap.filled(0.0)
             if datamap.ndim == 3:
@@ -496,7 +500,10 @@ def _opera_day_worker(job):
             continue
         out_name = f"nc4_{date_str}-Romania_{hhmm}_{product}.npy"
         out_path = os.path.join(out_dir, out_name)
-        if os.path.exists(out_path):
+        # output_exists, not os.path.exists: a compressed output counts as
+        # present, otherwise a re-run reprojects every file again and
+        # leaves a plain .npy beside the .npy.zst.
+        if output_exists(out_path):
             skipped += 1
             continue
         try:
@@ -573,7 +580,8 @@ def _read_mtg_source_grid_from_constants(constants_path, resolution):
     return lat_2d.astype(np.float64), lon_2d.astype(np.float64)
 
 
-def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=None):
+def reproject_satellite_mtg(data_root, target_lats, target_lons,
+                            date_filter=None, mtg_dir=None):
     """
     Reproject MTG channels from pipeline-produced .npy files.
 
@@ -590,7 +598,12 @@ def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=Non
     reconstruct full .nc files
     for GIS viewing.
     """
-    mtg_dir = os.path.join(data_root, 'satellite_data', 'MTG')
+    # The MTG store is the one product large enough to outgrow a disk:
+    # ~47 MB of .npy per repeat cycle, so a year and a half runs past a
+    # terabyte. `mtg_dir` lets it live wherever there is room while the
+    # reprojected output still lands under `data_root`, which is what
+    # every later stage reads.
+    mtg_dir = mtg_dir or os.path.join(data_root, 'satellite_data', 'MTG')
     constants_path = os.path.join(mtg_dir, 'mtg_constants.json')
     reprojected_base = os.path.join(
         data_root, 'reprojected_data', 'satellite_data', 'MTG'
@@ -672,9 +685,8 @@ def reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter=Non
             if not os.path.isdir(day_path):
                 continue
             out_dir = os.path.join(reprojected_base, channel, day_folder)
-            npy_files = sorted(
-                f for f in os.listdir(day_path) if f.endswith('.npy')
-            )
+            # Logical .npy names, whether or not the day is compressed.
+            npy_files = list_arrays(day_path)
             if npy_files:
                 day_jobs.append((day_folder, day_path, out_dir, npy_files))
 
@@ -749,9 +761,8 @@ def reproject_lightning(data_root, date_filter=None):
             if not os.path.isdir(day_path):
                 continue
             out_dir = os.path.join(reprojected_base, product, day_folder)
-            npy_files = sorted(
-                f for f in os.listdir(day_path) if f.endswith('.npy')
-            )
+            # Logical .npy names, whether or not the day is compressed.
+            npy_files = list_arrays(day_path)
             if npy_files:
                 day_jobs.append((day_folder, day_path, out_dir, npy_files))
 
@@ -927,7 +938,8 @@ def reproject_opera(data_root, target_lats, target_lons, date_filter=None):
 # Main pipeline
 # =============================================================================
 
-def run(data_root, mode, instrument=None, date_filter=None):
+def run(data_root, mode, instrument=None, date_filter=None,
+        mtg_dir=None):
     print("=" * 70)
     print("COALITION-4 Data Reprojection Pipeline (precomputed mappings)")
     print("=" * 70)
@@ -961,7 +973,37 @@ def run(data_root, mode, instrument=None, date_filter=None):
         print(f"{'='*70}")
         if target_lats is None:
             target_lats, target_lons = init_romania_grid()
-        reproject_satellite_mtg(data_root, target_lats, target_lons, date_filter)
+
+        # The store can span drives. Each root is reprojected in turn -
+        # the KD-tree is rebuilt per store from the constants beside its
+        # arrays, so they are independent - and every one writes into the
+        # same canonical reprojected_data/ tree under data_root.
+        if mtg_dir:
+            store_roots = [mtg_dir]
+        else:
+            default_store = os.path.join(data_root, 'satellite_data', 'MTG')
+            try:
+                sys.path.insert(
+                    0, os.path.join(data_root, 'satellite_data'))
+                from store_registry import roots as _store_roots
+                store_roots = _store_roots(include_default=default_store)
+            except Exception as exc:              # noqa: BLE001
+                print(f"  NOTE: store index unavailable ({exc}); "
+                      f"using the default store only.")
+                store_roots = [default_store]
+            if not store_roots:
+                store_roots = [default_store]
+
+        if len(store_roots) > 1:
+            print(f"  {len(store_roots)} store(s) registered:")
+            for r in store_roots:
+                print(f"    {r}")
+
+        for root in store_roots:
+            if len(store_roots) > 1:
+                print(f"\n  --- store: {root} ---")
+            reproject_satellite_mtg(data_root, target_lats, target_lons,
+                                    date_filter, mtg_dir=root)
 
     if mode in ('lightning', 'all'):
         print(f"\n{'='*70}")
@@ -1004,6 +1046,16 @@ if __name__ == "__main__":
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--mtg_dir", type=str, default=None, metavar="PATH",
+        help="A single MTG store to read, overriding the store index. "
+             "Without it, every root registered in "
+             "our_data/satellite_data/mtg_store_index.json is walked in "
+             "turn, so a store split across drives is reprojected in one "
+             "run. Reprojected output always goes under --data_root, so "
+             "the canonical tree the rest of the pipeline reads stays in "
+             "one place.",
+    )
     group.add_argument("--satellite", type=str, choices=['MTG'],
                        metavar='INSTRUMENT', help="Reproject satellite channels")
     group.add_argument("--lightning", action="store_true",
@@ -1032,4 +1084,5 @@ if __name__ == "__main__":
         mode=mode,
         instrument=instrument,
         date_filter=args.date,
+        mtg_dir=args.mtg_dir,
     )

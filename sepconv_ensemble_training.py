@@ -35,12 +35,22 @@ from tensorflow.keras import Model
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callback
 
 from create_datasets import get_mode_config, load_tfrecord_dataset
-from pipeline_config import SOURCE
+from pipeline_config import (
+    SOURCE,
+    resolve_data_root,
+    resolve_datasets_root,
+    resolve_model_dir,
+)
 # `weighted_loss_multiple_thresholds` / RAINFALL_MSE_WEIGHTS are NOT
 # imported any more: those were built for the /70-bounded continuous head.
 # The baseline's target is log_zscore, so its weighting is derived from
 # measured class frequencies instead — see build_sepconv_loss below.
-from train_models import build_run_tag
+from train_models import (
+    DEFAULT_TRAINING_CONFIG,
+    build_run_tag,
+    load_training_config,
+    _ResumableCheckpoint,
+)
 
 
 # ============================================================================
@@ -327,6 +337,7 @@ class WallTimeCallback(Callback):
 # ============================================================================
 
 def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
+                    checkpoint_cfg=None, resume=True,
                      learning_rate=1e-3, lr_patience=5, es_patience=10,
                      period=None):
     """Train one base model Bm{lead_steps}.
@@ -373,11 +384,43 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
         monitor='val_loss', patience=es_patience,
         restore_best_weights=True, verbose=1)
     wall_timer = WallTimeCallback()
-
-    history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
-                        callbacks=[reduce_lr, early_stop, wall_timer], verbose=1)
+    callbacks = [reduce_lr, early_stop, wall_timer]
 
     run_tag = build_run_tag(SEPCONV_MODE, SOURCE, period)
+
+    # Per-epoch rolling checkpoint, mirroring RECONVECT. Each base model
+    # gets its own file: three are trained per invocation, and a shared
+    # one would have Bm3 resume from Bm1's weights.
+    ckpt_cfg = checkpoint_cfg or {}
+    initial_epoch = 0
+    if ckpt_cfg.get("enabled", True):
+        ckpt_dir = Path(model_dir) / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = ckpt_dir / f"sepconv_{run_tag}_bm{lead_steps}_latest.keras"
+        meta_path = ckpt_dir / f"sepconv_{run_tag}_bm{lead_steps}_latest.json"
+        if resume and ckpt_path.is_file():
+            try:
+                print(f"  Resuming from checkpoint: {ckpt_path}")
+                model.load_weights(str(ckpt_path))
+                if meta_path.is_file():
+                    with open(meta_path) as f:
+                        initial_epoch = int(json.load(f).get("next_epoch", 0))
+                    print(f"    Resumed at epoch {initial_epoch}")
+            except Exception as e:
+                print(f"  WARNING: could not load {ckpt_path}: {e}")
+                print(f"  Starting fresh.")
+                initial_epoch = 0
+        callbacks.append(_ResumableCheckpoint(str(ckpt_path),
+                                              str(meta_path)))
+
+    if initial_epoch >= epochs:
+        print(f"  Already trained to epoch {initial_epoch} of {epochs}; "
+              f"nothing to do. Delete the checkpoint or raise epochs to "
+              f"continue.")
+
+    history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
+                        initial_epoch=initial_epoch,
+                        callbacks=callbacks, verbose=1)
     model_path = Path(model_dir) / f"sepconv_{run_tag}_bm{lead_steps}.keras"
     model.save(str(model_path))
     print(f"  Saved: {model_path}")
@@ -409,14 +452,15 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
 # Main
 # ============================================================================
 
-def train(data_root, model_dir, epochs=50, batch_size=8, lead=None,
-          learning_rate=1e-3, lr_patience=5, es_patience=10, period=None):
-    data_root = Path(data_root)
-    model_dir = Path(model_dir)
+def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
+          learning_rate=1e-3, lr_patience=5, es_patience=6, period=None,
+          datasets_root=None, checkpoint_cfg=None, resume=True):
+    data_root = resolve_data_root(data_root)
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
+    model_dir = resolve_model_dir(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    ds_root = (data_root / "datasets"
-               / build_run_tag(SEPCONV_MODE, SOURCE, period))
+    ds_root = datasets_root / build_run_tag(SEPCONV_MODE, SOURCE, period)
     for split in ["train", "validation"]:
         if not (ds_root / split).exists():
             raise FileNotFoundError(
@@ -457,13 +501,14 @@ def train(data_root, model_dir, epochs=50, batch_size=8, lead=None,
     for lead_steps in leads_to_train:
         all_results[f"bm{lead_steps}"] = train_base_model(
             lead_steps, data_root, model_dir, epochs, batch_size,
+            checkpoint_cfg=checkpoint_cfg, resume=resume,
             learning_rate=learning_rate, lr_patience=lr_patience,
             es_patience=es_patience, period=period)
 
     total_time = time.time() - total_start
 
     history_data = {
-        "mode": mode, "architecture": "sepconv_ensemble",
+        "mode": SEPCONV_MODE, "architecture": "sepconv_ensemble",
         "output_type": "regression",
         "base_models": all_results,
         "total_wall_time": total_time,
@@ -481,7 +526,11 @@ def train(data_root, model_dir, epochs=50, batch_size=8, lead=None,
         },
     }
 
-    history_path = model_dir / f"history_sepconv_ensemble_{mode}.json"
+    # Tagged like the weights beside it: several windows are trained
+    # from the same mode, and one filename for all of them would keep
+    # only the last run's history.
+    history_path = (Path(model_dir)
+                    / f"history_sepconv_{build_run_tag(SEPCONV_MODE, SOURCE, period)}.json")
     with open(history_path, 'w') as f:
         json.dump(history_data, f, indent=2)
 
@@ -501,34 +550,79 @@ def main():
                     "Radar-only by design; consumes the "
                     f"{SEPCONV_MODE} dataset built on a past=4/future=8 "
                     "sequence window.")
-    parser.add_argument("--data_root", type=str, default="./our_data")
-    parser.add_argument("--model_dir", type=str, default="./models")
+    parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
+    parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     parser.add_argument("--period", type=str, default=None,
                         help="Ensemble member label, if the baseline is "
                              "being trained per period. Omit for the "
                              "whole-archive run used by the comparison.")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--config", type=str,
+                        default=str(DEFAULT_TRAINING_CONFIG), metavar="PATH",
+                        help="Hyperparameters come from this file - the SAME "
+                             "one RECONVECT uses - so both halves of the "
+                             "comparison train under identical settings. "
+                             "[defaults] supplies epochs and batch_size; the "
+                             "optional [sepconv] section overrides them and "
+                             "carries the ReduceLROnPlateau patience. Flags "
+                             "below override the file.")
+    parser.add_argument("--datasets_root", type=str, default=None,
+                        metavar="PATH",
+                        help="Root holding the built TFRecord datasets "
+                             "(default: <data_root>/datasets, or "
+                             "$COALITION4_DATASETS_ROOT).")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override [defaults].epochs / [sepconv].epochs.")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override [defaults].batch_size / "
+                             "[sepconv].batch_size.")
     parser.add_argument("--lead", type=int, default=None,
                         choices=list(SEPCONV_BASE_LEADS),
                         help="Train one base model instead of all three. "
                              f"{SEPCONV_BASE_LEADS} = "
                              f"{[LEAD_MINUTES[k] for k in SEPCONV_BASE_LEADS]} "
                              f"minutes ahead.")
-    parser.add_argument("--learning_rate", type=float, default=1e-3,
-                        help="Published value is 1e-3; exposed for the "
-                             "documented tuning sweep.")
-    parser.add_argument("--lr_patience", type=int, default=5,
-                        help="Epochs on a val_loss plateau before the rate "
-                             "is halved.")
-    parser.add_argument("--es_patience", type=int, default=10,
-                        help="Early-stopping patience. Not stated in the "
-                             "paper; ours, and recorded in the history JSON.")
+    parser.add_argument("--learning_rate", type=float, default=None,
+                        help="Override [sepconv].learning_rate (which "
+                             "defaults to [lr_schedule].initial_lr). The "
+                             "published value is 1e-3.")
+    parser.add_argument("--lr_patience", type=int, default=None,
+                        help="Override [sepconv].lr_patience - epochs on a "
+                             "val_loss plateau before the rate is halved.")
+    parser.add_argument("--es_patience", type=int, default=None,
+                        help="Override [sepconv].es_patience (which defaults "
+                             "to [early_stopping].patience).")
+    parser.add_argument("--fresh", action="store_true",
+                        help="Ignore any per-epoch checkpoint and start "
+                             "from scratch, regardless of "
+                             "[checkpointing].resume.")
     args = parser.parse_args()
+
+    full_cfg = load_training_config(Path(args.config))
+    cfg = full_cfg["sepconv"]
+    ckpt_cfg = full_cfg["checkpointing"]
+    # Flag beats file, file beats nothing - the same precedence the roots
+    # use, so `--epochs 80` still works for a one-off sweep.
+    def pick(flag, key):
+        return cfg[key] if flag is None else flag
+
+    epochs = pick(args.epochs, "epochs")
+    batch_size = pick(args.batch_size, "batch_size")
+    learning_rate = pick(args.learning_rate, "learning_rate")
+    lr_patience = pick(args.lr_patience, "lr_patience")
+    es_patience = pick(args.es_patience, "es_patience")
+
+    print(f"Config        : {args.config}")
+    print(f"  epochs={epochs}  batch_size={batch_size}  "
+          f"lr={learning_rate}  lr_patience={lr_patience}  "
+          f"es_patience={es_patience}")
+
     train(data_root=args.data_root, model_dir=args.model_dir,
-          epochs=args.epochs, batch_size=args.batch_size, lead=args.lead,
-          learning_rate=args.learning_rate, lr_patience=args.lr_patience,
-          es_patience=args.es_patience, period=args.period)
+          epochs=epochs, batch_size=batch_size, lead=args.lead,
+          learning_rate=learning_rate, lr_patience=lr_patience,
+          es_patience=es_patience, period=args.period,
+          datasets_root=args.datasets_root,
+          checkpoint_cfg=ckpt_cfg,
+          resume=ckpt_cfg.get("resume", True) and not args.fresh)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
+from periods import sequence_meta_name, split_csv_name
 from pipeline_config import SOURCE
 
 
@@ -61,7 +62,7 @@ N_COLS = 6
 N_ROWS = 3
 
 
-def _load_step_minutes(data_root, source="dbscan"):
+def _load_step_minutes(data_root, source="dbscan", period=None):
     """Read the cadence (`step_minutes`) used to build the per-source
     split CSVs.
 
@@ -77,7 +78,7 @@ def _load_step_minutes(data_root, source="dbscan"):
       3. 15 minutes (historical hardcoded default).
     """
     candidates = [
-        os.path.join(data_root, f"sequence_meta_{source}.json"),
+        os.path.join(data_root, sequence_meta_name(source, period)),
         os.path.join(data_root, "timestep_config.json"),
     ]
     for path in candidates:
@@ -508,6 +509,13 @@ def main():
              "explicitly. Default: train."
     )
     parser.add_argument(
+        "--period", "-p", type=str, default=None, metavar="LABEL",
+        help="Describe a period's split instead of the whole archive: "
+             "--period w34 reads <split>_data_<source>_w34.csv and the "
+             "matching sequence_meta. Ignored when --csv is given "
+             "explicitly. Omit for the untagged whole-archive split."
+    )
+    parser.add_argument(
         "--csv", "-c", type=str, default=None,
         help="Explicit path to a per-source split CSV "
              "(train_data_<source>.csv / validation_data_<source>.csv / "
@@ -525,9 +533,12 @@ def main():
                 seq_path = alt_path
     else:
         seq_path = os.path.join(
-            args.data_root, f"{args.split}_data_{SOURCE}.csv",
+            args.data_root,
+            split_csv_name(args.split, SOURCE, args.period),
         )
     out_dir = os.path.join(args.data_root, 'data_statistics')
+    if args.period:
+        out_dir = os.path.join(out_dir, args.period)
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
@@ -561,11 +572,10 @@ def main():
         for other in ("train", "validation", "test"):
             if other == args.split:
                 continue
-            other_path = os.path.join(
-                args.data_root, f"{other}_data_{SOURCE}.csv",
-            )
+            other_name = split_csv_name(other, SOURCE, args.period)
+            other_path = os.path.join(args.data_root, other_name)
             if not os.path.isfile(other_path):
-                print(f"  ({other}_data_{SOURCE}.csv not found - "
+                print(f"  ({other_name} not found - "
                       f"plots 1-4 will skip it)")
                 continue
             extra = load_sequences(other_path)

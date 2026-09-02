@@ -47,6 +47,7 @@ from netCDF4 import Dataset
 from pyresample import geometry, kd_tree
 
 from c4dl.projection import GridProjection, romania_grid_area
+from compress_datasets import array_exists, list_arrays, load_array
 
 
 # Path to the timestep configuration file produced by validate_timestep.py
@@ -695,9 +696,7 @@ def discover_opera_files(data_root):
         day_dir = os.path.join(opera_dir, entry)
         if not os.path.isdir(day_dir):
             continue
-        for f in sorted(os.listdir(day_dir)):
-            if not f.endswith('.npy'):
-                continue
+        for f in list_arrays(day_dir):
             if not is_on_grid(f):
                 filtered += 1
                 continue
@@ -740,7 +739,7 @@ def process_single_opera_file(filepath):
     date_str, time_str, iso_str = parse_opera_filename(filepath)
     if date_str is None:
         return None
-    reprojected = np.load(filepath)
+    reprojected = load_array(filepath)
     # NaN may appear for off-grid pixels; DBSCAN expects finite values.
     reprojected = np.nan_to_num(reprojected, nan=0.0)
     binary_mask = dbscan_binary_mask(reprojected)
@@ -749,7 +748,7 @@ def process_single_opera_file(filepath):
 
 
 def purge_plots(output_dir):
-    """Delete every .png and .nc under <output_dir>/plots, with progress.
+    """Delete every .png and .nc under <output_dir>/plots.
 
     These are diagnostics, not pipeline inputs: nothing reads them, and
     `--date <d> --plot` regenerates them. The .nc files are the reason
@@ -776,9 +775,8 @@ def purge_plots(output_dir):
 
     print(f"Deleting {total:,} diagnostic file(s) under {plot_dir} ...")
 
-    width = 40
     freed = removed = failed = 0
-    for i, path in enumerate(targets, start=1):
+    for path in targets:
         try:
             freed += os.path.getsize(path)
             os.remove(path)
@@ -786,19 +784,8 @@ def purge_plots(output_dir):
         except OSError as exc:
             failed += 1
             if failed <= 5:
-                print(f"{chr(10)}  WARNING: could not remove {path}: {exc}",
+                print(f"  WARNING: could not remove {path}: {exc}",
                       file=sys.stderr)
-
-        # Redraw at most ~200 times: a bar that flushes on every file is
-        # slower than the deletion it is measuring.
-        if i % max(1, total // 200) == 0 or i == total:
-            done = int(width * i / total)
-            bar = "#" * done + "." * (width - done)
-            sys.stdout.write(
-                f"\r  [{bar}] {i / total * 100:5.1f}%  "
-                f"{i:,}/{total:,}  {freed / (1024 ** 3):.2f} GB freed")
-            sys.stdout.flush()
-    sys.stdout.write(chr(10))
 
     print(f"  Removed {removed:,} file(s), freed "
           f"{freed / (1024 ** 3):.2f} GB")
