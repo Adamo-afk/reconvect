@@ -414,7 +414,7 @@ python create_datasets.py --mode opera_radar_only_rainfall --period w34 --no-arc
 python sepconv_ensemble_training.py --period w44
 python train_models.py --config training.config --mode opera_radar_only_rainfall --period w34 --stage base
 ```
-- **Does** — trains Bm1/Bm3/Bm5 (t+1, t+3, t+5 = 15/45/75 min) for the baseline, and the RECONVECT-architecture ablation.
+- **Does** — trains the baseline's three base models and the RECONVECT-architecture ablation. Each `Bm{k}` is named for its **own** lead — how far ahead it predicts from the end of its own input window — not for the horizon it serves: Bm1 supplies t+1, Bm3 supplies t+2 and t+3, and Bm5 supplies t+4 because its window is shifted back one step. The **forecast horizon is t+4 = 60 min**; the 75 min in Bm5's name is its intrinsic lead, not a product.
 - **Writes** — `models/sepconv_<run_tag>_bm{1,3,5}.keras`, `history_sepconv_<run_tag>.json` **CRITICAL**
 - **Also writes** — `models/checkpoints/<name>_latest.keras` after every epoch, with a `.json` sidecar carrying the next-epoch index. Both models resume from it; `--fresh` ignores it. So each run leaves **two** states: best weights in the final save, last epoch in the checkpoint.
 - **Note** — both read the same `training.config`: `[defaults]` supplies `epochs` and `batch_size` to each, and the optional `[sepconv]` section overrides them, inheriting `learning_rate` from `[lr_schedule].initial_lr` and `es_patience` from `[early_stopping].patience`. A gap between the two models therefore cannot be a gap in training budget. The learning-rate *schedule* is deliberately not unified — RECONVECT uses cosine warmup, the baseline reproduces the paper's `ReduceLROnPlateau`.

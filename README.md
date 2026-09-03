@@ -422,7 +422,7 @@ reach only +1, +3 and +5 — landing on +2 and +4 requires a window ending
 at `t−1`, and therefore a fifth frame. The baseline needs `past=4`
 whatever the horizon.
 
-`Bm1/Bm3/Bm5` land at 15/45/75 min on our grid, not the paper's 6/18/30.
+`Bm1/Bm3/Bm5` are named for their own leads — 15/45/75 min on our grid, against the paper's 6/18/30. Those are leads *from each model's own window end*, not forecast horizons: Bm5's window is shifted back one step, so it supplies t+4. **The composition forecasts to t+4 = 60 min and no further.**
 
 ### Normalization scoping
 
