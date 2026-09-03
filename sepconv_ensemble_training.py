@@ -332,7 +332,7 @@ class WallTimeCallback(Callback):
 # ============================================================================
 
 def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
-                    checkpoint_cfg=None, resume=True,
+                     ds_root, checkpoint_cfg=None, resume=True,
                      learning_rate=1e-3, lr_patience=5, es_patience=10,
                      period=None):
     """Train one base model Bm{lead_steps}.
@@ -347,12 +347,14 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
     lead_name = LEAD_NAMES[lead_steps]
 
     print(f"\n{'-' * 60}")
-    print(f"  Training Bm{lead_steps} "
-          f"({lead_name} = {LEAD_MINUTES[lead_steps]} min ahead)")
+    print(f"  Training Bm{lead_steps}: {lead_steps}-step model, "
+          f"{LEAD_MINUTES[lead_steps]} min from its own window end")
     print(f"{'-' * 60}")
 
-    ds_root = (data_root / "datasets"
-               / build_run_tag(SEPCONV_MODE, SOURCE, period))
+    # `ds_root` is passed in, never rebuilt here: train() already
+    # resolved it against --datasets_root and checked the splits exist.
+    # Deriving it a second time is how the check came to pass on one disk
+    # while the loader looked on another.
     train_ds = prepare_dataset(ds_root / "train", lead_steps, batch_size, True)
     val_ds = prepare_dataset(ds_root / "validation", lead_steps, batch_size)
 
@@ -489,13 +491,35 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
     print(f"  Train: {n_train}, Val: {n_val}")
 
     leads_to_train = [lead] if lead is not None else list(SEPCONV_BASE_LEADS)
-    print(f"  Base models: {[f'Bm{k} (t+{LEAD_MINUTES[k]}min)' for k in leads_to_train]}")
+
+    # A base model is named for its OWN lead - how far ahead it predicts
+    # from the end of its own input window - not for the horizon it
+    # serves. Bm5 is a 5-step model, but it supplies t+4 because its
+    # window is shifted back one step. Spelling both out, because
+    # "Bm5 (t+75min)" reads as a 75-minute forecast and the ensemble
+    # makes no such thing.
+    from sepconv_compose import COMPOSITION, OBSERVED_ONLY_STEPS
+    serves = {}
+    for step, lead_k, _offsets in COMPOSITION:
+        if step in OBSERVED_ONLY_STEPS:
+            serves.setdefault(lead_k, []).append(step)
+    print("  Base models (each named by its own lead, not the horizon):")
+    for k in leads_to_train:
+        steps = serves.get(k, [])
+        supplies = (", ".join(f"t+{t} ({LEAD_MINUTES[t]} min)" for t in steps)
+                    if steps else "not used by the composition")
+        print(f"    Bm{k}: {k}-step model "
+              f"({LEAD_MINUTES[k]} min from its window end) -> {supplies}")
+    horizon = max(OBSERVED_ONLY_STEPS)
+    print(f"  Forecast horizon: t+{horizon} = {LEAD_MINUTES[horizon]} min "
+          f"(nothing autoregressive)")
     total_start = time.time()
     all_results = {}
 
     for lead_steps in leads_to_train:
         all_results[f"bm{lead_steps}"] = train_base_model(
             lead_steps, data_root, model_dir, epochs, batch_size,
+            ds_root=ds_root,
             checkpoint_cfg=checkpoint_cfg, resume=resume,
             learning_rate=learning_rate, lr_patience=lr_patience,
             es_patience=es_patience, period=period)
