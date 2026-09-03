@@ -90,14 +90,17 @@ from train_models import build_run_tag
 from periods import normalization_stats_name
 from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 
-_MODE_CHOICES = [
-    "mtg_lightning",
-    "mtg_radar_rainfall", "mtg_radar_continuous_rainfall",
-    "mtg_opera_radar_only_rainfall", "mtg_opera_mtgmr_rainfall",
-    "mtg_lightning_opera_rainfall",
-    "mtg_lightning_opera_occurrence",
-    "mtg_opera_occurrence",
-]
+def _mode_choices():
+    """Every mode with trained weights, derived from the registries.
+
+    Never a hardcoded literal: the list this replaces still named three
+    modes that had been retired, and omitted ones that had been added,
+    so a valid mode was rejected while dead names were accepted.
+    """
+    from train_lightning_kd import STUDENT_MODE
+    from train_models import TRAINING_MODES
+    return sorted(set(TRAINING_MODES) | {STUDENT_MODE})
+
 
 
 # ============================================================================
@@ -966,7 +969,7 @@ def main() -> int:
                     "without touching training-pipeline artefacts.",
     )
     parser.add_argument("--mode", required=True, type=str,
-                        choices=_MODE_CHOICES,
+                        choices=_mode_choices(),
                         help="Model variant. The name states its own track: "
                              "`_rainfall` for the OPERA 5-class head, "
                              "`_occurrence` for the lightning binary head.")

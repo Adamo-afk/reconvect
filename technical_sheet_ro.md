@@ -92,17 +92,16 @@ de interpolare.
 
 ## 3. Moduri: intrări și etichete
 
-Denumirea modului indică direct sarcina: `_rainfall` = OPERA în 5 clase, `_continuous` =
-regresie OPERA (varianta utilizată pentru comparația cu modelul de referință),
-`_occurrence` = fulgere binar. Eticheta este întotdeauna HR (256 px), indiferent de
-nivelurile de intrare.
+Denumirea modului indică direct sarcina: `_rainfall` = OPERA în 5 clase, `_logz` =
+precipitații OPERA în spațiul `log_zscore` (ținta proprie a modelului de referință
+SepConv), `_occurrence` = fulgere binar. Eticheta este întotdeauna HR (256 px), indiferent
+de nivelurile de intrare.
 
 | Mod | Intrări HR | Intrări MR | Etichetă |
 |---|---|---|---|
 | `mtg_opera_radar_only_rainfall` | `vis_06` | `opera_reflectivity` `opera_rainfall_rate` | precipitații, 5 clase |
 | `mtg_opera_mtgmr_rainfall` | `vis_06` | + `ir_38` `ir_105` `wv_63` `wv_73` | precipitații, 5 clase |
 | `mtg_lightning_opera_rainfall` | `density` `current` `occurrence` `vis_06` | + MTG IR/WV | precipitații, 5 clase |
-| `mtg_opera_mtgmr_continuous` | `vis_06` | + MTG IR/WV | precipitații, regresie |
 | `mtg_lightning_opera_occurrence` | `density` `current` `occurrence` `vis_06` | + MTG IR/WV | fulgere, binar |
 | `mtg_opera_occurrence` † | `vis_06` | + MTG IR/WV | fulgere, binar |
 | `opera_radar_only_rainfall` ‡ | `opera_rainfall_rate_hr` | — | precipitații, 5 clase |
@@ -168,7 +167,6 @@ sub `--min_free_gb`, criteriu reevaluat înaintea fiecărei ferestre **și în a
 | Optimizator | `Adam(lr=1e-3)` | etapa base |
 | Pierdere (fulgere) | `WeightedFocalLoss(gamma=2.0)` | distribuție a priori din `lightning_fraction` |
 | Pierdere (clasificarea precipitațiilor) | `WeightedFocalCategoricalCrossentropy` | distribuție a priori din `opera_rainfall_fraction` |
-| Pierdere (regresia precipitațiilor) | MSE ponderat | comună cu SepConv |
 | Epoci / batch | `20` / `32` | toate |
 | Dropout / normalizare | `0.1` / `layer` | toate |
 | Precizie mixtă | `true` (fp16) | toate |
@@ -648,7 +646,7 @@ printr-o joncțiune NTFS. **CRITIC** Blocajele de arhivare și marcajele de util
 
 Matricele reprezintă cea mai mare parte a proiectului — **5.292 GB în 1,10 milioane de
 fișiere**, față de ~66 GB de seturi de date construite. Acestea sunt comprimate **direct pe
-loc** cu zstd (`foo.npy` → `foo.npy.zst`), nu arhivate integral, deoarece fluxul de
+loc** cu zstd, nu arhivate integral, deoarece fluxul de
 procesare le deschide câte un cadru pe rând, după denumire. Fiecare cititor rezolvă
 denumirea logică `.npy` către forma existentă pe disc, astfel încât **nu este necesară nicio
 restaurare înaintea unei execuții**.

@@ -9,14 +9,14 @@ Loss: weighted MSE from Czibula et al. 2024 (upweights high precipitation).
 Labels: one-hot from create_datasets.py auto-converted to continuous midpoints.
 Classification: recovered at evaluation time via post-processing thresholds.
 
-Baseline counterpart to COALITION-4's `mtg_opera_mtgmr_continuous` mode:
-same inputs, same continuous OPERA rainfall target, different
-architecture. Compare the two either continuous-vs-continuous, or with
-both binned back to the 5 classes via create_datasets.RAINFALL_CLASS_EDGES.
+Radar-only by design, and compared against `opera_radar_only_rainfall`
+on the identical input tensor. Both predictions are binned in mm/h at
+create_datasets.RAINFALL_CLASS_EDGES, so the two cannot be told apart by
+their thresholds.
 
 Usage:
-    python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous         --epochs 50 --batch_size 8
-    python sepconv_ensemble_training.py --mode mtg_opera_mtgmr_continuous         --lead 1 --epochs 50
+    python sepconv_ensemble_training.py --period w44
+    python sepconv_ensemble_training.py --period w44 --lead 1
 """
 
 import argparse
@@ -41,10 +41,6 @@ from pipeline_config import (
     resolve_datasets_root,
     resolve_model_dir,
 )
-# `weighted_loss_multiple_thresholds` / RAINFALL_MSE_WEIGHTS are NOT
-# imported any more: those were built for the /70-bounded continuous head.
-# The baseline's target is log_zscore, so its weighting is derived from
-# measured class frequencies instead — see build_sepconv_loss below.
 from train_models import (
     DEFAULT_TRAINING_CONFIG,
     build_run_tag,
@@ -57,12 +53,11 @@ from train_models import (
 # Mode configurations
 # ============================================================================
 
-# Branch shapes mirror create_datasets.get_mode_config for the matching
-# COALITION-4 mode, so the SepConv baseline consumes byte-identical
-# batches. `mtg_opera_mtgmr_continuous`:
-#   HR  = MTG vis_06                                        -> 1 channel
-#   MR  = OPERA reflectivity + rainfall_rate + MTG IR/WV     -> 6 channels
-# Leading 3 = past timesteps (t-2, t-1, t0).
+# Branch shapes mirror create_datasets.get_mode_config for
+# `opera_sepconv_logz`, so the baseline consumes byte-identical batches:
+#   HR  = OPERA rainfall_rate at 256 px                     -> 1 channel
+# The ablation it is compared against carries the same single field in
+# the same tier, so a gap between them is architecture, not input.
 # The baseline is radar-only by design — no MTG, no LINET. Modality
 # enrichment is what RECONVECT is being credited for, so handing it to
 # the baseline would erase the very difference under test.

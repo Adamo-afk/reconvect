@@ -5,17 +5,14 @@ Creates train, validation, and test TF datasets from pre-extracted .npy patches.
 
 Every mode reads OPERA in MR and MTG vis_06 in HR; the lightning modes
 add the three LINET channels to HR. Mode names state their own track:
-`_rainfall` = OPERA rainfall 5-class, `_continuous` = OPERA rainfall
-regression, `_occurrence` = lightning binary. See BUILDABLE_MODES.
+`_rainfall` = OPERA rainfall 5-class, `_logz` = OPERA rainfall in
+log_zscore space, `_occurrence` = lightning binary. See BUILDABLE_MODES.
 
 Usage:
     # Rainfall track (5-class)
     python create_datasets.py --mode mtg_opera_radar_only_rainfall  --data_root ./our_data
     python create_datasets.py --mode mtg_opera_mtgmr_rainfall       --data_root ./our_data
     python create_datasets.py --mode mtg_lightning_opera_rainfall   --data_root ./our_data
-
-    # Rainfall track, continuous head (SepConv baseline)
-    python create_datasets.py --mode mtg_opera_mtgmr_continuous     --data_root ./our_data
 
     # Lightning track (binary occurrence)
     python create_datasets.py --mode mtg_lightning_opera_occurrence --data_root ./our_data
@@ -284,13 +281,10 @@ def label_transform_occurrence(x):
     return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
-# Shared 5-class rain-rate bin edges (mm/h). The continuous label below
-# normalises against RAINFALL_MAX_MMH so the two heads describe the same
-# physical quantity on different scales — that is what makes the
-# `*_rainfall` (5-class) and `*_continuous` (regression) modes directly
-# comparable in the SepConv baseline study.
+# Shared 5-class rain-rate bin edges (mm/h). The RECONVECT label and the
+# SepConv baseline's predictions are both binned at these, so the two
+# models cannot be told apart by their thresholds.
 RAINFALL_CLASS_EDGES = (10.0, 20.0, 30.0, 40.0)
-RAINFALL_MAX_MMH = 70.0
 
 
 def label_transform_opera_rainfall_multiclass(x):
@@ -323,9 +317,8 @@ def label_transform_opera_rainfall_logz(x):
     in the space it consumes it, so a composed rollout can feed its own
     output back in without a change of units.
 
-    Deliberately NOT the `/RAINFALL_MAX_MMH` scaling used by
-    `label_transform_opera_rainfall_continuous`. That one is bounded in
-    [0, 1] and linear in mm/h, which crushes the 10-70 mm/h band this
+    Deliberately not a bounded linear /max scaling: that kind sits in
+    [0, 1] and is linear in mm/h, which crushes the 10-70 mm/h band this
     comparison is about into the top 14% of its range.
 
     Inverting for physical-space thresholding is `10 ** (z * std + mean)`
@@ -353,26 +346,10 @@ def mmh_to_logz(mmh):
     return (np.log10(clipped) - spec["mean"]) / spec["std"]
 
 
-def label_transform_opera_rainfall_continuous(x):
-    """OPERA instantaneous rain rate → continuous label in [0, 1].
-
-    NaN → 0, clip to [0, RAINFALL_MAX_MMH], divide by RAINFALL_MAX_MMH.
-    Target of the `*_continuous` modes, which exist so the SepConv
-    ensemble (a regression model) can be baselined against COALITION-4
-    on identical inputs — either continuous-vs-continuous, or by binning
-    both back to the 5 classes via RAINFALL_CLASS_EDGES.
-    Returns (H, W) float32.
-    """
-    x = np.where(np.isnan(x), 0.0, x)
-    x = np.clip(x, 0.0, RAINFALL_MAX_MMH)
-    return (x / RAINFALL_MAX_MMH).astype(np.float32)
-
-
 # Number of label channels per target type
 LABEL_CHANNELS = {
     "lightning": 1,           # binary occurrence
     "radar": 5,               # 5-class precipitation
-    "radar_continuous": 1,    # continuous rain rate [0, 1]
     "radar_logz": 1,          # rain rate in log_zscore space (SepConv)
 }
 
@@ -449,7 +426,7 @@ INPUT_GROUP_KEYS = ("past_hr", "past_mr")
 # plus one entry here.
 #
 # Naming: the mode name states its own track — `_rainfall` = OPERA
-# rainfall 5-class, `_continuous` = OPERA rainfall regression,
+# rainfall 5-class, `_logz` = OPERA rainfall in log_zscore space,
 # `_occurrence` = lightning binary. train_models.build_run_tag appends
 # `_<source>` to get the on-disk artefact tag.
 
@@ -458,7 +435,6 @@ BUILDABLE_MODES = (
     "mtg_opera_radar_only_rainfall",
     "mtg_opera_mtgmr_rainfall",
     "mtg_lightning_opera_rainfall",
-    "mtg_opera_mtgmr_continuous",
     "mtg_lightning_opera_occurrence",
     # Baseline comparison pair — radar-only, see get_mode_config.
     # `opera_sepconv_logz` needs a past=4/future=8 sequence set;
@@ -601,23 +577,6 @@ def get_mode_config(mode):
             "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
             "label_type": "radar",
-        }
-
-    # --- Rainfall track, continuous head (SepConv baseline) -----------
-    elif mode == "mtg_opera_mtgmr_continuous":
-        # Identical input stack to `mtg_opera_mtgmr_rainfall`; the only
-        # difference is the head, which regresses normalised rain rate
-        # instead of emitting 5 classes. That pairing is the point: it
-        # lets the SepConv ensemble be baselined against COALITION-4
-        # either continuous-vs-continuous, or with both binned back to
-        # the 5 classes via RAINFALL_CLASS_EDGES.
-        return {
-            "past_hr": (hr_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "MR"),
-            "label_var": "opera_rainfall_rate_hr",
-            "label_transform": label_transform_opera_rainfall_continuous,
-            "label_suffix": "HR",
-            "label_type": "radar_continuous",
         }
 
     # --- Lightning track: binary occurrence ---------------------------

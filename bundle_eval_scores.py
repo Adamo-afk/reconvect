@@ -81,7 +81,7 @@ def _default_metric(label_type: str) -> str:
         return "CSI"
     if label_type == "radar":
         return "accuracy"
-    # Anything else (e.g. radar_continuous) falls back to MAE if present.
+    # Anything without a CSI column falls back to MAE if present.
     return "MAE"
 
 
