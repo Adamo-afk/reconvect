@@ -37,7 +37,6 @@ choices for the full list).
                  in MR.
         Target:  opera_rainfall_rate 5-class.
 
-  - mtg_opera_mtgmr_continuous
         Inputs:  same as mtg_opera_mtgmr_rainfall.
         Target:  opera_rainfall_rate continuous regression in [0, 1].
                  Exists so the SepConv ensemble baseline can be compared
@@ -55,7 +54,7 @@ A sixth mode, `mtg_opera_occurrence`, is the knowledge-distillation
 student. It is NOT trainable here — see train_lightning_kd.py.
 
 Mode names carry their own track marker: `_rainfall` (5-class),
-`_continuous` (regression), `_occurrence` (lightning binary). The mode
+`_logz` (log_zscore, the baseline), `_occurrence` (lightning binary). The mode
 name is therefore also the artefact tag — `build_run_tag` just appends
 `_<source>`.
 
@@ -126,11 +125,6 @@ TRAINING_MODES: dict[str, dict[str, str]] = {
         "target":  "opera_rainfall_rate 5-class",
         "summary": "Lightning + MTG vis_06 in HR; OPERA + MTG IR/WV in MR; "
                    "OPERA rainfall as label.",
-    },
-    "mtg_opera_mtgmr_continuous": {
-        "target":  "opera_rainfall_rate continuous regression",
-        "summary": "Same inputs as mtg_opera_mtgmr_rainfall, regression "
-                   "head. Counterpart for the SepConv ensemble baseline.",
     },
     "mtg_lightning_opera_occurrence": {
         "target":  "lightning binary occurrence",
@@ -948,16 +942,8 @@ def _build_radar_loss(class_fractions, radar_loss_cfg):
 
 
 # ============================================================================
-# Continuous rainfall loss (regression head)
+# SepConv baseline loss: inverse-frequency weights in log_zscore space
 # ============================================================================
-# Weights from Czibula et al. The `_continuous` modes exist to be compared
-# against the SepConv ensemble baseline, so BOTH models must minimise the
-# same objective — otherwise an architecture comparison is confounded by a
-# loss change. sepconv_ensemble_training.py imports this function rather
-# than keeping its own copy, so the two cannot drift apart.
-# ---------------------------------------------------------------------------
-# SepConv baseline: inverse-frequency weights in log_zscore space
-# ---------------------------------------------------------------------------
 # The paper's own weighting ("modified MSE ... more weight to higher
 # values") is unpublished, so this is ours and is documented as ours.
 #
@@ -1011,42 +997,6 @@ def load_sepconv_class_weights(data_root, source, period=None,
     with open(path, encoding="utf-8") as fh:
         fractions = json.load(fh)["fractions"]
     return sepconv_class_weights(fractions, cap=cap)
-
-
-RAINFALL_MSE_WEIGHTS = [15, 1, 2, 7, 15, 30, 1000]
-
-
-def weighted_loss_multiple_thresholds(weights=None, max_value=1.0):
-    """Weighted MSE that upweights high precipitation.
-
-    Splits [0, max_value] into len(weights) equal bins and applies a
-    per-bin weight to the squared error, so the rare intense-rainfall
-    pixels are not drowned out by the dry majority. Operates on the
-    normalised target (rain rate / RAINFALL_MAX_MMH), hence max_value=1.
-    """
-    if weights is None:
-        weights = RAINFALL_MSE_WEIGHTS
-    num_steps = len(weights)
-    thresholds = [max_value * i / num_steps for i in range(1, num_steps)]
-
-    def inner_weighted_loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        diff = tf.pow(y_true - y_pred, 2)
-
-        masks_less = [tf.cast(y_true < t, tf.float32) for t in thresholds]
-        masks_greater = [tf.cast(y_true >= t, tf.float32)
-                         for t in [0.0] + thresholds]
-
-        result = tf.constant(0.0, dtype=tf.float32)
-        for i in range(len(masks_less)):
-            result += weights[i] * tf.reduce_mean(
-                masks_less[i] * masks_greater[i] * diff)
-        result += weights[-1] * tf.reduce_mean(masks_greater[-1] * diff)
-        return result
-
-    inner_weighted_loss.__name__ = "weighted_mse_rainfall"
-    return inner_weighted_loss
 
 
 def build_coalition_model(input_shapes, label_type, past_timesteps=3,
@@ -1164,17 +1114,6 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
                             activation='sigmoid', dtype='float32')
         loss = WeightedFocalLoss(ones_fraction=ones_fraction, gamma=2.0)
         metrics = [iou_metric, true_pos, false_pos, false_neg]
-    elif label_type == "radar_continuous":
-        # Regression head: ONE channel, sigmoid into [0, 1] matching the
-        # normalised label (rain rate / RAINFALL_MAX_MMH). Deliberately
-        # the same weighted MSE the SepConv baseline minimises so the two
-        # differ only in architecture. Do NOT route this through the
-        # 5-class branch below - the label carries 1 channel, not 5.
-        num_outputs = 1
-        final_conv = Conv2D(num_outputs, kernel_size=(1, 1),
-                            activation='sigmoid', dtype='float32')
-        loss = weighted_loss_multiple_thresholds()
-        metrics = ['mae', 'mse']
     else:  # radar multiclass
         num_outputs = 5
         final_conv = Conv2D(num_outputs, kernel_size=(1, 1),

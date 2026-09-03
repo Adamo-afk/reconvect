@@ -82,16 +82,15 @@ fabricate pixels and the model would overfit interpolation artefacts.
 
 ## 3. Modes: inputs and labels
 
-The mode name states its track: `_rainfall` = OPERA 5-class, `_continuous` = OPERA
-regression (the counterpart used for the baseline comparison), `_occurrence` = lightning
-binary. The label is always HR (256 px) regardless of input tiers.
+The mode name states its track: `_rainfall` = OPERA 5-class, `_logz` = OPERA rainfall in
+`log_zscore` space (the SepConv baseline's own target), `_occurrence` = lightning binary.
+The label is always HR (256 px) regardless of input tiers.
 
 | Mode | HR inputs | MR inputs | Label |
 |---|---|---|---|
 | `mtg_opera_radar_only_rainfall` | `vis_06` | `opera_reflectivity` `opera_rainfall_rate` | rainfall 5-class |
 | `mtg_opera_mtgmr_rainfall` | `vis_06` | + `ir_38` `ir_105` `wv_63` `wv_73` | rainfall 5-class |
 | `mtg_lightning_opera_rainfall` | `density` `current` `occurrence` `vis_06` | + MTG IR/WV | rainfall 5-class |
-| `mtg_opera_mtgmr_continuous` | `vis_06` | + MTG IR/WV | rainfall regression |
 | `mtg_lightning_opera_occurrence` | `density` `current` `occurrence` `vis_06` | + MTG IR/WV | lightning binary |
 | `mtg_opera_occurrence` † | `vis_06` | + MTG IR/WV | lightning binary |
 | `opera_radar_only_rainfall` ‡ | `opera_rainfall_rate_hr` | — | rainfall 5-class |
@@ -153,7 +152,6 @@ space to the disk it is reading from. `store_registry.py` records which date lan
 | Optimizer | `Adam(lr=1e-3)` | base stage |
 | Loss (lightning) | `WeightedFocalLoss(gamma=2.0)` | prior from `lightning_fraction` |
 | Loss (rain classification) | `WeightedFocalCategoricalCrossentropy` | prior from `opera_rainfall_fraction` |
-| Loss (rain regression) | weighted MSE | shared with SepConv |
 | Epochs / batch | `20` / `32` | all |
 | Dropout / norm | `0.1` / `layer` | all |
 | Mixed precision | `true` (fp16) | all |
@@ -625,8 +623,8 @@ restore/reclaim lifecycle consistent with training.
 ### Reclaiming disk: compressing the `.npy` stores
 
 The arrays are the bulk of the project — **5,292 GB across 1.10 M files**, against ~66 GB
-of built datasets. They are compressed **in place** with zstd (`foo.npy` → `foo.npy.zst`),
-not archived whole, because the pipeline opens them one frame at a time by name. Every
+of built datasets. They are compressed **in place** with zstd, not archived whole,
+because the pipeline opens them one frame at a time by name. Every
 reader resolves the logical `.npy` to whichever form is on disk, so **nothing needs
 restoring before a run**.
 
