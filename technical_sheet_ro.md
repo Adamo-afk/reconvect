@@ -22,7 +22,7 @@ arhivă       2025-01-01 .. 2026-08-13
 [5 Arhitectură](#5-arhitectura-și-parametrii-impliciți-de-antrenare) · [6 Praguri](#6-praguri-esențiale) ·
 [7 Etape comune](#7-planul-de-execuție--etapele-comune) · [8 Ramura A](#8-ramura-a-antrenarea-completă-reconvect) ·
 [9 Ramura B](#9-ramura-b-studiul-de-ablație-și-modelul-de-referință-sepconv-ens) ·
-[10 Ramura C](#10-ramura-c-ansamblul-sezonier) · [11 Ramura D](#11-ramura-d-distilarea-cunoștințelor) ·
+[10 Ramura C](#10-ramura-c-ansamblul-sezonier) · [11 Ramura D](#11-ramura-d-transferul-de-cunoștințe) ·
 [12 Criticalitate](#12-criticalitatea-artefactelor)
 
 ---
@@ -108,7 +108,7 @@ nivelurile de intrare.
 | `opera_radar_only_rainfall` ‡ | `opera_rainfall_rate_hr` | — | precipitații, 5 clase |
 | `opera_sepconv_logz` ‡ | `opera_rainfall_rate_hr` | — | precipitații `log_zscore` |
 
-† Exclusiv model-student pentru distilare — nu poate fi construit cu `create_datasets.py`; se antrenează pe setul de date al modelului-profesor.
+† Exclusiv model-student pentru transferul de cunoștințe — nu poate fi construit cu `create_datasets.py`; se antrenează pe setul de date al modelului-profesor.
 ‡ Perechea de comparație cu modelul de referință, exclusiv radar prin concepție. Ambele preiau câmpul în HR la 256 px, astfel încât tensorii de intrare sunt identici; rezoluția de ieșire a modelului este dată de cea mai fină intrare a sa, iar acesta este singurul mod fără alt canal HR care să o mențină la 256.
 
 Numărul de canale decurge direct: un tensor HR are forma `(T, 256, 256, n_hr)`, iar unul LR
@@ -522,7 +522,7 @@ membrul de sezon și apoi la modelul global.
 
 ---
 
-## 11. Ramura D: distilarea cunoștințelor
+## 11. Ramura D: transferul de cunoștințe
 
 Antrenează un model-student care funcționează **fără intrare de fulgere**, astfel încât
 componenta de fulgere să poată fi utilizată și la datele la care LINET nu este disponibil.
@@ -535,7 +535,7 @@ python train_models.py --config training.config --mode mtg_lightning_opera_occur
 - **Descriere** — modelul-profesor primește stiva completă de intrări, inclusiv LINET `density`, `current`, `occurrence`.
 - **Scrie** — `models/coalition_mtg_lightning_opera_occurrence_<source>.keras` **CRITIC**
 
-### D2. Distilarea către modelul-student
+### D2. Transferul cunoștințelor către modelul-student
 ```bash
 python train_lightning_kd.py --teacher_mode mtg_lightning_opera_occurrence --student_mode mtg_opera_occurrence
 ```
