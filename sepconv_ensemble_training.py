@@ -344,7 +344,7 @@ class WallTimeCallback(Callback):
 def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
                      ds_root, checkpoint_cfg=None, resume=True,
                      learning_rate=1e-3, lr_patience=5, es_patience=10,
-                     period=None, verbose=1):
+                     period=None, verbose=1, steps_per_execution=1):
     """Train one base model Bm{lead_steps}.
 
     Optimiser parity with the paper: AMSGrad variant of Adam at lr 1e-3,
@@ -382,7 +382,16 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
     # with this same period.
     loss = build_sepconv_loss(data_root, SOURCE,
                               weights_period=period, stats_period=period)
-    model.compile(optimizer=optimizer, loss=loss, metrics=["mse", "mae"])
+    # `steps_per_execution` is what removes the `on_train_batch_end is
+    # slow` warning. Keras syncs the metric tensors from device to host
+    # inside its per-batch hook, so the cost it reports as a callback is
+    # really a GPU stall - and it does not go away by making the
+    # callbacks cheaper, because none of ours implement a batch hook.
+    # Running N batches per tf.function call fires the hooks every N
+    # batches instead, amortising the sync. Epoch-level callbacks
+    # (ReduceLROnPlateau, EarlyStopping, the checkpoint) are unaffected.
+    model.compile(optimizer=optimizer, loss=loss, metrics=["mse", "mae"],
+                  steps_per_execution=steps_per_execution)
 
     reduce_lr = ReduceLROnPlateau(
         monitor='val_loss', factor=0.5, patience=lr_patience,
@@ -461,7 +470,8 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
 
 def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
           learning_rate=1e-3, lr_patience=5, es_patience=6, period=None,
-          datasets_root=None, checkpoint_cfg=None, resume=True, verbose=1):
+          datasets_root=None, checkpoint_cfg=None, resume=True, verbose=1,
+          steps_per_execution=1):
     data_root = resolve_data_root(data_root)
     datasets_root = resolve_datasets_root(data_root, datasets_root)
     model_dir = resolve_model_dir(model_dir)
@@ -479,11 +489,26 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
                 f"    python create_datasets.py --mode {SEPCONV_MODE} "
                 f"--period <label>")
 
-    # NOTE: no mixed precision here. The target lives in log_zscore space
-    # with a tail at z = +9.5 and a loss weight up to 1000x, so the
-    # weighted squared error reaches ~1e5 — comfortably inside fp32 but
-    # close enough to fp16's 65504 ceiling that overflow is a real risk.
-    # The model is 100k parameters; there is nothing to gain by taking it.
+    # NOTE: no mixed precision here, for two independent reasons.
+    #
+    # Numerically: the target lives in log_zscore space with a tail at
+    # z = +9.5 and a loss weight up to 1000x, so the weighted squared
+    # error reaches ~1e5 — comfortably inside fp32 but close enough to
+    # fp16's 65504 ceiling that overflow is a real risk.
+    #
+    # And it would not even be faster. Measured on this model at batch
+    # 32: fp32 1156 ms/batch, mixed_float16 2963 ms/batch — 2.6x SLOWER.
+    # The trunk is eleven separable convolutions at full 256x256 with no
+    # spatial reduction, so it is depthwise-dominated; depthwise kernels
+    # do not use tensor cores, and the casts plus loss-scaling machinery
+    # are pure overhead. XLA is no help either: jit_compile fails because
+    # ResourceApplyAdamWithAmsgrad has no XLA_GPU_JIT kernel, and AMSGrad
+    # is the published optimiser.
+    #
+    # The model is simply compute-bound: ~28 samples/s regardless of
+    # batch size, so ~28 min per epoch over this split. That is the cost
+    # of the architecture, not of the input pipeline (65 ms/batch) or of
+    # the callbacks (none of ours implement a per-batch hook).
     tf.keras.mixed_precision.set_global_policy('float32')
 
     mode_config = get_mode_config(SEPCONV_MODE)
@@ -538,6 +563,7 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
         all_results[f"bm{lead_steps}"] = train_base_model(
             lead_steps, data_root, model_dir, epochs, batch_size,
             ds_root=ds_root, verbose=verbose,
+            steps_per_execution=steps_per_execution,
             checkpoint_cfg=checkpoint_cfg, resume=resume,
             learning_rate=learning_rate, lr_patience=lr_patience,
             es_patience=es_patience, period=period)
@@ -628,6 +654,14 @@ def main():
     parser.add_argument("--es_patience", type=int, default=None,
                         help="Override [sepconv].es_patience (which defaults "
                              "to [early_stopping].patience).")
+    parser.add_argument("--steps_per_execution", type=int, default=8,
+                        metavar="N",
+                        help="Batches per tf.function call. Keras syncs "
+                             "metrics from device to host in its per-batch "
+                             "hook, which it misreports as a slow callback; "
+                             "running N batches per call amortises that. 1 "
+                             "restores the old behaviour. Epoch-level "
+                             "callbacks are unaffected.")
     parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
                         help="Keras fit verbosity. 1 draws a per-batch "
                              "progress bar; 2 prints one line per epoch. On "
@@ -667,7 +701,8 @@ def main():
           datasets_root=args.datasets_root,
           checkpoint_cfg=ckpt_cfg,
           resume=ckpt_cfg.get("resume", True) and not args.fresh,
-          verbose=args.verbose)
+          verbose=args.verbose,
+          steps_per_execution=args.steps_per_execution)
 
 
 if __name__ == "__main__":
