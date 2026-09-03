@@ -9,10 +9,10 @@ from the cached reprojected data.
 
 Resolution categories:
     HR (1km)  -> no pooling   -> 256x256  (lightning, MTG vis_06)
-    LR (2km)  -> 2x2 avg pool -> 128x128  (MTG IR/WV channels)
+    MR (2km)  -> 2x2 avg pool -> 128x128  (MTG IR/WV channels)
 
 Output:
-    our_data/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
+    our_data/patches/{date}/{variable}_{HHMM}_{HR|MR}.npy
     Each file has shape (num_active_patches, H, W).
     Patch order matches the active patches from the source patch-index
     (patch_index.csv), so the idx_t* columns in the split CSVs index
@@ -59,10 +59,10 @@ N_PATCHES = N_COLS * N_ROWS
 
 MTG_PRODUCTS = {
     'vis_06': ('satellite_MTG', 'HR', 1),
-    'ir_38':  ('satellite_MTG', 'LR', 2),
-    'ir_105': ('satellite_MTG', 'LR', 2),
-    'wv_63':  ('satellite_MTG', 'LR', 2),
-    'wv_73':  ('satellite_MTG', 'LR', 2),
+    'ir_38':  ('satellite_MTG', 'MR', 2),
+    'ir_105': ('satellite_MTG', 'MR', 2),
+    'wv_63':  ('satellite_MTG', 'MR', 2),
+    'wv_73':  ('satellite_MTG', 'MR', 2),
 }
 
 LIGHTNING_PRODUCTS = {
@@ -76,8 +76,8 @@ LIGHTNING_PRODUCTS = {
 # HR (no pooling, 256×256) so it can be used as the multi-class label target
 # in OPERA-driven modes. Both aliases point to the same source `.npy`.
 OPERA_PRODUCTS = {
-    'opera_reflectivity':     ('opera', 'LR', 2),
-    'opera_rainfall_rate':    ('opera', 'LR', 2),
+    'opera_reflectivity':     ('opera', 'MR', 2),
+    'opera_rainfall_rate':    ('opera', 'MR', 2),
     'opera_rainfall_rate_hr': ('opera', 'HR', 1),
 }
 

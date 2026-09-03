@@ -66,12 +66,12 @@ Always read the physical resolution, not the tier name.
 | Tier | Native | Patch | Pooling | Channels |
 |---|---|---|---|---|
 | `past_hr` (HR) | 1 km | 256 × 256 | none | MTG `vis_06`; LINET `density`, `current`, `occurrence` |
-| `past_mr` (LR) | 2 km | 128 × 128 | 2 × 2 avg | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
+| `past_mr` (MR) | 2 km | 128 × 128 | 2 × 2 avg | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
 
-**HR is the high-resolution tier and LR the low-resolution one.** Extracted patches are
-named `{variable}_{HHMM}_{HR|LR}.npy` accordingly. The low-resolution input tensor is still
-called `past_mr` in code and in `metadata.json`, because that name is written into every
-trained checkpoint; read it as the LR tier.
+**HR is the higher-resolution tier and MR the minimum-resolution one.** There are only
+these two; extracted patches are named `{variable}_{HHMM}_{HR|MR}.npy` accordingly, and the
+input tensors are `past_hr` and `past_mr`. One vocabulary throughout — code, filenames and
+documentation.
 
 **How the tiers are reconciled.** (1) Reproject everything onto the same 1 km grid first,
 so a patch number maps to the same geographic tile across all products and cross-scale
@@ -86,7 +86,7 @@ The mode name states its track: `_rainfall` = OPERA 5-class, `_continuous` = OPE
 regression (the counterpart used for the baseline comparison), `_occurrence` = lightning
 binary. The label is always HR (256 px) regardless of input tiers.
 
-| Mode | HR inputs | LR inputs | Label |
+| Mode | HR inputs | MR inputs | Label |
 |---|---|---|---|
 | `mtg_opera_radar_only_rainfall` | `vis_06` | `opera_reflectivity` `opera_rainfall_rate` | rainfall 5-class |
 | `mtg_opera_mtgmr_rainfall` | `vis_06` | + `ir_38` `ir_105` `wv_63` `wv_73` | rainfall 5-class |
@@ -100,8 +100,8 @@ binary. The label is always HR (256 px) regardless of input tiers.
 † KD student only — not buildable by `create_datasets.py`; trains on the teacher's dataset.
 ‡ Baseline comparison pair, radar-only by design. Both carry the field in HR at 256 px so the input tensors are identical; the model's output resolution is its finest input, and this is the only mode with no other HR channel to hold it at 256.
 
-Channel counts follow directly: an HR tensor is `(T, 256, 256, n_hr)`, LR is
-`(T, 128, 128, n_lr)`. A mode with **no HR inputs has no `past_hr` tensor at all** — the
+Channel counts follow directly: an HR tensor is `(T, 256, 256, n_hr)`, MR is
+`(T, 128, 128, n_mr)`. A mode with **no HR inputs has no `past_hr` tensor at all** — the
 model is built from whatever groups the dataset provides.
 
 `opera_rainfall_rate` and `opera_rainfall_rate_hr` are the same field at two tiers: the
@@ -295,8 +295,8 @@ python extract_patch_seq_for_datasets.py [--period LABEL --past N --future M --s
 ```bash
 python extract_patches.py [--period LABEL] [--products opera ...]
 ```
-- **Does** — slices 256 × 256 tiles from the full canvases; LR products are average-pooled to 128 px. Always down, never up.
-- **Writes** — `our_data/patches/<date>/<var>_<HHMM>_{HR|LR}.npy` **CRITICAL**
+- **Does** — slices 256 × 256 tiles from the full canvases; MR products are average-pooled to 128 px. Always down, never up.
+- **Writes** — `our_data/patches/<date>/<var>_<HHMM>_{HR|MR}.npy` **CRITICAL**
 - **Note** — output is **not** period-suffixed: every period writes into one shared tree, so a second period is largely a no-op over the overlap. The pool is invalidated by a rebuilt `patch_index.csv`, never by a new period.
 - **Also writes** — `our_data/patches/<date>/_patch_index.json`, the active-patch lists each date was built from. Any timestep whose list has since moved is re-extracted instead of skipped, because a patch that becomes active inserts mid-list and shifts every later slot. **CRITICAL**
 - **Alone** — `--audit_pool` reports which dates drifted and extracts nothing.

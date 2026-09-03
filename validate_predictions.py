@@ -2105,7 +2105,7 @@ def run_visualization_lightning(
 #   * OPERA-driven sample selection (same shared list as rainfall/lightning)
 #   * Hann-overlapped inputs built once per reference; TEACHER consumes them
 #     as-is (LINET + MTG vis_06 in HR), STUDENT consumes a slice of the
-#     LAST N HR channels (vis_06 only). Same MR / LR pass through.
+#     LAST N HR channels (vis_06 only). Same MR pass through.
 #   * Per candidate high in the sweep grid we hysteresis-binarise EACH model
 #     against LINET GT independently, so each ends up with its own tuned
 #     per-lead high threshold.
