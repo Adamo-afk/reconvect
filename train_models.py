@@ -1086,7 +1086,7 @@ def build_coalition_model(input_shapes, label_type, past_timesteps=3,
         shape = input_shapes[name]  # [T, H, W, C]
         res = shape[1]
         channels = shape[-1]
-        divisor = max_res // res  # 1 for HR, 2 for MR, 4 for LR
+        divisor = max_res // res  # 1 for HR, 2 for MR
 
         inp = Input(shape=(past_timesteps, res, res, channels), name=name)
         all_inputs.append(inp)

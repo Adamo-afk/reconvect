@@ -6,7 +6,7 @@ Post-processing primitives for the lightning-occurrence prediction head:
   1. Overlapping inference with Hann blending
      - Enumerate patch positions at stride < patch_size across the
        768x1536 canvas (default stride 128 -> 5x11 = 55 positions).
-     - Slice HR / MR / LR input tiles at each position (MR/LR are
+     - Slice HR / MR input tiles at each position (MR is
        pooled versions of the same HR window, matching what the model
        consumed during training).
      - Run the model once per batch.

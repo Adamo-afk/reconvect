@@ -31,7 +31,7 @@ Inputs (<source> is always `dbscan` — see pipeline_config.SOURCE):
     - sequence_meta_<source>.json in data_root/
       (step_minutes, past_steps, future_steps)
     - normalization_stats_<source>.json in data_root/
-    - .npy patch files in data_root/patches/{date}/{variable}_{HHMM}_{HR|LR}.npy
+    - .npy patch files in data_root/patches/{date}/{variable}_{HHMM}_{HR|MR}.npy
 
 Outputs (per --mode):
     - TFRecord shards in data_root/datasets/{mode}_{source}/train/
@@ -430,12 +430,10 @@ OPERA_MR_CONFIG = {
 # trained checkpoint and into every dataset's metadata.json — renaming it
 # would invalidate existing models.
 #
-# ON-DISK SUFFIX CAVEAT: extracted patches are named
-# `{variable}_{HHMM}_{HR|LR}.npy` — only TWO suffixes, where `_LR` means
-# "was pooled" rather than naming a tier. MR-tier variables therefore live
-# in `_LR` files. Since the LR tier is gone, every `_LR` patch on disk is
-# now MR: 128x128 at 2 km. The mode config carries the suffix explicitly
-# as the third element of each group tuple, so nothing infers it.
+# Extracted patches are named `{variable}_{HHMM}_{HR|MR}.npy` — two
+# suffixes, matching the two tiers exactly. The mode config carries the
+# suffix explicitly as the third element of each group tuple, so nothing
+# infers it from the resolution.
 
 # Iteration order of the input groups. This order sets the model's input
 # ordering, so it must stay stable across dataset builds and checkpoints.
@@ -490,12 +488,11 @@ def get_mode_config(mode):
         and:
             "label_var": str — variable name for labels
             "label_transform": callable
-            "label_suffix": str — HR or LR
+            "label_suffix": str — HR or MR
     """
     # HR (256 px) always carries MTG vis_06; the lightning modes add the
     # three LINET channels alongside it. MR (128 px, 2 km native, 2x pool)
-    # always carries OPERA, optionally joined by MTG IR/WV. There is no LR
-    # tier in this build.
+    # always carries OPERA, optionally joined by MTG IR/WV.
     hr_vis = MTG_HR_SAT_CONFIG
     hr_lightning_vis = {**HR_LIGHTNING_CONFIG, **MTG_HR_SAT_CONFIG}
     mr_opera = OPERA_MR_CONFIG
@@ -576,7 +573,7 @@ def get_mode_config(mode):
         # Lightest baseline: MTG vis_06 + OPERA. No MTG IR/WV, no lightning.
         return {
             "past_hr": (hr_vis, 256, "HR"),
-            "past_mr": (mr_opera, 128, "LR"),
+            "past_mr": (mr_opera, 128, "MR"),
             "label_var": "opera_rainfall_rate_hr",
             "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
@@ -586,7 +583,7 @@ def get_mode_config(mode):
         # Baseline + MTG IR/WV in MR.
         return {
             "past_hr": (hr_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "past_mr": (mr_opera_mtg, 128, "MR"),
             "label_var": "opera_rainfall_rate_hr",
             "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
@@ -599,7 +596,7 @@ def get_mode_config(mode):
         # for the dual-target experiment.
         return {
             "past_hr": (hr_lightning_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "past_mr": (mr_opera_mtg, 128, "MR"),
             "label_var": "opera_rainfall_rate_hr",
             "label_transform": label_transform_opera_rainfall_multiclass,
             "label_suffix": "HR",
@@ -616,7 +613,7 @@ def get_mode_config(mode):
         # the 5 classes via RAINFALL_CLASS_EDGES.
         return {
             "past_hr": (hr_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "past_mr": (mr_opera_mtg, 128, "MR"),
             "label_var": "opera_rainfall_rate_hr",
             "label_transform": label_transform_opera_rainfall_continuous,
             "label_suffix": "HR",
@@ -632,7 +629,7 @@ def get_mode_config(mode):
         # lightning_fraction_<source>.json at training time.
         return {
             "past_hr": (hr_lightning_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "past_mr": (mr_opera_mtg, 128, "MR"),
             "label_var": "occurrence",
             "label_transform": label_transform_occurrence,
             "label_suffix": "HR",
@@ -649,7 +646,7 @@ def get_mode_config(mode):
         # LINET feed is late, missing, or being validated.
         return {
             "past_hr": (hr_vis, 256, "HR"),
-            "past_mr": (mr_opera_mtg, 128, "LR"),
+            "past_mr": (mr_opera_mtg, 128, "MR"),
             "label_var": "occurrence",
             "label_transform": label_transform_occurrence,
             "label_suffix": "HR",

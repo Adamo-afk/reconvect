@@ -73,13 +73,13 @@ Se recomandă consultarea rezoluției fizice, nu a denumirii nivelului.
 | Nivel | Nativ | Patch | Pooling | Canale |
 |---|---|---|---|---|
 | `past_hr` (HR) | 1 km | 256 × 256 | fără | MTG `vis_06`; LINET `density`, `current`, `occurrence` |
-| `past_mr` (LR) | 2 km | 128 × 128 | medie 2 × 2 | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
+| `past_mr` (MR) | 2 km | 128 × 128 | medie 2 × 2 | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
 
-**HR desemnează nivelul de rezoluție ridicată, iar LR nivelul de rezoluție redusă.**
-Patch-urile extrase sunt denumite `{variable}_{HHMM}_{HR|LR}.npy` în consecință. Tensorul
-de intrare de rezoluție redusă poartă în continuare denumirea `past_mr` în cod și în
-`metadata.json`, întrucât aceasta este înscrisă în fiecare checkpoint antrenat; se citește
-ca nivelul LR.
+**HR desemnează nivelul de rezoluție superioară, iar MR nivelul de rezoluție minimă.**
+Există exclusiv aceste două niveluri; patch-urile extrase sunt denumite
+`{variable}_{HHMM}_{HR|MR}.npy` în consecință, iar tensorii de intrare sunt `past_hr` și
+`past_mr`. Aceeași terminologie este utilizată peste tot — în cod, în denumirile fișierelor
+și în documentație.
 
 **Reconcilierea nivelurilor de rezoluție.** (1) Se reproiectează mai întâi toate datele pe
 aceeași grilă de 1 km, astfel încât un număr de patch să corespundă aceleiași porțiuni
@@ -97,7 +97,7 @@ regresie OPERA (varianta utilizată pentru comparația cu modelul de referință
 `_occurrence` = fulgere binar. Eticheta este întotdeauna HR (256 px), indiferent de
 nivelurile de intrare.
 
-| Mod | Intrări HR | Intrări LR | Etichetă |
+| Mod | Intrări HR | Intrări MR | Etichetă |
 |---|---|---|---|
 | `mtg_opera_radar_only_rainfall` | `vis_06` | `opera_reflectivity` `opera_rainfall_rate` | precipitații, 5 clase |
 | `mtg_opera_mtgmr_rainfall` | `vis_06` | + `ir_38` `ir_105` `wv_63` `wv_73` | precipitații, 5 clase |
@@ -111,8 +111,8 @@ nivelurile de intrare.
 † Exclusiv model-student pentru transferul de cunoștințe — nu poate fi construit cu `create_datasets.py`; se antrenează pe setul de date al modelului-profesor.
 ‡ Perechea de comparație cu modelul de referință, exclusiv radar prin concepție. Ambele preiau câmpul în HR la 256 px, astfel încât tensorii de intrare sunt identici; rezoluția de ieșire a modelului este dată de cea mai fină intrare a sa, iar acesta este singurul mod fără alt canal HR care să o mențină la 256.
 
-Numărul de canale decurge direct: un tensor HR are forma `(T, 256, 256, n_hr)`, iar unul LR
-`(T, 128, 128, n_lr)`. Un mod **fără intrări HR nu deține deloc tensorul `past_hr`** —
+Numărul de canale decurge direct: un tensor HR are forma `(T, 256, 256, n_hr)`, iar unul MR
+`(T, 128, 128, n_mr)`. Un mod **fără intrări HR nu deține deloc tensorul `past_hr`** —
 modelul se construiește din grupurile pe care setul de date le furnizează.
 
 `opera_rainfall_rate` și `opera_rainfall_rate_hr` reprezintă același câmp la două niveluri:
@@ -311,8 +311,8 @@ python extract_patch_seq_for_datasets.py [--period LABEL --past N --future M --s
 ```bash
 python extract_patches.py [--period LABEL] [--products opera ...]
 ```
-- **Descriere** — decupează plăci de 256 × 256 din suprafețele complete; produsele LR sunt reduse prin average pooling la 128 px. Întotdeauna descendent, niciodată ascendent.
-- **Scrie** — `our_data/patches/<date>/<var>_<HHMM>_{HR|LR}.npy` **CRITIC**
+- **Descriere** — decupează plăci de 256 × 256 din suprafețele complete; produsele MR sunt reduse prin average pooling la 128 px. Întotdeauna descendent, niciodată ascendent.
+- **Scrie** — `our_data/patches/<date>/<var>_<HHMM>_{HR|MR}.npy` **CRITIC**
 - **Notă** — rezultatul **nu** este sufixat cu perioada: toate perioadele scriu în același arbore, astfel încât o a doua perioadă reprezintă în mare parte o operațiune fără efect pe zona de suprapunere. Colecția este invalidată de reconstruirea fișierului `patch_index.csv`, niciodată de o perioadă nouă.
 - **Scrie de asemenea** — `our_data/patches/<date>/_patch_index.json`, listele de patch-uri active din care a fost construită fiecare dată. Orice pas de timp a cărui listă s-a modificat între timp este re-extras, nu ignorat, deoarece un patch care devine activ se inserează în mijlocul listei și deplasează toate pozițiile ulterioare. **CRITIC**
 - **Separat** — `--audit_pool` raportează ce date s-au desincronizat și nu extrage nimic.
