@@ -1294,6 +1294,27 @@ def load_tfrecord_with_patch(shard_dir: Path,
                   num_parallel_calls=tf.data.AUTOTUNE)
 
 
+def dataset_n_samples(shard_dir) -> int | None:
+    """Sample count for a split, from the metadata.json beside its shards.
+
+    write_tfrecord_shards records it, so counting by iteration is never
+    necessary — and iteration is expensive here: a single sample is a
+    few megabytes of float32, so counting one split re-reads the whole
+    split off disk.
+
+    None when the file is absent or unusable, so callers can fall back
+    rather than fail on an older dataset.
+    """
+    meta = Path(shard_dir) / "metadata.json"
+    if not meta.is_file():
+        return None
+    try:
+        n = int(json.loads(meta.read_text(encoding="utf-8"))["n_samples"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return n if n > 0 else None
+
+
 def load_tfrecord_dataset(shard_dir: Path,
                            mode_config: dict) -> tf.data.Dataset:
     """Load a split's TFRecord shards into a tf.data.Dataset whose

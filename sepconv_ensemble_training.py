@@ -34,7 +34,11 @@ from tensorflow.keras.layers import (
 from tensorflow.keras import Model
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callback
 
-from create_datasets import get_mode_config, load_tfrecord_dataset
+from create_datasets import (
+    dataset_n_samples,
+    get_mode_config,
+    load_tfrecord_dataset,
+)
 from pipeline_config import (
     SOURCE,
     resolve_data_root,
@@ -296,6 +300,12 @@ def prepare_dataset(ds_path, lead_steps, batch_size, shuffle=False,
     # TFRecord shards written by create_datasets.py; the mode config
     # supplies the parse signature.
     ds = load_tfrecord_dataset(Path(ds_path), get_mode_config(SEPCONV_MODE))
+    # Tell tf.data how long the split is, from the metadata rather than by
+    # counting. Without it Keras reports `Unknown` steps, has no ETA, and
+    # re-measures the progress bar on every batch.
+    n = dataset_n_samples(ds_path)
+    if n:
+        ds = ds.apply(tf.data.experimental.assert_cardinality(n))
     ds = ds.map(lambda x, y: extract_lead_time(x, y, lead_steps),
                 num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
@@ -334,7 +344,7 @@ class WallTimeCallback(Callback):
 def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
                      ds_root, checkpoint_cfg=None, resume=True,
                      learning_rate=1e-3, lr_patience=5, es_patience=10,
-                     period=None):
+                     period=None, verbose=1):
     """Train one base model Bm{lead_steps}.
 
     Optimiser parity with the paper: AMSGrad variant of Adam at lr 1e-3,
@@ -417,7 +427,7 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
 
     history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
                         initial_epoch=initial_epoch,
-                        callbacks=callbacks, verbose=1)
+                        callbacks=callbacks, verbose=verbose)
     model_path = Path(model_dir) / f"sepconv_{run_tag}_bm{lead_steps}.keras"
     model.save(str(model_path))
     print(f"  Saved: {model_path}")
@@ -451,7 +461,7 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
 
 def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
           learning_rate=1e-3, lr_patience=5, es_patience=6, period=None,
-          datasets_root=None, checkpoint_cfg=None, resume=True):
+          datasets_root=None, checkpoint_cfg=None, resume=True, verbose=1):
     data_root = resolve_data_root(data_root)
     datasets_root = resolve_datasets_root(data_root, datasets_root)
     model_dir = resolve_model_dir(model_dir)
@@ -477,8 +487,16 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
     tf.keras.mixed_precision.set_global_policy('float32')
 
     mode_config = get_mode_config(SEPCONV_MODE)
-    n_train = sum(1 for _ in load_tfrecord_dataset(ds_root / "train", mode_config))
-    n_val = sum(1 for _ in load_tfrecord_dataset(ds_root / "validation", mode_config))
+    # From metadata.json, not by iterating: a full pass over these two
+    # splits reads well over a hundred gigabytes to learn two integers.
+    n_train = dataset_n_samples(ds_root / "train")
+    n_val = dataset_n_samples(ds_root / "validation")
+    if n_train is None or n_val is None:
+        print("  NOTE: no n_samples in metadata.json; counting by iteration.")
+        n_train = sum(1 for _ in load_tfrecord_dataset(
+            ds_root / "train", mode_config))
+        n_val = sum(1 for _ in load_tfrecord_dataset(
+            ds_root / "validation", mode_config))
 
     print("=" * 70)
     print(f"SepConv-ens baseline (Czibula et al. 2024) — {SEPCONV_MODE}")
@@ -519,7 +537,7 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
     for lead_steps in leads_to_train:
         all_results[f"bm{lead_steps}"] = train_base_model(
             lead_steps, data_root, model_dir, epochs, batch_size,
-            ds_root=ds_root,
+            ds_root=ds_root, verbose=verbose,
             checkpoint_cfg=checkpoint_cfg, resume=resume,
             learning_rate=learning_rate, lr_patience=lr_patience,
             es_patience=es_patience, period=period)
@@ -610,6 +628,13 @@ def main():
     parser.add_argument("--es_patience", type=int, default=None,
                         help="Override [sepconv].es_patience (which defaults "
                              "to [early_stopping].patience).")
+    parser.add_argument("--verbose", type=int, default=1, choices=[0, 1, 2],
+                        help="Keras fit verbosity. 1 draws a per-batch "
+                             "progress bar; 2 prints one line per epoch. On "
+                             "a slow console the per-batch redraw can cost "
+                             "more than the batch itself - Keras says so "
+                             "with an `on_train_batch_end is slow` warning "
+                             "- and 2 removes it.")
     parser.add_argument("--fresh", action="store_true",
                         help="Ignore any per-epoch checkpoint and start "
                              "from scratch, regardless of "
@@ -641,7 +666,8 @@ def main():
           es_patience=es_patience, period=args.period,
           datasets_root=args.datasets_root,
           checkpoint_cfg=ckpt_cfg,
-          resume=ckpt_cfg.get("resume", True) and not args.fresh)
+          resume=ckpt_cfg.get("resume", True) and not args.fresh,
+          verbose=args.verbose)
 
 
 if __name__ == "__main__":
