@@ -34,6 +34,8 @@ from tensorflow.keras.layers import (
 from tensorflow.keras import Model
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callback
 
+from sepconv_compose import (BASE_LEADS, COMPOSITION, OBSERVED_ONLY_STEPS,
+                             REAL_FRAME_OFFSETS)
 from create_datasets import (
     dataset_n_samples,
     get_mode_config,
@@ -83,11 +85,10 @@ MAX_COMPOSED_STEPS = 8
 LEAD_MINUTES = {k: k * STEP_MINUTES for k in range(1, MAX_COMPOSED_STEPS + 1)}
 LEAD_NAMES = {k: f"t+{v}" for k, v in LEAD_MINUTES.items()}
 
-# Which of the 5 available past frames (t-4 .. t0) feed the model during
-# TRAINING. The paper trains every base model on the last four frames,
-# Phi_i(M_t-3, M_t-2, M_t-1, M_t) = M_t+i; t-4 is used only by the
-# composition scheme at inference. Index 0 is t-4.
-TRAIN_FRAME_SLICE = slice(1, 5)
+# Which of the 5 past frames (t-4 .. t0) a base model trains on is NOT
+# fixed -- see training_pair(). Bm1 and Bm3 use the last four,
+# Phi_i(M_t-3, M_t-2, M_t-1, M_t) = M_t+i; Bm5 cannot, because t0 plus 5
+# steps lies past the end of the label.
 
 # Post-processing thresholds to recover 5 classes (used in evaluation)
 # Raw rain rate normalized by /70: thresholds at 10, 20, 30, 40 mm/h
@@ -282,17 +283,52 @@ def build_sepconv_loss(data_root, source, weights_period=None,
     return WeightedMSELogZ(edges_z, weights)
 
 
+def training_pair(lead_steps, n_label_steps=None):
+    """Which past frames Bm<lead_steps> sees, and which label it targets.
+
+    These are one decision, not two. A k-step model must be shown a
+    window whose last frame is k steps before its target, so the input
+    slice and the label index have to be read off the same composition
+    entry. Taking the last four frames for every model and then indexing
+    the label by `lead_steps - 1` agrees with the composition only when
+    that window happens to end at t0.
+
+    Bm1 and Bm3 do have such an entry, and it is the one preferred here,
+    so they train exactly as before. Bm5 has only (4, 5, (-4,-3,-2,-1)):
+    frames t-4..t-1 targeting t+4, five steps from that window's end.
+
+    Returns (frame slice into past_hr, index into the label).
+    """
+    candidates = [(step, offsets) for step, lead, offsets in COMPOSITION
+                  if lead == lead_steps and step in OBSERVED_ONLY_STEPS]
+    if not candidates:
+        raise ValueError(
+            f"no observation-only composition entry for a {lead_steps}-step "
+            f"model; the base leads are {BASE_LEADS}")
+    # Prefer the window reaching furthest forward, i.e. ending at t0 when
+    # one does, so a model trains on the freshest frames available.
+    step, offsets = max(candidates, key=lambda c: c[1][-1])
+    if n_label_steps is not None and step > n_label_steps:
+        raise ValueError(
+            f"Bm{lead_steps} trains on t{offsets[0]:+d}..t{offsets[-1]:+d} "
+            f"and targets t+{step}, but this dataset's label holds only "
+            f"{n_label_steps} future steps (t+1..t+{n_label_steps}). "
+            f"Rebuild it with at least {step} future timesteps.")
+    start = REAL_FRAME_OFFSETS.index(offsets[0])
+    return slice(start, start + SEPCONV_PAST_STEPS), step - 1
+
+
 def extract_lead_time(inputs, labels, lead_steps):
     """Reshape one sample for a SepConv base model.
 
-    Inputs arrive as a dict with `past_hr` of shape (5, 256, 256, 1) —
-    frames t-4 .. t0. Training uses the last four, matching the paper's
-    Phi_i(M_t-3, M_t-2, M_t-1, M_t). Labels arrive as (8, 256, 256, 1);
-    a base model targets exactly one of them.
+    `past_hr` arrives as (5, 256, 256, 1) - frames t-4 .. t0 - and the
+    label as (n_future, 256, 256, 1). training_pair picks four of those
+    frames and the one label frame that goes with them.
     """
-    frames = inputs["past_hr"][TRAIN_FRAME_SLICE]
+    frame_slice, label_index = training_pair(lead_steps)
+    frames = inputs["past_hr"][frame_slice]
     model_inputs = {f"past_t{i}": frames[i] for i in range(SEPCONV_PAST_STEPS)}
-    return model_inputs, labels[lead_steps - 1]
+    return model_inputs, labels[label_index]
 
 
 def prepare_dataset(ds_path, lead_steps, batch_size, shuffle=False,
@@ -306,6 +342,10 @@ def prepare_dataset(ds_path, lead_steps, batch_size, shuffle=False,
     n = dataset_n_samples(ds_path)
     if n:
         ds = ds.apply(tf.data.experimental.assert_cardinality(n))
+    # Check the label is deep enough here, where the error can name the
+    # window. Inside the graph the same mistake surfaces only as
+    # `strided_slice index N of dimension 0 out of bounds`.
+    training_pair(lead_steps, n_label_steps=ds.element_spec[1].shape[0])
     ds = ds.map(lambda x, y: extract_lead_time(x, y, lead_steps),
                 num_parallel_calls=tf.data.AUTOTUNE)
     if shuffle:
@@ -357,8 +397,13 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
     lead_name = LEAD_NAMES[lead_steps]
 
     print(f"\n{'-' * 60}")
+    _slice, _label_idx = training_pair(lead_steps)
+    _frames = REAL_FRAME_OFFSETS[_slice]
     print(f"  Training Bm{lead_steps}: {lead_steps}-step model, "
           f"{LEAD_MINUTES[lead_steps]} min from its own window end")
+    # State the window explicitly: it is not the same for every model.
+    print(f"    trains on t{_frames[0]:+d}..t{_frames[-1]:+d} "
+          f"-> t+{_label_idx + 1} (label index {_label_idx})")
     print(f"{'-' * 60}")
 
     # `ds_root` is passed in, never rebuilt here: train() already
