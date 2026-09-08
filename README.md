@@ -652,6 +652,8 @@ Requires **Conda**, an **NVIDIA GPU**, and **Windows**. Follow this order exactl
 
 Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optional.
 
+> **Tables as images.** The long tables below are shown as rendered images so they read at desktop width; the markdown source of each sits in a collapsed *Text version* block directly under it. The text is what gets edited when something changes, and the PNG in `assets/` is re-rendered from it.
+>
 > **Reading the tables.** Tokens in $\color{red}{\textbf{\textit{red bold italic}}}$ are **placeholders you must supply** — they are not in this repository. Everything else in the example commands is a literal path the pipeline produces or reads.
 >
 > **Date formats differ by script** — there are two conventions, and the end bound is not uniform:
@@ -663,6 +665,11 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 > | `HH:MM` · integer | `--time`, `--start-time`, `--end-time` · `--hour` 0–23, `--year`, `--month` 1–12 | — |
 >
 > `linet_export.py` used to be the exception, with an exclusive `--end` that silently stopped a day early; it is inclusive now, and `--start D --end D` exports exactly one day.
+
+<p align="center"><img src="assets/table1_training.png" width="100%" alt="Table 1 — Training a model from scratch"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | # | Script | Arguments | What the step does | Commands |
 |---|---|---|---|---|
@@ -688,6 +695,8 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 | **12** | `sepconv_ensemble_training.py` | `--period` window tag of the baseline dataset · `--lead 1\|3\|5` train one base model, not all three · `--epochs` `--batch_size` training length and samples per step · `--learning_rate` published value 1e-3; exposed for the sweep · `--lr_patience` epochs on a plateau before halving · `--es_patience` early-stopping patience; ours, not the paper's · `--data_root` `--model_dir` dataset root and checkpoint destination | **SepConv-ens baseline.** Three radar-only regression models (Bm1/Bm3/Bm5 = 15/45/75 min) composed to **t+1…t+4** from observations alone — nothing autoregressive. Consumes `opera_sepconv_logz`, which needs a past=4 window because t+2 and t+4 read `t−4`. See [SepConv-ens baseline](#sepconv-ens-baseline). | `python sepconv_ensemble_training.py --period w44`<br>`python sepconv_ensemble_training.py --period w44 --lead 1` |
 | **13** | `verification_keys.py` | `--sepconv_tag` window tag of the baseline split · `--write` freeze the key set to JSON · `--output PATH` frozen key-set destination · `--data_root PATH` root holding the split CSVs | Builds the leakage-free key set shared by RECONVECT and the baseline: intersect the two test splits, then subtract every key in either model's train or validation. **Run with `--write` before the test data is scored.** | `python verification_keys.py`<br>`python verification_keys.py --write` |
 | **14** | `compress_datasets.py` | `--compress TAG` archive, verify, delete shards · `--restore TAG` extract back · `--reclaim TAG` drop the on-disk copy of an archived dataset · `--reclaim-all` sweep leftovers · `--jobs` background job state · `--background` detach the job · `--workers N` 7-Zip threads · `--level` `-mx` compression level · `--keep` archive without deleting | Dataset archiving with 7-Zip — shards compress to ~4.8 % at `-mx=5`. Deletion only after the archive verifies. See [Dataset archiving](#dataset-archiving). | `python compress_datasets.py`<br>`python compress_datasets.py --compress <run_tag> --background`<br>`python compress_datasets.py --reclaim-all` |
+
+</details>
 
 ### Ad-hoc helpers (no CLI)
 
@@ -956,6 +965,11 @@ python our_data/opera_data/pipeline_opera.py \
 
 ## Table 2 — Validation, inference, visualisation & analysis
 
+<p align="center"><img src="assets/table2_validation_inference.png" width="100%" alt="Table 2 — Validation, inference, visualisation & analysis"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
+
 | # | Script | Arguments | What the step does | Commands |
 |---|---|---|---|---|
 | **1** | `evaluate_coalition.py` | `--mode` model variant to evaluate; required · `--split train\|validation\|test` which dataset split to score · `--finetuned` \| `--kd` evaluate Swin head or KD student · `--threshold` fixed decision threshold; else optimised on validation · `--plot_threshold` probability floor for the lightning visualisation · `--date YYYY-MM-DD` `--hour 0-23` reference for the sample figure · `--batch_size` samples per inference step · `--data_root` `--model_dir` `--output_dir` dataset, checkpoint and results locations | Full metric suite on a held-out split → `evaluation/eval_<run_tag>/evaluation_results.json` + plots. Per-lead metrics feed the coalition study. | `python evaluate_coalition.py --mode mtg_opera_mtgmr_rainfall`<br>`python evaluate_coalition.py --mode mtg_lightning_opera_occurrence --finetuned`<br>`python evaluate_coalition.py --mode mtg_opera_occurrence --kd`<br>`python evaluate_coalition.py --mode mtg_opera_mtgmr_rainfall --split validation` |
@@ -966,9 +980,11 @@ python our_data/opera_data/pipeline_opera.py \
 | **6** | `generate_report.py` | `--year` `--month 1-12` reporting period; both required · `--track rainfall\|lightning\|both` which tracks the report covers · `--language ro\|en` output language; `en` skips translation · `--bilingual` render Romanian and English side by side · `--model TAG` Ollama model tag used for generation · `--temperature` sampling temperature; 0.0 collapses Gemma · `--seed` Ollama seed for reproducible generation · `--max_tokens` hard cap on tokens per call · `--refresh_cache` `--no_cache` rebuild or bypass the translation cache · `--skip_pdf` run generation without rendering the PDF · `--pred_coupling` couple cells from predictions, not ground truth · `--validation_dir` `--assets_dir` `--output` inputs, banner assets, PDF destination · `--data_root` `--model_dir` dataset and checkpoint locations | Builds a PDF from `validate_predictions.py` outputs with commentary from a local Ollama LLM. `--language en` skips the Romanian translation phase and halves the LLM calls. `--track both` requires both tracks' extraction outputs on disk. | `python generate_report.py --year 2025 --month 5`<br>`python generate_report.py --year 2025 --month 5 --language en`<br>`python generate_report.py --year 2025 --month 5 --track lightning --bilingual`<br>`python generate_report.py --year 2025 --month 5 --skip_pdf --no_cache` |
 | **7** | `bundle_eval_scores.py` | `--mode MODE=LETTERS` repeatable mode-to-coalition-letter mapping · `--prefix` filename prefix for the emitted CSVs · `--metric` override the auto-detected scoring metric · `--eval_root` `--output_dir` evaluation source and CSV destination · `--finetuned` read the Swin head's evaluation results | Converts each mode's `evaluation_results.json` into the per-lead-time CSVs classical Shapley expects. Coalition letters encode which input groups a model saw (`o` = OPERA only, `om` = + MTG IR/WV). | `python bundle_eval_scores.py`<br>`python bundle_eval_scores.py --metric HSS`<br>`python bundle_eval_scores.py --mode "mtg_opera_radar_only_rainfall=o" --mode "mtg_opera_mtgmr_rainfall=om"` |
 | **8** | `feature_importance_analysis.py` | `--model PATH` trained checkpoint to analyse · `--data PATH` test dataset directory feeding the analysis · `--output PATH` destination for the figures and CSVs · `--methods` gradcam_xi, shap, classical_shapley; repeatable · `--num-samples` how many samples to average over · `--scores-dir PATH` per-leadtime CSVs for classical Shapley · `--model-ablated` `--data-ablated` second model and dataset for ablation | Grad-CAM + Xi correlation (spatial attention), SHAP (pixel importance), and classical Shapley (source-level). The ablation pair diffs two Xi matrices to show how remaining inputs absorb a dropped group's role. | `python feature_importance_analysis.py --model models/coalition_mtg_opera_mtgmr_rainfall_dbscan.keras --data our_data/datasets/mtg_opera_mtgmr_rainfall_dbscan/test --output results/fi --methods gradcam_xi`<br>`… --methods gradcam_xi shap`<br>`… --model-ablated models/coalition_mtg_opera_radar_only_rainfall_dbscan.keras --data-ablated our_data/datasets/mtg_opera_radar_only_rainfall_dbscan/test` |
-| **9** | `data_statistics.py` | `--split train\|validation\|test` which split to summarise · `--csv PATH` explicit CSV overriding the split default · `--data_root PATH` root holding the per-split CSVs | Six dataset diagnostic panels: diurnal cycle, spatial heatmap, daily timeline, simultaneously-active patches, samples per date, patch survival. | `python data_statistics.py`<br>`python data_statistics.py --split test` |
+| **9** | `data_statistics.py` | `--split train\|validation\|test` which split to summarise · `--csv PATH` explicit CSV overriding the split default · `--data_root PATH` root holding the per-split CSVs | Four dataset diagnostic panels: active patches per hour of day, spatial heatmap, simultaneously-active patches, patch survival. | `python data_statistics.py`<br>`python data_statistics.py --split test` |
 | **11** | `our_data/lightning_data/inspect_lightning.py` | `--npy PATH` reprojected lightning array to inspect · `--output PATH` destination for the rendered figure · `--grid_dir PATH` directory holding the Romania grid coords | Same idea for a rasterised LINET field — a quick check that `read_kml_version2.py` put strokes where they belong on the 1 km grid. | `python our_data/lightning_data/inspect_lightning.py --npy path/to/occurrence.npy` |
 | **12** | `our_data/lightning_data/visualize_lightning_stats.py` | `--csv PATH` lightning activity index CSV to plot · `--output_dir PATH` destination for the chart | Lightning activity by time of day — for each HH:MM, how many days carry a stroke — from step 2c's activity index. The one view only the per-(date, HH:MM) record can give. Plots only — reads no model. | `python our_data/lightning_data/visualize_lightning_stats.py` |
+
+</details>
 
 **Ablation pairs** for step 8 — the mode set is already an ablation ladder:
 
@@ -1002,6 +1018,11 @@ python predict_full_domain.py --mode mtg_lightning_opera_occurrence --date 2026-
 
 Everything under **COALITION-4** lives in [`training.config`](training.config); per-mode overrides go in `[mode.<name>]`.
 
+<p align="center"><img src="assets/table3_architecture_defaults.png" width="100%" alt="Table 3 — Architecture & training defaults"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
+
 | Parameter | Value | Scope | Source |
 |---|---|---|---|
 | **Architecture** ||||
@@ -1009,17 +1030,15 @@ Everything under **COALITION-4** lives in [`training.config`](training.config); 
 | Decoder | reversed `[128, 64, 32]`, bilinear upsampling + skip connections | all | — |
 | Input branches | one per tier, merged at matching scales | all | `INPUT_GROUP_KEYS` |
 | Output head | `Conv2D(1, 1×1, sigmoid)` | lightning | — |
-| Output head | `Conv2D(1, 1×1, sigmoid)` | rainfall continuous | — |
 | Output head | `Conv2D(5, 1×1, softmax)` | rainfall 5-class | — |
-| Past / future timesteps | 3 / 3 | all | `sequence_meta_dbscan.json` |
+| Past / future timesteps | read from the dataset — `w34`: 3 / 4 | all | `sequence_meta_<source>[_<period>].json` |
 | **Base training** (`[defaults]`) ||||
 | Optimizer | `Adam(lr=1e-3)` | base stage | — |
-| Loss | `WeightedFocalLoss(gamma=2.0)`, prior from `lightning_fraction_dbscan.json` (~1 % positive pixels) | lightning | — |
+| Loss | `WeightedFocalLoss(gamma=2.0)`, prior from `lightning_fraction_<source>[_<period>].json` (~1 % positive pixels) | lightning | — |
 | Loss | `WeightedFocalCategoricalCrossentropy` (see `[radar_loss]`) | rainfall 5-class | — |
 | Metrics | `iou_metric`, `true_pos`, `false_pos`, `false_neg` | lightning | — |
 | Metrics | `accuracy` | rainfall 5-class | — |
-| Metrics | `mae`, `mse` | rainfall continuous | — |
-| Epochs / batch size | `20` / `32` | all | `[defaults]` |
+| Epochs / batch size | `30` / `32` | all | `[defaults]` |
 | Dropout / normalisation | `0.1` / `layer` (`none` \| `batch` \| `layer`) | all | `[defaults]` |
 | Shuffle buffer / seed | `256` samples / `0` | all | `[defaults]` |
 | Mixed precision | `true` (fp16 on tensor cores) | all | `[defaults]` |
@@ -1029,7 +1048,7 @@ Everything under **COALITION-4** lives in [`training.config`](training.config); 
 | Warmup epochs | `3` | base stage | `[lr_schedule]` |
 | **Early stopping** (`[early_stopping]`) ||||
 | Monitor / mode | `val_loss` / `min` | all | `[early_stopping]` |
-| Patience / min delta | `6` / `1e-5` | all | `[early_stopping]` |
+| Patience / min delta | `8` / `1e-5` | all | `[early_stopping]` |
 | Restore best weights | `true` | all | `[early_stopping]` |
 | **Radar loss** (`[radar_loss]`) ||||
 | Weighting | `median` (`inverse` \| `median` \| `none`) | rainfall 5-class | `[radar_loss]` |
@@ -1038,8 +1057,8 @@ Everything under **COALITION-4** lives in [`training.config`](training.config); 
 | *Baseline equivalent* | `weighting = none` + `gamma = 0` → plain `CategoricalCrossentropy(label_smoothing=0.01)` | rainfall 5-class | — |
 | **Swin fine-tune** (`[finetune]`, `--stage finetune`/`both`) ||||
 | Optimizer | `AdamW`, `weight_decay = 0.01` (falls back to `Adam` where unavailable) | finetune | `[finetune]` |
-| Initial / min LR, warmup | `3e-4` / `1e-6`, `3` epochs | finetune | `[finetune]` |
-| Epochs | `20` | finetune | `[finetune]` |
+| Initial / min LR, warmup | `3e-4` / `1e-6`, `5` epochs | finetune | `[finetune]` |
+| Epochs | `30` | finetune | `[finetune]` |
 | Swin blocks | `2` (block 0 = W-MSA, block 1 = SW-MSA) | finetune | `[finetune]` |
 | Window size / heads | `8` / `4` | finetune | `[finetune]` |
 | Head width / dropout | `c_shared = 64` / `0.1` | finetune | `[finetune]` |
@@ -1049,11 +1068,13 @@ Everything under **COALITION-4** lives in [`training.config`](training.config); 
 | Alpha / temperature | `0.7` / `4.0` (Hinton canonical) | KD student | `--kd_alpha` / `--kd_temperature` |
 | Optimizer / LR | `Adam` / `1e-4` | KD student | `--learning_rate` |
 | Epochs / batch / patience | `50` / `8` / `10` | KD student | CLI |
-| **SepConv baseline** (`sepconv_ensemble_training.py`) ||||
-| Architecture | 3 independent `SeparableConv2D` models, one per lead; kernel `5×5` | baseline | — |
-| Optimizer | `Adam(lr=0.001, amsgrad=True)`, halve on plateau | baseline | — |
-| Epochs / batch | `50` / `8` | baseline | CLI |
-| Output | sigmoid `[0,1]` continuous; binned to 5 classes at evaluation | baseline | — |
+| **SepConv baseline** (`sepconv_ensemble_training.py`, `[sepconv]`) ||||
+| Architecture | 3 independent `SeparableConv2D` models, one per lead (`1`, `3`, `5` steps), 4 input frames each; kernel `5×5`; ~100k parameters | baseline | — |
+| Optimizer | `Adam(lr=1e-3, amsgrad=True)`, halve on plateau (`lr_patience = 5`) | baseline | `[sepconv]`, LR from `[lr_schedule]` |
+| Epochs / batch / patience | `30` / `32` / `8` — inherited from `[defaults]` and `[early_stopping]` unless set in `[sepconv]` | baseline | `[sepconv]` |
+| Loss / output | weighted MSE in `log_zscore` space, weights from the measured class frequencies; linear output, denormalised to mm/h and binned at `RAINFALL_CLASS_EDGES` at evaluation | baseline | — |
+
+</details>
 
 ---
 
@@ -1069,11 +1090,23 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 ### Stage 0 — master cadence
 
+<p align="center"><img src="assets/stage0.png" width="100%" alt="Stage 0 — master cadence"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
+
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
 | `validate_timestep.py` | `our_data/timestep_config.json` | every acquisition script · `reproject` · `identify_patches` · `extract_patch_seq` · `extract_patches` · `compute_normalization_stats` · `create_datasets` · `intersect_product_coverage` · all summarisers | The master step (15 min) and **the minute filter each product snaps to** — MTG at :00/:10/:30/:40, OPERA at :00/:15/:30/:45. Every later stage reads it instead of hard-coding a cadence, so changing the step is one edit. |
 
+</details>
+
 ### Stage 1 — acquisition
+
+<p align="center"><img src="assets/stage1.png" width="100%" alt="Stage 1 — acquisition"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1081,14 +1114,28 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `our_data/opera_data/pipeline_opera.py` | `our_data/opera_data/{reflectivity,rainfall_rate}/<YYYY>/<MM>/<DD>/*.h5` | `reproject` · `summarize_opera_data` | OPERA composite HDF5 mirrored in the remote's date hierarchy. Kept in native format so a projection fix never costs a re-download. |
 | `our_data/lightning_data/linet_export.py` | `<out>/kml_data/<date>/<date>.kml` | `read_kml_version2` | Raw LINET stroke exports, one KML per day. `--end` is inclusive, like everywhere else in the pipeline. |
 
+</details>
+
 ### Stage 2 — onto the Romania grid
+
+<p align="center"><img src="assets/stage2.png" width="100%" alt="Stage 2 — onto the Romania grid"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
 | `reproject.py` | `our_data/reprojected_data/<group>/<product>/nc4_<date>-Romania_<product>/nc4_<date>-Romania_<HHMM>_<product>.npy` · `our_data/romania_grid_lats.npy` · `..._lons.npy` · `reproject_<category>.log` | `identify_patches` · `extract_patches` · `compute_normalization_stats` · `intersect --errors_log` | KD-tree resampling onto the shared 768 × 1536 canvas, so every modality is pixel-aligned. The lat/lon pair is the grid definition reused by plotting and NetCDF export. The error log is subtracted from the coverage manifest, so a failed reprojection is not counted as present. |
 | `our_data/lightning_data/read_kml_version2.py` | `<root>/{density,current,occurrence}/nc4_<date>-Romania_<product>/lightning_<product>_<yyyymmdd>_<HHMM>.npy` · `<root>/filtered_out_reports/lightning_filtered_out_<date>.json` | `extract_patches` · `compute_normalization_stats` · `summarize_lightning_data` · report is **terminal** (audit) | Strokes binned straight onto the Romania grid at the label cadence — binning places them there, so no reprojection step is needed. The audit JSON lists strokes dropped for falling **outside the grid**, so a coverage dip can be traced to geography rather than to a bug. |
 
+</details>
+
 ### Stage 3 — coverage accounting
+
+<p align="center"><img src="assets/stage3.png" width="100%" alt="Stage 3 — coverage accounting"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1097,7 +1144,14 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `our_data/lightning_data/summarize_lightning_data.py` | `our_data/lightning_data/`: `lightning_summary.csv` · `lightning_missing_timesteps.json` · `lightning_active_steps.csv` · `lightning_coverage.png` (`--chart`) | `intersect` (missing JSON) · `lightning_fraction` and `visualize_lightning_stats` (activity index) · chart is **terminal** | The intersection gates lightning on **presence**, like MTG and OPERA: a frame of zeros is an observation. A quiet day gets its zero frames from `read_kml_version2`, so it is a day, not an outage. `lightning_active_steps.csv` remains the activity index behind `visualize_lightning_stats`' diurnal chart. |
 | `intersect_product_coverage.py` | `our_data/timestep_manifest.csv` · `our_data/intersect_summary.png` | `extract_patch_seq_for_datasets` · plot is **terminal** | The timesteps where *every requested product* exists — `date,hhmm` plus each product's snapped time. **The product set is your choice**: passing only `--summary opera_rainfall_rate=…` gates on radar alone, so MTG gaps stop constraining radar-only work. OPERA's two fields are separate keys, so a rainfall-only model keeps samples that reflectivity happens to be missing, and a model that reads reflectivity is never handed a timestep without it. |
 
+</details>
+
 ### Stage 4 — sample selection
+
+<p align="center"><img src="assets/stage4.png" width="100%" alt="Stage 4 — sample selection"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1105,7 +1159,14 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `extract_patch_seq_for_datasets.py` | `our_data/{train,validation,test}_data_<source>[_<period>].csv` · `sequence_meta_<source>[_<period>].json` · `extract_patch_seq_drops_<source>[_<period>].csv` | `extract_patches` · `create_datasets` · `compute_normalization_stats` · `opera_rainfall_fraction` · `lightning_fraction` · `verification_keys` · `data_statistics` | The authoritative sample list: one row per sequence with `idx_t-N … idx_t+M` columns indexing into the saved patch arrays. `sequence_meta` records **the window itself** (`past_steps`, `future_steps`, `step_minutes`), which is what makes the model's horizon a property of the data rather than of the code. The drops CSV explains every candidate that did not survive. |
 | `extract_patches.py` | `our_data/patches/<date>/<variable>_<HHMM>_{HR,MR}.npy` | `create_datasets` | 256 × 256 tiles sliced from the full canvases, HR kept at 1 km and MR average-pooled to 128 px — **always pooled down, never up**, so no product carries fabricated resolution. Shape is `(active_patches, H, W)`, ordered by the patch index. Not period-suffixed: every period writes into the same shared tree. |
 
+</details>
+
 ### Stage 5 — statistics & class priors
+
+<p align="center"><img src="assets/stage5.png" width="100%" alt="Stage 5 — statistics & class priors"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1113,14 +1174,28 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `opera_rainfall_fraction.py` | `our_data/opera_rainfall_fraction_<source>[_<period>].json` | `train_models` · `sepconv_ensemble_training` | Measured pixel fraction of each of the 5 rain classes, feeding the focal / weighted loss prior. Class 0 is ~99.8 % of pixels — without it, plain MSE is minimised by predicting dry everywhere. |
 | `lightning_fraction.py` | `our_data/lightning_fraction_<source>[_<period>].json` | `train_models` (occurrence modes) | Fraction of non-zero pixels in the occurrence maps — the focal-loss `ones_fraction`. Both priors take `--period` so scope and filename come from one tag; scoped to a different window, a prior describes a balance the model never sees. |
 
+</details>
+
 ### Stage 6 — datasets
+
+<p align="center"><img src="assets/stage6.png" width="100%" alt="Stage 6 — datasets"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
 | `create_datasets.py` | `our_data/datasets/<mode>_<source>[_<period>]/{train,validation,test}/*.tfrecord` · `.../<split>/metadata.json` · `our_data/ensemble_registry.json` (`--ensemble`) | `train_models` · `sepconv_ensemble_training` · `train_lightning_kd` · `evaluate_coalition` · `evaluate_sepconv_ensemble` · `compress_datasets` | Serialised samples, normalised and label-transformed. `metadata.json` carries `input_shapes` and `label_shape`, and **training reads its architecture from them** — past and future step counts are dataset properties, so a 4→8 window needs no code change. The registry records ensemble member bounds for later validation. |
 | `compress_datasets.py` | `our_data/datasets/<run_tag>.7z` · `_archive_jobs/<run_tag>.lock` · `.status` · `.log` | `train_models` (auto-restore) · `compress_datasets --jobs` | TFRecords compress to ~5 % of size, and shards are deleted only after `7z t` verifies and the file count matches. The job files carry the PID-stamped lock and status so two detached runs cannot touch one dataset. Training restores an archive-only dataset before it starts. |
 
+</details>
+
 ### Stage 7 — trained models
+
+<p align="center"><img src="assets/stage7.png" width="100%" alt="Stage 7 — trained models"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1128,7 +1203,14 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `sepconv_ensemble_training.py` | `models/sepconv_<run_tag>_bm{1,3,5}.keras` · `models/history_sepconv_ensemble_<mode>.json` | `sepconv_predict` · `evaluate_sepconv_ensemble` | The three SepConv-ens base models, predicting t+1 / t+3 / t+5 (15 / 45 / 75 min). Combined at inference by the composition table, never retrained together — which is why they are three files, not one. |
 | `train_lightning_kd.py` | `models/coalition_<student_run_tag>_kd.keras` · `models/history_<student_run_tag>_kd.json` | `validate_predictions --track kd` · `predict_full_domain` | Distilled student for the lightning track: trains on the teacher's dataset with `past_hr` sliced away, so it runs without lightning input at inference. |
 
+</details>
+
 ### Stage 8 — inference, validation & reporting
+
+<p align="center"><img src="assets/stage8.png" width="100%" alt="Stage 8 — inference, validation & reporting"/></p>
+
+<details>
+<summary>Text version (source of the image — edit this, then re-render)</summary>
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
@@ -1139,7 +1221,9 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `evaluate_coalition.py` · `evaluate_sepconv_ensemble.py` | `<output>/evaluation_results.json` · `confusion_matrix.png` · `csi_per_class.png` · `metrics_per_leadtime.png` · `calibration.png` · `roc_curve.png` · … | `bundle_eval_scores` · figures are **terminal** | Held-out test scoring for the two architectures, with the same metric set on both sides so the comparison table is built from like-for-like numbers. |
 | `bundle_eval_scores.py` | `<output_dir>/eval_leadtime-<prefix>-<letters>.csv` | **terminal** (tables for the write-up) | Collapses several runs' `evaluation_results.json` into one lead-time table per modality combination; the letters encode which inputs a run received (`o` = OPERA only, `om` = OPERA + MTG). |
 | `generate_report.py` | `validation/report_<yyyy>_<mm>.pdf` · `validation/rainfall_lightning_coupling/coupling_<date>_<ref>.png` | **terminal** (deliverable) | The monthly PDF: cover, contents, executive summary, per-lead metrics, per-event coupling figures, data appendix. Reads the validation summaries rather than re-running anything. |
-| `data_statistics.py` · `feature_importance_analysis.py` · `visualize_gt_vs_pred.py` | `our_data/data_statistics/1_diurnal_cycle.png` … `6_patch_survival_<prefix>.png` · `results/feature_importance/{shap_importance.csv,xi_matrix.csv,*.html}` · `full_domain_plots/full_domain_<run_tag>/*.png` | **terminal** (analysis only) | Split composition and patch survival, Shapley and Xi feature attributions, and ground-truth-versus-prediction canvases. Nothing downstream depends on them. |
+| `data_statistics.py` · `feature_importance_analysis.py` · `visualize_gt_vs_pred.py` | `our_data/data_statistics/[<period>/]1_patches_per_hour.png` … `4_patch_survival_<prefix>.png` · `results/feature_importance/{shap_importance.csv,xi_matrix.csv,*.html}` · `full_domain_plots/full_domain_<run_tag>/*.png` | **terminal** (analysis only) | Split composition and patch survival, Shapley and Xi feature attributions, and ground-truth-versus-prediction canvases. Nothing downstream depends on them. |
+
+</details>
 
 ### Reading the naming conventions
 
