@@ -14,25 +14,25 @@ constants (`{mtg,opera}_constants.json`) are written **once** as sidecars
 so the reprojected arrays remain self-recoverable for inspection.
 
     - MTG:       vis_06, ir_38, ir_105, wv_63, wv_73    → .npy
-    - Lightning: density, current, occurrence (already on grid) → .npy
     - OPERA:     reflectivity, rainfall_rate            → .npy
+
+Lightning is not reprojected: read_kml_version2.py bins strokes straight
+onto the Romania grid and writes our_data/lightning_data/, which every
+reader opens directly.
 
 Input paths:
     our_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
     our_data/satellite_data/MTG/mtg_constants.json
-    our_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
     our_data/opera_data/{reflectivity|rainfall_rate}/{YYYY}/{MM}/{DD}/*.h5
 
 Output paths:
     our_data/reprojected_data/romania_grid_{lats,lons}.npy             (shared)
     our_data/reprojected_data/satellite_data/MTG/{channel}/nc4_{date}-Romania_{channel}/*.npy
-    our_data/reprojected_data/lightning_data/{product}/nc4_{date}-Romania_{product}/*.npy
     our_data/reprojected_data/opera_data/{product}/nc4_{date}-Romania_{product}/*.npy
     our_data/reprojected_data/opera_data/opera_constants.json
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
     python reproject.py --satellite MTG
-    python reproject.py --lightning
     python reproject.py --opera
     python reproject.py --all
     python reproject.py --opera --date 2024-06-13
@@ -201,7 +201,6 @@ MTG_CHANNELS = [
 MTG_1KM_CHANNELS = {'vis_06'}
 MTG_2KM_CHANNELS = {'ir_38', 'ir_105', 'wv_63', 'wv_73'}
 
-LIGHTNING_PRODUCTS = ['density', 'current', 'occurrence']
 
 # Maximum parallel workers for day-folder processing
 MAX_WORKERS = 6
@@ -435,46 +434,6 @@ def _mtg_day_worker(job):
             reprojected = mapping.apply(sat_data, fill_value=np.nan)
             ensure_dir(out_dir)
             np.save(out_path, reprojected)
-            new += 1
-        except Exception as e:
-            errors.append((npy_file, str(e)))
-    return day_folder, new, skipped, errors
-
-
-def _lightning_day_worker(job):
-    """Lightning is already on the Romania grid (binned by `GridProjection`
-    inside `read_kml_version2.py`), so 'reprojection' is just a one-step
-    pass-through: load the source `.npy`, optionally normalise dtype /
-    squeeze a stray time axis, save under `reprojected_data/`. The
-    occurrence map keeps its int8 dtype; density / current become
-    float32. Source and destination both use the
-    `lightning_<product>_YYYYMMDD_HHMM.npy` naming convention so file
-    names stay stable across the move.
-    """
-    day_folder, day_path, out_dir, npy_files = job
-    new, skipped = 0, 0
-    errors: list[tuple[str, str]] = []
-    for npy_file in npy_files:
-        out_path = os.path.join(out_dir, npy_file)
-        if output_exists(out_path):
-            skipped += 1
-            continue
-        try:
-            filepath = os.path.join(day_path, npy_file)
-            datamap = load_array(filepath)
-            if isinstance(datamap, np.ma.MaskedArray):
-                datamap = datamap.filled(0.0)
-            if datamap.ndim == 3:
-                datamap = np.squeeze(datamap, axis=0)
-            ensure_dir(out_dir)
-            # Preserve the on-disk dtype of the occurrence binary map
-            # (int8 from read_kml_version2.write_single_npy_file) so
-            # downstream consumers can treat it as a categorical flag.
-            np.save(
-                out_path,
-                datamap if datamap.dtype == np.int8
-                else datamap.astype(np.float32),
-            )
             new += 1
         except Exception as e:
             errors.append((npy_file, str(e)))
@@ -719,83 +678,6 @@ def reproject_satellite_mtg(data_root, target_lats, target_lons,
     )
 
 
-# =============================================================================
-# Lightning (no reprojection)
-# =============================================================================
-
-def reproject_lightning(data_root, date_filter=None):
-    """Copy lightning `.npy` files from `lightning_data/` to
-    `reprojected_data/lightning_data/`, day folders in parallel.
-
-    Lightning is already on the Romania grid by virtue of being binned
-    with the `GridProjection` inside `read_kml_version2.py`, which now
-    writes `.npy` directly. This step exists to keep lightning's
-    on-disk layout consistent with the other products (raw source dir
-    -> reprojected_data mirror), not to do any actual reprojection.
-    """
-    lightning_dir = os.path.join(data_root, 'lightning_data')
-    reprojected_base = os.path.join(
-        data_root, 'reprojected_data', 'lightning_data'
-    )
-
-    if not os.path.isdir(lightning_dir):
-        print(f"  Lightning directory not found: {lightning_dir}")
-        return
-
-    all_errors: list[tuple[str, str]] = []
-
-    for product in LIGHTNING_PRODUCTS:
-        product_dir = os.path.join(lightning_dir, product)
-        if not os.path.isdir(product_dir):
-            print(f"\n  Product: {product} — NOT FOUND at {product_dir}")
-            continue
-
-        print(f"\n  Product: {product}")
-
-        # Collect day folders
-        day_jobs = []
-        for day_folder in sorted(os.listdir(product_dir)):
-            if date_filter and date_filter not in day_folder:
-                continue
-            day_path = os.path.join(product_dir, day_folder)
-            if not os.path.isdir(day_path):
-                continue
-            out_dir = os.path.join(reprojected_base, product, day_folder)
-            # Logical .npy names, whether or not the day is compressed.
-            npy_files = list_arrays(day_path)
-            if npy_files:
-                day_jobs.append((day_folder, day_path, out_dir, npy_files))
-
-        if not day_jobs:
-            print(f"    No day folders found for {product}")
-            continue
-
-        # Lightning has no reproject step (already on the Romania grid) —
-        # the worker just reads NetCDF and writes `.npy`. No mapping
-        # to share, but we still hand `_init_worker` an empty state so
-        # `_WORKER_STATE` is in a known shape inside the pool.
-        with ProcessPoolExecutor(
-            max_workers=MAX_WORKERS,
-            initializer=_init_worker,
-            initargs=({},),
-        ) as pool:
-            futures = {
-                pool.submit(_lightning_day_worker, job): job[0]
-                for job in day_jobs
-            }
-            for future in as_completed(futures):
-                day_folder, new, skipped, errs = future.result()
-                total = new + skipped
-                if total > 0 or errs:
-                    print(f"    {day_folder}: {new} new, {skipped} cached, "
-                          f"{total} total, {len(errs)} errors")
-                all_errors.extend(errs)
-
-    _write_reproject_log(
-        os.path.join(data_root, 'reprojected_data'),
-        'lightning', all_errors,
-    )
-
 
 
 
@@ -1005,12 +887,6 @@ def run(data_root, mode, instrument=None, date_filter=None,
             reproject_satellite_mtg(data_root, target_lats, target_lons,
                                     date_filter, mtg_dir=root)
 
-    if mode in ('lightning', 'all'):
-        print(f"\n{'='*70}")
-        print("Lightning products")
-        print(f"{'='*70}")
-        reproject_lightning(data_root, date_filter)
-
     if mode in ('opera', 'all'):
         print(f"\n{'='*70}")
         print("OPERA radar products")
@@ -1058,12 +934,12 @@ if __name__ == "__main__":
     )
     group.add_argument("--satellite", type=str, choices=['MTG'],
                        metavar='INSTRUMENT', help="Reproject satellite channels")
-    group.add_argument("--lightning", action="store_true",
-                       help="Cache lightning data as .npy")
     group.add_argument("--opera", action="store_true",
                        help="Reproject OPERA radar products (HDF5 -> .npy)")
     group.add_argument("--all", action="store_true",
-                       help="Reproject all products")
+                       help="Reproject MTG and OPERA. Lightning is never "
+                            "reprojected: read_kml_version2.py writes it "
+                            "onto the grid directly.")
 
     args = parser.parse_args()
 
@@ -1072,8 +948,6 @@ if __name__ == "__main__":
 
     if args.satellite:
         mode, instrument = 'satellite', args.satellite
-    elif args.lightning:
-        mode, instrument = 'lightning', None
     elif args.opera:
         mode, instrument = 'opera', None
     elif args.all:

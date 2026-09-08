@@ -534,34 +534,20 @@ def find_reprojected_file_lightning(data_root, product, date_str, time_str):
     """
     Find a lightning .npy file on disk.
 
-    `read_kml_version2.py` writes lightning maps directly onto the
-    Romania grid via `GridProjection`, so they live at
+    `read_kml_version2.py` bins strokes directly onto the Romania grid
+    via `GridProjection`, so the frames live at
         `lightning_data/{product}/nc4_<date>-Romania_<product>/lightning_<product>_<YYYYMMDD>_<HHMM>.npy`
-    (no `reprojected_data/` prefix). The legacy
-    `reproject.py --lightning` flow used to mirror them into
-    `reprojected_data/lightning_data/...`; we try that location first
-    for backward compatibility, then fall back to the canonical native
-    path.
+    beside `reprojected_data/`, not inside it. That is the only store;
+    the mirror `reproject.py --lightning` once wrote went stale as soon
+    as a day was rasterised after it, and is gone.
     """
     hhmm = _resolve_hhmm(time_str.replace(':', ''), 'lightning')
     date_compact = date_str.replace('-', '')
     day_folder = f"nc4_{date_str}-Romania_{product}"
     filename = f"lightning_{product}_{date_compact}_{hhmm}.npy"
-
-    # 1. Legacy mirrored location under reprojected_data/.
-    legacy_path = os.path.join(
-        data_root, 'reprojected_data', 'lightning_data',
-        product, day_folder, filename,
-    )
-    if array_exists(legacy_path):
-        return legacy_path
-
-    # 2. Canonical path: read_kml_version2.py writes here directly.
-    native_path = os.path.join(
-        data_root, 'lightning_data',
-        product, day_folder, filename,
-    )
-    return native_path if array_exists(native_path) else None
+    path = os.path.join(data_root, 'lightning_data',
+                        product, day_folder, filename)
+    return path if array_exists(path) else None
 
 
 
