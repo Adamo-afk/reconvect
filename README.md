@@ -921,7 +921,7 @@ python our_data/satellite_data/pipeline_msg_mtg.py --start … --end … --delet
 
 ```
 Deleting 49,281 raw chunk file(s) ...
-  [##########################..............]  65.3%  32,180/49,281  498.2 GB freed
+  Removed 49,281 file(s), freed 762.9 GB
 ```
 
 Nothing is verified in that mode, which is the whole point — that judgement
