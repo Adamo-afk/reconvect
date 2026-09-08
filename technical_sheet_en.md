@@ -39,7 +39,7 @@ acquire -> reproject -> common coverage -> select patches -> build sequences -> 
 | Task | Target |
 |---|---|
 | Rainfall, 5-class | OPERA `rainfall_rate` binned at 10/20/30/40 mm/h |
-| Rainfall, continuous | OPERA `rainfall_rate` |
+| Rainfall, `log_zscore` (SepConv baseline only) | OPERA `rainfall_rate`, denormalised and binned at the same edges for scoring |
 | Lightning occurrence | LINET binary occurrence |
 
 **Class imbalance.** The overwhelming majority of pixels carry no significant rainfall,
@@ -148,7 +148,7 @@ space to the disk it is reading from. `store_registry.py` records which date lan
 | Encoder | ResBlock + ConvGRU (`ResGRU`), channels `[32, 64, 128]` | all |
 | Decoder | reversed `[128, 64, 32]`, bilinear up + skips | all |
 | Input branches | one per tier, merged at matching scales | all |
-| Past / future steps | read from `sequence_meta` (3/3 default) | all |
+| Past / future steps | read from `sequence_meta_<source>[_<period>].json` — `w34`/`f34`: 3 / 4, `w44`: 4 / 4 | all |
 | Optimizer | `Adam(lr=1e-3)` | base stage |
 | Loss (lightning) | `WeightedFocalLoss(gamma=2.0)` | prior from `lightning_fraction` |
 | Loss (rain classification) | `WeightedFocalCategoricalCrossentropy` | prior from `opera_rainfall_fraction` |
