@@ -223,7 +223,7 @@ python our_data/opera_data/pipeline_opera.py --start ... --end ... --ssh_key ...
 python our_data/lightning_data/linet_export.py --start ... --end ... --format kml
 ```
 - **Does** — downloads raw stroke exports, one KML per day.
-- **Note** — `--end` is **exclusive** here, unlike every other script.
+- **Note** — both bounds are inclusive, as everywhere else; `--start D --end D` exports one day.
 - **Writes** — `<out>/kml_data/<date>/<date>.kml` **CRITICAL**
 - **Read by** — `read_kml_version2.py`
 

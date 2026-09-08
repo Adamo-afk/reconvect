@@ -17,7 +17,7 @@ Credentials come from either
 Usage:
     # via credentials file (recommended)
     python our_data/lightning_data/linet_export.py \\
-        --start 2024-06-01 --end 2024-07-01 \\
+        --start 2024-06-01 --end 2024-06-30 \\
         --password_file linet_credentials.txt
 
     # via env vars (Windows: `setx` affects only NEW shells, not the shell
@@ -25,11 +25,12 @@ Usage:
     # effect in the current session)
     set LINET_USER=...
     set LINET_PASS=...
-    python our_data/lightning_data/linet_export.py --start 2024-06-01 --end 2024-07-01
+    python our_data/lightning_data/linet_export.py --start 2024-06-01 --end 2024-06-30
 
-    python our_data/lightning_data/linet_export.py --start 2024-06-15 --end 2024-06-16 \\
+    # one day: start and end name the same date
+    python our_data/lightning_data/linet_export.py --start 2024-06-15 --end 2024-06-15 \\
         --format kml -pw linet_credentials.txt
-    python our_data/lightning_data/linet_export.py --start 2024-06-01 --end 2024-09-01 ^
+    python our_data/lightning_data/linet_export.py --start 2024-06-01 --end 2024-08-31 ^
         --bbox 20.0 43.5 30.0 48.5 --out linet_summer2024 -pw linet_credentials.txt
 """
 
@@ -312,7 +313,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", required=True, type=parse_utc_date,
                    help="start of period, UTC (YYYY-MM-DD or ISO datetime), inclusive")
     p.add_argument("--end", required=True, type=parse_utc_date,
-                   help="end of period, UTC, exclusive")
+                   help="end of period, UTC (YYYY-MM-DD or ISO datetime), "
+                        "inclusive: a date covers that whole day, so "
+                        "--start D --end D exports exactly one day. An ISO "
+                        "datetime with a time is an instant and bounds the "
+                        "range at that moment.")
     p.add_argument("--bbox", nargs=4, type=float, default=list(DEFAULT_BBOX),
                    metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
                    help="rectangle in EPSG:4326 (default: densified WGS84 "
@@ -351,8 +356,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pause", type=float, default=PAUSE_BETWEEN_REQUESTS,
                    help="seconds between requests")
     args = p.parse_args()
+    # --end is inclusive on the command line, like every other script in
+    # the pipeline. The range generators below keep their half-open
+    # [start, end) contract, so a bare date is widened here, once, to the
+    # midnight that closes the day it names.
+    args.end_inclusive = args.end
+    if args.end == args.end.replace(hour=0, minute=0, second=0, microsecond=0):
+        args.end = args.end + timedelta(days=1)
     if args.end <= args.start:
-        p.error("--end must be after --start")
+        p.error("--end must not be before --start")
     if args.daily_window is not None:
         try:
             h0, m0 = map(int, args.daily_window[0].split(":"))
