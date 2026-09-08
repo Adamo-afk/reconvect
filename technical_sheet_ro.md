@@ -344,7 +344,7 @@ după etapa 9.
 
 ### A1. Construirea setului de date
 ```bash
-python create_datasets.py --mode mtg_lightning_opera_rainfall [--period LABEL] [--no-archive]
+python create_datasets.py --mode mtg_lightning_opera_rainfall [mtg_lightning_opera_occurrence ...] [--period LABEL] [--no-archive]
 ```
 - **Scrie** — `our_data/datasets/<run_tag>/{train,validation,test}/*.tfrecord` **CRITIC**
 - **Scrie** — `metadata.json` per partiție **CRITIC** — `input_shapes` și `label_shape`. Antrenarea își citește arhitectura din aceste fișiere, astfel încât o fereastră diferită nu impune nicio modificare de cod.
