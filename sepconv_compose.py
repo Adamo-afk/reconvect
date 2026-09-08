@@ -2,11 +2,11 @@
 sepconv_compose.py — the SepConv-ens composition scheme (Czibula et al. 2024)
 =============================================================================
 The three base models Bm1, Bm3, Bm5 each predict a fixed number of steps
-ahead. Reaching t+1 … t+8 is done by *composing* them, and the paper is
-explicit that the composition is part of the architecture rather than a
-post-hoc convenience: its Table 2 shows the alternative — repeatedly
-applying a single base model — losing 3-4x in CSI. Dropping it would make
-the baseline a strawman.
+past the end of their own input window. Reaching t+1 … t+4 is done by
+*composing* them, and the paper is explicit that the composition is part
+of the architecture rather than a post-hoc convenience: its Table 2 shows
+the alternative — repeatedly applying a single base model — losing 3-4x
+in CSI. Dropping it would make the baseline a strawman.
 
 The rule
 --------
@@ -16,22 +16,22 @@ past the LAST of them:
     Phi_i(M_a, M_b, M_c, M_tau)  ->  M_{tau + i}
 
 So the target step of an entry is (last frame offset) + (base model lead).
-`_validate_scheme` re-derives that for all eight entries at import time,
-which is what stops a mis-transcribed row from silently producing a
-forecast for the wrong lead time.
+`_validate_scheme` re-derives that for every entry at import time, which
+is what stops a mis-transcribed row from silently producing a forecast
+for the wrong lead time.
 
-Steps 1-4 are computed from real observations only. Steps 5-8 are
-autoregressive: they consume the predictions of steps 1-4. That is the
-paper's design ("the estimations up to 24 minutes ahead is based only on
-real radar data"), and it is why skill drops sharply past step 4.
-
-Cadence
+Horizon
 -------
-The paper's step is 6 minutes, so its t+8 is 48 min. Ours is 15 minutes,
-so the same eight steps reach **120 min**. Steps beyond t+4 therefore run
-well past anything the paper validated, and past the horizon RECONVECT
-produces at all. Only t+1..t+3 (15/30/45 min) overlap RECONVECT; the rest
-are reported separately and must not anchor a comparative claim.
+All four steps are computed from real observations only. The paper goes
+on to t+8 by feeding steps 1-4 back in as inputs ("the estimations up to
+24 minutes ahead is based only on real radar data"; beyond that,
+autoregressive, with skill dropping sharply). Its step is 6 minutes, so
+its t+8 is 48 min; ours is 15 minutes, so those rows would reach 120 min
+- past the four future steps the data holds and past anything the paper
+validated. They are not part of the scheme here. The horizon is t+4 =
+60 min, the same four steps RECONVECT predicts, and every base model's
+name is its lead in steps: Bm5 predicts five steps past a window that
+ends at t-1, which is how it lands on t+4.
 
 One transcription note: the paper prints M_{t+4} = Phi_5(M_{t-4}, M_{t-3},
 M_{t-3}, M_{t-1}), repeating t-3 and omitting t-2. Read literally the
@@ -49,19 +49,14 @@ import numpy as np
 REAL_FRAME_OFFSETS = (-4, -3, -2, -1, 0)
 
 # (target_step, base_model_lead, four consecutive frame offsets)
-# Negative/zero offsets are observations; positive ones are predictions
-# made earlier in this same table.
+# Every offset is an observation. The scheme ends here: the paper's
+# autoregressive continuation to t+8 is described in the docstring and
+# deliberately not transcribed, so nothing can run it by default.
 COMPOSITION: tuple[tuple[int, int, tuple[int, int, int, int]], ...] = (
-    # --- from observations only ---
     (1, 1, (-3, -2, -1, 0)),
     (2, 3, (-4, -3, -2, -1)),
     (3, 3, (-3, -2, -1, 0)),
     (4, 5, (-4, -3, -2, -1)),
-    # --- autoregressive ---
-    (5, 1, (1, 2, 3, 4)),
-    (6, 3, (0, 1, 2, 3)),
-    (7, 3, (1, 2, 3, 4)),
-    (8, 5, (0, 1, 2, 3)),
 )
 
 BASE_LEADS = (1, 3, 5)
@@ -95,11 +90,15 @@ def _validate_scheme() -> None:
                 raise ValueError(f"step {step}: no observation at offset {f}")
         seen.add(step)
     if seen != set(range(1, len(COMPOSITION) + 1)):
-        raise ValueError(f"composition does not cover t+1..t+8: {sorted(seen)}")
+        raise ValueError(f"composition does not cover t+1..t+{len(COMPOSITION)}: "
+                         f"{sorted(seen)}")
 
 
 _validate_scheme()
 
+# The one horizon. Every script that composes, evaluates or prints lead
+# times reads it from here; a second constant elsewhere is how a table
+# and its consumers drift apart.
 MAX_STEP = len(COMPOSITION)
 LEAD_MINUTES = {k: k * STEP_MINUTES for k in range(1, MAX_STEP + 1)}
 
@@ -125,10 +124,10 @@ def describe() -> str:
         lines.append(f"  {step:>4} {LEAD_MINUTES[step]:>6} min  "
                      f"Bm{lead:<4} ({fs})  {src}")
     lines.append("")
-    lines.append(f"  observed-only : t+{OBSERVED_ONLY_STEPS} "
-                 f"(to {LEAD_MINUTES[max(OBSERVED_ONLY_STEPS)]} min)")
-    lines.append(f"  autoregressive: t+{AUTOREGRESSIVE_STEPS} "
-                 f"(to {LEAD_MINUTES[MAX_STEP]} min)")
+    lines.append(f"  horizon: t+{MAX_STEP} = {LEAD_MINUTES[MAX_STEP]} min, "
+                 f"observations only"
+                 + (f"; autoregressive: t+{AUTOREGRESSIVE_STEPS}"
+                    if AUTOREGRESSIVE_STEPS else ", nothing autoregressive"))
     return "\n".join(lines)
 
 
