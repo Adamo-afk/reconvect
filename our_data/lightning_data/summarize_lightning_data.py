@@ -13,20 +13,25 @@ loads the array to test for any non-zero pixel, and produces:
        Plus unified columns (any-of-three semantics):
           complete_union / expected_grid / coverage_pct
 
-    2. `lightning_active_steps.csv` (project root by default)
+    2. `lightning_missing_timesteps.json`
+       Per-date list of expected timesteps with no frame on disk. This
+       is what `intersect_product_coverage.py` gates lightning on, the
+       same way it gates MTG and OPERA: a timestep survives if a frame
+       exists, whether or not it holds a stroke. A zero frame is an
+       observation - no lightning - and a valid input.
+
+    3. `lightning_active_steps.csv`
        One row per (date, HH:MM) pair where at least one sub-product has
        activity, with columns:
           date,time_utc,density,current,occurrence
        Flags are 1 if the sub-product has any non-zero pixel at that step,
-       0 otherwise. This is the artifact `intersect_product_coverage.py`
-       consumes via `--active lightning=...`, replacing the missing-JSON
-       gate for lightning.
+       0 otherwise. Read by `lightning_fraction.py --scope_csv` and by
+       `visualize_lightning_stats.py`; not a gate.
 
 The summary mirrors `our_data/opera_data/summarize_opera_data.py` so the
-two products feel consistent in `intersect_product_coverage.py`.
-
-Lightning does not emit a missing-timesteps JSON: the active CSV is the
-sole presence gate for lightning in the cross-product intersection.
+two products feel consistent in `intersect_product_coverage.py`. In the
+CSV, `{p}_present` counts frames on disk and `{p}_on_grid` counts frames
+with a stroke; coverage_pct is the activity share.
 
 Usage:
     python our_data/lightning_data/summarize_lightning_data.py
@@ -77,6 +82,7 @@ from compress_datasets import list_arrays, load_array  # noqa: E402
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent  # our_data/lightning_data
 DEFAULT_OUTPUT_CSV = PRODUCT_DIR / "lightning_summary.csv"
+DEFAULT_MISSING_JSON = PRODUCT_DIR / "lightning_missing_timesteps.json"
 DEFAULT_ACTIVE_CSV = PRODUCT_DIR / "lightning_active_steps.csv"
 
 # Lightning sub-products + their on-disk subdir + .npy filename prefix.
@@ -337,6 +343,7 @@ def summarize(activity_by_product: dict[str, dict[str, dict[str, bool]]],
             coverage = (len(on_grid_active) / len(expected_set) * 100
                         if expected_set else 0.0)
             row[f'{p}_files']         = len(files)
+            row[f'{p}_present']       = len(on_grid)
             row[f'{p}_on_grid']       = len(on_grid_active)
             row[f'{p}_off_grid']      = len(off_grid_active)
             row[f'{p}_expected']      = len(expected_set)
@@ -346,6 +353,7 @@ def summarize(activity_by_product: dict[str, dict[str, dict[str, bool]]],
             date_detail[p] = {
                 'on_grid_active':  sorted(on_grid_active),
                 'off_grid_active': sorted(off_grid_active),
+                'missing':         sorted(expected_set - on_grid),
             }
 
         # Unified coverage = UNION of per-product on-grid actives
@@ -356,6 +364,12 @@ def summarize(activity_by_product: dict[str, dict[str, dict[str, bool]]],
         row['complete_union']    = len(union_active)
         row['expected_grid']     = len(expected_set)
         row['coverage_pct']      = round(unified, 1)
+        # A timestep is present when all three sub-products have a frame;
+        # they are always written together, so this is normally equal to
+        # any one of them, and strictly the right gate if it ever is not.
+        present_all = set.intersection(*on_grid_present_by_product.values())
+        row['present_all']       = len(present_all)
+        date_detail['missing']   = sorted(expected_set - present_all)
 
         rows.append(row)
         detail[date_str] = date_detail
@@ -448,10 +462,11 @@ def save_summary_csv(rows: list[dict], output_path: Path) -> None:
     fieldnames = ['date']
     for p in PRODUCTS:
         fieldnames.extend([
-            f'{p}_files', f'{p}_on_grid', f'{p}_off_grid',
+            f'{p}_files', f'{p}_present', f'{p}_on_grid', f'{p}_off_grid',
             f'{p}_expected', f'{p}_coverage_pct',
         ])
-    fieldnames.extend(['complete_union', 'expected_grid', 'coverage_pct'])
+    fieldnames.extend(['complete_union', 'expected_grid', 'coverage_pct',
+                       'present_all'])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, 'w', newline='') as f:
@@ -460,6 +475,51 @@ def save_summary_csv(rows: list[dict], output_path: Path) -> None:
         writer.writerows(rows)
 
     print(f"Saved CSV: {output_path}")
+
+
+def save_missing_json(rows: list[dict], detail: dict,
+                      minute_filter: set[int], output_path: Path) -> None:
+    """Write the missing-timesteps JSON the intersection gates on.
+
+    Same shape as the OPERA and MTG files: a per-date block with
+    `missing_times` as HH:MM strings, plus config and totals. Missing
+    means no frame on disk for that slot. A frame of zeros is present.
+    """
+    payload = {
+        'config': {
+            'products':      list(PRODUCTS),
+            'minute_filter': sorted(minute_filter),
+        },
+        'dates': {},
+        'summary': {},
+    }
+    totals = {'expected': 0, 'present': 0, 'missing': 0, 'active': 0}
+    for r in rows:
+        date_str = r['date']
+        missing = detail[date_str]['missing']
+        expected = r['expected_grid']
+        payload['dates'][date_str] = {
+            'expected':      expected,
+            'present':       r['present_all'],
+            'missing':       len(missing),
+            'active':        r['complete_union'],
+            'missing_times': [f"{t[:2]}:{t[2:]}" for t in missing],
+        }
+        totals['expected'] += expected
+        totals['present']  += r['present_all']
+        totals['missing']  += len(missing)
+        totals['active']   += r['complete_union']
+    pct = (totals['present'] / totals['expected'] * 100
+           if totals['expected'] else 0.0)
+    payload['summary'] = {
+        'n_dates': len(rows), **totals,
+        'overall_presence_pct': round(pct, 1),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved missing timesteps: {output_path}  "
+          f"({totals['missing']} of {totals['expected']} slots missing)")
 
 
 def save_active_csv(activity_by_product: dict[str, dict[str, dict[str, bool]]],
@@ -527,9 +587,9 @@ def render_chart(rows, output_path):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Summarise lightning .npy cache by date + emit the "
-                    "per-step active CSV consumed by "
-                    "intersect_product_coverage.py."
+        description="Summarise lightning .npy cache by date: coverage "
+                    "CSV, the missing-timesteps JSON the intersection "
+                    "gates on, and the per-step activity index."
     )
     parser.add_argument(
         '--data_dir', type=str, default=str(DEFAULT_DATA_DIR),
@@ -540,8 +600,15 @@ def main() -> int:
         help=f'Output summary CSV (default: {DEFAULT_OUTPUT_CSV})',
     )
     parser.add_argument(
+        '--missing', '-m', type=str, default=str(DEFAULT_MISSING_JSON),
+        help=f'Output JSON with missing timesteps, the presence gate '
+             f'intersect_product_coverage.py reads for lightning '
+             f'(default: {DEFAULT_MISSING_JSON})',
+    )
+    parser.add_argument(
         '--active', '-a', type=str, default=str(DEFAULT_ACTIVE_CSV),
-        help=f'Output active-steps CSV consumed by intersect_product_coverage.py '
+        help=f'Output active-steps CSV, the activity index read by '
+             f'lightning_fraction.py and visualize_lightning_stats.py '
              f'(default: {DEFAULT_ACTIVE_CSV})',
     )
     parser.add_argument(
@@ -604,11 +671,12 @@ def main() -> int:
         print(f"  {p:10s} : {n_dates} dates, {n_files} files, {n_active} active")
     print()
 
-    rows, _detail = summarize(activity_by_product, minute_filter,
-                              start=args.start, end=args.end)
+    rows, detail = summarize(activity_by_product, minute_filter,
+                             start=args.start, end=args.end)
     print_table(rows)
 
     save_summary_csv(rows, Path(args.output))
+    save_missing_json(rows, detail, minute_filter, Path(args.missing))
     if args.chart:
         render_chart(rows, args.chart)
     save_active_csv(activity_by_product, minute_filter, Path(args.active))
