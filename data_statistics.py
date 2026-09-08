@@ -1,18 +1,16 @@
 """
 COALITION-4 dataset statistics and visualizations.
 
-Generates 6 diagnostic plots derived from the per-source split CSVs
+Generates 4 diagnostic plots derived from the per-source split CSVs
 (train_data_<source>.csv, validation_data_<source>.csv,
 test_data_<source>.csv). All three splits are loaded so the
-overview plots (1-4) reflect the full dataset; the split-specific
-plots (5, 6) only describe the --split passed on the CLI.
+overview plots (1-3) reflect the full dataset; the split-specific
+plot (4) only describes the --split passed on the CLI.
 
-    1. Diurnal cycle of convective activity                 (all splits)
+    1. Distribution of active patches per hour of day       (all splits)
     2. Spatial heatmap of patch activation frequency        (all splits)
-    3. Daily activity timeline (dates × hours)              (all splits)
-    4. Distribution of simultaneously active patches        (all splits)
-    5. Valid training samples per date                      (--split)
-    6. Per-patch active vs qualifying + overall survival    (all + --split)
+    3. Distribution of simultaneously active patches        (all splits)
+    4. Per-patch active vs qualifying + overall survival    (all + --split)
 
 All plots are saved to our_data/data_statistics/
 
@@ -33,11 +31,9 @@ Usage:
 
 import numpy as np
 import csv
-import json
 import os
 import argparse
 from collections import defaultdict, Counter
-from datetime import datetime
 import ast
 
 import matplotlib
@@ -45,7 +41,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
-from periods import sequence_meta_name, split_csv_name
+from periods import split_csv_name
 from pipeline_config import SOURCE
 
 
@@ -61,39 +57,6 @@ N_PATCHES = 18
 N_COLS = 6
 N_ROWS = 3
 
-
-def _load_step_minutes(data_root, source="dbscan", period=None):
-    """Read the cadence (`step_minutes`) used to build the per-source
-    split CSVs.
-
-    Looks in this order:
-      1. `our_data/sequence_meta_<source>.json` (canonical, recorded
-         alongside the train/val/test CSVs). For the lightning track
-         it carries both the aggregation `step_minutes` and the native
-         `source_step_minutes_native`; we prefer the native value
-         because the daily-timeline plot is laid out on the
-         per-timestep grid before any aggregation.
-      2. `our_data/timestep_config.json` (master cadence from
-         `validate_timestep.py`).
-      3. 15 minutes (historical hardcoded default).
-    """
-    candidates = [
-        os.path.join(data_root, sequence_meta_name(source, period)),
-        os.path.join(data_root, "timestep_config.json"),
-    ]
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, 'r') as f:
-                cfg = json.load(f)
-        except (OSError, ValueError):
-            continue
-        val = (cfg.get('source_step_minutes_native')
-               or cfg.get('step_minutes'))
-        if val:
-            return int(val)
-    return 15
 
 COLORS = {
     'primary': '#2196F3',
@@ -166,48 +129,41 @@ def patch_activity_from_sequences(seq_data):
 
 
 # =============================================================================
-# Plot 1: Diurnal cycle
+# Plot 1: Active patches per hour of day
 # =============================================================================
 
-def plot_diurnal_cycle(patch_data, out_dir):
+def plot_patches_per_hour(patch_data, out_dir):
     """
-    Line plot: average number of active timesteps per hour of day.
-    Shows the convective diurnal cycle and whether the test window
-    (00-06 UTC) is representative.
+    Bar plot: how many active patches fall in each hour of the day,
+    summed over every reference timestep of every split. This is the
+    quantity the training set is made of - a patch at a timestep is
+    one sample - so it shows directly where in the day the samples
+    come from and whether the test window is representative.
     """
-    # Count active timesteps per hour per date
-    hour_date_counts = defaultdict(lambda: defaultdict(int))
+    per_hour = np.zeros(24, dtype=int)
     for row in patch_data:
-        hour_date_counts[row['hour']][row['date']] += 1
-
-    hours = list(range(24))
-    dates = sorted(set(r['date'] for r in patch_data))
-    n_dates = len(dates)
-
-    # Mean and std across dates
-    means = []
-    stds = []
-    for h in hours:
-        counts = [hour_date_counts[h].get(d, 0) for d in dates]
-        means.append(np.mean(counts))
-        stds.append(np.std(counts))
-
-    means = np.array(means)
-    stds = np.array(stds)
+        per_hour[row['hour']] += row['n_active']
+    total = int(per_hour.sum())
+    hours = np.arange(24)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(hours, means, color=COLORS['primary'], linewidth=2, zorder=3)
-    ax.fill_between(hours, means - stds, means + stds,
-                    color=COLORS['primary'], alpha=0.15, zorder=2)
+    ax.bar(hours, per_hour, width=0.8, color=COLORS['primary'],
+           edgecolor='white', linewidth=0.5, zorder=3)
+    peak = int(per_hour.argmax())
+    ax.annotate(f'{per_hour[peak]:,} ({100 * per_hour[peak] / max(total, 1):.0f}%)',
+                (peak, per_hour[peak]), textcoords='offset points',
+                xytext=(0, 4), ha='center', fontsize=8, color=COLORS['text'])
 
     ax.set_xlabel('Hour (UTC)', fontsize=11)
-    ax.set_ylabel('Active timesteps per hour (mean ± std)', fontsize=11)
-    ax.set_title('Diurnal cycle of convective activity', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Active patches', fontsize=11)
+    ax.set_title(f'Distribution of active patches per hour  '
+                 f'({total:,} patch-timesteps, all splits)',
+                 fontsize=13, fontweight='bold')
     ax.set_xticks(hours)
-    ax.set_xlim(0, 23)
-    ax.grid(axis='y', alpha=0.3)
+    ax.set_xlim(-0.6, 23.6)
+    ax.grid(axis='y', alpha=0.3, zorder=0)
 
-    save_path = os.path.join(out_dir, '1_diurnal_cycle.png')
+    save_path = os.path.join(out_dir, '1_patches_per_hour.png')
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
@@ -262,60 +218,8 @@ def plot_spatial_heatmap(patch_data, out_dir):
 
 
 # =============================================================================
-# Plot 3: Daily activity timeline
 # =============================================================================
-
-def plot_daily_timeline(patch_data, out_dir, step_minutes=15):
-    """
-    Heatmap: dates (y) × hours (x), colored by number of active patches.
-    Exposes data gaps, missing days, and convective clustering.
-
-    The grid resolution adapts to `step_minutes` so each row of
-    `patch_index.csv` maps to exactly one slot — previously the 96-slot
-    grid was hardcoded for a 15-min cadence and silently aliased entries
-    at finer cadences (e.g. :00 and :10 both wrote to slot 0).
-    """
-    dates = sorted(set(r['date'] for r in patch_data))
-    n_dates = len(dates)
-    date_idx = {d: i for i, d in enumerate(dates)}
-
-    # 1440 min / step_minutes slots per day. For step=15 -> 96 slots; for
-    # step=10 -> 144 slots; for step=30 -> 48 slots.
-    slots_per_day = 24 * 60 // step_minutes
-    grid = np.zeros((n_dates, slots_per_day))
-    for row in patch_data:
-        di = date_idx[row['date']]
-        slot = (row['hour'] * 60 + row['minute']) // step_minutes
-        if 0 <= slot < slots_per_day:
-            grid[di, slot] = row['n_active']
-
-    fig, ax = plt.subplots(figsize=(14, max(4, n_dates * 0.35)))
-    cmap = LinearSegmentedColormap.from_list('act', ['#fafafa', '#bbdefb', '#1565c0'])
-    im = ax.imshow(grid, cmap=cmap, aspect='auto', interpolation='nearest')
-    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
-    cbar.set_label('Active patches', fontsize=10)
-
-    # X-axis: show every 2 hours — slot index per hour scales with cadence.
-    slots_per_hour = 60 // step_minutes
-    xticks = [h * slots_per_hour for h in range(0, 24, 2)]
-    ax.set_xticks(xticks)
-    ax.set_xticklabels([f'{h:02d}:00' for h in range(0, 24, 2)], fontsize=8)
-
-    ax.set_yticks(range(n_dates))
-    ax.set_yticklabels(dates, fontsize=7)
-    ax.set_xlabel('Time (UTC)', fontsize=11)
-    ax.set_ylabel('Date', fontsize=11)
-    ax.set_title('Daily convective activity timeline',
-                 fontsize=13, fontweight='bold')
-
-    save_path = os.path.join(out_dir, '3_daily_timeline.png')
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved: {save_path}")
-
-
-# =============================================================================
-# Plot 4: Simultaneously active patches distribution
+# Plot 3: Simultaneously active patches distribution
 # =============================================================================
 
 def plot_active_distribution(patch_data, out_dir):
@@ -344,51 +248,15 @@ def plot_active_distribution(patch_data, out_dir):
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
 
-    save_path = os.path.join(out_dir, '4_active_distribution.png')
+    save_path = os.path.join(out_dir, '3_active_distribution.png')
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
 
 
 # =============================================================================
-# Plot 5: Valid training samples per date
 # =============================================================================
-
-def plot_samples_per_date(seq_data, out_dir, prefix='sequences'):
-    """
-    Bar plot: how many qualifying sequences each date contributes.
-    Reveals if a few dates dominate the training set.
-    """
-    date_counts = Counter(r['date'] for r in seq_data)
-    dates = sorted(date_counts.keys())
-    counts = [date_counts[d] for d in dates]
-
-    fig, ax = plt.subplots(figsize=(max(8, len(dates) * 0.6), 5))
-    x = range(len(dates))
-    ax.bar(x, counts, color=COLORS['accent'], edgecolor='white',
-           linewidth=0.5, alpha=0.85, zorder=3)
-
-    mean_val = np.mean(counts)
-    ax.axhline(mean_val, color=COLORS['secondary'], linestyle='--',
-               linewidth=1.2, label=f'Mean: {mean_val:.1f}')
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(dates, rotation=45, ha='right', fontsize=8)
-    ax.set_xlabel('Date', fontsize=11)
-    ax.set_ylabel('Valid sequences', fontsize=11)
-    ax.set_title(f'Valid samples per date ({prefix})',
-                 fontsize=13, fontweight='bold')
-    ax.legend(fontsize=9)
-    ax.grid(axis='y', alpha=0.3)
-
-    save_path = os.path.join(out_dir, f'5_samples_per_date_{prefix}.png')
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f"  Saved: {save_path}")
-
-
-# =============================================================================
-# Plot 6: Patch survival rate
+# Plot 4: Patch survival rate
 # =============================================================================
 
 def plot_patch_survival(seq_all, seq_split, out_dir,
@@ -481,7 +349,7 @@ def plot_patch_survival(seq_all, seq_split, out_dir,
     ax.legend(fontsize=9)
     ax.grid(axis='y', alpha=0.3)
 
-    save_path = os.path.join(out_dir, f'6_patch_survival_{prefix}.png')
+    save_path = os.path.join(out_dir, f'4_patch_survival_{prefix}.png')
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
@@ -550,11 +418,11 @@ def main():
     print(f"Output    : {out_dir}")
 
     # Load the --split CSV first. This is the canonical source for
-    # plots 5 + 6 ("samples per date" and "patch survival") - they
-    # only describe the split the user picked. Plots 1-4 then union
-    # all three split CSVs (train + validation + test) so the
-    # diurnal / spatial / timeline / active-count diagnostics
-    # describe the full dataset rather than just one split.
+    # plot 4 ("patch survival"), which only describes the split the
+    # user picked. Plots 1-3 then union all three split CSVs
+    # (train + validation + test) so the per-hour / spatial /
+    # active-count diagnostics describe the full dataset rather than
+    # just one split.
     print(f"\nLoading split CSV ({os.path.basename(seq_path)})...")
     seq_split = load_sequences(seq_path)
     if not seq_split:
@@ -576,7 +444,7 @@ def main():
             other_path = os.path.join(args.data_root, other_name)
             if not os.path.isfile(other_path):
                 print(f"  ({other_name} not found - "
-                      f"plots 1-4 will skip it)")
+                      f"plots 1-3 will skip it)")
                 continue
             extra = load_sequences(other_path)
             if extra:
@@ -588,23 +456,14 @@ def main():
     print(f"  Combined patch-activity: {len(patch_data)} active "
           f"timesteps across {len(activity_dates)} dates")
 
-    # Cadence is read from sequence_meta_<source>.json (preferred) or
-    # timestep_config.json (fallback) so the daily-timeline grid sizes
-    # itself correctly for any --step_minutes validate_timestep.py was
-    # run with.
-    step_minutes = _load_step_minutes(args.data_root, SOURCE)
-    print(f"  step_minutes: {step_minutes} (from config)")
-
     # Generate plots
     print("\nGenerating plots...")
 
-    plot_diurnal_cycle(patch_data, out_dir)
+    plot_patches_per_hour(patch_data, out_dir)
     plot_spatial_heatmap(patch_data, out_dir)
-    plot_daily_timeline(patch_data, out_dir, step_minutes=step_minutes)
     plot_active_distribution(patch_data, out_dir)
 
     seq_prefix = os.path.splitext(os.path.basename(seq_path))[0]
-    plot_samples_per_date(seq_split, out_dir, seq_prefix)
     plot_patch_survival(seq_all, seq_split, out_dir,
                         prefix=seq_prefix, split_label=args.split)
 
