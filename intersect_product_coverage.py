@@ -52,9 +52,15 @@ Example
 -------
     python intersect_product_coverage.py \
         --summary mtg=our_data/satellite_data/mtg_summary.csv \
-        --summary opera=our_data/opera_data/opera_summary.csv \
+        --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv \
+        --summary opera_reflectivity=our_data/opera_data/opera_summary.csv \
         --summary lightning=our_data/lightning_data/lightning_summary.csv \
         --errors_log our_data/reprojected_data/reproject_satellite_MTG.log
+
+Gate on every field the modes will read. `opera` alone is an alias for
+`opera_rainfall_rate`; a manifest built with it admits the few timesteps
+that have rainfall but no reflectivity, and modes reading reflectivity
+then drop those samples silently at build.
 """
 
 from __future__ import annotations

@@ -261,9 +261,10 @@ python our_data/<product>/summarize_<product>.py --start 2025-01-01 --end 2026-0
 ### 4. Determining the common coverage period
 ```bash
 python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv \
+    [--summary opera_reflectivity=our_data/opera_data/opera_summary.csv] \
     [--summary mtg=our_data/satellite_data/mtg_summary.csv --summary lightning=our_data/lightning_data/lightning_summary.csv]
 ```
-- **Does** — intersects the requested products into the timesteps where *all* of them are available. Which products are required is chosen per run, so a radar-only model is not held back by gaps in another instrument.
+- **Does** — intersects the requested products into the timesteps where *all* of them are available. Which products are required is chosen per run, so a radar-only model is not held back by gaps in another instrument. Gate on every field the modes will read: `opera` alone is an alias for `opera_rainfall_rate`, and the full modes also read reflectivity.
 - **Writes** — `our_data/timestep_manifest.csv` **CRITICAL** — the timesteps every later stage is allowed to draw on.
 - **Graph** — `our_data/intersect_summary.png` — monthly lines, one per category, kept against each omission reason.
 - **Note** — OPERA's two fields are separate keys, so a rainfall-only model keeps samples reflectivity happens to lack, and a model reading reflectivity is never handed a timestep without it.
