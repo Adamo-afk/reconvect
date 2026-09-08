@@ -45,7 +45,7 @@ achiziție -> reproiecție -> perioada comună -> selecția patch-urilor -> cons
 | Sarcină | Țintă |
 |---|---|
 | Precipitații, 5 clase | OPERA `rainfall_rate` discretizat la 10/20/30/40 mm/h |
-| Precipitații, continuu | OPERA `rainfall_rate` |
+| Precipitații, `log_zscore` (exclusiv modelul de referință SepConv) | OPERA `rainfall_rate`, denormalizat și discretizat la aceleași praguri pentru evaluare |
 | Apariția fulgerelor | LINET, apariție binară |
 
 **Dezechilibrul claselor.** Marea majoritate a pixelilor nu prezintă precipitații
@@ -163,7 +163,7 @@ sub `--min_free_gb`, criteriu reevaluat înaintea fiecărei ferestre **și în a
 | Encoder | ResBlock + ConvGRU (`ResGRU`), canale `[32, 64, 128]` | toate |
 | Decoder | `[128, 64, 32]` în ordine inversă, upsampling biliniar + conexiuni skip | toate |
 | Ramuri de intrare | câte una per nivel, unificate la scările corespunzătoare | toate |
-| Pași anteriori / ulteriori | citiți din `sequence_meta` (implicit 3/3) | toate |
+| Pași anteriori / ulteriori | citiți din `sequence_meta_<source>[_<period>].json` — `w34`/`f34`: 3 / 4, `w44`: 4 / 4 | toate |
 | Optimizator | `Adam(lr=1e-3)` | etapa base |
 | Pierdere (fulgere) | `WeightedFocalLoss(gamma=2.0)` | distribuție a priori din `lightning_fraction` |
 | Pierdere (clasificarea precipitațiilor) | `WeightedFocalCategoricalCrossentropy` | distribuție a priori din `opera_rainfall_fraction` |
