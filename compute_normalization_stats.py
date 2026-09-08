@@ -534,7 +534,11 @@ def _walk_lightning(root: Path, var: str,
                     training_keys: set[tuple[str, str]]
                     ) -> list[Path]:
     """
-    `reprojected_data/lightning_data/{var}/nc4_{date}-Romania_{var}/lightning_{var}_{YYYYMMDD}_{HHMM}.npy`
+    `lightning_data/{var}/nc4_{date}-Romania_{var}/lightning_{var}_{YYYYMMDD}_{HHMM}.npy`
+
+    The native store written by read_kml_version2.py, beside
+    reprojected_data rather than inside it: lightning is binned straight
+    onto the Romania grid and is never reprojected.
     """
     var_root = root / var
     if not var_root.is_dir():
@@ -598,6 +602,12 @@ def _walk_opera(root: Path, var: str,
     return out
 
 
+def lightning_root(reproject_root: Path) -> Path:
+    """Where the lightning frames live: `<data_root>/lightning_data`,
+    the sibling of reprojected_data."""
+    return reproject_root.parent / "lightning_data"
+
+
 def discover_inputs(reproject_root: Path, var: str,
                     training_keys: set[tuple[str, str]],
                     product_filters: dict[str, set[int]] | None = None,
@@ -629,22 +639,12 @@ def discover_inputs(reproject_root: Path, var: str,
             reproject_root / "satellite_data" / "MTG", var, keys,
         )
     if source == "lightning":
-        # Lightning maps are written natively onto the Romania grid by
-        # read_kml_version2.py at `data_root/lightning_data/...`, NOT
-        # `reproject_root/lightning_data/...`. The legacy
-        # reproject.py --lightning flow used to mirror them under
-        # reproject_root, so try the legacy location first for
-        # backward compatibility, then fall back to the canonical
-        # native location (reproject_root's sibling).
-        for candidate in (
-            reproject_root / "lightning_data",
-            reproject_root.parent / "lightning_data",
-        ):
-            if (candidate / var).is_dir():
-                return _walk_lightning(candidate, var, keys)
-        # Neither exists - return [] so the caller's empty-list branch
-        # logs a clean "0 file(s) match" line.
-        return []
+        # Lightning is written natively onto the Romania grid by
+        # read_kml_version2.py at `data_root/lightning_data/...`, beside
+        # reproject_root, not inside it. There is exactly one store: a
+        # mirror under reproject_root used to exist and went stale the
+        # first time a day was rasterised after it was made.
+        return _walk_lightning(lightning_root(reproject_root), var, keys)
     if source == "opera":
         return _walk_opera(
             reproject_root / "opera_data", var, keys,
@@ -893,7 +893,8 @@ def main() -> int:
     print("=" * 70)
     print("Normalization Stats Computation")
     print("=" * 70)
-    print(f"Reproject root         : {reproject_root}")
+    print(f"Reproject root         : {reproject_root}  (MTG, OPERA)")
+    print(f"Lightning root         : {lightning_root(reproject_root)}")
     print(f"Training filter     : "
           f"{'DISABLED — using all files' if args.no_split_filter else f'enabled ({len(training_keys)} unique (date, HHMM) keys)'}")
     print(f"Variables           : {sorted(variables)}")

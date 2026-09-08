@@ -25,7 +25,7 @@ does not.
 Minimum on-disk requirements (nothing else):
   our_data/reprojected_data/satellite_data/MTG/<var>/nc4_<date>-Romania_<var>/*.npy
   our_data/reprojected_data/opera_data/<var>/nc4_<date>-Romania_<var>/*.npy
-  our_data/lightning_data/<var>/nc4_<date>-Romania_<var>/*.npy   (or the reprojected_data mirror)
+  our_data/lightning_data/<var>/nc4_<date>-Romania_<var>/*.npy
   our_data/normalization_stats_<source>.json
   our_data/sequence_meta_<source>.json
   our_data/timestep_config.json

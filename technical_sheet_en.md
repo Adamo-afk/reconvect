@@ -639,7 +639,6 @@ python compress_datasets.py --restore-npy DIR                         # and back
 | `our_data/patches/` | 66.8 GB | 11.3× | 5.9 GB |
 | `reprojected_data/satellite_data/MTG/` | 1313.4 GB | 8.8× | 148.5 GB |
 | `reprojected_data/opera_data/` | 519.3 GB | 37.6× | 13.8 GB |
-| `reprojected_data/lightning_data/` | 314.2 GB | 7110× | ~0 GB |
 | `our_data/lightning_data/` | 313.4 GB | 16180× | ~0 GB |
 | MTG store (E: + G:) | 2765.2 GB | 6.1× | 454.0 GB |
 | **Total** | **5292.3 GB** | **8.5×** | **622.3 GB** |
