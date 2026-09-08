@@ -239,7 +239,7 @@ python our_data/opera_data/pipeline_opera.py --start ... --end ... --ssh_key ...
 python our_data/lightning_data/linet_export.py --start ... --end ... --format kml
 ```
 - **Descriere** — descarcă exporturile brute de descărcări electrice, câte un fișier KML pe zi.
-- **Notă** — `--end` este **exclusiv** în acest script, spre deosebire de toate celelalte.
+- **Notă** — ambele limite sunt inclusive, ca în toate celelalte scripturi; `--start D --end D` exportă exact o zi.
 - **Scrie** — `<out>/kml_data/<date>/<date>.kml` **CRITIC**
 - **Citit de** — `read_kml_version2.py`
 
