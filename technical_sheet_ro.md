@@ -277,9 +277,10 @@ python our_data/<product>/summarize_<product>.py --start 2025-01-01 --end 2026-0
 ### 4. Determinarea perioadei comune de acoperire a produselor
 ```bash
 python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv \
+    [--summary opera_reflectivity=our_data/opera_data/opera_summary.csv] \
     [--summary mtg=our_data/satellite_data/mtg_summary.csv --summary lightning=our_data/lightning_data/lightning_summary.csv]
 ```
-- **Descriere** — intersectează produsele solicitate, păstrând pașii de timp în care *toate* sunt disponibile. Produsele impuse se aleg pentru fiecare execuție în parte, astfel încât un model exclusiv radar să nu fie limitat de lacunele altui instrument.
+- **Descriere** — intersectează produsele solicitate, păstrând pașii de timp în care *toate* sunt disponibile. Produsele impuse se aleg pentru fiecare execuție în parte, astfel încât un model exclusiv radar să nu fie limitat de lacunele altui instrument. Se impun toate câmpurile citite de modurile vizate: `opera` singur este un alias pentru `opera_rainfall_rate`, iar modurile complete citesc și reflectivitatea.
 - **Scrie** — `our_data/timestep_manifest.csv` **CRITIC** — pașii de timp pe care fiecare etapă ulterioară îi poate utiliza.
 - **Grafic** — `our_data/intersect_summary.png` — linii lunare, câte una per categorie, raportate la fiecare motiv de omisiune.
 - **Notă** — cele două câmpuri OPERA constituie chei separate; astfel, un model exclusiv de precipitații păstrează eșantioane pentru care reflectivitatea lipsește, iar un model care citește reflectivitate nu primește niciodată un pas de timp fără aceasta.
