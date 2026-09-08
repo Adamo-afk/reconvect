@@ -84,6 +84,13 @@ import json
 from pathlib import Path
 import argparse
 
+# The frames may be zstd-compressed in place (compress_datasets.py
+# --compress-npy); list_arrays yields logical .npy names either way, so
+# a compressed day still counts as complete. The shim lives at the repo
+# root, two levels up from this file.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from compress_datasets import list_arrays  # noqa: E402
+
 
 # =============================================================================
 # Configuration
@@ -689,9 +696,12 @@ def is_date_complete(output_root, date_str, expected_count):
         day_dir = output_root / prod_name / f"nc4_{date_str}-Romania_{prod_name}"
         if not day_dir.is_dir():
             return False
+        # list_arrays yields logical `.npy` names whether the frame on
+        # disk is plain or `.npy.zst`, so a compressed day still counts
+        # as complete and is not rasterised a second time.
         n_found = sum(
-            1 for f in os.listdir(day_dir)
-            if f.startswith(f"{file_prefix}_") and f.endswith(".npy")
+            1 for f in list_arrays(day_dir)
+            if f.startswith(f"{file_prefix}_")
         )
         if n_found != expected_count:
             return False

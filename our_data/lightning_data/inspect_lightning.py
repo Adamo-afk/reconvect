@@ -35,6 +35,10 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import sys
+from pathlib import Path as _P
+sys.path.insert(0, str(_P(__file__).resolve().parents[2]))
+from compress_datasets import load_array  # noqa: E402
 
 try:
     import xarray as xr
@@ -119,7 +123,8 @@ def build_reprojected_nc(npy_path: Path,
     lats = np.load(grid_dir / "romania_grid_lats.npy")
     lons = np.load(grid_dir / "romania_grid_lons.npy")
 
-    data = np.load(npy_path).astype(np.float32)
+    # Through the shim: the frame may be `.npy` or `.npy.zst` on disk.
+    data = load_array(npy_path).astype(np.float32)
     if data.shape != lats.shape:
         raise ValueError(
             f"Shape mismatch: data {data.shape} vs grid {lats.shape}. "
