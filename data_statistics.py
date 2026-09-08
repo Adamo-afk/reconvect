@@ -149,11 +149,6 @@ def plot_patches_per_hour(patch_data, out_dir):
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.bar(hours, per_hour, width=0.8, color=COLORS['primary'],
            edgecolor='white', linewidth=0.5, zorder=3)
-    peak = int(per_hour.argmax())
-    ax.annotate(f'{per_hour[peak]:,} ({100 * per_hour[peak] / max(total, 1):.0f}%)',
-                (peak, per_hour[peak]), textcoords='offset points',
-                xytext=(0, 4), ha='center', fontsize=8, color=COLORS['text'])
-
     ax.set_xlabel('Hour (UTC)', fontsize=11)
     ax.set_ylabel('Active patches', fontsize=11)
     ax.set_title(f'Distribution of active patches per hour  '
