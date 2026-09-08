@@ -393,7 +393,7 @@ A reimplementation of **SepConv-ens** (Czibula et al., *Procedia Computer Scienc
 |---|---|---|---|
 | 1 | 6 reflectivity elevations (R01–R04, R06–R07) | 1 channel, OPERA composite rainfall rate | Different instrument. First layer becomes 1→51; the 51-wide expansion, the 204 concat and the whole trunk are unchanged. |
 | 2 | SELU after every separable layer | **Linear** output layer | The target is `log_zscore` rain rate with a tail at z = +9.5, exponentiated downstream. SELU's floor (−λα = −1.7581) would in fact reach the dry value at z = −0.2912, but a saturating nonlinearity in front of a value we exponentiate turns a top-of-range error into a multiplicative one. |
-| 3 | 6-minute steps, t+1…t+8 | 15-minute steps, **t+1…t+4 = 15/30/45/60 min** | Our master cadence, and the horizon is capped at t+4 on purpose: those four steps are the ones the composition builds from observations alone (see below). t+5…t+8 would be 75–120 min, past anything the paper validated, and would be autoregressive. |
+| 3 | 6-minute steps, t+1…t+8 | 15-minute steps, **t+1…t+4 = 15/30/45/60 min** | Our master cadence, and the horizon is capped at t+4 on purpose: those four steps are the ones the composition builds from observations alone (see below), and the four RECONVECT predicts. The paper's t+5…t+8 are autoregressive and, on our grid, past anything it validated; they are not transcribed. |
 | 4 | Weighted MSE, weights unpublished | Inverse-frequency by class, capped at 1000× | Their weighting is not in the paper. Ours is derived from measured class fractions and **reported as ours**. |
 | 5 | min-max normalisation to [0,1] | `log_zscore` (fill 0.01, clip 0.01) | Matches the space the field is consumed in — input and label are the same field in the same units, which is what would make a rollout possible at all were one used. |
 | 6 | `M_{t+4} = Φ₅(M_{t−4}, M_{t−3}, M_{t−3}, M_{t−1})` | `(t−4, t−3, t−2, t−1)` | Transcription error in the paper — `t−3` twice, `t−2` missing. Read literally the frames are non-consecutive; the correction is what makes the step arithmetic land on t+4. |
@@ -402,12 +402,17 @@ A reimplementation of **SepConv-ens** (Czibula et al., *Procedia Computer Scienc
 
 Reproduced in full — the paper's Table 2 shows that replacing it with repeated single-model application costs 3–4× in CSI, so dropping it would make the baseline a strawman. `sepconv_compose.py` **validates the table at import**: it re-derives `last_frame_offset + base_lead` for every entry and refuses to load if that doesn't equal the target step.
 
-| step | t+1 | t+2 | t+3 | t+4 | t+5 | t+6 | t+7 | t+8 |
-|---|---|---|---|---|---|---|---|---|
-| lead (min) | 15 | 30 | 45 | 60 | 75 | 90 | 105 | 120 |
-| model | Bm1 | Bm3 | Bm3 | Bm5 | Bm1 | Bm3 | Bm3 | Bm5 |
-| source | observed | observed | observed | observed | autoregressive | autoregressive | autoregressive | autoregressive |
-| **in use** | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
+| step | t+1 | t+2 | t+3 | t+4 |
+|---|---|---|---|---|
+| lead (min) | 15 | 30 | 45 | 60 |
+| model | Bm1 | Bm3 | Bm3 | Bm5 |
+| window | t−3…t0 | t−4…t−1 | t−3…t0 | t−4…t−1 |
+| source | observed | observed | observed | observed |
+
+The paper continues to t+8 by feeding these four predictions back in as inputs. Those rows are
+described in `sepconv_compose.py` and deliberately not transcribed into the table, so nothing
+can run them by default: `MAX_STEP` is the length of the table, and every script that composes,
+evaluates or prints lead times imports it from there.
 
 **Nothing here is run autoregressively.** The comparison stops at t+4, and
 the first four steps read observations only — `compose(predict_fn, frames,
@@ -421,7 +426,7 @@ reach only +1, +3 and +5 — landing on +2 and +4 requires a window ending
 at `t−1`, and therefore a fifth frame. The baseline needs `past=4`
 whatever the horizon.
 
-`Bm1/Bm3/Bm5` are named for their own leads — 15/45/75 min on our grid, against the paper's 6/18/30. Those are leads *from each model's own window end*, not forecast horizons: Bm5's window is shifted back one step, so it supplies t+4. **The composition forecasts to t+4 = 60 min and no further.**
+`Bm1/Bm3/Bm5` are named for their own leads **in steps** — 1, 3 and 5 steps past the end of their own input window, as in the paper. Those are not forecast horizons and are never quoted in minutes here: Bm5's window is shifted back one step, so it supplies t+4. **The composition forecasts to t+4 = 60 min and no further.**
 
 ### Normalization scoping
 

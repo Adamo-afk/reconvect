@@ -34,8 +34,8 @@ from tensorflow.keras.layers import (
 from tensorflow.keras import Model
 from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callback
 
-from sepconv_compose import (BASE_LEADS, COMPOSITION, OBSERVED_ONLY_STEPS,
-                             REAL_FRAME_OFFSETS)
+from sepconv_compose import (BASE_LEADS, COMPOSITION, LEAD_MINUTES, MAX_STEP,
+                             OBSERVED_ONLY_STEPS, REAL_FRAME_OFFSETS)
 from create_datasets import (
     dataset_n_samples,
     get_mode_config,
@@ -75,14 +75,13 @@ KERNEL = (5, 5)
 ACTIVATION = 'selu'
 DEPTH_MULT = 1
 
-# Base models, per the paper: Bm1, Bm3, Bm5 predict 1, 3 and 5 steps
-# ahead. On our 15-minute grid that is 15, 45 and 75 minutes — the paper's
-# 6-minute grid made them 6, 18 and 30.
+# Base models, per the paper: Bm1, Bm3, Bm5 predict 1, 3 and 5 steps past
+# the end of their own input window. The composition uses them to reach
+# t+1..t+4; the horizon and the lead-time table are sepconv_compose's.
 SEPCONV_BASE_LEADS = (1, 3, 5)
 STEP_MINUTES = 15
-MAX_COMPOSED_STEPS = 8
+MAX_COMPOSED_STEPS = MAX_STEP
 
-LEAD_MINUTES = {k: k * STEP_MINUTES for k in range(1, MAX_COMPOSED_STEPS + 1)}
 LEAD_NAMES = {k: f"t+{v}" for k, v in LEAD_MINUTES.items()}
 
 # Which of the 5 past frames (t-4 .. t0) a base model trains on is NOT
@@ -399,11 +398,12 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
     print(f"\n{'-' * 60}")
     _slice, _label_idx = training_pair(lead_steps)
     _frames = REAL_FRAME_OFFSETS[_slice]
-    print(f"  Training Bm{lead_steps}: {lead_steps}-step model, "
-          f"{LEAD_MINUTES[lead_steps]} min from its own window end")
-    # State the window explicitly: it is not the same for every model.
+    print(f"  Training Bm{lead_steps}: {lead_steps}-step base model")
+    # State the window explicitly: it is not the same for every model,
+    # and minutes are always counted from t0, never from the window end.
     print(f"    trains on t{_frames[0]:+d}..t{_frames[-1]:+d} "
-          f"-> t+{_label_idx + 1} (label index {_label_idx})")
+          f"-> t+{_label_idx + 1} ({LEAD_MINUTES[_label_idx + 1]} min from t0; "
+          f"label index {_label_idx})")
     print(f"{'-' * 60}")
 
     # `ds_root` is passed in, never rebuilt here: train() already
@@ -488,7 +488,8 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
 
     return {
         "lead_idx": lead_steps, "lead_name": lead_name,
-        "lead_minutes": LEAD_MINUTES[lead_steps],
+        "target_step": _label_idx + 1,
+        "target_minutes": LEAD_MINUTES[_label_idx + 1],
         "hyperparameters": {
             "learning_rate": learning_rate,
             "optimizer": "adam_amsgrad",
@@ -580,13 +581,12 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
 
     leads_to_train = [lead] if lead is not None else list(SEPCONV_BASE_LEADS)
 
-    # A base model is named for its OWN lead - how far ahead it predicts
-    # from the end of its own input window - not for the horizon it
+    # A base model is named for its OWN lead in steps - how far past the
+    # end of its own input window it predicts - not for the horizon it
     # serves. Bm5 is a 5-step model, but it supplies t+4 because its
-    # window is shifted back one step. Spelling both out, because
-    # "Bm5 (t+75min)" reads as a 75-minute forecast and the ensemble
-    # makes no such thing.
-    from sepconv_compose import COMPOSITION, OBSERVED_ONLY_STEPS
+    # window is shifted back one step. Spelling both out, and never
+    # converting a base lead to minutes: that reads as a forecast horizon
+    # the ensemble does not have.
     serves = {}
     for step, lead_k, _offsets in COMPOSITION:
         if step in OBSERVED_ONLY_STEPS:
@@ -596,8 +596,7 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
         steps = serves.get(k, [])
         supplies = (", ".join(f"t+{t} ({LEAD_MINUTES[t]} min)" for t in steps)
                     if steps else "not used by the composition")
-        print(f"    Bm{k}: {k}-step model "
-              f"({LEAD_MINUTES[k]} min from its window end) -> {supplies}")
+        print(f"    Bm{k}: {k}-step base model -> supplies {supplies}")
     horizon = max(OBSERVED_ONLY_STEPS)
     print(f"  Forecast horizon: t+{horizon} = {LEAD_MINUTES[horizon]} min "
           f"(nothing autoregressive)")
@@ -686,9 +685,9 @@ def main():
     parser.add_argument("--lead", type=int, default=None,
                         choices=list(SEPCONV_BASE_LEADS),
                         help="Train one base model instead of all three. "
-                             f"{SEPCONV_BASE_LEADS} = "
-                             f"{[LEAD_MINUTES[k] for k in SEPCONV_BASE_LEADS]} "
-                             f"minutes ahead.")
+                             "The number is the model's lead in steps past "
+                             "the end of its own window; the composition "
+                             f"uses them to reach t+1..t+{MAX_STEP}.")
     parser.add_argument("--learning_rate", type=float, default=None,
                         help="Override [sepconv].learning_rate (which "
                              "defaults to [lr_schedule].initial_lr). The "

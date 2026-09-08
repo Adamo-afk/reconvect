@@ -66,7 +66,9 @@ from train_models import build_run_tag
 # Constants
 # ============================================================================
 
-MAX_STEP = 4          # t+1..t+4; beyond this the composition goes AR
+# The horizon is the composition's, imported rather than restated: a
+# second constant here is how the table and its evaluator drift apart.
+from sepconv_compose import MAX_STEP  # noqa: E402
 CLASS_NAMES = ["R<10", "10≤R<20", "20≤R<30", "30≤R<40", "R≥40"]
 N_CLASSES = len(CLASS_NAMES)
 
