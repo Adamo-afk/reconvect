@@ -38,7 +38,7 @@ import numpy as np
 import sys
 from pathlib import Path as _P
 sys.path.insert(0, str(_P(__file__).resolve().parents[2]))
-from compress_datasets import load_array  # noqa: E402
+from compress_datasets import array_exists, load_array  # noqa: E402
 
 try:
     import xarray as xr
@@ -110,7 +110,14 @@ def discover_grid_dir(npy_path: Path) -> Path:
 def build_reprojected_nc(npy_path: Path,
                           grid_dir: Path | None = None) -> xr.Dataset:
     """Load a reprojected lightning `.npy` and assemble a CF dataset."""
-    if not npy_path.is_file():
+    # A frame named by its logical .npy path may be .npy.zst on disk;
+    # array_exists and load_array resolve either. A .zst path given
+    # directly is normalised to the logical name so the filename parser
+    # and the shim both see the .npy form.
+    npy_path = Path(npy_path)
+    if npy_path.suffix == ".zst":
+        npy_path = npy_path.with_suffix("")
+    if not array_exists(npy_path):
         raise FileNotFoundError(npy_path)
 
     info = parse_lightning_filename(npy_path)
