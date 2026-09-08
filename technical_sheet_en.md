@@ -327,7 +327,7 @@ The headline model: all three modalities, 5-class rainfall. Runs straight on fro
 
 ### A1. Build the dataset
 ```bash
-python create_datasets.py --mode mtg_lightning_opera_rainfall [--period LABEL] [--no-archive]
+python create_datasets.py --mode mtg_lightning_opera_rainfall [mtg_lightning_opera_occurrence ...] [--period LABEL] [--no-archive]
 ```
 - **Writes** — `our_data/datasets/<run_tag>/{train,validation,test}/*.tfrecord` **CRITICAL**
 - **Writes** — `metadata.json` per split **CRITICAL** — `input_shapes` and `label_shape`. Training reads its architecture from these, so a different window needs no code change.

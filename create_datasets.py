@@ -1500,10 +1500,15 @@ def main():
         description="Create COALITION-4 TF datasets from pre-extracted patches."
     )
     parser.add_argument(
-        "--mode", type=str, required=True, choices=list(BUILDABLE_MODES),
-        help="Dataset mode. The KD student (mtg_opera_occurrence) is "
-             "absent by design: it trains on the teacher's dataset with "
-             "past_hr sliced — see train_lightning_kd.py."
+        "--mode", type=str, required=True, nargs="+",
+        choices=list(BUILDABLE_MODES), metavar="MODE",
+        help="One or more dataset modes, built in turn over the same "
+             "split: --mode mtg_lightning_opera_rainfall "
+             "mtg_lightning_opera_occurrence. Choices: "
+             f"{', '.join(BUILDABLE_MODES)}. The KD student "
+             "(mtg_opera_occurrence) is absent by design: it trains on "
+             "the teacher's dataset with past_hr sliced — see "
+             "train_lightning_kd.py."
     )
     parser.add_argument(
         "--datasets_root", type=str, default=None, metavar="PATH",
@@ -1594,7 +1599,8 @@ def main():
             Path(args.data_root) / "patch_index" / "patch_index.csv"
         )
         plan = enumerate_members(counts, seasons)
-        print(format_plan(plan, mode=args.mode, source=SOURCE))
+        for mode in args.mode:
+            print(format_plan(plan, mode=mode, source=SOURCE))
 
         # An overlap means two members would train on shared dates, which
         # defeats the entire point of the split. Refuse to register it.
@@ -1604,17 +1610,18 @@ def main():
                 "registering. Nothing was written."
             )
 
-        state = append_state(args.data_root, plan,
-                             mode=args.mode, source=SOURCE)
-        print(f"\nRegistered {state['n_members']} member(s) "
-              f"({state['n_buildable']} buildable) in "
-              f"{registry_path(args.data_root)}")
+        for mode in args.mode:
+            state = append_state(args.data_root, plan,
+                                 mode=mode, source=SOURCE)
+            print(f"\nRegistered {state['n_members']} member(s) "
+                  f"({state['n_buildable']} buildable) for {mode} in "
+                  f"{registry_path(args.data_root)}")
         buildable = [m.label for m in plan.buildable]
         if buildable:
-            print("\nBuild them one at a time:")
+            print("\nBuild them one member at a time:")
             for label in buildable:
-                print(f"    python create_datasets.py --mode {args.mode} "
-                      f"--period {label}")
+                print(f"    python create_datasets.py --mode "
+                      f"{' '.join(args.mode)} --period {label}")
         return
 
     # --- Build mode ------------------------------------------------------
@@ -1665,28 +1672,35 @@ def main():
     # metadata before any sample-generating function is called.
     init_sequence_config(args.data_root, SOURCE, period=period)
 
-    save_dir = create_and_save_datasets(
-        data_root=args.data_root,
-        datasets_root=args.datasets_root,
-        mode=args.mode,
-        source=SOURCE,
-        output_root=args.output_root,
-        period=period,
-        stats_period=None if args.global_stats else _UNSET,
-    )
+    # Every mode shares the split, the period and the schema; only the
+    # input stack and the label differ. Build them in turn, and hand each
+    # to the archiver as soon as it is written, so a second dataset over
+    # the same split is one flag rather than a second invocation.
+    for i, mode in enumerate(args.mode, 1):
+        if len(args.mode) > 1:
+            print(f"\n{'=' * 70}\n  Dataset {i}/{len(args.mode)}: {mode}\n{'=' * 70}")
+        save_dir = create_and_save_datasets(
+            data_root=args.data_root,
+            datasets_root=args.datasets_root,
+            mode=mode,
+            source=SOURCE,
+            output_root=args.output_root,
+            period=period,
+            stats_period=None if args.global_stats else _UNSET,
+        )
 
-    # Compression happens once, here, and only here: training never
-    # modifies a dataset, so this archive stays valid for its lifetime.
-    # Detached so the next member can start building immediately - a
-    # 66 GB member takes ~20 min to compress at -mx=5.
-    if not args.no_archive and save_dir is not None:
-        from compress_datasets import spawn_job
-        print("\nArchiving in the background ...")
-        spawn_job("compress", save_dir.name, save_dir.parent,
-                  level=args.archive_level, workers=args.archive_workers,
-                  max_concurrent=args.max_concurrent)
-        print("  Dataset creation is done; you can start the next member "
-              "or begin training now.")
+        # Compression happens once, here, and only here: training never
+        # modifies a dataset, so this archive stays valid for its
+        # lifetime. Detached so the next dataset can start building
+        # immediately - a 66 GB member takes ~20 min to compress at -mx=5.
+        if not args.no_archive and save_dir is not None:
+            from compress_datasets import spawn_job
+            print("\nArchiving in the background ...")
+            spawn_job("compress", save_dir.name, save_dir.parent,
+                      level=args.archive_level, workers=args.archive_workers,
+                      max_concurrent=args.max_concurrent)
+            print("  Dataset creation is done; you can start the next "
+                  "member or begin training now.")
 
 
 if __name__ == "__main__":
