@@ -177,9 +177,9 @@ def read_kml_extract_coordinates(kml_file):
     quiet days with no detected strokes. pyogrio doesn't treat that as
     "zero rows" - it raises `IndexError` from `get_default_layer`
     because there are no readable layers. We catch that (and any other
-    read failure) and return an empty DataFrame so the surrounding
-    pipeline's existing "empty df -> skip" path takes over instead of
-    aborting the whole batch.
+    read failure) and return an empty DataFrame; process_single_date
+    then asks kml_has_placemarks() whether the file was genuinely quiet
+    (write a day of zero frames) or unreadable (write nothing).
 
     Args:
         kml_file (str): Path to the KML file
@@ -193,8 +193,8 @@ def read_kml_extract_coordinates(kml_file):
         # pyogrio surfaces "no layers" as IndexError; gdal-style "failed
         # to open" errors come through as RuntimeError/OSError. Any of
         # them is reported once and treated as a no-stroke day.
-        print(f"  WARNING: cannot read {kml_file} ({type(exc).__name__}: "
-              f"{exc}) - treating as no-stroke day, skipping.")
+        print(f"  NOTE: cannot read {kml_file} ({type(exc).__name__}: "
+              f"{exc}) - no rows extracted.")
         return _empty_lightning_df()
     print(f"  Raw placemarks: {len(gdf)}")
     if len(gdf) == 0:
@@ -249,6 +249,43 @@ def read_kml_extract_coordinates(kml_file):
 # =============================================================================
 # Grid accumulation
 # =============================================================================
+
+def kml_has_placemarks(kml_file):
+    """Whether the raw KML text carries any `<Placemark>` at all.
+
+    The geopandas reader cannot tell a quiet day from a broken file:
+    both come back as zero rows. The raw text can. Returns None when
+    the file itself cannot be read.
+    """
+    try:
+        with open(kml_file, "r", encoding="utf-8", errors="replace") as f:
+            return "<Placemark" in f.read()
+    except OSError:
+        return None
+
+
+def write_quiet_day(date_str, output_root, grid_projection):
+    """Write a full day of all-zero maps for the three sub-products.
+
+    A day with no strokes is an observation, not a gap: the density,
+    current and occurrence fields are zero everywhere. Without these
+    frames the day is indistinguishable from a sensor outage, the
+    coverage intersection drops it, and the rain samples on it are lost
+    for no reason. The frames come out byte-identical to the quiet
+    bins of an active day, since those go through the same writer.
+    """
+    timestamps, _ = generate_timesteps_and_windows(date_str)
+    zeros = np.zeros(
+        (grid_projection.area.height, grid_projection.area.width),
+        dtype=np.float32,
+    )
+    n = len(timestamps)
+    print(f"  Quiet day: writing {n} x 3 all-zero maps")
+    save_lightning_maps_parallel(
+        [zeros] * n, [zeros] * n, [zeros] * n,
+        timestamps, grid_projection, output_root, date_str,
+    )
+
 
 def grid_accumulate(i, j, grid=None, weights=None, weighted_grid=None):
     """Accumulate values on a grid (occurrence or weighted)."""
@@ -690,8 +727,23 @@ def process_single_date(kml_path, date_str, output_root, force=False):
     lightning_df = read_kml_extract_coordinates(kml_path)
     print(f"  Extracted {len(lightning_df)} lightning records")
 
+    # Create grid projection
+    grid_projection = GridProjection(romania_grid_area)
+
     if len(lightning_df) == 0:
-        print(f"  WARNING: No records found, skipping")
+        # Zero rows means one of two things, and only the raw text can
+        # tell them apart: a quiet day (LINET's stylesheet-only KML) is
+        # an observation and gets its zero frames; an unreadable or
+        # unparsable file is an error and gets nothing, so the day
+        # shows up as missing in the summary instead of as quiet.
+        placemarks = kml_has_placemarks(kml_path)
+        if placemarks is False:
+            write_quiet_day(date_str, output_root, grid_projection)
+        else:
+            print(f"  ERROR: {kml_path} "
+                  + ("could not be read" if placemarks is None
+                     else "has placemarks but none could be parsed")
+                  + " - nothing written for this date")
         return
 
     print(f"  Time range: {lightning_df['timestamp'].min()} to "
@@ -705,11 +757,9 @@ def process_single_date(kml_path, date_str, output_root, force=False):
     print(f"  After date filter: {len(lightning_df)} records")
 
     if len(lightning_df) == 0:
-        print(f"  WARNING: No records for {date_str}, skipping")
+        # Every stroke in the file belongs to another date: a quiet day.
+        write_quiet_day(date_str, output_root, grid_projection)
         return
-
-    # Create grid projection
-    grid_projection = GridProjection(romania_grid_area)
 
     # Drop strokes whose projected pixel index falls outside the Romania
     # grid. grid_accumulate would silently mask them anyway; doing it once
@@ -724,8 +774,8 @@ def process_single_date(kml_path, date_str, output_root, force=False):
           f"(audit: {report_path.name})")
     lightning_df = inside_df
     if len(lightning_df) == 0:
-        print(f"  WARNING: no in-grid strokes for {date_str}, "
-              f"skipping map generation")
+        # Strokes exist but all fall outside the grid: quiet over Romania.
+        write_quiet_day(date_str, output_root, grid_projection)
         return
 
     # Generate filter-aligned time grid (or fixed-cadence fallback when
