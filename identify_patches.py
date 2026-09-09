@@ -28,7 +28,7 @@ Input structure:
 Output:
     {output_dir}/patch_index.csv
     {output_dir}/patch_index.json
-    {output_dir}/plots/dbscan_patch_selection/<date>.gif   (--date --plot)
+    {output_dir}/plots/dbscan_<rule>_patch_selection/<date>.gif  (--date --plot)
     {output_dir}/plots/patch_highlight/<date>.gif          (--date --plot)
     {output_dir}/plots/nc/patches_<date>_<HHMM>.nc         (--date --plot)
 
@@ -1183,7 +1183,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     gif_paths = []
     if save_plots:
         day = date_filter or results[0][0]
-        for sub, frames in (("dbscan_patch_selection", frames_selection),
+        for sub, frames in ((f"dbscan_{DBSCAN_RULE}_patch_selection", frames_selection),
                             ("patch_highlight", frames_highlight)):
             path = save_gif(frames, os.path.join(plot_dir, sub, f"{day}.gif"))
             if path:
@@ -1366,7 +1366,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--plot", action="store_true",
         help="Render the day into two GIFs, one frame per timestep: "
-             "plots/dbscan_patch_selection/<date>.gif (threshold field, "
+             "plots/dbscan_<rule>_patch_selection/<date>.gif (threshold field, "
              "cluster centroids and their boxes | cluster mask, grid, "
              "selected tiles) and plots/patch_highlight/<date>.gif (the "
              "field and the selection with borders). A NetCDF twin per "

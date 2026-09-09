@@ -278,7 +278,7 @@ python identify_patches.py --start 2025-01-01 --end 2026-08-13
 - **Does** — DBSCAN over OPERA `rainfall_rate` (threshold, eps and min_samples default to the values recorded in the master index — 8 mm/h, 5, 20 today — else 10 / 5 / 20; `--threshold` overrides, with a warning that a rebuilt index invalidates the patch pool) marking which of the 18 patches are active per timestep. Selects **patches, not pixels**.
 - **Rule** — `--rule pixel|box`, recorded in the index as `selection_rule` and the default once an index exists. `pixel` selects a tile holding ≥ 1 cluster pixel — every index so far. `box` centres a 256 × 256 box on each cluster centroid and selects a tile meeting the union of those boxes: every cell keeps 128 px of context on each side, and an edge cell brings its dry neighbour in with it. Changing the rule rebuilds a different index and invalidates the patch pool.
 - **Writes** — `our_data/patch_index/patch_index.csv` and `.json` **CRITICAL**
-- **Graph** — with `--date --plot`, one GIF per diagnostic per day, one frame per timestep: `plots/dbscan_patch_selection/<date>.gif` (left: the field above the threshold, each cluster's centroid and a 256 × 256 box around it; right: the mask the rule in force tests — the cluster pixels under `pixel`, the union of centroid boxes with the cluster pixels drawn over it under `box` — the 6 × 3 grid dotted in red, tiles holding ≥ 1 mask pixel outlined in green) and `plots/patch_highlight/<date>.gif` (the field and the selection with borders). A NetCDF twin per active timestep, ~28 MB each, lands in `plots/nc/`. Diagnostics only; `--purge_plots` clears them.
+- **Graph** — with `--date --plot`, one GIF per diagnostic per day, one frame per timestep: `plots/dbscan_<rule>_patch_selection/<date>.gif` (left: the field above the threshold, each cluster's centroid and a 256 × 256 box around it; right: the mask the rule in force tests — the cluster pixels under `pixel`, the union of centroid boxes with the cluster pixels drawn over it under `box` — the 6 × 3 grid dotted in red, tiles holding ≥ 1 mask pixel outlined in green) and `plots/patch_highlight/<date>.gif` (the field and the selection with borders). A NetCDF twin per active timestep, ~28 MB each, lands in `plots/nc/`. Diagnostics only; `--purge_plots` clears them.
 - **Note** — one index serves every period, and its row order defines the patch axis of the saved arrays. A `--date` run never overwrites the master index.
 - **Read by** — `extract_patch_seq_for_datasets`, `extract_patches`, `data_statistics`
 
@@ -562,7 +562,7 @@ made them will make them again:
 |---|---|
 | `<product>_coverage.png` | the three summarisers |
 | `intersect_summary.png` | `intersect_product_coverage` |
-| `patch_index/plots/{dbscan_patch_selection,patch_highlight}/<date>.gif` and `plots/nc/` | `identify_patches --plot` |
+| `patch_index/plots/{dbscan_<rule>_patch_selection,patch_highlight}/<date>.gif` and `plots/nc/` | `identify_patches --plot` |
 | `mtg_store_distribution.png` | `store_registry --chart` |
 | `inference/` figures, `full_domain_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | `evaluation/` figures | `evaluate_*` |
