@@ -6,12 +6,12 @@
 
 Recurrent-convolutional nowcasting of **rainfall intensity** and **lightning occurrence** over Romania, adapted from MeteoSwiss COALITION-4 (Leinonen et al.).
 
-An encoder-forecaster (ResBlock + ConvGRU) ingests a multi-resolution stack of MTG FCI satellite channels, OPERA composite radar, and LINET lightning, and predicts three lead times: **T+15, T+30, T+45 min**.
+An encoder-forecaster (ResBlock + ConvGRU) ingests a multi-resolution stack of MTG FCI satellite channels, OPERA composite radar, and LINET lightning, and predicts the next four 15-minute steps: **t+15 … t+60 min**.
 
 - **Grid:** Romania, EPSG:31700 (Stereo70), **1536 × 768** @ ~1 km — a fixed 6 × 3 array of 18 patches of 256 × 256.
 - **Area extent:** `(-177324, 77148, 1331353, 723370)` metres.
 - **Cadence:** 15 min (configurable — Step 0).
-- **Sample window:** 3 past steps (t−30, t−15, t0) → 3 future steps (t+15, t+30, t+45).
+- **Sample window:** a property of the dataset (`sequence_meta`); the current window is 3 past steps (t−30, t−15, t0) → 4 future steps (t+15 … t+60).
 
 Precipitation is driven by the pan-European **OPERA** composite; lightning by **LINET**. Sample selection is DBSCAN over OPERA `rainfall_rate`, so every artefact is tagged `<mode>_dbscan`.
 
@@ -25,10 +25,8 @@ Two input tiers. **Always read the physical resolution, not the tier name.**
 
 | Tier | Native | Patch | Pooling | Channels |
 |---|---|---|---|---|
-| `past_hr` — high resolution | 1 km | 256 × 256 | none | MTG `vis_06`; LINET `density`, `current`, `occurrence` |
-| `past_mr` — medium resolution | 2 km | 128 × 128 | 2 × 2 avg | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
-
-> **Why "medium" when MR is the coarsest tier?** There used to be a third tier (`past_lr`, 3 km, 64 × 64, 4 × 4 pooling) carrying MSG SEVIRI and NWCSAF. Both products were retired and the tier removed, so MR only reads as "middle" relative to that old MSG stack. The name is kept because `past_mr` is baked into the input-tensor names of every trained checkpoint and every dataset's `metadata.json`.
+| `past_hr` — higher resolution | 1 km | 256 × 256 | none | MTG `vis_06`; LINET `density`, `current`, `occurrence` |
+| `past_mr` — minimum resolution | 2 km | 128 × 128 | 2 × 2 avg | OPERA `reflectivity`, `rainfall_rate`; MTG `ir_38`, `ir_105`, `wv_63`, `wv_73` |
 
 > **On-disk suffix:** extracted patches are named `{variable}_{HHMM}_{HR|MR}.npy` — two suffixes for the two tiers, matching the `past_hr` / `past_mr` input tensors. One vocabulary throughout: **HR is the higher-resolution tier, MR the minimum-resolution one.**
 
@@ -47,7 +45,7 @@ INPUT  past_hr (256×256, 1 km) ─┐
        past_mr (128×128, 2 km) ─┴────── concat ─────────────────[merge @128]
                                                                  │
                                                                  ▼
-                                                            DECODER → T+15/30/45
+                                                            DECODER → t+15 … t+60
 ```
 
 **4. The model rebuilds itself from `metadata.json`.** Each dataset records its input group names and shapes `[T, H, W, C]`. The builder creates one branch per group, derives each branch's downsample factor as `max_res / branch_res` (1 for HR, 2 for MR), concatenates branches that share a resolution, and sizes the encoder-decoder accordingly. A dataset built from any subset of inputs produces a matching model with no code change; the Swin head from `--stage finetune` inherits the backbone's shape the same way.
@@ -88,7 +86,7 @@ can feed its own output straight back in without changing resolution.
 
 † **KD student only.** Not buildable via `create_datasets.py` — it trains on the teacher's dataset with `past_hr` sliced.
 
-‡ **Baseline comparison pair, radar-only by design** — no MTG, no LINET. Modality enrichment is what RECONVECT is being credited for, so neither the baseline nor its ablation may receive it. Both take **`opera_rainfall_rate_hr` alone, in HR at 256 px**: input parity is the point, so a gap between them is attributable to the architecture rather than to a field one of them was handed. Parity has to mean the same *tensor*, not merely the same field — the MR (2x2-pooled, 128 px) form was used here originally, and while pooling is near-lossless over the domain as a whole, inside wet blocks 79 % are non-constant and 4.3 % of their pixels change class, because the 2 km OPERA cells do not align with the 1 km grid's 2x2 boundaries. The HR form is also load-bearing structurally: the model's output resolution is its **finest input**, and this is the only mode with no other HR channel to hold it at 256, so the MR form emitted 128x128 against a 256x256 label and training died on the shape mismatch — which is why the ablation drops `opera_reflectivity` that the RECONVECT modes keep. `opera_sepconv_logz` additionally needs a **past=4/future=8** sequence window, not the standard one. The modality question is answered separately, against the full model, by the ablation ladder in [Table 2](#table-2--validation-inference-visualisation--analysis). See [SepConv-ens baseline](#sepconv-ens-baseline).
+‡ **Baseline comparison pair, radar-only by design** — no MTG, no LINET. Modality enrichment is what RECONVECT is being credited for, so neither the baseline nor its ablation receives it. Both take **`opera_rainfall_rate_hr` alone, in HR at 256 px**, so the two models see the same tensor and a gap between them is attributable to the architecture. The HR form is also structural: a model's output resolution is its **finest input**, and this is the only mode with no other HR channel to hold it at 256. `opera_sepconv_logz` needs a **past=4** window (see the composition scheme). The modality question is answered separately, against the full model, by the ablation ladder in [Table 2](#table-2--validation-inference-visualisation--analysis). See [SepConv-ens baseline](#sepconv-ens-baseline).
 
 **Rainfall classes (mm/h):** `0: R<10 · 1: 10–20 · 2: 20–30 · 3: 30–40 · 4: R≥40`. The SepConv baseline predicts in `log_zscore` space and is denormalised back to mm/h before being binned at these same edges, so neither model can be favoured by its thresholds.
 
@@ -99,8 +97,6 @@ can feed its own output straight back in without changing resolution.
 ## Periods and the seasonal ensemble
 
 A **period** is a labelled, inclusive date range — `2025warm` = `2025-04-01 .. 2025-09-30`. Every dataset and every model can carry one, which buys two things: datasets over different ranges stop colliding on disk, and a model reused as a frozen feature extractor can be checked against the dates it is about to be fine-tuned over.
-
-Omitting `--period` everywhere reproduces the old behaviour exactly — `build_run_tag` still returns `{mode}_{source}` and existing artefacts keep their names.
 
 ### Season definitions
 
@@ -138,7 +134,7 @@ Scoring happens **inside `validate_predictions.py`**, not in the ensemble script
 | Lightning | Hann-blended at stride 128, then hysteresis at the tuned per-lead HIGH |
 | Rainfall | Hysteresis on `p(argmax)` at the tuned per-lead HIGH |
 
-Scoring raw model output instead would judge something you never emit. It also has to happen on the full 768 × 1536 canvas — a Hann blend deliberately spans patch boundaries, so it is undefined on an isolated patch.
+Scoring happens on the full 768 × 1536 canvas — a Hann blend spans patch boundaries, so it is undefined on an isolated patch.
 
 Each extraction run writes a `per_patch` block into its summary: per-patch CSI, POD, FAR, per-lead breakdown and pooled TP/FP/FN. Counts are pooled and CSI computed once at the end, because CSI is not additive — averaging per-sample scores would weight a sparse sample equally with a busy one.
 
@@ -169,8 +165,6 @@ The lightning track already tuned its HIGH threshold over a 0.91–0.99 grid and
 The default margin spans the operational `DEFAULT_RAIN_HIGH` of 0.55, so the currently shipped setting is always inside the swept range and the sweep can only improve on it. The per-lead winner maximises aggregate CSI; on a tie the **lower** threshold wins, which is the conservative choice. Results land in `post_processing` in the rainfall summary, mirroring the lightning schema.
 
 Every candidate's per-patch counts are pooled during the sweep, so once a winner is picked its per-patch table already exists — no second inference pass.
-
-This closes a real gap: rainfall was previously **validated on raw argmax but shipped with hysteresis**, so validation numbers did not describe the emitted product.
 
 The manifest is the ensemble. Inference reads it rather than re-scoring, so repeated validations resolve the same members and reproduce the same numbers. `knowledge_cutoff` records the latest training-period end across all members — it moves only when a member is retrained and the manifest rebuilt.
 
@@ -211,11 +205,9 @@ train_models --period 2025warm
 
 Opt out of the automatic jobs with `--no-archive` on either `create_datasets.py` or `train_models.py`.
 
-**Concurrency.** Each dataset gets a lock in `our_data/datasets/_archive_jobs/`, so two 7-Zip processes can never write the same archive. Training takes an `.inuse` marker on the same dataset; an archive job that finds one keeps the archive and **skips its delete step**, recording `pending-delete` for a later reclaim. That is what makes *build a member, then immediately train it* safe — the shards are not pulled out from under the run. Markers are PID-stamped, so a crashed run does not block the dataset forever.
+**Concurrency.** Each dataset gets a PID-stamped lock in `our_data/datasets/_archive_jobs/`; training takes an `.inuse` marker on the dataset, and an archive job that finds one keeps the archive and records `pending-delete` for a later reclaim, so a member can be built and trained back to back.
 
-**Deletion safety.** The source is removed only after all three of: 7-Zip exits 0, `7z t` passes on the archive, and the archive's file count matches what was on disk. Any failure leaves both copies. A reclaim that finds a *corrupt* archive refuses to delete the only good copy and says so.
-
-One consequence worth planning around: between the archive job finishing and the reclaim completing you hold the uncompressed dataset *and* its archive. That peak is unavoidable if you want the archive built while training proceeds.
+**Deletion.** The source is removed only after 7-Zip exits 0, `7z t` passes, and the archive's file count matches the disk. Between the archive finishing and the reclaim, the dataset and its archive coexist on disk.
 
 ### Period-tagged artefacts
 
@@ -224,18 +216,7 @@ sequence metadata, the normalization statistics, the class priors, the
 dataset, the weights and the evaluation output all carry the same tag.
 Omitting it means the untagged whole-archive run.
 
-**Every script that reads a tagged artefact takes the flag**, and that had to
-be swept: `evaluate_coalition`, `predict_full_domain`, `validate_predictions`,
-`visualize_gt_vs_pred` and `data_statistics` were resolving tagged artefacts
-to the *untagged* name, and `train_models.load_class_fractions` did the same
-for the class priors while its two sibling loaders were already correct.
-
-That class of bug is worth understanding because only one of its symptoms is
-loud. A missing file raises. **Mismatched normalization statistics do not** —
-a z-value only means something against the mean/std that produced it, so
-inverting with another window's constants returns plausible mm/h biased
-monotonically with intensity, and calibration absorbs the bias into its
-thresholds. It surfaces as a skill difference that is not real.
+Every script that reads a tagged artefact takes the flag.
 
 Two scripts stay period-less by design: `verification_keys.py` spans *two*
 windows and so takes `--reconvect_tag` / `--sepconv_tag`, and
@@ -244,15 +225,11 @@ windows and so takes `--reconvect_tag` / `--sepconv_tag`, and
 ### Where the data lives
 
 Every default path resolves against **the repository**, not the working
-directory. `./our_data` used to mean the scripts only worked when invoked from
-the repo root; run one from anywhere else and it would quietly create an empty
-tree beside you instead of finding the real one. Nothing needs a `cd` now.
+directory, so the scripts run from anywhere.
 
-`datasets/` resolves **separately** from `data_root`, because the two have very
-different sizes and lifetimes: the patch pool and reprojected archive are
-terabytes that stay put, while a TFRecord dataset is tens of gigabytes that may
-need to sit on whichever disk has room this month. That separation previously
-required an NTFS junction.
+`datasets/` resolves **separately** from `data_root`: the patch pool and
+reprojected archive are terabytes that stay put, while a TFRecord dataset is
+tens of gigabytes that may sit on whichever disk has room.
 
 | Root | Flag | Environment variable | Default |
 |---|---|---|---|
@@ -283,13 +260,8 @@ reads or writes a dataset. **Archive locks and in-use markers follow it**, so
 `_archive_jobs/` lands beside the datasets it guards and the
 restore/reclaim lifecycle stays consistent with training.
 
-`train_models.py --output_dir` now defaults to the same place the evaluators
-read from, so training from a different working directory no longer strands
-checkpoints where evaluation will not look.
-
-**Pass the same roots to every stage of a run.** A dataset built under one
-`--datasets_root` and trained under another fails loudly (`FileNotFoundError`),
-not silently — but exporting the environment variable avoids the question.
+Pass the same roots to every stage of a run; exporting the environment
+variables once does that.
 
 ### Bounding the MTG store across disks
 
@@ -351,7 +323,7 @@ python compress_datasets.py --compress-npy our_data/reprojected_data our_data/li
 
 **Why level 10?** Level 19 reaches 10.7× but runs at 3 MB/s against level 10's ~35 MB/s per worker — days of extra CPU over a store this size, for about 20 % more space.
 
-**Deletion safety.** Each file is compressed to a `.tmp`, read *back off disk*, and compared byte for byte against the original before anything is unlinked. A mismatch leaves both copies and reports the path. What is stored is the entire `.npy` file, header included, so a restore is byte-identical by construction — dtype, shape, byte order and fill values cannot drift. Re-running skips files whose target already exists, so an interrupted pass resumes.
+**Deletion.** Each file is compressed to a `.tmp`, read back off disk and compared byte for byte against the original before the original is unlinked. What is stored is the entire `.npy` file, header included, so a restore is byte-identical. Re-running skips files whose target already exists, so an interrupted pass resumes.
 
 `romania_grid_lats.npy` and `romania_grid_lons.npy` are never compressed. They are ~9 MB in total and are read by nearly everything, including ad-hoc scripts that will never go through the shim.
 
@@ -365,21 +337,11 @@ python compress_datasets.py --compress-npy our_data/reprojected_data our_data/li
 | `find_arrays(root)` | a recursive walk, filterable by form |
 | `save_array(path, arr, compress=)` | `np.save` |
 
-Routed through it: `reproject.py`, `extract_patches.py`, `identify_patches.py`, `compute_normalization_stats.py`, `create_datasets.py`, `lightning_fraction.py`, `opera_rainfall_fraction.py`, `validate_predictions.py`, `store_registry.py`, and the three summarizers. A compressed frame cannot be memory-mapped; `load_array(..., mmap_mode=...)` raises and names the restore command rather than silently loading the whole array.
+Routed through it: `reproject.py`, `extract_patches.py`, `identify_patches.py`, `compute_normalization_stats.py`, `create_datasets.py`, `lightning_fraction.py`, `opera_rainfall_fraction.py`, `validate_predictions.py`, `store_registry.py`, and the three summarizers. A compressed frame cannot be memory-mapped.
 
 ### Feature-extractor leakage gate
 
-When `--stage finetune` freezes a base model as a feature extractor, its recorded period is compared against the dataset's. Any shared date aborts:
-
-```
-ERROR: Feature-extractor period overlaps the dataset period.
-  FE trained on : 2025-01-01 .. 2025-06-30 (2025h1)
-  dataset period: 2025-04-01 .. 2025-09-30 (2025warm)
-  overlap       : 2025-04-01 .. 2025-06-30 (91 days)
-Rebuild the dataset over a disjoint range, or pass --allow_period_overlap to proceed anyway.
-```
-
-The comparison uses the periods recorded in the model sidecar and the dataset `metadata.json` — dates, never filenames. A model with no sidecar (anything trained before this existed) reports its period as **unknown**, which prints a warning rather than passing silently; unknown is not the same as safe.
+When `--stage finetune` freezes a base model as a feature extractor, the period recorded in its `.meta.json` sidecar is compared against the dataset's `metadata.json`. Any shared date aborts the run unless `--allow_period_overlap` is passed; a model without a sidecar reports its period as unknown and warns.
 
 ---
 
@@ -432,9 +394,7 @@ whatever the horizon.
 
 Both the statistics and the loss weights are scoped to the model's **own training split**, not shared with RECONVECT. The two models sit on different windows — `w44` for the baseline, `w34` for the ablation — so each has its own statistics file.
 
-The invariant that matters is *not* that the two models share a space — it is that **training and inversion use the same constants**. A z-value only means something relative to the `mean`/`std` that produced it; train under one set and invert with another and `10**(z·std+mean)` recovers the wrong mm/h, biased monotonically with intensity (about −6 % at 30 mm/h for a 1 % difference in std). Nothing raises, and calibration absorbs the bias into its thresholds, so it surfaces as a skill difference that is not real.
-
-RECONVECT's training split contains **36 of the baseline's test timestamps**, so normalising the baseline with RECONVECT's statistics would put its own test data inside the constants defining its space. Scoping per split removes that entirely.
+The invariant is that **training and inversion use the same constants** — a z-value only means something relative to the `mean`/`std` that produced it. RECONVECT's training split contains 36 of the baseline's test timestamps, so scoping per split also keeps each model's test data out of the constants defining its space.
 
 | | value | consumers |
 |---|---|---|
@@ -458,12 +418,9 @@ holds the *latest* epoch (plus a `.json` sidecar with the next-epoch index).
 | ablation | `coalition_<run_tag>.keras` | `checkpoints/<run_tag>_latest.keras` |
 | baseline | `sepconv_<run_tag>_bm{1,3,5}.keras` | `checkpoints/sepconv_<run_tag>_bm{1,3,5}_latest.keras` |
 
-The baseline previously had **no** checkpoint at all, so a driver-level CUDA
-crash at epoch 40 of 50 lost the whole run — three times over, once per base
-model. It now shares RECONVECT's `_ResumableCheckpoint` and its
-`[checkpointing]` section, resumes at the right epoch with optimizer state
-intact, and takes `--fresh` to ignore a checkpoint. Each base model keeps its
-own file: a shared one would have Bm3 resume from Bm1's weights.
+Both share `_ResumableCheckpoint` and the `[checkpointing]` section, resume
+at the right epoch with optimizer state intact, and take `--fresh` to ignore
+a checkpoint. Each base model keeps its own checkpoint file.
 
 Either state is selectable with `--weights best|latest` on both evaluators —
 `best` (the default) is the final save, `latest` is the per-epoch checkpoint:
@@ -475,11 +432,9 @@ python evaluate_sepconv_ensemble.py --period w44 --weights latest ...
 
 Comparing the two on the frozen verification keys answers whether the epochs
 after the best one were overfitting, or whether the run was still improving
-when early stopping cut it — which is what tells you if the epoch ceiling was
-set sensibly. The baseline resolves all three base models internally, and
-`--weights latest` on `--finetuned` picks the finetune stage's own checkpoint
-rather than the base one. A missing checkpoint names the files it wanted and
-says to drop the flag.
+when early stopping cut it. The baseline resolves all three base models
+internally, and `--weights latest` on `--finetuned` picks the finetune stage's
+own checkpoint.
 
 The one thing deliberately *not* unified is the learning-rate schedule:
 RECONVECT uses the cosine warmup in `[lr_schedule]`, the baseline reproduces
@@ -487,23 +442,15 @@ the paper's `ReduceLROnPlateau` (`[sepconv].lr_patience`). Forcing them
 together would mean abandoning the published method, so both are recorded in
 the history JSON instead.
 
-Both files must be scoped to the **same** set of training timesteps, and that is checkable: `compute_normalization_stats.load_training_keys` and `lightning_fraction.load_scope_set` should return identical key sets for a given tag (24,066 for `w44`, 24,395 for `w34`). They did not until the midnight-rollover fix — `start_utc`/`end_utc` are clock times with no date, and a window through midnight arrives with `end_utc` numerically *before* `start_utc`. Those rows were dropped as malformed, excluding every 22:00–01:00 timestep from the class priors while the statistics kept them. The row's `date` dates the **reference**, not the start, so the expansion now anchors on `reference_utc` and walks outwards: `reference_utc` 23:45 pushes `end_utc` to the next day, 00:15 pulls `start_utc` back to the previous one.
+Both files are scoped to the same set of training timesteps: `compute_normalization_stats.load_training_keys` and `lightning_fraction.load_scope_set` return identical key sets for a given tag, both anchored on `reference_utc` so windows through midnight expand correctly.
 
-**No entry point defaults the window tag.** Several windows coexist on
-disk, each with its own statistics, so `sepconv_predict.to_mmh` takes
-`stats_period` as a required argument and `verification_keys.py` requires
-`--sepconv_tag`. A default would silently pick one, and denormalising with
-the wrong constants returns plausible mm/h biased with intensity while
-raising nothing. `to_mmh` also fails loudly if the file is absent rather
-than falling back. `create_datasets.py --global_stats` exists for the
-opposite case and prints `<- overridden, decoupled from --period` when
-used, but the baseline does **not** use it.
+Several windows coexist on disk, each with its own statistics, so `sepconv_predict.to_mmh` takes `stats_period` as a required argument and `verification_keys.py` requires `--sepconv_tag`. The baseline does not use `create_datasets.py --global_stats`.
 
 ### Sample selection is shared, splits are not
 
 Both models draw from the same `patch_index.csv`, DBSCAN-gated at the threshold recorded in `patch_index.json` (8 mm/h for the current index) — that gate is upstream of both. Within a selected patch every pixel is used by both, including the 99.8 % dry ones; there is no per-pixel thresholding. **The weighted loss exists because of that**: plain MSE on this distribution is minimised by emitting the dry value everywhere, at a cost of 0.09 versus 91.6 under the weighting.
 
-The splits differ only because the windows do — `past=4/future=8` needs 13 consecutive timesteps against RECONVECT's 6, so fewer references qualify and SepConv's dates are a strict subset. The Czibula splitter then assigns by position within each 6-hour block, which puts the same key on opposite sides:
+The splits differ only because the windows do — `past=4/future=4` needs 9 consecutive timesteps against `w34`'s 8, so fewer references qualify. The Czibula splitter then assigns by position within each 6-hour block, which puts the same key on opposite sides:
 
 ```
 sepconv_test_in_reconvect_train    41
@@ -521,42 +468,26 @@ naive intersection     : 4745      reconvect_test_in_sepconv_train      1
 dropped as contaminated:    0      reconvect_test_in_sepconv_val       22
 ```
 
-The subtraction is a no-op — a key in one model's validation set cannot also be in its own test split, so it never survives the intersection. **The intersection is what does the work**, removing 12–13 % of each test split. And the leakage is real in the other direction: 380 of the baseline's test keys were seen by RECONVECT during fitting.
+The intersection removes 12–13 % of each test split; 380 of the baseline's test keys were seen by RECONVECT during fitting.
 
-The frozen file is **enforced, not advisory**, and on **both** sides of the comparison — `evaluate_sepconv_ensemble.py --verification_keys PATH` for the baseline and `evaluate_coalition.py --verification_keys PATH` for the ablation. Pass the *same* file to both; scoring them on different key sets is the failure this exists to prevent. Without the flag either evaluator scores its full split and prints why that is not comparable. This requires the `date` and `reference_utc` fields in the TFRecord shards — datasets built before those existed parse them as `""`, match no key, and are refused with an instruction to rebuild rather than silently scored on nothing.
+The frozen file is enforced on **both** sides of the comparison — `evaluate_sepconv_ensemble.py --verification_keys PATH` and `evaluate_coalition.py --verification_keys PATH`. Pass the same file to both. It matches on the `date` and `reference_utc` fields carried in the TFRecord shards.
 
 ### Patch pool staleness
 
 `our_data/patches/` is shared by every period and mode — a patch file is a pure function of (date, time, variable, resolution) and `patch_index.csv`, so `w44` and `w34` produce the same file and the second run is largely a no-op. The pool is **not** invalidated by a new period. It is invalidated by exactly one thing: **`patch_index.csv` changing.**
 
-The reason that matters is the file format. A patch file is an array of tiles with nothing recording which tile is in which slot — slot *k* means "the *k*-th active patch at this timestep", and that ordering lives only in the index. When a patch becomes active it **inserts into the middle of the list** and shifts every later slot by one:
-
-```
-file holds  : [2, 3, 4,    7, 8, 9, 13, 14]     (8 tiles, written earlier)
-index says  : [2, 3, 4, 5, 7, 8, 9, 13, 14]     (9 tiles, after a re-run)
-              ok ok ok  ^--- every slot from here on is off by one
-```
-
-Only the last slot goes out of range. The five shifted slots stay in range and **read cleanly while returning the wrong tile** — patch 5 and patch 7 are ~1,000 km apart on the 1536 × 768 km domain, so training pairs one region's input with another region's label. Shapes are right, the loss falls, nothing raises.
-
-Because `extract_patches` skips files that already exist, that state is sticky — nothing regenerates them. Two guards close it:
+A patch file is an array of tiles in the order of the index's active-patch list, so a rebuilt index reorders the slots. Two guards keep the pool consistent with it:
 
 | guard | where | what it does |
 |---|---|---|
-| **Stamp** | `our_data/patches/<date>/_patch_index.json` | Records the active-patch list every file in that date was built from, plus the index's SHA-256. `extract_patches` compares per timestep and **re-extracts** any whose list has moved, instead of skipping. Merged on write, so a `--date` run doesn't erase the rest. |
-| **Raise** | `create_datasets.StalePatchPool` | An out-of-range `idx_t*` was previously zero-filled. It now raises, naming the date, timestep, variable, requested slot and actual length. |
+| **Stamp** | `our_data/patches/<date>/_patch_index.json` | Records the active-patch list every file in that date was built from, plus the index's SHA-256. `extract_patches` compares per timestep and **re-extracts** any whose list has moved. Merged on write, so a `--date` run doesn't erase the rest. |
+| **Raise** | `create_datasets.StalePatchPool` | An out-of-range `idx_t*` raises, naming the date, timestep, variable, requested slot and actual length. A missing variable stays zero-filled, since a mode may reference a product with gaps. |
 
 ```bash
 python extract_patches.py --audit_pool [--period TAG]    # report drifted dates, extract nothing
 ```
 
-The raise is deliberately *not* extended to a **missing** variable, which stays zero-filled — a mode may legitimately reference a product with gaps. An out-of-range slot is never legitimate.
-
-Note the asymmetry: the raise catches only the one detectable slot; the stamp is what catches the silently-shifted ones. Zero-filling the detectable case would have hidden the only evidence that the rest were wrong.
-
-**Overwriting a stale file also deletes its `.npy.zst` twin**, so a compressed shadow copy cannot resurrect the old tiles.
-
-> **Ordering, if you compress the pool:** compression rewrites every file's mtime. For a pool built *before* stamping, mtime against `patch_index.csv` is the only evidence of staleness — so purge stale files **before** running `--compress-npy our_data/patches`, or that evidence is gone and the only repair left is deleting the whole pool.
+Overwriting a stale file also deletes its `.npy.zst` twin.
 
 ### Running the comparison
 
@@ -604,14 +535,7 @@ python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34 \
     --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
 ```
 
-Both `create_datasets` runs must print a period-suffixed statistics file
-with **no** `<- overridden` note — each model is normalised by its own
-split, so `--global_stats` must be absent from both.
-
-The two `extract_patches` runs write into the same shared `patches/`
-tree, so the second is largely a no-op over the overlap.
-
-The ablation takes `opera_rainfall_rate` only — one channel, matching the baseline. A second consequence of that choice is practical: the coverage manifest represents OPERA by `opera_rainfall_rate`, so a timestep holding rainfall but not reflectivity passes the gate and would then be dropped at build time without an error. Rainfall-only makes the gate and the mode agree.
+Each model is normalised by its own split, so `--global_stats` is absent from both builds. The two `extract_patches` runs write into the same shared `patches/` tree, so the second is largely a no-op over the overlap. The ablation takes `opera_rainfall_rate` only — one channel, matching the baseline.
 
 Reclaim the ~86 GB of TFRecords afterwards with `python compress_datasets.py --reclaim-all`.
 
@@ -623,19 +547,18 @@ Results license **single RECONVECT vs SepConv-ens** claims only. The seasonal en
 
 ## Environment Setup
 
-Requires **Conda**, an **NVIDIA GPU**, and **Windows**. Follow this order exactly; it sidesteps the two Windows traps.
+Requires **Conda**, an **NVIDIA GPU**, and **Windows**. Follow this order.
 
-1. **Install CUDA 11.2 + cuDNN 8.1 via the NVIDIA installers** — *not* `conda install cudatoolkit=11.2 cudnn=8.1.0`, which silently downgrades Python 3.10 → 3.9 (conda-forge has no CUDA 11.2 builds for 3.10). Then confirm `CUDA_PATH` is set — Python 3.8+ on Windows no longer honours `PATH` for DLL loading in C extensions, so TensorFlow finds CUDA through `CUDA_PATH` specifically:
+1. **Install CUDA 11.2 + cuDNN 8.1 via the NVIDIA installers** (not conda), then set `CUDA_PATH`, which is how TensorFlow finds CUDA on Windows:
    ```powershell
    setx CUDA_PATH "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.2"
    ```
-   `setx` only affects newly-launched shells — open a fresh terminal afterwards.
+   Open a fresh terminal afterwards.
 2. **Create the env** (3.10 is the last Python with native Windows TF GPU support):
    ```powershell
    conda create -n tfenv python=3.10 -y; conda activate tfenv
-   python --version    # MUST still print 3.10.x at every step below
    ```
-3. **Geospatial stack via conda-forge first**, so `pyproj` / `proj` / `geopandas` / `cartopy` / `pyresample` share one PROJ ABI. Pip-installing these on Windows yields mismatched `proj.db` paths and every CRS lookup then fails with `Invalid projection: … no database context specified`:
+3. **Geospatial stack via conda-forge first**, so `pyproj` / `proj` / `geopandas` / `cartopy` / `pyresample` share one PROJ ABI:
    ```powershell
    conda install -c conda-forge -y pyproj proj geopandas pyogrio shapely cartopy pyresample pykdtree netCDF4 xarray hdf5plugin h5py
    ```
@@ -648,7 +571,6 @@ Requires **Conda**, an **NVIDIA GPU**, and **Windows**. Follow this order exactl
    python -c "import pyproj; print(pyproj.CRS('EPSG:4326'))"
    python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
    ```
-   An empty `[]` plus `Could not load dynamic library 'cudart64_110.dll'` means this shell can't see `CUDA_PATH` — reopen the terminal.
 
 ---
 
@@ -668,7 +590,6 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 > | `YYYY-MM-DD` | `linet_export.py`, `read_kml_version2.py`, `reproject.py`, `identify_patches.py`, `extract_patches.py`, `predict_full_domain.py`, `validate_predictions.py`, `evaluate_*.py` | **inclusive** everywhere |
 > | `HH:MM` · integer | `--time`, `--start-time`, `--end-time` · `--hour` 0–23, `--year`, `--month` 1–12 | — |
 >
-> `linet_export.py` used to be the exception, with an exclusive `--end` that silently stopped a day early; it is inclusive now, and `--start D --end D` exports exactly one day.
 
 <p align="center"><img src="assets/table1_training.png" width="100%" alt="Table 1 — Training a model from scratch"/></p>
 
@@ -679,18 +600,18 @@ Run in step order. Steps 9a/9b are conditional on the track; 11–12 are optiona
 |---|---|---|---|---|
 | **0** | `validate_timestep.py` | `--step_minutes N` desired master training cadence, in minutes · `--cadences_file PATH` per-product native cadence config file · `--output_path PATH` where the generated timestep config lands · `--print` show the existing config and exit | Picks the master cadence and derives each product's minute filter → `our_data/timestep_config.json`, read by every later step. | `python validate_timestep.py --step_minutes 15`<br>`python validate_timestep.py --print` |
 | **1a** | `our_data/satellite_data/pipeline_msg_mtg.py` | `--start` `--end` `yyyy/mm/dd-hhmm` download window, both required · `--source nma\|datastore\|both\|local` which archive to pull from, or none · `--password_file PATH` SSH password; only for the NMA server · `--eumdac_credentials PATH` two-line EUMDAC key and secret · `--missing_json PATH` gap list driving `--source datastore` · `--fill_dry_run` list Data Store fetches without downloading · `--no_fill_incomplete` recover only fully-absent cycles · `--batch_months N` run the range in N-month windows, one at a time · `--stop_on_error` abort at the first failed window instead of continuing · `--products_file PATH` JSON listing which FCI channels to fetch · `--output_dir PATH` destination root for downloaded MTG data · `--timesteps` override the per-product minute filter · `--workers N` parallel download and processing worker count · `--full_disk` fetch full disk instead of Romania chunks · `--skip_download` process local raw chunks without downloading · `--reprocess` re-extract cycles whose `.npy` already exist · `--delete_raw` reclaim each wave's raw chunks as it extracts · `--delete_only` delete raw chunks without re-extracting first · `--provenance nma\|datastore` origin to stamp on a `--source local` pass · `--record_existing nma\|datastore` stamp everything already on disk, then exit | Downloads and extracts MTG FCI L1C. **The source is your choice** and is recorded per cycle in `provenance.json`: `nma` (default) is the internal server, `datastore` fetches only the cycles `mtg_missing_timesteps.json` lists as missing — so run step 2a first — `both` does NMA then fills the remainder, and `local` downloads nothing at all, extracting raw already in `_raw_chunks/`. | `python our_data/satellite_data/pipeline_msg_mtg.py --start 2025/05/01-0000 --end 2025/05/31-2350 --password_file $\color{red}{\textbf{\textit{creds.txt}}}$<br>`… --source datastore --eumdac_credentials `$\color{red}{\textbf{\textit{eumdac.txt}}}$<br>`… --source local --delete_raw --provenance nma` |
-| **1b** | `our_data/opera_data/pipeline_opera.py` | `--start` `--end` `yyyy/mm/dd-hhmm` window, **end inclusive** · `--ssh_key PATH` SSH private key; excludes `--password_file` · `--password_file PATH` text file holding the SSH password · `--products` reflectivity, rainfall_rate, or both by default · `--remote_base PATH` remote EWC mount root directory · `--remote_host` `--remote_user` SSH endpoint and login account · `--cache_dir PATH` local OPERA destination root directory · `--timesteps` override the per-product minute filter | Fetches OPERA composite HDF5. If the default `--remote_base /eumetsatdata` errors with "No such file", pass `/home/eumetsatdata` — the mount root differs between EWC images. | `python our_data/opera_data/pipeline_opera.py --start 2025/05/01-0000 --end 2025/05/31-2359 --ssh_key `$\color{red}{\textbf{\textit{path/to/ssh-key}}}$<br>`… --remote_base /home/eumetsatdata` |
-| **1c** | `our_data/lightning_data/linet_export.py` | `--start` `--end` `YYYY-MM-DD` period, both inclusive · `--format` txt point list, kml, or asc · `--out PATH` destination root for the exported strokes · `--bbox` lon/lat rectangle limiting the export area · `--password_file PATH` text file holding the LINET password · `--lightning-type` 0 all, 1 cloud-to-ground, 2 intracloud · `--amp-threshold` minimum stroke amplitude to keep · `--daily-window` split the request into per-day windows · `--pause` seconds to wait between successive requests · `--force` re-download even when the output exists · `--dry-run` plan the fetch without downloading anything | Downloads LINET strokes. Use `--format kml`: it writes `{out}/kml_data/YYYY-MM-DD/…` which the rasteriser reads directly. | `python our_data/lightning_data/linet_export.py --start 2025-05-01 --end 2025-06-01 --format kml --out our_data/lightning_data --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$<br>*(`--end 2025-06-01` to cover all of May — the bound is exclusive)* |
+| **1b** | `our_data/opera_data/pipeline_opera.py` | `--start` `--end` `yyyy/mm/dd-hhmm` window, **end inclusive** · `--ssh_key PATH` SSH private key; excludes `--password_file` · `--password_file PATH` text file holding the SSH password · `--products` reflectivity, rainfall_rate, or both by default · `--remote_base PATH` remote EWC mount root directory · `--remote_host` `--remote_user` SSH endpoint and login account · `--cache_dir PATH` local OPERA destination root directory · `--timesteps` override the per-product minute filter | Fetches OPERA composite HDF5. `--remote_base /home/eumetsatdata` on EWC images whose mount root differs from the default `/eumetsatdata`. | `python our_data/opera_data/pipeline_opera.py --start 2025/05/01-0000 --end 2025/05/31-2359 --ssh_key `$\color{red}{\textbf{\textit{path/to/ssh-key}}}$<br>`… --remote_base /home/eumetsatdata` |
+| **1c** | `our_data/lightning_data/linet_export.py` | `--start` `--end` `YYYY-MM-DD` period, both inclusive · `--format` txt point list, kml, or asc · `--out PATH` destination root for the exported strokes · `--bbox` lon/lat rectangle limiting the export area · `--password_file PATH` text file holding the LINET password · `--lightning-type` 0 all, 1 cloud-to-ground, 2 intracloud · `--amp-threshold` minimum stroke amplitude to keep · `--daily-window` split the request into per-day windows · `--pause` seconds to wait between successive requests · `--force` re-download even when the output exists · `--dry-run` plan the fetch without downloading anything | Downloads LINET strokes. Use `--format kml`: it writes `{out}/kml_data/YYYY-MM-DD/…` which the rasteriser reads directly. | `python our_data/lightning_data/linet_export.py --start 2025-05-01 --end 2025-05-31 --format kml --out our_data/lightning_data --password_file `$\color{red}{\textbf{\textit{creds.txt}}}$ |
 | **1d** | `our_data/lightning_data/read_kml_version2.py` | `--data_root PATH` root holding the downloaded KML files · `--output_root PATH` destination for the rasterised grid arrays · `--date YYYY-MM-DD` process one date instead of all · `--force` reprocess and overwrite the existing outputs | Rasterises strokes onto the 1 km Romania grid → `density`, `current`, `occurrence`. | `python our_data/lightning_data/read_kml_version2.py --data_root our_data` |
 | **2** | `reproject.py` | `--satellite MTG` \| `--opera` \| `--all` product family; mutually exclusive, one required (lightning is never reprojected: `read_kml_version2.py` writes it onto the grid directly) · `--data_root PATH` root containing the raw product folders · `--date YYYY-MM-DD` process a single date only · `--workers N` parallel day-folder worker processes | Regrids everything onto the 1536 × 768 EPSG:31700 canvas as `.npy`. Also writes the shared `romania_grid_{lats,lons}.npy` and per-source projection constants so the arrays stay self-recoverable. | `python reproject.py --all`<br>`python reproject.py --opera --workers 6`<br>`python reproject.py --satellite MTG --date 2025-05-14` |
-| **2a** | `our_data/satellite_data/summarize_mtg.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--scan npy\|raw\|reprojected` measure from the extracted store, the raw chunks, or the reprojected arrays `extract_patches` actually reads · `--npy_dir PATH` MTG root holding the per-channel arrays · `--raw_dir PATH` directory of downloaded FCI chunk files · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--timesteps` override the cadence minute filter · `--chart [PATH]` monthly coverage chart PNG | Per-date MTG coverage → `mtg_summary.csv` + `mtg_missing_timesteps.json`, consumed by step 3 **and** by `--source datastore` as its shopping list. Also reports the NMA / Data Store split from `provenance.json`. **Give `--start` and `--end`** — without them the range is inferred from the files found, so a date absent from disk is not reported missing and can never be requested. | `python our_data/satellite_data/summarize_mtg.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/satellite_data/summarize_mtg.py --scan raw` |
+| **2a** | `our_data/satellite_data/summarize_mtg.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--scan npy\|raw\|reprojected` measure from the extracted store, the raw chunks, or the reprojected arrays `extract_patches` actually reads · `--npy_dir PATH` MTG root holding the per-channel arrays · `--raw_dir PATH` directory of downloaded FCI chunk files · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--timesteps` override the cadence minute filter · `--chart [PATH]` monthly coverage chart PNG | Per-date MTG coverage → `mtg_summary.csv` + `mtg_missing_timesteps.json`, consumed by step 3 **and** by `--source datastore` as its shopping list. Also reports the NMA / Data Store split from `provenance.json`. Pass `--start` and `--end` so a date with no files is reported as missing. | `python our_data/satellite_data/summarize_mtg.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/satellite_data/summarize_mtg.py --scan raw` |
 | **2b** | `our_data/opera_data/summarize_opera_data.py` | `--start` `--end` `YYYY-MM-DD` range the archive should cover · `--data_dir PATH` local OPERA download root to scan · `--products` reflectivity, rainfall_rate, or both · `--timesteps` override the per-product minute filter · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timestep JSON destination · `--chart [PATH]` monthly coverage chart PNG | Same for OPERA → `opera_summary.csv` + `opera_missing_timesteps.json`. | `python our_data/opera_data/summarize_opera_data.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/opera_data/summarize_opera_data.py --products opera_rainfall_rate` |
 | **2c** | `our_data/lightning_data/summarize_lightning_data.py` | `--start` `--end` `YYYY-MM-DD` range the cache should cover · `--data_dir PATH` rasterised lightning `.npy` root to scan · `--workers N` parallel workers for the per-date scan · `--output PATH` per-date coverage summary CSV destination · `--missing PATH` missing-timesteps JSON destination · `--active PATH` per-timestep activity index CSV destination · `--chart [PATH]` monthly coverage chart PNG | Same for LINET → `lightning_summary.csv` + `lightning_missing_timesteps.json` + `lightning_active_steps.csv`. Every array is read in full to test for a non-zero pixel, so the scan is disk-bound and parallel by default. The intersection gates on the missing JSON (presence); the activity index feeds `lightning_fraction.py --scope_csv` and `visualize_lightning_stats.py`. | `python our_data/lightning_data/summarize_lightning_data.py --start 2025-01-01 --end 2026-08-13 --chart`<br>`python our_data/lightning_data/summarize_lightning_data.py -w 12` |
 | **3** | `intersect_product_coverage.py` | `--summary name=PATH` per-product coverage summary CSV; `name` is `mtg`, `lightning`, `opera_rainfall_rate` or `opera_reflectivity` (`opera` is an alias for the former) · `--missing name=PATH` per-product missing-timestep JSON · `--errors_log PATH` reprojection error log to subtract · `--timestep_config PATH` master cadence config to validate against · `--output_csv PATH` where the timestep manifest is written · `--output_plot PATH` destination for the coverage bar chart | Intersects per-product coverage into `timestep_manifest.csv` — the timesteps where *all* requested products exist. Gates step 5. **The requested set is your choice**, and OPERA's two fields are named separately so a manifest requires only what its modes read: both OPERA keys draw on the same summary CSV and missing JSON, selecting different blocks. | `python intersect_product_coverage.py --summary mtg=our_data/satellite_data/mtg_summary.csv --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv --summary opera_reflectivity=our_data/opera_data/opera_summary.csv`<br>`python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/opera_data/opera_summary.csv --output_csv our_data/timestep_manifest_rain.csv` |
-| **4** | `identify_patches.py` | `--threshold` mm/h rain-rate floor for DBSCAN clustering; default = the master index's recorded value, else 10 · `--rule pixel\|box` how clusters become tiles (see the thresholds reference); default = the master index's recorded rule, else `pixel` · `--eps` DBSCAN neighbourhood radius, in pixels · `--min_samples` minimum pixels needed to accept a cluster · `--data_root PATH` root holding the reprojected OPERA data · `--output_dir PATH` destination for the patch index CSV/JSON · `--date YYYY-MM-DD` single date; excludes `--start`/`--end` · `--start` `--end` `YYYY-MM-DD` range, **both bounds inclusive** · `--plot` render the day into two GIFs, one frame per timestep (requires `--date`) | DBSCAN over OPERA `rainfall_rate`; marks which of the 18 patches are convectively active per timestep → `patch_index.csv`. A `--date` that is not on disk is an error naming the folder expected and the `reproject.py` command that writes it. | `python identify_patches.py`<br>`python identify_patches.py --start 2025-05-01 --end 2025-05-31`<br>`python identify_patches.py --date 2025-05-14 --plot` |
+| **4** | `identify_patches.py` | `--threshold` mm/h rain-rate floor for DBSCAN clustering; default = the master index's recorded value, else 10 · `--rule pixel\|box` how clusters become tiles (see the thresholds reference); default = the master index's recorded rule, else `pixel` · `--eps` DBSCAN neighbourhood radius, in pixels · `--min_samples` minimum pixels needed to accept a cluster · `--data_root PATH` root holding the reprojected OPERA data · `--output_dir PATH` destination for the patch index CSV/JSON · `--date YYYY-MM-DD` single date; excludes `--start`/`--end` · `--start` `--end` `YYYY-MM-DD` range, **both bounds inclusive** · `--plot` render the day into two GIFs, one frame per timestep (requires `--date`) | DBSCAN over OPERA `rainfall_rate`; marks which of the 18 patches are convectively active per timestep → `patch_index.csv`. | `python identify_patches.py`<br>`python identify_patches.py --start 2025-05-01 --end 2025-05-31`<br>`python identify_patches.py --date 2025-05-14 --plot` |
 | **5** | `extract_patch_seq_for_datasets.py` | `--past N` past steps required before the reference · `--future N` future steps required after the reference · `--test_frac` fraction of each block held for test · `--val_frac` fraction of each block held for validation · `--block_hours N` temporal block size; must divide 24 · `--manifest PATH` coverage gate; `none` disables the filter · `--data_root PATH` root holding the patch index CSV | Builds temporally-continuous sequences and the Czibula block-wise 80/10/10 split → `{train,validation,test}_data_dbscan.csv` + `sequence_meta_dbscan.json`. | `python extract_patch_seq_for_datasets.py`<br>`python extract_patch_seq_for_datasets.py --past 3 --future 3 --block_hours 12`<br>`python extract_patch_seq_for_datasets.py --manifest none` |
 | **6** | `extract_patches.py` | `--products` satellite_MTG, lightning, opera; default all three · `--data_root PATH` root holding the reprojected full-domain canvases · `--output_dir PATH` destination for the sliced patch arrays · `--date YYYY-MM-DD` process a single date only | Slices 256 × 256 patches from the reprojected canvases, applying each variable's pooling factor → `patches/{date}/{var}_{HHMM}_{HR\|MR}.npy`. | `python extract_patches.py`<br>`python extract_patches.py --products satellite_MTG opera`<br>`python extract_patches.py --date 2025-05-14` |
-| **7** | `compute_normalization_stats.py` | `--variables` restrict to a subset of variables · `--sample_fraction` fraction of pixels sampled per file · `--with_percentiles` also emit p01/p50/p99 and MAD · `--reservoir_size` reservoir sample size backing the percentiles · `--device auto\|cpu\|gpu` compute backend for the accumulation · `--no_split_filter` **DIAGNOSTIC ONLY — leaks val/test data** · `--train_csv PATH` training split scoping the statistics · `--sequence_meta PATH` sequence schema describing the sample window · `--timestep_config PATH` master cadence for per-product snapping · `--reproject_root PATH` root holding the reprojected product data · `--output PATH` destination for the statistics JSON · `--seed` RNG seed for reproducible pixel sampling | Per-variable mean/std over the **training split only** → `normalization_stats_dbscan.json`. Required by step 8; there is no fallback, and a missing variable fails loudly. | `python compute_normalization_stats.py`<br>`python compute_normalization_stats.py --variables ir_105 opera_rainfall_rate`<br>`python compute_normalization_stats.py --device gpu --with_percentiles` |
+| **7** | `compute_normalization_stats.py` | `--variables` restrict to a subset of variables · `--sample_fraction` fraction of pixels sampled per file · `--with_percentiles` also emit p01/p50/p99 and MAD · `--reservoir_size` reservoir sample size backing the percentiles · `--device auto\|cpu\|gpu` compute backend for the accumulation · `--no_split_filter` **DIAGNOSTIC ONLY — leaks val/test data** · `--train_csv PATH` training split scoping the statistics · `--sequence_meta PATH` sequence schema describing the sample window · `--timestep_config PATH` master cadence for per-product snapping · `--reproject_root PATH` root holding the reprojected product data · `--output PATH` destination for the statistics JSON · `--seed` RNG seed for reproducible pixel sampling | Per-variable mean/std over the **training split only** → `normalization_stats_dbscan.json`. Required by step 8. | `python compute_normalization_stats.py`<br>`python compute_normalization_stats.py --variables ir_105 opera_rainfall_rate`<br>`python compute_normalization_stats.py --device gpu --with_percentiles` |
 | **8** | `create_datasets.py` | `--mode` one or more buildable dataset modes, built in turn over the same split · `--data_root PATH` root holding split CSVs and patches · `--output_root PATH` destination root for the TFRecord datasets | Applies transforms + label binning, writes TFRecord shards plus a per-split `metadata.json` (input shapes, label type, cadence) that drives model construction. | `python create_datasets.py --mode mtg_opera_mtgmr_rainfall`<br>`python create_datasets.py --mode mtg_lightning_opera_occurrence` |
 | **9a** | `lightning_fraction.py` | `--scope_csv PATH` scope CSV; `none` scans every file · `--data_root PATH` root holding the lightning patch arrays · `--output PATH` destination for the focal-loss prior JSON | **`_occurrence` modes only** (`mtg_lightning_opera_occurrence`, `mtg_opera_occurrence`). Training-scope positive-pixel fraction → `lightning_fraction_dbscan.json`, the focal-loss prior. | `python lightning_fraction.py`<br>`python lightning_fraction.py --scope_csv none` |
 | **9b** | `opera_rainfall_fraction.py` | `--scope_csv PATH` scope CSV; `none` scans every file · `--data_root PATH` root holding the OPERA patch arrays · `--output PATH` destination for the class-weight prior JSON | **`_rainfall` modes only, when `[radar_loss].weighting != none`.** Per-class pixel fractions → `opera_rainfall_fraction_dbscan.json`, the class-weight prior. | `python opera_rainfall_fraction.py` |
@@ -748,7 +669,7 @@ python our_data/satellite_data/pipeline_msg_mtg.py … --source datastore --fill
 | Collection | **FDHSI** (`EO:EUM:DAT:0662`) only — it carries all five channels at the resolutions used. HRFI would add `vis_06` at 500 m, which the pipeline pools away. |
 | What gets fetched | Both `missing_times` (no chunks) and `incomplete_times` (one of the two Romania chunks). `--no_fill_incomplete` restricts it to fully-absent cycles. |
 | Chunks | 35 and 36, matching `ROMANIA_CHUNKS` — see the chunk map under [Data products](#data-products). |
-| Extraction | Fetched chunks are extracted to `.npy` in the same run. Without that the coverage figure would climb while nothing `reproject.py` can read appeared. |
+| Extraction | Fetched chunks are extracted to `.npy` in the same run. |
 | Credentials | `--eumdac_credentials PATH` (two lines: key, then secret), or `EUMDAC_KEY` / `EUMDAC_SECRET`. Get a key at <https://api.eumetsat.int/api-key/>. `--password_file` is **not** needed for `--source datastore`. |
 | Dependency | `eumdac`, imported lazily — the pipeline runs normally without it unless the Data Store is requested. |
 
@@ -778,9 +699,7 @@ not spend windows on months that have nothing to fetch. `--fill_dry_run`
 deliberately stays whole-list: it downloads nothing, and seeing the complete
 set is the point of asking.
 
-Cycles that *fail* to extract keep their raw in either case. Deleting those
-would destroy the only copy before any summary had seen them, and would
-remove the retry path that is the one thing that can fix them.
+Cycles that fail to extract keep their raw for the `--reprocess` retry.
 
 ### Processing raw already on disk (`--source local`)
 
@@ -795,19 +714,12 @@ python our_data/satellite_data/pipeline_msg_mtg.py \
     --delete_raw --provenance nma --batch_months 1 --workers 12
 ```
 
-This covers raw left behind by an interrupted run, and any range downloaded
-before extraction was wired into the download path — the two can drift far
-apart without it being obvious, since the summary measures `.npy` and the
-disk usage comes from `.nc`.
+Extraction skips cycles whose `.npy` already exist, and `--delete_raw`
+still reclaims them; `--reprocess` forces re-extraction.
 
-Extraction skips cycles whose `.npy` already exist, so a second pass is
-cheap and `--delete_raw` still reclaims them: "already present" counts as
-done, not as skipped-and-therefore-kept. `--reprocess` forces re-extraction.
-
-`--provenance nma|datastore` stamps what the run extracts. It is optional
-and local-only: raw sitting in `_raw_chunks/` carries no evidence of its
-origin, so omitted it records **nothing** rather than guessing. Entries
-already in the ledger are never overwritten.
+`--provenance nma|datastore` stamps what the run extracts; raw in
+`_raw_chunks/` carries no evidence of its origin, so without the flag
+nothing is recorded. Entries already in the ledger are never overwritten.
 
 ### Gate on the fields your modes actually read
 
@@ -832,10 +744,7 @@ On the current archive the choice is worth 7 timesteps:
 
 Those 7 hold rainfall but not reflectivity. Requiring only rainfall keeps
 them, which is right for a rainfall-only model; requiring both excludes
-them up front, which is right for a model that reads reflectivity — and
-is the case that used to go wrong. Before the split they entered every
-manifest, and `create_datasets` dropped them at build time into the
-`skipped` counter, with no error.
+them up front, which is right for a model that reads reflectivity.
 
 Two gates means two manifests, so give them distinct paths and pass the
 one you want explicitly:
@@ -847,26 +756,11 @@ python extract_patch_seq_for_datasets.py --manifest our_data/timestep_manifest_r
     --period w44 --start 2025-01-01 --end 2026-08-13 --past 4 --future 4
 ```
 
-### Declare the expected range, or gaps stay invisible
+### Declare the expected range
 
-All three summarisers take `--start` / `--end`. Without them the range is
-inferred from the files found, and a date with **no files at all** is not
-reported as missing — it simply does not exist as far as the report is
-concerned, so nothing can ever request it.
-
-The difference is not cosmetic. MTG's first *extracted* date was 2025-04-01,
-so the inferred range began there and reported near-full coverage:
-
-```
-inferred range   : 24637/25728 present (95.9%)
-2025-01-01 .. 2026-08-13 : 24637/48000 present (51.3%),
-                           332 date(s) have NO files at all
-```
-
-Raw on disk went back to **2025-01-01** the whole time — downloaded but never
-extracted, so `--scan npy` could not see it and `--scan raw` was not the
-default. That is the drift `--source local` exists to close: the two scans
-answer different questions, and only one of them is what training reads.
+All three summarisers take `--start` / `--end`, the range the archive is
+expected to cover; a date in range with no files at all is then reported
+as missing, and the Data Store backfill can request it.
 
 ### Provenance
 
@@ -878,9 +772,8 @@ source produced the cycle, and reported by every summary run:
 Provenance : nma=24,637 (99.5%), datastore=132 (0.5%)
 ```
 
-Cycles from before the ledger existed report as `unrecorded`. That is
-honest rather than flattering: the two sources share filenames, so their
-origin is genuinely unrecoverable and is not guessed at.
+Cycles from before the ledger existed report as `unrecorded`; the two
+sources share filenames, so their origin is not guessed at.
 
 Where you know the origin out-of-band, `--record_existing nma|datastore`
 stamps every cycle already on disk and exits — no window, no credentials,
@@ -929,35 +822,18 @@ Deleting 49,281 raw chunk file(s) ...
   Removed 49,281 file(s), freed 762.9 GB
 ```
 
-Nothing is verified in that mode, which is the whole point — that judgement
-belongs to the summary, which you run *beforehand* and which records the
-gaps, corrupt cycles included. Grouping still runs, so deletion is confined
-to the requested window rather than emptying `_raw_chunks/` wholesale.
+Nothing is verified in that mode; the summary, run beforehand, holds that
+judgement. Deletion is confined to the requested window.
 
-Deletion is **irreversible** either way. Two consequences:
-
-**`--scan raw` becomes misleading.** It would see only whatever was
-downloaded since, and report the rest of the archive as missing. `--scan
-npy` is the default for this reason, and after deletion it is the only
-correct view.
-
-Compare the two over the *same* `--start` / `--end` before deleting
-anything. They agree only where extraction has kept up with the download,
-and a raw count that exceeds the `.npy` count means raw is about to be
-deleted that was never extracted — run `--source local` first.
-
-**Reprocessing costs a re-download.** `--source local` re-derives `.npy`
-from raw after a bug in the extraction code; once raw is gone that is no
-longer possible.
+Deletion is irreversible: afterwards `--scan npy` is the only valid
+coverage view, and `--source local` can no longer re-derive `.npy` from
+raw. Compare `--scan raw` and `--scan npy` over the same range before
+deleting, and run `--source local` first if raw exceeds `.npy`.
 
 ### OPERA SFTP notes (step 1b)
 
-Two distinct failures both surface as `cannot list …` — tell them apart by what follows.
-
-| Symptom | Cause | What to do |
-|---|---|---|
-| `cannot list …: Permission denied` | The EWC VM rejects password authentication. | Switch to key auth: `--ssh_key ~/.ssh/id_ed25519`, or any other key registered under `claudiu@` on the server. |
-| `cannot list …: No such file`, per date, at a mount root that already resolved | None — this is upstream. `--remote_base` auto-fallback already picked the correct EWC mount, so the remote directories genuinely do not exist for those dates. | Nothing to fix locally. Ask the NMA (National Meteorological Administration) data operators when the target range will land. |
+The EWC VM takes key authentication (`--ssh_key`), and `--remote_base`
+falls back to the EWC mount root on its own.
 
 ```bash
 python our_data/opera_data/pipeline_opera.py \
@@ -1129,8 +1005,8 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
-| `reproject.py` | `our_data/reprojected_data/<group>/<product>/nc4_<date>-Romania_<product>/nc4_<date>-Romania_<HHMM>_<product>.npy` · `our_data/romania_grid_lats.npy` · `..._lons.npy` · `reproject_<category>.log` | `identify_patches` · `extract_patches` · `compute_normalization_stats` · `intersect --errors_log` | KD-tree resampling onto the shared 768 × 1536 canvas, so every modality is pixel-aligned. The lat/lon pair is the grid definition reused by plotting and NetCDF export. The error log is subtracted from the coverage manifest, so a failed reprojection is not counted as present. |
-| `our_data/lightning_data/read_kml_version2.py` | `<root>/{density,current,occurrence}/nc4_<date>-Romania_<product>/lightning_<product>_<yyyymmdd>_<HHMM>.npy` · `<root>/filtered_out_reports/lightning_filtered_out_<date>.json` | `extract_patches` · `compute_normalization_stats` · `summarize_lightning_data` · report is **terminal** (audit) | Strokes binned straight onto the Romania grid at the label cadence — binning places them there, so no reprojection step is needed. The audit JSON lists strokes dropped for falling **outside the grid**, so a coverage dip can be traced to geography rather than to a bug. |
+| `reproject.py` | `our_data/reprojected_data/<group>/<product>/nc4_<date>-Romania_<product>/nc4_<date>-Romania_<HHMM>_<product>.npy` · `our_data/romania_grid_lats.npy` · `..._lons.npy` · `reproject_<category>.log` | `identify_patches` · `extract_patches` · `compute_normalization_stats` · `intersect --errors_log` | KD-tree resampling onto the shared 768 × 1536 canvas, so every modality is pixel-aligned. The lat/lon pair is the grid definition reused by plotting and NetCDF export. The error log is subtracted from the coverage manifest. |
+| `our_data/lightning_data/read_kml_version2.py` | `<root>/{density,current,occurrence}/nc4_<date>-Romania_<product>/lightning_<product>_<yyyymmdd>_<HHMM>.npy` · `<root>/filtered_out_reports/lightning_filtered_out_<date>.json` | `extract_patches` · `compute_normalization_stats` · `summarize_lightning_data` · report is **terminal** (audit) | Strokes binned straight onto the Romania grid at the label cadence — binning places them there, so no reprojection step is needed. The audit JSON lists strokes dropped for falling **outside the grid**. |
 
 </details>
 
@@ -1143,7 +1019,7 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
-| `our_data/satellite_data/summarize_mtg.py` | `our_data/satellite_data/`: `mtg_summary.csv` · `mtg_missing_timesteps.json` · `mtg_coverage.png` (`--chart`) | `intersect_product_coverage` · `pipeline_msg_mtg --source datastore` · chart is **terminal** | Per-date coverage measured from the `.npy` output. The missing-timestep JSON is **the Data Store shopping list** — the backfill fetches exactly what it names. Pass `--start`/`--end`, or a date with no files at all is never reported missing and can never be requested. |
+| `our_data/satellite_data/summarize_mtg.py` | `our_data/satellite_data/`: `mtg_summary.csv` · `mtg_missing_timesteps.json` · `mtg_coverage.png` (`--chart`) | `intersect_product_coverage` · `pipeline_msg_mtg --source datastore` · chart is **terminal** | Per-date coverage measured from the `.npy` output. The missing-timestep JSON is **the Data Store shopping list** — the backfill fetches exactly what it names. |
 | `our_data/opera_data/summarize_opera_data.py` | `our_data/opera_data/`: `opera_summary.csv` · `opera_missing_timesteps.json` · `opera_coverage.png` (`--chart`) | `intersect_product_coverage` · chart is **terminal** | The same accounting for the radar composites. The only summary needed when gating on radar alone. |
 | `our_data/lightning_data/summarize_lightning_data.py` | `our_data/lightning_data/`: `lightning_summary.csv` · `lightning_missing_timesteps.json` · `lightning_active_steps.csv` · `lightning_coverage.png` (`--chart`) | `intersect` (missing JSON) · `lightning_fraction` and `visualize_lightning_stats` (activity index) · chart is **terminal** | The intersection gates lightning on **presence**, like MTG and OPERA: a frame of zeros is an observation. A quiet day gets its zero frames from `read_kml_version2`, so it is a day, not an outage. `lightning_active_steps.csv` remains the activity index behind `visualize_lightning_stats`' diurnal chart. |
 | `intersect_product_coverage.py` | `our_data/timestep_manifest.csv` · `our_data/intersect_summary.png` | `extract_patch_seq_for_datasets` · plot is **terminal** | The timesteps where *every requested product* exists — `date,hhmm` plus each product's snapped time. **The product set is your choice**: passing only `--summary opera_rainfall_rate=…` gates on radar alone, so MTG gaps stop constraining radar-only work. OPERA's two fields are separate keys, so a rainfall-only model keeps samples that reflectivity happens to be missing, and a model that reads reflectivity is never handed a timestep without it. |
@@ -1159,7 +1035,7 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
-| `identify_patches.py` | `our_data/patch_index/patch_index.csv` · `patch_index.json` · `plots/dbscan_<rule>_patch_selection/<date>.gif` · `plots/patch_highlight/<date>.gif` · `plots/nc/patches_<date>_<HHMM>.nc` | `extract_patch_seq_for_datasets` · `extract_patches` · `data_statistics` · plots + `.nc` are **terminal** | DBSCAN over OPERA rain rate (≥10 mm/h, eps 5, min_samples 20) flags which of the 18 patches are convectively active per timestep. **Selects patches, not pixels** — every pixel of a chosen patch is used, dry ones included, which is why the weighted losses exist. Two rules turn clusters into tiles, recorded in the index as `selection_rule`: **`pixel`** selects a tile that holds ≥ 1 cluster pixel (every index so far); **`box`** centres a 256 × 256 box on each cluster centroid and selects a tile that meets the union of those boxes, so every cell keeps 128 px of context on each side and an edge cell brings its dry neighbour in with it. One index serves every period, and its row order defines the patch axis of the saved arrays. Diagnostics cost ~28 MB each; `--purge_plots` clears them. |
+| `identify_patches.py` | `our_data/patch_index/patch_index.csv` · `patch_index.json` · `plots/dbscan_<rule>_patch_selection/<date>.gif` · `plots/patch_highlight/<date>.gif` · `plots/nc/patches_<date>_<HHMM>.nc` | `extract_patch_seq_for_datasets` · `extract_patches` · `data_statistics` · plots + `.nc` are **terminal** | DBSCAN over OPERA rain rate (threshold and rule recorded in `patch_index.json`; eps 5, min_samples 20) flags which of the 18 patches are convectively active per timestep. **Selects patches, not pixels** — every pixel of a chosen patch is used, dry ones included, which is why the weighted losses exist. Two rules turn clusters into tiles, recorded in the index as `selection_rule`: **`pixel`** selects a tile that holds ≥ 1 cluster pixel (every index so far); **`box`** centres a 256 × 256 box on each cluster centroid and selects a tile that meets the union of those boxes, so every cell keeps 128 px of context on each side and an edge cell brings its dry neighbour in with it. One index serves every period, and its row order defines the patch axis of the saved arrays. Diagnostics cost ~28 MB each; `--purge_plots` clears them. |
 | `extract_patch_seq_for_datasets.py` | `our_data/{train,validation,test}_data_<source>[_<period>].csv` · `sequence_meta_<source>[_<period>].json` · `extract_patch_seq_drops_<source>[_<period>].csv` | `extract_patches` · `create_datasets` · `compute_normalization_stats` · `opera_rainfall_fraction` · `lightning_fraction` · `verification_keys` · `data_statistics` | The authoritative sample list: one row per sequence with `idx_t-N … idx_t+M` columns indexing into the saved patch arrays. `sequence_meta` records **the window itself** (`past_steps`, `future_steps`, `step_minutes`), which is what makes the model's horizon a property of the data rather than of the code. The drops CSV explains every candidate that did not survive. |
 | `extract_patches.py` | `our_data/patches/<date>/<variable>_<HHMM>_{HR,MR}.npy` | `create_datasets` | 256 × 256 tiles sliced from the full canvases, HR kept at 1 km and MR average-pooled to 128 px — **always pooled down, never up**, so no product carries fabricated resolution. Shape is `(active_patches, H, W)`, ordered by the patch index. Not period-suffixed: every period writes into the same shared tree. |
 
@@ -1174,9 +1050,9 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 
 | Script | Files written | Consumed by | What it holds & why |
 |---|---|---|---|
-| `compute_normalization_stats.py` | `our_data/normalization_stats_<source>[_<period>].json` | `create_datasets` · `train_models` · `predict_full_domain` · `validate_predictions` · `sepconv_predict` · `evaluate_coalition` · `generate_report` · `visualize_gt_vs_pred` | Per-variable mean/std in `log_zscore` or linear space, over the *training* keys only. The invariant that matters is that **training and inversion use the same constants** — train under one set and invert with another and `10**(z·std+mean)` returns the wrong mm/h, biased with intensity, and nothing raises. |
+| `compute_normalization_stats.py` | `our_data/normalization_stats_<source>[_<period>].json` | `create_datasets` · `train_models` · `predict_full_domain` · `validate_predictions` · `sepconv_predict` · `evaluate_coalition` · `generate_report` · `visualize_gt_vs_pred` | Per-variable mean/std in `log_zscore` or linear space, over the *training* keys only. Training and inversion use the same constants. |
 | `opera_rainfall_fraction.py` | `our_data/opera_rainfall_fraction_<source>[_<period>].json` | `train_models` · `sepconv_ensemble_training` | Measured pixel fraction of each of the 5 rain classes, feeding the focal / weighted loss prior. Class 0 is ~99.8 % of pixels — without it, plain MSE is minimised by predicting dry everywhere. |
-| `lightning_fraction.py` | `our_data/lightning_fraction_<source>[_<period>].json` | `train_models` (occurrence modes) | Fraction of non-zero pixels in the occurrence maps — the focal-loss `ones_fraction`. Both priors take `--period` so scope and filename come from one tag; scoped to a different window, a prior describes a balance the model never sees. |
+| `lightning_fraction.py` | `our_data/lightning_fraction_<source>[_<period>].json` | `train_models` (occurrence modes) | Fraction of non-zero pixels in the occurrence maps — the focal-loss `ones_fraction`. Both priors take `--period` so scope and filename come from one tag. |
 
 </details>
 
@@ -1269,7 +1145,7 @@ Two coverage metrics per (sample, lead): **`iou_mask`** (IoU of the binary ≥10
 | `<track>_<year>_<month>_metrics.png` | Left: grouped FAR/POD/CSI bars per lead. Right: per-sample coverage scatter (IoU vs class-weighted, marker per lead). |
 | `<track>_<year>_<month>_<date>_<HHMM>_<lead>.png` | Visualisation mode. Left: structure overlay (red = GT class == Pred class and both ≥10 mm/h). Right: 256 × 256 zoom into the most GT-active patch — red matched, blue misses, orange false alarms. |
 
-Visualisation title colour: **green** if the date cleared the coverage threshold for that lead/metric, **orange** if selected but below it. A date absent from the initial selection raises `SystemExit`.
+Visualisation title colour: **green** if the date cleared the coverage threshold for that lead/metric, **orange** if selected but below it.
 
 ### `feature_importance_analysis.py` → `--output` (default `results/feature_importance/`)
 
@@ -1293,7 +1169,7 @@ Hinton-style teacher–student distillation producing a student that gives the s
 | Mode | `mtg_lightning_opera_occurrence` | `mtg_opera_occurrence` |
 | HR inputs | LINET (density + current + occurrence) + MTG `vis_06` | MTG `vis_06` only |
 | MR inputs | OPERA reflectivity + rainfall_rate + MTG IR/WV | *(same)* |
-| Label | Binary lightning occurrence at t+15/+30/+45 | *(same)* |
+| Label | Binary lightning occurrence at each future step | *(same)* |
 | Weights | `coalition_mtg_lightning_opera_occurrence_dbscan[_finetuned].keras` | `coalition_mtg_opera_occurrence_dbscan_kd.keras` |
 
 **KD loss** (adapted for binary sigmoid outputs):
@@ -1339,8 +1215,8 @@ Tune these to change behaviour without touching the architecture.
 
 | Constant | Default | CLI override | Purpose | Effect of changing |
 |---|---|---|---|---|
-| `DBSCAN_THRESHOLD` | `10` mm/h as the module default; **the master `patch_index.json` records the value it was built with (8 mm/h today) and that becomes the default once it exists** | `--threshold` | Rain-rate cut for training-patch selection; pixels strictly above it are clustered. A run that names nothing reproduces the index's rule; one that names a different value is warned that a rebuilt index invalidates the patch pool. |
-| `selection_rule` | `pixel` | `--rule pixel\|box` | How clusters become tiles. `pixel`: a tile holding ≥ 1 cluster pixel. `box`: a tile meeting the union of 256 × 256 boxes centred on the cluster centroids. Recorded in `patch_index.json`; the recorded rule is the default once an index exists. | `box` selects more tiles — the dry neighbours of cells near a tile edge — and guarantees 128 px of context around every cell; `pixel` keeps only tiles that contain convective pixels. Changing the rule rebuilds a different index and invalidates the patch pool. | Lower → weaker events enter training. Higher → smaller, more selective training set. |
+| `DBSCAN_THRESHOLD` | `10` mm/h module default; the master `patch_index.json` records the value it was built with (8 mm/h today), which is the default once it exists | `--threshold` | Rain-rate cut for training-patch selection; pixels strictly above it are clustered. | Lower → weaker events enter training. Higher → smaller, more selective training set. Changing it rebuilds a different index and invalidates the patch pool. |
+| `selection_rule` | `pixel` | `--rule pixel\|box` | How clusters become tiles. `pixel`: a tile holding ≥ 1 cluster pixel. `box`: a tile meeting the union of 256 × 256 boxes centred on the cluster centroids. Recorded in `patch_index.json`; the recorded rule is the default once an index exists. | `box` selects more tiles — the dry neighbours of cells near a tile edge — and guarantees 128 px of context around every cell. Changing the rule rebuilds a different index and invalidates the patch pool. |
 | `DBSCAN_EPS` | `5` px | — | DBSCAN neighbourhood radius. | Larger → clusters merge. Smaller → cells fragment. |
 | `DBSCAN_MIN_SAMPLES` | `20` px | — | Minimum cluster size; smaller regions become noise. | Lower → tiny cells qualify. Higher → only substantial storms. |
 | `RAINFALL_THRESHOLD_MMH` | `10.0` mm/h | `--rainfall_threshold_mmh` | Validation **sample-selection** scope. The binary event for FAR/POD/CSI/IoU stays anchored to class ≥ 1 — that is the model's trained decision boundary. | Lower → more samples selected. Higher → only intense convection. |
@@ -1395,13 +1271,8 @@ lightning follows; the two cannot drift apart.
 
 At 15 min a map stamped 12:30 counts strokes from 12:15–12:30, so the
 window closes exactly where the label is taken and the filter is
-`[0,15,30,45]` — on-grid, no snapping jitter. At the previous literal 10
-it aggregated 12:20–12:30 onto `[0,10,30,40]`, leaving a **5-minute hole**
-between consecutive maps in which strokes appeared in no map at all.
-
-One trade-off: MTG stays at its native 10 min and keeps the `[0,10,30,40]`
-filter, so lightning and MTG no longer coincide at `:15`/`:45`. Lightning
-is now aligned to the label; MTG remains up to 5 minutes off it, as before.
+`[0,15,30,45]`. MTG stays at its native 10 min with the `[0,10,30,40]`
+filter, so it sits up to 5 minutes off the label.
 
 **Satellite channel selection** — 5 channels chosen by physical property:
 
