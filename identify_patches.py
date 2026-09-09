@@ -9,10 +9,12 @@ Steps:
     1. Read pre-reprojected OPERA rainfall_rate .npy files
        (written by reproject.py --opera)
     2. Run DBSCAN to identify convective clusters (threshold >10, eps=5)
-    3. Create binary mask: all cluster pixels = 1, rest = 0
+    3. Build the selection mask, by rule (--rule, recorded in the index):
+         pixel  the cluster pixels themselves
+         box    the union of 256×256 boxes centred on each cluster centroid
     4. Overlay fixed 6×3 grid (18 patches of 256×256)
-    5. Mark patches with ≥1 non-zero pixel as active
-    6. Save patch index (CSV + JSON)
+    5. Mark patches holding ≥1 selection-mask pixel as active
+    6. Save patch index (CSV + JSON), with the rule and parameters used
 
 Grid layout (1536×768, numbered left-to-right, top-to-bottom):
     R1:  1   2   3   4   5   6
@@ -119,6 +121,13 @@ DBSCAN_THRESHOLD = 10   # mm/h — pixels at or below this are ignored
 DBSCAN_EPS = 5           # neighborhood radius in pixels
 DBSCAN_MIN_SAMPLES = 20  # minimum cluster size
 DBSCAN_SOURCE = "module defaults"
+
+# How the cluster result becomes a set of tiles. `pixel` tests the
+# cluster pixels themselves; `box` tests the union of 256x256 boxes
+# centred on each cluster centroid. Recorded in the index like the
+# DBSCAN parameters, and inherited from it the same way.
+SELECTION_RULES = ("pixel", "box")
+DBSCAN_RULE = "pixel"
 
 
 # =============================================================================
@@ -381,6 +390,34 @@ def get_patch_bounds(patch_number):
     return r0, r0 + PATCH_SIZE, c0, c0 + PATCH_SIZE
 
 
+def box_union_mask(centres, shape):
+    """The union of PATCH_SIZE x PATCH_SIZE boxes centred on `centres`,
+    clipped to the canvas. Empty when there are no clusters."""
+    mask = np.zeros(shape, dtype=np.uint8)
+    half = PATCH_SIZE // 2
+    for r, c in centres:
+        mask[max(r - half, 0):r + half, max(c - half, 0):c + half] = 1
+    return mask
+
+
+def selection_mask(binary_mask, centres, rule=None):
+    """The mask the fixed grid is tested against, under `rule`.
+
+    pixel: the cluster pixels (binary_mask) as they are.
+    box:   the union of boxes around the cluster centroids, so a tile is
+           selected whenever a centroid lies within 128 px of it - every
+           cell keeps its surroundings even when it sits on a tile edge,
+           and the dry neighbour is selected along with it.
+    """
+    rule = rule or DBSCAN_RULE
+    if rule == "pixel":
+        return binary_mask
+    if rule == "box":
+        return box_union_mask(centres, binary_mask.shape)
+    raise ValueError(f"unknown selection rule {rule!r}; "
+                     f"choose one of {SELECTION_RULES}")
+
+
 def identify_active_patches(binary_mask):
     """
     Check which of the 18 fixed patches contain at least one non-zero pixel.
@@ -431,7 +468,8 @@ def save_gif(frames, path, duration_ms=500):
 
 
 def render_dbscan_selection(reprojected, binary_mask, centres, active_patches,
-                            date_str, time_str, threshold=None):
+                            date_str, time_str, threshold=None,
+                            sel_mask=None, rule=None):
     """One frame of the selection diagnostic: how DBSCAN turned a field
     into a set of patches.
 
@@ -440,12 +478,17 @@ def render_dbscan_selection(reprojected, binary_mask, centres, active_patches,
     original selection notebook drew. The boxes are orientation only;
     the selection does not read them.
 
-    Right: the cluster mask the selection actually tests, the fixed 6x3
+    Right: the mask the selection actually tests under the rule in
+    force - the cluster pixels (`pixel`) or the union of centroid boxes
+    (`box`, with the cluster pixels drawn over it in red) - the fixed 6x3
     grid dotted in red, and each tile holding at least one mask pixel
     outlined in green with its number. That is the whole rule.
     """
     if threshold is None:
         threshold = DBSCAN_THRESHOLD
+    rule = rule or DBSCAN_RULE
+    if sel_mask is None:
+        sel_mask = selection_mask(binary_mask, centres, rule)
     above = (reprojected > threshold).astype(np.uint8)
     half = PATCH_SIZE // 2
     active_set = set(active_patches)
@@ -478,8 +521,14 @@ def render_dbscan_selection(reprojected, binary_mask, centres, active_patches,
                    fontsize=11)
 
     # --- right: the mask, the grid, the selected tiles ------------------
-    ax_r.imshow(binary_mask, cmap='gray', vmin=0, vmax=1, aspect='equal',
+    ax_r.imshow(sel_mask, cmap='gray', vmin=0, vmax=1, aspect='equal',
                 interpolation='nearest')
+    if rule == "box" and binary_mask.any():
+        # The polygon is what is tested; the cluster pixels it was built
+        # from stay visible on top so the two are never confused.
+        rr, cc = np.nonzero(binary_mask)
+        ax_r.scatter(cc, rr, s=1, c='#f44336', marker='s', linewidths=0,
+                     zorder=3)
     for x in range(0, GRID_WIDTH + 1, PATCH_SIZE):
         ax_r.axvline(x, color='#f44336', linewidth=0.9,
                      linestyle=(0, (1, 3)), zorder=2)
@@ -498,9 +547,11 @@ def render_dbscan_selection(reprojected, binary_mask, centres, active_patches,
     ax_r.set_xlabel('X (px)')
     ax_r.set_ylabel('Y (px)')
     ax_r.grid(False)
-    n_px = int(binary_mask.sum())
-    ax_r.set_title(f'Cluster mask ({n_px:,} px) -> tiles with >= 1 mask '
-                   f'pixel selected', fontsize=11)
+    n_px = int(sel_mask.sum())
+    what = ('Cluster mask' if rule == 'pixel'
+            else 'Union of centroid boxes (cluster pixels in red)')
+    ax_r.set_title(f'Rule "{rule}": {what} ({n_px:,} px) -> tiles with '
+                   f'>= 1 mask pixel selected', fontsize=11)
 
     patches_str = (', '.join(str(p) for p in active_patches)
                    if active_patches else 'none')
@@ -613,6 +664,7 @@ def render_patch_highlight(reprojected, binary_mask, active_patches,
 
 
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
+                        sel_mask=None, rule=None, *_ignored,
                         date_str, time_str, output_dir,
                         data_root):
     """
@@ -683,6 +735,9 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                             np.asarray(reprojected, dtype=np.float32)),
             "dbscan_mask": (["y", "x"],
                             np.asarray(binary_mask, dtype=np.int8)),
+            "selection_mask": (["y", "x"],
+                               np.asarray(binary_mask if sel_mask is None
+                                          else sel_mask, dtype=np.int8)),
             "patch_id":    (["y", "x"], patch_id_grid),
             "active_patch": (["y", "x"], is_active_grid),
         },
@@ -731,6 +786,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                          f"{date_str} {time_str} UTC",
         "active_patches": ",".join(str(p) for p in active_patches)
                           if active_patches else "",
+        "selection_rule": rule or DBSCAN_RULE,
         "source":        "identify_patches.py (OPERA rainfall_rate)",
         "Conventions":   "CF-1.8",
     }
@@ -876,9 +932,10 @@ def process_single_opera_file(filepath):
     # NaN may appear for off-grid pixels; DBSCAN expects finite values.
     reprojected = np.nan_to_num(reprojected, nan=0.0)
     binary_mask, centres = dbscan_clusters(reprojected)
-    active_patches = identify_active_patches(binary_mask)
+    sel_mask = selection_mask(binary_mask, centres)
+    active_patches = identify_active_patches(sel_mask)
     return (date_str, time_str, iso_str, active_patches, reprojected,
-            binary_mask, centres)
+            binary_mask, centres, sel_mask)
 
 
 def index_parameters(output_dir):
@@ -897,6 +954,9 @@ def index_parameters(output_dir):
             'threshold': float(meta['dbscan_threshold']),
             'eps': float(meta['dbscan_eps']),
             'min_samples': int(meta['dbscan_min_samples']),
+            # Indexes written before the rule was recorded were all
+            # built under the pixel rule, the only one that existed.
+            'rule': str(meta.get('selection_rule', 'pixel')),
         }
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -913,11 +973,12 @@ def resolve_parameters(args, output_dir):
     recorded = index_parameters(output_dir)
     explicit = {k: v for k, v in (('threshold', args.threshold),
                                   ('eps', args.eps),
-                                  ('min_samples', args.min_samples))
+                                  ('min_samples', args.min_samples),
+                                  ('rule', args.rule))
                 if v is not None}
     base = dict(recorded) if recorded else {
         'threshold': DBSCAN_THRESHOLD, 'eps': DBSCAN_EPS,
-        'min_samples': DBSCAN_MIN_SAMPLES}
+        'min_samples': DBSCAN_MIN_SAMPLES, 'rule': DBSCAN_RULE}
     base.update(explicit)
     if explicit:
         source = "command line" + (" over patch_index.json" if recorded else "")
@@ -925,7 +986,8 @@ def resolve_parameters(args, output_dir):
         source = "patch_index.json"
     else:
         source = "module defaults"
-    return base['threshold'], base['eps'], base['min_samples'], source, recorded
+    return (base['threshold'], base['eps'], base['min_samples'],
+            base['rule'], source, recorded)
 
 
 def purge_plots(output_dir):
@@ -1001,15 +1063,21 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     print(f"Grid       : {GRID_WIDTH}x{GRID_HEIGHT} -> {N_COLS}x{N_ROWS} patches of {PATCH_SIZE}x{PATCH_SIZE}")
     print(f"DBSCAN     : threshold={DBSCAN_THRESHOLD:g} mm/h, eps={DBSCAN_EPS:g}, "
           f"min_samples={DBSCAN_MIN_SAMPLES}  ({DBSCAN_SOURCE})")
+    print(f"Rule       : {DBSCAN_RULE} - "
+          + ("a tile is selected when it holds a cluster pixel"
+             if DBSCAN_RULE == "pixel" else
+             "a tile is selected when it meets a 256x256 box centred on a "
+             "cluster centroid"))
     recorded = index_parameters(output_dir)
     if recorded and (recorded['threshold'], recorded['eps'],
-                     recorded['min_samples']) != (
-            DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES):
+                     recorded['min_samples'], recorded['rule']) != (
+            DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, DBSCAN_RULE):
         print(f"  WARNING: the master index was built at threshold="
               f"{recorded['threshold']:g}, eps={recorded['eps']:g}, "
-              f"min_samples={recorded['min_samples']}. A rebuilt index "
-              f"under different parameters invalidates the patch pool "
-              f"and every dataset selected from it.")
+              f"min_samples={recorded['min_samples']}, rule="
+              f"{recorded['rule']}. A rebuilt index under different "
+              f"parameters or rule invalidates the patch pool and every "
+              f"dataset selected from it.")
     if save_plots:
         print(f"Plots      : enabled")
 
@@ -1077,7 +1145,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
             out = process_single_opera_file(filepath)
             if out is None:
                 continue
-            d, t, iso, active, reprojected, binary_mask, centres = out
+            (d, t, iso, active, reprojected, binary_mask, centres,
+             sel_mask) = out
             results.append((d, t, iso, active))
 
             if active:
@@ -1088,7 +1157,8 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
 
             if save_plots:
                 frames_selection.append(render_dbscan_selection(
-                    reprojected, binary_mask, centres, active, d, t))
+                    reprojected, binary_mask, centres, active, d, t,
+                    sel_mask=sel_mask, rule=DBSCAN_RULE))
                 frames_highlight.append(render_patch_highlight(
                     reprojected, binary_mask, active, d, t))
                 # The .nc carries the same arrays the frames render plus
@@ -1097,6 +1167,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                 if active:
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
+                        sel_mask, DBSCAN_RULE,
                         d, t, plot_dir,
                         data_root=data_root,
                     )
@@ -1219,6 +1290,7 @@ def save_json(results, output_dir):
             "dbscan_threshold": DBSCAN_THRESHOLD,
             "dbscan_eps": DBSCAN_EPS,
             "dbscan_min_samples": DBSCAN_MIN_SAMPLES,
+            "selection_rule": DBSCAN_RULE,
             "projection": "EPSG:31700",
             "created": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "patch_numbering": "left-to-right, top-to-bottom, 1-indexed"
@@ -1281,6 +1353,17 @@ if __name__ == "__main__":
              f"else {DBSCAN_MIN_SAMPLES}."
     )
     parser.add_argument(
+        "--rule", type=str, default=None, choices=list(SELECTION_RULES),
+        help="How clusters become tiles. `pixel`: a tile is selected when "
+             "it holds at least one cluster pixel. `box`: a 256x256 box is "
+             "centred on each cluster centroid and a tile is selected when "
+             "at least one pixel of the union of those boxes falls inside "
+             "it, so every cell keeps 128 px of context on each side and "
+             "the dry neighbour of an edge cell is selected with it. "
+             "Default: the rule recorded in the master patch_index.json, "
+             f"else {DBSCAN_RULE}. Changing it rebuilds a different index."
+    )
+    parser.add_argument(
         "--plot", action="store_true",
         help="Render the day into two GIFs, one frame per timestep: "
              "plots/dbscan_patch_selection/<date>.gif (threshold field, "
@@ -1317,7 +1400,7 @@ if __name__ == "__main__":
     # Explicit flag > master index on disk > module constant. The index
     # is the record of the rule the datasets were selected under, so a
     # run that names nothing reproduces it instead of the constants.
-    (DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES,
+    (DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, DBSCAN_RULE,
      DBSCAN_SOURCE, _recorded) = resolve_parameters(args, args.output_dir)
 
     ok = run_pipeline(

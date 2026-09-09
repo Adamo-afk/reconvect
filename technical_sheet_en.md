@@ -172,6 +172,7 @@ The full table is in `README.md`; these are the ones that change results rather 
 | Constant | Default | CLI | Purpose |
 |---|---|---|---|
 | `DBSCAN_THRESHOLD` | 10 mm/h module default; the master index records its own (8 mm/h today) and that is the default once it exists | `--threshold` | Rain-rate cut for training-patch selection |
+| `selection_rule` | `pixel` | `--rule pixel\|box` | `pixel`: a tile holding ≥ 1 cluster pixel; `box`: a tile meeting the union of 256 × 256 boxes centred on the cluster centroids. Recorded in the index; the recorded rule is the default |
 | `DBSCAN_EPS` / `MIN_SAMPLES` | 5 px / 20 px | — | Cluster radius and minimum size |
 | `RAINFALL_CLASS_EDGES` | 10/20/30/40 | — | 5-class boundaries; changing requires retraining |
 | `DEFAULT_RAIN_LOW` / `HIGH` | 0.35 / 0.55 | `--rainfall_*` | Hysteresis on `p(argmax)` for rainy classes |
@@ -275,8 +276,9 @@ python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/oper
 python identify_patches.py --start 2025-01-01 --end 2026-08-13
 ```
 - **Does** — DBSCAN over OPERA `rainfall_rate` (threshold, eps and min_samples default to the values recorded in the master index — 8 mm/h, 5, 20 today — else 10 / 5 / 20; `--threshold` overrides, with a warning that a rebuilt index invalidates the patch pool) marking which of the 18 patches are active per timestep. Selects **patches, not pixels**.
+- **Rule** — `--rule pixel|box`, recorded in the index as `selection_rule` and the default once an index exists. `pixel` selects a tile holding ≥ 1 cluster pixel — every index so far. `box` centres a 256 × 256 box on each cluster centroid and selects a tile meeting the union of those boxes: every cell keeps 128 px of context on each side, and an edge cell brings its dry neighbour in with it. Changing the rule rebuilds a different index and invalidates the patch pool.
 - **Writes** — `our_data/patch_index/patch_index.csv` and `.json` **CRITICAL**
-- **Graph** — with `--date --plot`, one GIF per diagnostic per day, one frame per timestep: `plots/dbscan_patch_selection/<date>.gif` (left: the field above the threshold, each cluster's centroid and a 256 × 256 box around it; right: the cluster mask, the 6 × 3 grid dotted in red, tiles holding ≥ 1 mask pixel outlined in green) and `plots/patch_highlight/<date>.gif` (the field and the selection with borders). A NetCDF twin per active timestep, ~28 MB each, lands in `plots/nc/`. Diagnostics only; `--purge_plots` clears them.
+- **Graph** — with `--date --plot`, one GIF per diagnostic per day, one frame per timestep: `plots/dbscan_patch_selection/<date>.gif` (left: the field above the threshold, each cluster's centroid and a 256 × 256 box around it; right: the mask the rule in force tests — the cluster pixels under `pixel`, the union of centroid boxes with the cluster pixels drawn over it under `box` — the 6 × 3 grid dotted in red, tiles holding ≥ 1 mask pixel outlined in green) and `plots/patch_highlight/<date>.gif` (the field and the selection with borders). A NetCDF twin per active timestep, ~28 MB each, lands in `plots/nc/`. Diagnostics only; `--purge_plots` clears them.
 - **Note** — one index serves every period, and its row order defines the patch axis of the saved arrays. A `--date` run never overwrites the master index.
 - **Read by** — `extract_patch_seq_for_datasets`, `extract_patches`, `data_statistics`
 
