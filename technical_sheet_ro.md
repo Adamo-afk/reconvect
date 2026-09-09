@@ -294,7 +294,7 @@ python identify_patches.py --start 2025-01-01 --end 2026-08-13
 - **Descriere** — DBSCAN aplicat pe OPERA `rainfall_rate` (pragul, eps și min_samples preiau implicit valorile înregistrate în indexul principal — 8 mm/h, 5, 20 în prezent — altfel 10 / 5 / 20; `--threshold` le suprascrie, cu un avertisment că un index reconstruit invalidează rezerva de patch-uri), marcând care dintre cele 18 patch-uri este activ la fiecare pas de timp. Selectează **patch-uri, nu pixeli**.
 - **Regulă** — `--rule pixel|box`, înregistrată în index ca `selection_rule` și implicită odată ce indexul există. `pixel` selectează un patch care conține ≥ 1 pixel de cluster — toate indexurile de până acum. `box` centrează un chenar de 256 × 256 pe centroidul fiecărui cluster și selectează un patch care intersectează reuniunea acestor chenare: fiecare celulă își păstrează 128 px de context de fiecare parte, iar o celulă de la marginea unui patch îl aduce și pe vecinul uscat. Schimbarea regulii reconstruiește un index diferit și invalidează rezerva de patch-uri.
 - **Scrie** — `our_data/patch_index/patch_index.csv` și `.json` **CRITIC**
-- **Grafic** — cu `--date --plot`, câte un GIF per diagnostic și per zi, cu un cadru per pas de timp: `plots/dbscan_patch_selection/<date>.gif` (stânga: câmpul peste prag, centroidul fiecărui cluster și un chenar de 256 × 256 în jurul său; dreapta: masca testată de regula în vigoare — pixelii clusterelor sub `pixel`, reuniunea chenarelor centrate pe centroizi, cu pixelii clusterelor desenați deasupra, sub `box` — grila 6 × 3 punctată în roșu, iar patch-urile care conțin ≥ 1 pixel din mască conturate în verde) și `plots/patch_highlight/<date>.gif` (câmpul și selecția, cu frontiere). Un fișier NetCDF echivalent per pas activ, ~28 MB fiecare, este scris în `plots/nc/`. Exclusiv pentru diagnoză; `--purge_plots` le elimină.
+- **Grafic** — cu `--date --plot`, câte un GIF per diagnostic și per zi, cu un cadru per pas de timp: `plots/dbscan_<rule>_patch_selection/<date>.gif` (stânga: câmpul peste prag, centroidul fiecărui cluster și un chenar de 256 × 256 în jurul său; dreapta: masca testată de regula în vigoare — pixelii clusterelor sub `pixel`, reuniunea chenarelor centrate pe centroizi, cu pixelii clusterelor desenați deasupra, sub `box` — grila 6 × 3 punctată în roșu, iar patch-urile care conțin ≥ 1 pixel din mască conturate în verde) și `plots/patch_highlight/<date>.gif` (câmpul și selecția, cu frontiere). Un fișier NetCDF echivalent per pas activ, ~28 MB fiecare, este scris în `plots/nc/`. Exclusiv pentru diagnoză; `--purge_plots` le elimină.
 - **Notă** — un singur index deservește toate perioadele, iar ordinea rândurilor sale definește axa de patch a matricelor salvate. O execuție cu `--date` nu suprascrie niciodată indexul principal.
 - **Citit de** — `extract_patch_seq_for_datasets`, `extract_patches`, `data_statistics`
 
@@ -581,7 +581,7 @@ citește; scriptul care le-a generat le regenerează:
 |---|---|
 | `<product>_coverage.png` | cele trei scripturi de sumarizare |
 | `intersect_summary.png` | `intersect_product_coverage` |
-| `patch_index/plots/{dbscan_patch_selection,patch_highlight}/<date>.gif` și `plots/nc/` | `identify_patches --plot` |
+| `patch_index/plots/{dbscan_<rule>_patch_selection,patch_highlight}/<date>.gif` și `plots/nc/` | `identify_patches --plot` |
 | `mtg_store_distribution.png` | `store_registry --chart` |
 | figurile din `inference/`, `full_domain_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | figurile din `evaluation/` | `evaluate_*` |
