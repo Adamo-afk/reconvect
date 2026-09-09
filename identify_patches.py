@@ -26,10 +26,14 @@ Input structure:
 Output:
     {output_dir}/patch_index.csv
     {output_dir}/patch_index.json
+    {output_dir}/plots/dbscan_patch_selection/<date>.gif   (--date --plot)
+    {output_dir}/plots/patch_highlight/<date>.gif          (--date --plot)
+    {output_dir}/plots/nc/patches_<date>_<HHMM>.nc         (--date --plot)
 
 Usage (run from F:\\nowcasting\\coalition4-rcnn):
     python identify_patches.py
     python identify_patches.py --date 2024-06-13
+    python identify_patches.py --date 2024-06-13 --plot
     python identify_patches.py --data_root ./our_data --output_dir ./patch_index
 """
 
@@ -319,10 +323,38 @@ def dbscan_binary_mask(datamap, threshold=None, eps=None, min_samples=None):
     cluster_mask = labels != -1
     binary_mask[coords[cluster_mask, 0], coords[cluster_mask, 1]] = 1
 
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    n_cluster_pixels = int(cluster_mask.sum())
-
     return binary_mask
+
+
+def dbscan_clusters(datamap, threshold=None, eps=None, min_samples=None):
+    """The binary mask plus one (row, col) centroid per cluster.
+
+    Same clustering as dbscan_binary_mask - this is what the selection
+    diagnostic draws: the mask is what the fixed grid is tested against,
+    the centroids and their 256x256 boxes are the view the original
+    selection notebook used, kept for orientation only. Selection never
+    reads the boxes.
+    """
+    if threshold is None:
+        threshold = DBSCAN_THRESHOLD
+    if eps is None:
+        eps = DBSCAN_EPS
+    if min_samples is None:
+        min_samples = DBSCAN_MIN_SAMPLES
+    points = np.where(datamap > threshold)
+    binary_mask = np.zeros(datamap.shape, dtype=np.uint8)
+    if len(points[0]) == 0:
+        return binary_mask, []
+    coords = np.column_stack((points[0], points[1]))
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit(coords).labels_
+    centres = []
+    for label in sorted(set(labels)):
+        if label == -1:
+            continue
+        member = coords[labels == label]
+        binary_mask[member[:, 0], member[:, 1]] = 1
+        centres.append(tuple(int(v) for v in member.mean(axis=0)))
+    return binary_mask, centres
 
 
 # =============================================================================
@@ -369,8 +401,113 @@ def identify_active_patches(binary_mask):
 # Visualization
 # =============================================================================
 
-def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str,
-                    output_dir):
+def _fig_to_frame(fig):
+    """Rasterise a figure to an RGB array and close it.
+
+    Frames of one GIF must share a pixel size, so the figure is drawn at
+    its fixed figsize/dpi rather than through bbox_inches='tight', which
+    would let the margins vary with the title length.
+    """
+    fig.canvas.draw()
+    frame = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
+    plt.close(fig)
+    return frame
+
+
+def save_gif(frames, path, duration_ms=500):
+    """Write RGB frames as one looping GIF. Returns the path, or None."""
+    if not frames:
+        return None
+    from PIL import Image
+    images = [Image.fromarray(f).convert('P', palette=Image.ADAPTIVE)
+              for f in frames]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    images[0].save(path, save_all=True, append_images=images[1:],
+                   duration=duration_ms, loop=0, optimize=False)
+    return path
+
+
+def render_dbscan_selection(reprojected, binary_mask, centres, active_patches,
+                            date_str, time_str, threshold=None):
+    """One frame of the selection diagnostic: how DBSCAN turned a field
+    into a set of patches.
+
+    Left: pixels above the threshold in white, every cluster's centroid
+    as a red cross and a 256x256 box around it - the picture the
+    original selection notebook drew. The boxes are orientation only;
+    the selection does not read them.
+
+    Right: the cluster mask the selection actually tests, the fixed 6x3
+    grid dotted in red, and each tile holding at least one mask pixel
+    outlined in green with its number. That is the whole rule.
+    """
+    if threshold is None:
+        threshold = DBSCAN_THRESHOLD
+    above = (reprojected > threshold).astype(np.uint8)
+    half = PATCH_SIZE // 2
+    active_set = set(active_patches)
+
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(18, 5.6), dpi=100,
+                                     constrained_layout=True)
+
+    # --- left: field above threshold, centroids, centroid boxes ---------
+    ax_l.imshow(above, cmap='gray', vmin=0, vmax=1, aspect='equal',
+                interpolation='nearest')
+    if centres:
+        rows = [c[0] for c in centres]
+        cols = [c[1] for c in centres]
+        ax_l.scatter(cols, rows, marker='x', s=110, c='#f44336',
+                     linewidths=2.2, label='cluster centroid', zorder=3)
+        for r, c in centres:
+            ax_l.add_patch(Rectangle((c - half, r - half), PATCH_SIZE,
+                                     PATCH_SIZE, linewidth=1.6,
+                                     edgecolor='#f44336', facecolor='none',
+                                     zorder=2))
+        ax_l.legend(loc='upper right', fontsize=9, framealpha=0.85)
+    ax_l.set_xlim(0, GRID_WIDTH)
+    ax_l.set_ylim(GRID_HEIGHT, 0)
+    ax_l.set_xlabel('X (px)')
+    ax_l.set_ylabel('Y (px)')
+    ax_l.grid(False)
+    ax_l.set_title(f'Rain > {threshold:g} mm/h, DBSCAN: {len(centres)} '
+                   f'cluster{"s" if len(centres) != 1 else ""} '
+                   f'(eps {DBSCAN_EPS:g}, min {DBSCAN_MIN_SAMPLES})',
+                   fontsize=11)
+
+    # --- right: the mask, the grid, the selected tiles ------------------
+    ax_r.imshow(binary_mask, cmap='gray', vmin=0, vmax=1, aspect='equal',
+                interpolation='nearest')
+    for x in range(0, GRID_WIDTH + 1, PATCH_SIZE):
+        ax_r.axvline(x, color='#f44336', linewidth=0.9,
+                     linestyle=(0, (1, 3)), zorder=2)
+    for y in range(0, GRID_HEIGHT + 1, PATCH_SIZE):
+        ax_r.axhline(y, color='#f44336', linewidth=0.9,
+                     linestyle=(0, (1, 3)), zorder=2)
+    for p in active_patches:
+        r0, _, c0, _ = get_patch_bounds(p)
+        ax_r.add_patch(Rectangle((c0, r0), PATCH_SIZE, PATCH_SIZE,
+                                 linewidth=2.4, edgecolor='#2e7d32',
+                                 facecolor='none', zorder=4))
+        ax_r.text(c0 + 8, r0 + 10, str(p), color='#2e7d32', fontsize=10,
+                  fontweight='bold', ha='left', va='top', zorder=5)
+    ax_r.set_xlim(0, GRID_WIDTH)
+    ax_r.set_ylim(GRID_HEIGHT, 0)
+    ax_r.set_xlabel('X (px)')
+    ax_r.set_ylabel('Y (px)')
+    ax_r.grid(False)
+    n_px = int(binary_mask.sum())
+    ax_r.set_title(f'Cluster mask ({n_px:,} px) -> tiles with >= 1 mask '
+                   f'pixel selected', fontsize=11)
+
+    patches_str = (', '.join(str(p) for p in active_patches)
+                   if active_patches else 'none')
+    fig.suptitle(f'{date_str}  {time_str} UTC - selected patches: '
+                 f'[{patches_str}]', fontsize=13, fontweight='bold')
+    return _fig_to_frame(fig)
+
+
+def render_patch_highlight(reprojected, binary_mask, active_patches,
+                           date_str, time_str):
     """
     Plot the EPSG:31700-reprojected OPERA data with the 6×3 patch grid overlay.
 
@@ -386,7 +523,8 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
         active_patches: list of active patch numbers (1-indexed)
         date_str: 'YYYY-MM-DD'
         time_str: 'HH:MM'
-        output_dir: directory to save the PNG
+
+    Returns one RGB frame; the caller collects a day of them into a GIF.
     """
     _ensure_borders_cached()
     c_lo, c_hi, r_lo, r_hi = _VIEW_EXTENT
@@ -394,7 +532,7 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
     field_title = 'OPERA instantaneous rain rate'
     field_cbar  = 'OPERA rain rate (mm/h)'
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8),
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8), dpi=100,
                              constrained_layout=True)
 
     active_set = set(active_patches)
@@ -468,22 +606,14 @@ def plot_patch_grid(reprojected, binary_mask, active_patches, date_str, time_str
         f'{date_str}  {time_str} UTC — Active patches: [{patches_str}]',
         fontsize=13, fontweight='bold'
     )
-
-    os.makedirs(output_dir, exist_ok=True)
-    safe_time = time_str.replace(':', '')
-    filename = f"patches_{date_str}_{safe_time}.png"
-    save_path = os.path.join(output_dir, filename)
-    fig.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-
-    return save_path
+    return _fig_to_frame(fig)
 
 
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
                         date_str, time_str, output_dir,
                         data_root):
     """
-    Write a CF-compliant NetCDF mirroring `plot_patch_grid()`.
+    Write a CF-compliant NetCDF mirroring `render_patch_highlight()`.
 
     Loads the shared
     Romania-grid lat/lon arrays from
@@ -496,7 +626,7 @@ def write_diagnostic_nc(reprojected, binary_mask, active_patches,
     sibling folder of the PNGs so the two artifacts pair up by filename.
 
     Args:
-        reprojected: 2D array (768×1536) — the same array `plot_patch_grid`
+        reprojected: 2D array (768×1536) — the same array `render_patch_highlight`
             renders on the left.
         binary_mask: 2D array (768×1536) — the same DBSCAN mask the right
             subplot draws.
@@ -742,13 +872,14 @@ def process_single_opera_file(filepath):
     reprojected = load_array(filepath)
     # NaN may appear for off-grid pixels; DBSCAN expects finite values.
     reprojected = np.nan_to_num(reprojected, nan=0.0)
-    binary_mask = dbscan_binary_mask(reprojected)
+    binary_mask, centres = dbscan_clusters(reprojected)
     active_patches = identify_active_patches(binary_mask)
-    return date_str, time_str, iso_str, active_patches, reprojected, binary_mask
+    return (date_str, time_str, iso_str, active_patches, reprojected,
+            binary_mask, centres)
 
 
 def purge_plots(output_dir):
-    """Delete every .png and .nc under <output_dir>/plots.
+    """Delete every .gif, .png and .nc under <output_dir>/plots.
 
     These are diagnostics, not pipeline inputs: nothing reads them, and
     `--date <d> --plot` regenerates them. The .nc files are the reason
@@ -765,12 +896,12 @@ def purge_plots(output_dir):
     targets = []
     for dirpath, _dirnames, filenames in os.walk(plot_dir):
         for name in filenames:
-            if name.endswith(('.png', '.nc')):
+            if name.endswith(('.gif', '.png', '.nc')):
                 targets.append(os.path.join(dirpath, name))
 
     total = len(targets)
     if not total:
-        print(f"Nothing to purge: no .png or .nc files under {plot_dir}.")
+        print(f"Nothing to purge: no .gif, .png or .nc files under {plot_dir}.")
         return 0
 
     print(f"Deleting {total:,} diagnostic file(s) under {plot_dir} ...")
@@ -804,9 +935,12 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
         data_root: Path to our_data directory
         output_dir: Where to save CSV + JSON
         date_filter: Optional YYYY-MM-DD to process a single date
-        save_plots: If True, save a PNG for each active timestamp
+        save_plots: If True, render every timestep of the day into two
+            GIFs under <output_dir>/plots (requires date_filter)
         start_date: Optional inclusive lower bound YYYY-MM-DD
         end_date:   Optional inclusive upper bound YYYY-MM-DD
+
+    Returns True when at least one timestep was processed.
     """
     print("=" * 70)
     print("COALITION-4 Patch Identification Pipeline")
@@ -824,8 +958,28 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     source_label = "OPERA rainfall_rate"
 
     if date_filter:
+        try:
+            datetime.strptime(date_filter, "%Y-%m-%d")
+        except ValueError:
+            print(f"\nERROR: --date {date_filter!r} is not a YYYY-MM-DD date.")
+            return False
         all_files = [(d, f) for d, f in all_files if d == date_filter]
         print(f"Filtering to date: {date_filter}")
+        if not all_files:
+            # Say which of the two things is missing: the day was never
+            # reprojected, or it was and holds nothing on the cadence.
+            day_dir = os.path.join(
+                data_root, 'reprojected_data', 'opera_data', 'rainfall_rate',
+                f'nc4_{date_filter}-Romania_rainfall_rate')
+            if not os.path.isdir(day_dir):
+                print(f"\nERROR: {date_filter} is not on disk: no reprojected "
+                      f"OPERA rainfall_rate folder at\n  {day_dir}\n"
+                      f"Reproject it first:\n"
+                      f"  python reproject.py --opera --date {date_filter}")
+            else:
+                print(f"\nERROR: {day_dir} exists but holds no rainfall_rate "
+                      f"frame on the configured cadence.")
+            return False
 
     # YYYY-MM-DD strings are lexicographically orderable, so a simple
     # string compare implements the inclusive range filter correctly.
@@ -838,7 +992,7 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
 
     if not all_files:
         print(f"\nNo {source_label} files found.")
-        return
+        return False
 
     dates = sorted(set(d for d, _ in all_files))
     print(f"Found {len(all_files)} {source_label} files across {len(dates)} dates")
@@ -847,8 +1001,12 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     # Romania-grid .npy), so there is no per-file reprojection here and
     # no target lat/lon grid to build.
 
-    # Plot output directory
+    # Plot output directory. Every timestep of the day becomes one frame
+    # in each of two GIFs, quiet ones included, so the day plays through
+    # without jumps; the .nc twin is still written per active timestep.
     plot_dir = os.path.join(output_dir, 'plots') if save_plots else None
+    frames_selection = []
+    frames_highlight = []
 
     # Process all files
     results = []  # list of (date, time, iso, [active_patches])
@@ -859,29 +1017,29 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
             out = process_single_opera_file(filepath)
             if out is None:
                 continue
-            d, t, iso, active, reprojected, binary_mask = out
+            d, t, iso, active, reprojected, binary_mask, centres = out
             results.append((d, t, iso, active))
 
             if active:
                 patches_str = ','.join(str(p) for p in active)
                 print(f"  [{i+1}/{total}] {d} {t} -> patches: [{patches_str}]")
+            else:
+                print(f"  [{i+1}/{total}] {d} {t} -> no active patches")
 
-                # Save plot + companion .nc for active timestamps. The
-                # .nc carries the same arrays the plot renders plus the
-                # Romania-grid lat/lon coords + EPSG:31700 metadata, so
-                # the same outputs can be inspected in GIS software
-                # (open the .nc in QGIS to overlay on satellite basemap).
-                if save_plots:
-                    plot_patch_grid(
-                        reprojected, binary_mask, active, d, t, plot_dir,
-                    )
+            if save_plots:
+                frames_selection.append(render_dbscan_selection(
+                    reprojected, binary_mask, centres, active, d, t))
+                frames_highlight.append(render_patch_highlight(
+                    reprojected, binary_mask, active, d, t))
+                # The .nc carries the same arrays the frames render plus
+                # the Romania-grid lat/lon coords + EPSG:31700 metadata,
+                # so the same outputs can be inspected in GIS software.
+                if active:
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
                         d, t, plot_dir,
                         data_root=data_root,
                     )
-            else:
-                print(f"  [{i+1}/{total}] {d} {t} -> no active patches")
 
         except Exception as e:
             print(f"  [{i+1}/{total}] ERROR processing {filepath}: {e}")
@@ -889,7 +1047,16 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
 
     if not results:
         print("\nNo results produced.")
-        return
+        return False
+
+    gif_paths = []
+    if save_plots:
+        day = date_filter or results[0][0]
+        for sub, frames in (("dbscan_patch_selection", frames_selection),
+                            ("patch_highlight", frames_highlight)):
+            path = save_gif(frames, os.path.join(plot_dir, sub, f"{day}.gif"))
+            if path:
+                gif_paths.append((path, len(frames)))
 
     # Save outputs. When --date is set the run only processed one day,
     # so the master patch_index.csv would be overwritten with a single
@@ -922,9 +1089,11 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     print(f"  Unique patches hit : {sorted(all_active) if all_active else 'none'}")
     print(f"  Output             : {output_dir}")
     if save_plots:
-        print(f"  Plots saved        : {active_timesteps} PNGs in {plot_dir}")
+        for path, n in gif_paths:
+            print(f"  GIF saved          : {path}  ({n} frames)")
         print(f"  NetCDF saved       : {active_timesteps} .nc files in "
               f"{os.path.join(plot_dir, 'nc')}")
+    return True
 
 
 # =============================================================================
@@ -1049,14 +1218,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--plot", action="store_true",
-        help="Save a PNG for each active timestamp (requires --date)"
+        help="Render the day into two GIFs, one frame per timestep: "
+             "plots/dbscan_patch_selection/<date>.gif (threshold field, "
+             "cluster centroids and their boxes | cluster mask, grid, "
+             "selected tiles) and plots/patch_highlight/<date>.gif (the "
+             "field and the selection with borders). A NetCDF twin per "
+             "active timestep lands in plots/nc/. Requires --date."
     )
     parser.add_argument(
         "--purge_plots", action="store_true",
-        help="Delete every .png and .nc under <output_dir>/plots, then "
-             "exit. They are diagnostics that nothing reads, and --plot "
-             "regenerates them; the .nc files run ~28 MB each, so one "
-             "plotted day costs ~2.5 GB."
+        help="Delete every .gif, .png and .nc under <output_dir>/plots, "
+             "then exit. They are diagnostics that nothing reads, and "
+             "--plot regenerates them; the .nc files run ~28 MB each, so "
+             "one plotted day costs ~2.5 GB."
     )
 
     args = parser.parse_args()
@@ -1069,7 +1243,7 @@ if __name__ == "__main__":
 
     # Validate: --plot requires --date
     if args.plot and args.date is None:
-        parser.error("--plot requires --date to avoid generating thousands of PNGs")
+        parser.error("--plot requires --date: it renders one day into GIFs")
 
     # --date is the single-date shortcut; combining it with --start/--end is
     # ambiguous, so disallow it.
@@ -1081,7 +1255,7 @@ if __name__ == "__main__":
     DBSCAN_EPS = args.eps
     DBSCAN_MIN_SAMPLES = args.min_samples
 
-    run_pipeline(
+    ok = run_pipeline(
         data_root=args.data_root,
         output_dir=args.output_dir,
         date_filter=args.date,
@@ -1089,4 +1263,5 @@ if __name__ == "__main__":
         start_date=args.start,
         end_date=args.end,
     )
+    raise SystemExit(0 if ok else 1)
     
