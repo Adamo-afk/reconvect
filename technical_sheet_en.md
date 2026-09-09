@@ -276,7 +276,7 @@ python identify_patches.py --start 2025-01-01 --end 2026-08-13
 ```
 - **Does** — DBSCAN over OPERA `rainfall_rate` (threshold configurable, default 10 mm/h; eps 5, min_samples 20) marking which of the 18 patches are active per timestep. Selects **patches, not pixels**.
 - **Writes** — `our_data/patch_index/patch_index.csv` and `.json` **CRITICAL**
-- **Graph** — `plots/patches_<date>_<HHMM>.png` with `--date --plot`, plus a NetCDF twin at ~28 MB each. Diagnostics only; `--purge_plots` clears them.
+- **Graph** — with `--date --plot`, one GIF per diagnostic per day, one frame per timestep: `plots/dbscan_patch_selection/<date>.gif` (left: the field above the threshold, each cluster's centroid and a 256 × 256 box around it; right: the cluster mask, the 6 × 3 grid dotted in red, tiles holding ≥ 1 mask pixel outlined in green) and `plots/patch_highlight/<date>.gif` (the field and the selection with borders). A NetCDF twin per active timestep, ~28 MB each, lands in `plots/nc/`. Diagnostics only; `--purge_plots` clears them.
 - **Note** — one index serves every period, and its row order defines the patch axis of the saved arrays. A `--date` run never overwrites the master index.
 - **Read by** — `extract_patch_seq_for_datasets`, `extract_patches`, `data_statistics`
 
@@ -560,7 +560,7 @@ made them will make them again:
 |---|---|
 | `<product>_coverage.png` | the three summarisers |
 | `intersect_summary.png` | `intersect_product_coverage` |
-| `patch_index/plots/` and `plots/nc/` | `identify_patches --plot` |
+| `patch_index/plots/{dbscan_patch_selection,patch_highlight}/<date>.gif` and `plots/nc/` | `identify_patches --plot` |
 | `mtg_store_distribution.png` | `store_registry --chart` |
 | `inference/` figures, `full_domain_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | `evaluation/` figures | `evaluate_*` |
