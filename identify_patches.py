@@ -113,9 +113,12 @@ N_ROWS = 3          # rows of patches
 N_PATCHES = N_COLS * N_ROWS  # 18
 
 # DBSCAN parameters (same as current test_nc.py)
-DBSCAN_THRESHOLD = 10   # mm/h — pixels below this are ignored
+# Module defaults, used only when no master index exists yet. Once one
+# does, its recorded parameters are the default: see resolve_parameters.
+DBSCAN_THRESHOLD = 10   # mm/h — pixels at or below this are ignored
 DBSCAN_EPS = 5           # neighborhood radius in pixels
 DBSCAN_MIN_SAMPLES = 20  # minimum cluster size
+DBSCAN_SOURCE = "module defaults"
 
 
 # =============================================================================
@@ -878,6 +881,53 @@ def process_single_opera_file(filepath):
             binary_mask, centres)
 
 
+def index_parameters(output_dir):
+    """The DBSCAN parameters the master index on disk was built with.
+
+    Read from patch_index.json's metadata block. None when there is no
+    index yet or it predates the record.
+    """
+    path = os.path.join(output_dir, 'patch_index.json')
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            meta = json.load(f).get('metadata', {})
+        return {
+            'threshold': float(meta['dbscan_threshold']),
+            'eps': float(meta['dbscan_eps']),
+            'min_samples': int(meta['dbscan_min_samples']),
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def resolve_parameters(args, output_dir):
+    """Explicit flag > master index on disk > module constant.
+
+    A refresh or a --date --plot that silently ran at a different
+    threshold from the one the datasets were selected under is the
+    failure this prevents: the index is the record of the rule, so it
+    is the default. Returns (threshold, eps, min_samples, source).
+    """
+    recorded = index_parameters(output_dir)
+    explicit = {k: v for k, v in (('threshold', args.threshold),
+                                  ('eps', args.eps),
+                                  ('min_samples', args.min_samples))
+                if v is not None}
+    base = dict(recorded) if recorded else {
+        'threshold': DBSCAN_THRESHOLD, 'eps': DBSCAN_EPS,
+        'min_samples': DBSCAN_MIN_SAMPLES}
+    base.update(explicit)
+    if explicit:
+        source = "command line" + (" over patch_index.json" if recorded else "")
+    elif recorded:
+        source = "patch_index.json"
+    else:
+        source = "module defaults"
+    return base['threshold'], base['eps'], base['min_samples'], source, recorded
+
+
 def purge_plots(output_dir):
     """Delete every .gif, .png and .nc under <output_dir>/plots.
 
@@ -949,7 +999,17 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
     print(f"Data root  : {data_root}")
     print(f"Output dir : {output_dir}")
     print(f"Grid       : {GRID_WIDTH}x{GRID_HEIGHT} -> {N_COLS}x{N_ROWS} patches of {PATCH_SIZE}x{PATCH_SIZE}")
-    print(f"DBSCAN     : threshold={DBSCAN_THRESHOLD}, eps={DBSCAN_EPS}, min_samples={DBSCAN_MIN_SAMPLES}")
+    print(f"DBSCAN     : threshold={DBSCAN_THRESHOLD:g} mm/h, eps={DBSCAN_EPS:g}, "
+          f"min_samples={DBSCAN_MIN_SAMPLES}  ({DBSCAN_SOURCE})")
+    recorded = index_parameters(output_dir)
+    if recorded and (recorded['threshold'], recorded['eps'],
+                     recorded['min_samples']) != (
+            DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES):
+        print(f"  WARNING: the master index was built at threshold="
+              f"{recorded['threshold']:g}, eps={recorded['eps']:g}, "
+              f"min_samples={recorded['min_samples']}. A rebuilt index "
+              f"under different parameters invalidates the patch pool "
+              f"and every dataset selected from it.")
     if save_plots:
         print(f"Plots      : enabled")
 
@@ -1205,16 +1265,20 @@ if __name__ == "__main__":
         help="Inclusive upper bound date filter (YYYY-MM-DD)."
     )
     parser.add_argument(
-        "--threshold", type=float, default=DBSCAN_THRESHOLD,
-        help=f"Rain-rate threshold (mm/h) for DBSCAN (default: {DBSCAN_THRESHOLD})"
+        "--threshold", type=float, default=None,
+        help="Rain-rate threshold (mm/h): pixels strictly above it are "
+             "clustered. Default: the value recorded in the master "
+             f"patch_index.json, else {DBSCAN_THRESHOLD}."
     )
     parser.add_argument(
-        "--eps", type=float, default=DBSCAN_EPS,
-        help=f"DBSCAN eps parameter (default: {DBSCAN_EPS})"
+        "--eps", type=float, default=None,
+        help="DBSCAN eps. Default: the master index's value, else "
+             f"{DBSCAN_EPS}."
     )
     parser.add_argument(
-        "--min_samples", type=int, default=DBSCAN_MIN_SAMPLES,
-        help=f"DBSCAN min_samples parameter (default: {DBSCAN_MIN_SAMPLES})"
+        "--min_samples", type=int, default=None,
+        help="DBSCAN min_samples. Default: the master index's value, "
+             f"else {DBSCAN_MIN_SAMPLES}."
     )
     parser.add_argument(
         "--plot", action="store_true",
@@ -1250,10 +1314,11 @@ if __name__ == "__main__":
     if args.date and (args.start or args.end):
         parser.error("--date is mutually exclusive with --start / --end")
 
-    # Override globals if CLI args provided
-    DBSCAN_THRESHOLD = args.threshold
-    DBSCAN_EPS = args.eps
-    DBSCAN_MIN_SAMPLES = args.min_samples
+    # Explicit flag > master index on disk > module constant. The index
+    # is the record of the rule the datasets were selected under, so a
+    # run that names nothing reproduces it instead of the constants.
+    (DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES,
+     DBSCAN_SOURCE, _recorded) = resolve_parameters(args, args.output_dir)
 
     ok = run_pipeline(
         data_root=args.data_root,

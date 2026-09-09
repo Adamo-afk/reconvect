@@ -187,7 +187,7 @@ influențează rezultatele, nu prezentarea acestora.
 
 | Constantă | Implicit | CLI | Rol |
 |---|---|---|---|
-| `DBSCAN_THRESHOLD` | 10 mm/h | `--threshold` | Pragul ratei de precipitații pentru selecția patch-urilor de antrenare |
+| `DBSCAN_THRESHOLD` | 10 mm/h implicit în cod; indexul principal își înregistrează propria valoare (8 mm/h în prezent), care devine implicită odată ce indexul există | `--threshold` | Pragul ratei de precipitații pentru selecția patch-urilor de antrenare |
 | `DBSCAN_EPS` / `MIN_SAMPLES` | 5 px / 20 px | — | Raza clusterului și dimensiunea minimă |
 | `RAINFALL_CLASS_EDGES` | 10/20/30/40 | — | Limitele celor 5 clase; modificarea impune reantrenarea |
 | `DEFAULT_RAIN_LOW` / `HIGH` | 0.35 / 0.55 | `--rainfall_*` | Histerezis pe `p(argmax)` pentru clasele cu precipitații |
@@ -290,7 +290,7 @@ python intersect_product_coverage.py --summary opera_rainfall_rate=our_data/oper
 ```bash
 python identify_patches.py --start 2025-01-01 --end 2026-08-13
 ```
-- **Descriere** — DBSCAN aplicat pe OPERA `rainfall_rate` (prag configurabil, implicit 10 mm/h; eps 5, min_samples 20), marcând care dintre cele 18 patch-uri este activ la fiecare pas de timp. Selectează **patch-uri, nu pixeli**.
+- **Descriere** — DBSCAN aplicat pe OPERA `rainfall_rate` (pragul, eps și min_samples preiau implicit valorile înregistrate în indexul principal — 8 mm/h, 5, 20 în prezent — altfel 10 / 5 / 20; `--threshold` le suprascrie, cu un avertisment că un index reconstruit invalidează rezerva de patch-uri), marcând care dintre cele 18 patch-uri este activ la fiecare pas de timp. Selectează **patch-uri, nu pixeli**.
 - **Scrie** — `our_data/patch_index/patch_index.csv` și `.json` **CRITIC**
 - **Grafic** — cu `--date --plot`, câte un GIF per diagnostic și per zi, cu un cadru per pas de timp: `plots/dbscan_patch_selection/<date>.gif` (stânga: câmpul peste prag, centroidul fiecărui cluster și un chenar de 256 × 256 în jurul său; dreapta: masca clusterelor, grila 6 × 3 punctată în roșu, iar patch-urile care conțin ≥ 1 pixel din mască conturate în verde) și `plots/patch_highlight/<date>.gif` (câmpul și selecția, cu frontiere). Un fișier NetCDF echivalent per pas activ, ~28 MB fiecare, este scris în `plots/nc/`. Exclusiv pentru diagnoză; `--purge_plots` le elimină.
 - **Notă** — un singur index deservește toate perioadele, iar ordinea rândurilor sale definește axa de patch a matricelor salvate. O execuție cu `--date` nu suprascrie niciodată indexul principal.
