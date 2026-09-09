@@ -664,9 +664,8 @@ def render_patch_highlight(reprojected, binary_mask, active_patches,
 
 
 def write_diagnostic_nc(reprojected, binary_mask, active_patches,
-                        sel_mask=None, rule=None, *_ignored,
                         date_str, time_str, output_dir,
-                        data_root):
+                        data_root, sel_mask=None, rule=None):
     """
     Write a CF-compliant NetCDF mirroring `render_patch_highlight()`.
 
@@ -1167,9 +1166,9 @@ def run_pipeline(data_root, output_dir, date_filter=None, save_plots=False,
                 if active:
                     write_diagnostic_nc(
                         reprojected, binary_mask, active,
-                        sel_mask, DBSCAN_RULE,
                         d, t, plot_dir,
                         data_root=data_root,
+                        sel_mask=sel_mask, rule=DBSCAN_RULE,
                     )
 
         except Exception as e:
