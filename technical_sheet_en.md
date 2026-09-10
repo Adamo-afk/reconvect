@@ -361,11 +361,13 @@ python predict_full_domain.py --mode ... --date YYYY-MM-DD
 
 ### A5. Validation and threshold tuning
 ```bash
-python validate_predictions.py --track rainfall --year Y --month M
+python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period f34
+python validate_predictions.py --track rainfall --year Y --month M --baseline --period w44
 ```
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
-- **Writes** — `validation/rainfall_<Y>_<M>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block.
-- **Writes** — `…_samples.csv`
+- **Writes** — `validation/rainfall_<Y>_<M>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one month coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
+- **Writes** — `…_samples.csv`, with `hit_pct_t+<k>_ge<T>` for every threshold of the sweep (`--hit_threshold_step`, `--hit_threshold_factor`; base … base × 1.5).
+- **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
 - **Graph** — `…_metrics.png`; per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
@@ -431,6 +433,7 @@ python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34
 - **Does** — composes t+1…t+4 through `sepconv_compose`, denormalises with the window's own statistics, and bins in mm/h at the same class edges RECONVECT uses — so the two cannot be told apart by their thresholds.
 - **Writes** — `evaluation/eval_sepconv_<run_tag>/evaluation_results.json`
 - **Graph** — `metrics_per_leadtime.png`; `--plot_samples N` renders observed vs predicted class and predicted mm/h.
+- **Graph** — training curves, one figure per quantity (`training_loss.png`, `training_<metric>.png`; `training_loss_bm<k>.png` for the baseline) with the best-epoch and last-epoch cut-off lines taken from the history and the latest checkpoint sidecar. Leads follow the dataset's label depth.
 - **Alone** — `--weights best|latest` chooses which of the two saved states to score. `best` is the final save; `latest` is the per-epoch checkpoint. Comparing them shows whether the epochs after the best one were overfitting, or whether early stopping cut a run that was still improving.
 
 
@@ -461,6 +464,15 @@ python feature_importance_analysis.py --model ... --data ... --methods gradcam_x
 - **Does** — collapses several runs into per-lead CSVs, then runs Grad-CAM/Xi, SHAP and classical Shapley. The ablation pair diffs two Xi matrices to show how the remaining inputs absorb a dropped group's role.
 - **Writes** — `eval_leadtime-<prefix>-<letters>.csv`, `results/feature_importance/…`
 - **Note** — letters encode which inputs a run saw: `o` = OPERA only, `om` = OPERA + MTG IR/WV.
+
+### B7. Compare every model of a track
+```bash
+python compare_models.py --track rainfall --include_baseline
+python compare_models.py --track lightning
+```
+- **Does** — reads every model's `evaluation_results.json` and tagged validation `_samples.csv` for one track and draws them together: per-lead metric curves (one figure per metric plus a grid), a paper-style table with the best value in bold, and, for each rain-rate threshold of the sweep, the share of samples whose hit percentage clears 50…90 % per lead, per season and over the whole window.
+- **Writes** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_ge<T>.png`, `hit_levels.csv`, `comparison_summary.json` (deliverables; nothing reads them).
+- **Note** — `--include_baseline` has an effect on the rainfall track only: no lightning baseline exists yet. `--models`, `--label`, `--hit_levels` and `--seasons` narrow or rename what is drawn.
 
 ---
 
@@ -566,6 +578,7 @@ made them will make them again:
 | `mtg_store_distribution.png` | `store_registry --chart` |
 | `inference/` figures, `visualize_gt_vs_pred_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | `evaluation/` figures | `evaluate_*` |
+| `comparison/<track>/` | `compare_models` (deliverable) |
 | `results/feature_importance/` | `feature_importance_analysis` |
 | `validation/report_<Y>_<M>.pdf` | `generate_report` (deliverable) |
 | `our_data/data_statistics/` | `data_statistics` |
@@ -635,6 +648,7 @@ restoring before a run**.
 python compress_datasets.py --npy-stats our_data/reprojected_data     # project first
 python compress_datasets.py --compress-npy our_data/reprojected_data our_data/patches
 python compress_datasets.py --restore-npy DIR                         # and back
+python compress_datasets.py --move TAG --to ROOT      # carry a compressed dataset elsewhere and decompress it
 ```
 
 | Target | On disk | Ratio | After |
