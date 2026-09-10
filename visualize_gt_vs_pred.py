@@ -619,8 +619,14 @@ def build_full_soft_pred(predictions: np.ndarray,
 # ============================================================================
 # Rainfall post-processing (hysteresis on p(argmax) when argmax is rainy)
 # ============================================================================
-DEFAULT_RAIN_LOW = 0.35
-DEFAULT_RAIN_HIGH = 0.55
+# Measured on the f34 rainfall model: rainy-argmax pixels carry p(argmax)
+# between about 0.24 and 0.46 (median 0.28), because the probability is
+# split across five classes. 0.35 / 0.55 left the post-processed map
+# empty; 0.20 / 0.25 keeps anchored regions and drops isolated specks.
+# Validation tunes the pair per lead and inference reads it from the
+# summary; these are the fallback when no summary is given.
+DEFAULT_RAIN_LOW = 0.20
+DEFAULT_RAIN_HIGH = 0.25
 
 
 def rainfall_hysteresis(
@@ -1079,7 +1085,9 @@ def plot_full_domain(
                 _render_pred_rainfall_hyst_axes(
                     ax_r3, gt_canvases[t], row3_canvases[t],
                     lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
-                    low=(postproc_low if postproc_low is not None else 0.0),
+                    low=(postproc_low[LABEL_STEP_OFFSETS[t]]
+                         if isinstance(postproc_low, dict)
+                         else (postproc_low if postproc_low is not None else 0.0)),
                     high=hi,
                     valid_patches=valid_patches,
                     show_patch_numbers=True,
@@ -1421,7 +1429,9 @@ def plot_zoom_patch(
                 _render_pred_rainfall_hyst_axes(
                     ax, gt_canvases[t], row3_canvases[t],
                     lead_title=lead_titles[t], lead_hhmm=lead_hhmm,
-                    low=(postproc_low if postproc_low is not None else 0.0),
+                    low=(postproc_low[LABEL_STEP_OFFSETS[t]]
+                         if isinstance(postproc_low, dict)
+                         else (postproc_low if postproc_low is not None else 0.0)),
                     high=hi,
                     stats_crop=(r0, r1, c0, c1),
                 )
@@ -2251,11 +2261,12 @@ def main() -> int:
                              "--validation_summary. Default falls back to "
                              "lightning_postproc.DEFAULT_HIGH_THRESHOLD.")
     parser.add_argument("--validation_summary", type=str, default=None,
-                        help="Path to a {track}_{yyyy}_{mm}_summary.json "
-                             "produced by validate_predictions.py --track "
-                             "lightning. When present, the per-lead tuned "
-                             "high-threshold values are read from it and "
-                             "override --lightning_high_threshold.")
+                        help="Path to a summary JSON written by "
+                             "validate_predictions.py. Its tuned per-lead "
+                             "thresholds are applied: HIGH for lightning "
+                             "(over --lightning_high_threshold), the (LOW, "
+                             "HIGH) pair for rainfall (over the two "
+                             "--rainfall_*_threshold flags).")
     # ---- Rainfall post-processing (Row 3, rainfall/radar modes only) ----
     parser.add_argument("--rainfall_low_threshold", type=float,
                         default=DEFAULT_RAIN_LOW,
@@ -2408,6 +2419,19 @@ def main() -> int:
     is_rainfall = (label_type == "radar")
     run_hann_overlapped_inference = hysteresis_binary = None
     high_per_lead: dict[int, float] | None = None
+    # Rainfall: the tuned (LOW, HIGH) per lead from --validation_summary,
+    # else the two flags for every lead.
+    rain_low_per_lead: dict[int, float] = {}
+    rain_high_per_lead: dict[int, float] = {}
+    if is_rainfall:
+        from predict_full_domain import _resolve_rainfall_thresholds
+        _ns = argparse.Namespace(
+            validation_summary=args.validation_summary,
+            rainfall_low_threshold=args.rainfall_low_threshold,
+            rainfall_high_threshold=args.rainfall_high_threshold)
+        _lo, _hi = _resolve_rainfall_thresholds(_ns, step_minutes)
+        rain_low_per_lead = {o: _lo[o] for o in LABEL_STEP_OFFSETS}
+        rain_high_per_lead = {o: _hi[o] for o in LABEL_STEP_OFFSETS}
     if is_lightning:
         from lightning_postproc import (
             run_hann_overlapped_inference,
@@ -2510,16 +2534,15 @@ def main() -> int:
                 row3_canvases = [
                     rainfall_hysteresis(
                         soft_canvases[k],
-                        low=args.rainfall_low_threshold,
-                        high=args.rainfall_high_threshold,
+                        low=rain_low_per_lead[LABEL_STEP_OFFSETS[k]],
+                        high=rain_high_per_lead[LABEL_STEP_OFFSETS[k]],
                     )
                     for k in range(len(soft_canvases))
                 ]
                 raw_class_canvases = pred_canvases   # int32 argmax
                 raw_soft_canvases = soft_canvases    # (H, W, 5) softmax
-                print(f"  Rainfall hysteresis "
-                      f"(low={args.rainfall_low_threshold:.2f}, "
-                      f"high={args.rainfall_high_threshold:.2f}): "
+                print(f"  Rainfall hysteresis (per lead "
+                      f"{ {f't+{o}': (round(rain_low_per_lead[o], 2), round(rain_high_per_lead[o], 2)) for o in LABEL_STEP_OFFSETS} }): "
                       f"selected px per lead = "
                       f"{[int(np.sum((c > 0))) for c in row3_canvases]}")
 
@@ -2549,10 +2572,10 @@ def main() -> int:
             step_minutes=step_minutes,
             row3_canvases=row3_canvases,
             postproc_low=(args.lightning_low_threshold if is_lightning
-                          else args.rainfall_low_threshold),
-            postproc_high_per_lead=(high_per_lead if is_lightning else None),
-            postproc_high=(args.rainfall_high_threshold
-                           if is_rainfall else None),
+                          else rain_low_per_lead),
+            postproc_high_per_lead=(high_per_lead if is_lightning
+                                    else rain_high_per_lead),
+            postproc_high=None,
         )
         print(f"  Saved -> {out_png}")
 
@@ -2572,7 +2595,7 @@ def main() -> int:
                 step_minutes=step_minutes,
                 row3_canvases=row3_canvases,
                 postproc_low=(args.lightning_low_threshold if is_lightning
-                              else args.rainfall_low_threshold),
+                              else rain_low_per_lead),
                 postproc_high_per_lead=(high_per_lead if is_lightning
                                         else None),
                 postproc_high=(args.rainfall_high_threshold

@@ -376,7 +376,7 @@ python predict_full_domain.py --mode ... --pick best worst median --validation_s
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
-- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren.
+- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (perechea (LOW, HIGH) pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
@@ -389,7 +389,8 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
 - **Scrie** — `…_samples.csv`, cu `csi_t+<k>` și procentele de detecții / ratări / alarme false per orizont la pragul HIGH calibrat.
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
-- **Separat** — baleiajul HIGH parcurge implicit `low+0,01 … low+marjă` în pași de 0,01; `--rainfall_high_min`, `--rainfall_high_max` și `--rainfall_sweep_step` stabilesc explicit intervalul și pasul. Primul candidat trebuie să fie peste LOW (`--rainfall_low_threshold`).
+- **Separat** — pentru precipitații se baleiază perechi (LOW, HIGH): LOW peste 0,20, 0,25, 0,30, 0,35 (`--rainfall_low_min/max/step`, sau o singură valoare cu `--rainfall_low_threshold`), HIGH pentru fiecare LOW de la `low+0,01` la `low+0,30` în pași de 0,01 (`--rainfall_high_min/max`, `--rainfall_sweep_step`). Câștigătoare per orizont este perechea cu cel mai bun CSI cumulat. Un softmax cu 5 clase acordă pixelilor ploioși doar 0,24–0,46 încredere, de aici intervalul.
+- **Grafic** — `…_tuning.png`: CSI în funcție de HIGH, câte un panou per orizont, câte o linie per LOW, câștigătoarea marcată cu stea. `python validate_predictions.py --plot_tuning <summary.json>` o regenerează din rezumatul salvat, pentru oricare categorie.
 - **Cost** — o singură etichetare a componentelor conexe per eșantion și orizont deservește toți candidații HIGH (rezultate identice cu pragul aplicat fiecăruia); un fir de încărcare pregătește eșantionul următor cât timp GPU-ul îl procesează pe cel curent. Aproximativ 4–5 s per eșantion pe întreaga suprafață.
 - **Consemnează** — `representative_timesteps` în rezumat: eșantionul cel mai bun, cel mai slab și cel median după CSI-ul mediu pe orizonturi. A4 și A6 le preiau prin `--pick`.
 - **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă, linie roșie la 50 %); suprapuneri pe zile cu `--date`

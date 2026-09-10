@@ -519,6 +519,54 @@ def _resolve_high_threshold_per_lead(
     return {offset: DEFAULT_HIGH_THRESHOLD for offset in LEAD_STEP_OFFSETS}
 
 
+def _resolve_rainfall_thresholds(args: argparse.Namespace, step_minutes: int
+                                 ) -> tuple[dict[int, float], dict[int, float]]:
+    """({lead_offset: LOW}, {lead_offset: HIGH}) for the rainfall
+    hysteresis. --validation_summary wins (the per-lead pair validation
+    tuned); else the two flags, else DEFAULT_RAIN_LOW / DEFAULT_RAIN_HIGH."""
+    from visualize_gt_vs_pred import DEFAULT_RAIN_LOW, DEFAULT_RAIN_HIGH
+    if args.validation_summary:
+        summary_path = Path(args.validation_summary)
+        if not summary_path.is_file():
+            raise SystemExit(
+                f"--validation_summary points at a missing file: {summary_path}")
+        with open(summary_path) as fh:
+            pp = (json.load(fh).get("post_processing") or {})
+        highs = pp.get("high_threshold_per_lead") or {}
+        lows = pp.get("low_threshold_per_lead") or {}
+        low_single = pp.get("low_threshold")
+        lo_out, hi_out = {}, {}
+        for offset in LEAD_STEP_OFFSETS:
+            key = f"t+{offset}"
+            if key not in highs or highs[key] is None:
+                raise SystemExit(
+                    f"validation summary {summary_path} has no tuned rainfall "
+                    f"HIGH for {key} (a baseline summary has none).")
+            hi_out[offset] = float(highs[key])
+            lo = lows.get(key, low_single)
+            if lo is None:
+                raise SystemExit(f"validation summary {summary_path} has no "
+                                 f"LOW for {key}")
+            lo_out[offset] = float(lo)
+        return lo_out, hi_out
+    lo = (args.rainfall_low_threshold if args.rainfall_low_threshold is not None
+          else DEFAULT_RAIN_LOW)
+    hi = (args.rainfall_high_threshold if args.rainfall_high_threshold is not None
+          else DEFAULT_RAIN_HIGH)
+    return ({o: float(lo) for o in LEAD_STEP_OFFSETS},
+            {o: float(hi) for o in LEAD_STEP_OFFSETS})
+
+
+def _fmt_low_high(low, high, offset=None) -> str:
+    """`low=0.20, high=0.25` for scalars or one lead of the per-lead
+    dicts; every lead listed when no lead is named."""
+    if isinstance(low, dict):
+        if offset is not None:
+            return f"low={low[offset]:.2f}, high={high[offset]:.2f}"
+        return ", ".join(f"t+{o}: {low[o]:.2f}/{high[o]:.2f}" for o in low)
+    return f"low={low:.2f}, high={high:.2f}"
+
+
 def _plot_lightning_2x3(
     prob_canvases: list[np.ndarray],
     bin_canvases: list[np.ndarray],
@@ -861,7 +909,7 @@ def _plot_rainfall_zone_prepost_3x3(
         _plot_patch_grid(ax_r3)
         ax_r3.set_title(
             f"Post-processing (hysteresis) zone-overlap  "
-            f"(low={rainfall_low:.2f}, high={rainfall_high:.2f}) - "
+            f"({_fmt_low_high(rainfall_low, rainfall_high, offset)}) - "
             f"t+{lead_min}\n"
             f"{_format_hmf_pct(stats_post['hits'], stats_post['misses'], stats_post['false_alarms'])}",
             fontsize=10,
@@ -941,7 +989,7 @@ def _plot_rainfall_perclass_hits_2x3(
     row_labels = [
         ("Per-class hits (pre post-proc)", pred_canvases, ""),
         ("Per-class hits (post-processing / hysteresis)", hyst_canvases,
-         f"  (low={rainfall_low:.2f}, high={rainfall_high:.2f})"),
+         f"  ({_fmt_low_high(rainfall_low, rainfall_high)})"),
     ]
 
     for row_idx, (row_title, canvases_for_row, extra) in enumerate(row_labels):
@@ -1094,11 +1142,12 @@ def main() -> int:
                              "--validation_summary if that flag is also "
                              "given. Default 0.95.")
     parser.add_argument("--validation_summary", type=str, default=None,
-                        help="Path to the {track}_{yyyy}_{mm}_summary.json "
-                             "produced by validate_predictions.py --track "
-                             "lightning. When present, the per-lead tuned "
-                             "high-threshold values are read from it and "
-                             "override --lightning_high_threshold.")
+                        help="Path to a summary JSON written by "
+                             "validate_predictions.py. Its tuned per-lead "
+                             "thresholds are applied: HIGH for lightning "
+                             "(over --lightning_high_threshold), the (LOW, "
+                             "HIGH) pair for rainfall (over the two "
+                             "--rainfall_*_threshold flags).")
     # --- Rainfall post-processing controls (ignored for lightning) ---
     # Defaults imported lazily below to avoid loading visualize_gt_vs_pred
     # at argparse-build time.
@@ -1318,28 +1367,24 @@ def main() -> int:
         if label_type == "radar":
             from visualize_gt_vs_pred import (
                 build_full_soft_pred, rainfall_hysteresis,
-                DEFAULT_RAIN_LOW, DEFAULT_RAIN_HIGH,
             )
-            rainfall_low_used = (args.rainfall_low_threshold
-                                 if args.rainfall_low_threshold is not None
-                                 else DEFAULT_RAIN_LOW)
-            rainfall_high_used = (args.rainfall_high_threshold
-                                  if args.rainfall_high_threshold is not None
-                                  else DEFAULT_RAIN_HIGH)
+            # The tuned (LOW, HIGH) pair per lead from the validation
+            # summary, else the flags, else the defaults.
+            rainfall_low_used, rainfall_high_used = _resolve_rainfall_thresholds(
+                args, step_minutes)
             soft_canvases = build_full_soft_pred(
                 preds, valid_patches, n_classes=preds.shape[-1],
             )
             hyst_canvases = [
                 rainfall_hysteresis(
                     soft_canvases[k],
-                    low=rainfall_low_used,
-                    high=rainfall_high_used,
+                    low=rainfall_low_used[LEAD_STEP_OFFSETS[k]],
+                    high=rainfall_high_used[LEAD_STEP_OFFSETS[k]],
                 )
                 for k in range(len(soft_canvases))
             ]
             print(f"  Rainfall hysteresis "
-                  f"(low={rainfall_low_used:.2f}, "
-                  f"high={rainfall_high_used:.2f}): "
+                  f"({_fmt_low_high(rainfall_low_used, rainfall_high_used)}): "
                   f"selected px per lead = "
                   f"{[int(np.sum(c > 0)) for c in hyst_canvases]}")
 

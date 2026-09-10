@@ -359,7 +359,7 @@ python predict_full_domain.py --mode ... --pick best worst median --validation_s
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
-- **Alone** — `--pick` runs the timesteps a validation run recorded as best, worst and median (mean CSI over leads); no ground truth is needed.
+- **Alone** — `--pick` runs the timesteps a validation run recorded as best, worst and median (mean CSI over leads); no ground truth is needed. `--validation_summary` applies the tuned thresholds per lead for both tracks (the (LOW, HIGH) pair for rainfall); without it the fallback is 0.20 / 0.25.
 
 ### A5. Validation and threshold tuning
 ```bash
@@ -372,7 +372,8 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Writes** — `validation/rainfall_<scope>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
 - **Writes** — `…_samples.csv`, with `csi_t+<k>` and the hits / misses / false-alarm percentages per lead at the tuned HIGH.
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
-- **Alone** — the HIGH sweep runs `low+0.01 … low+margin` in 0.01 steps by default; `--rainfall_high_min`, `--rainfall_high_max` and `--rainfall_sweep_step` name the range and spacing outright. The first candidate must sit above LOW (`--rainfall_low_threshold`).
+- **Alone** — rainfall sweeps (LOW, HIGH) pairs: LOW over 0.20, 0.25, 0.30, 0.35 (`--rainfall_low_min/max/step`, or one value with `--rainfall_low_threshold`), HIGH per LOW from `low+0.01` to `low+0.30` in 0.01 steps (`--rainfall_high_min/max`, `--rainfall_sweep_step`). The winner per lead is the pair with the best pooled CSI. A 5-class softmax gives rainy pixels only 0.24–0.46 confidence, hence the range.
+- **Graph** — `…_tuning.png`: CSI against HIGH, one panel per lead, one line per LOW, winner starred. `python validate_predictions.py --plot_tuning <summary.json>` redraws it from the saved summary for either track.
 - **Cost** — one component labelling per sample and lead serves every HIGH candidate (identical results to thresholding each one); a loader thread assembles the next sample while the GPU runs the current one. About 4–5 s per sample on the full canvas.
 - **Records** — `representative_timesteps` in the summary: the best, worst and median sample by mean CSI over leads. A4 and A6 take them with `--pick`.
 - **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed, red line at 50 %); per-date overlays with `--date`
