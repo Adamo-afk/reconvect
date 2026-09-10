@@ -279,6 +279,145 @@ def rainfall_high_grid(low: float,
     return [round(lo + step * k, 4) for k in range(0, n + 1)]
 
 
+_PATCH_ID_CANVAS: np.ndarray | None = None
+
+
+def _patch_id_canvas() -> np.ndarray:
+    """(H_FULL, W_FULL) int64 canvas holding patch index 0..N_PATCHES-1."""
+    global _PATCH_ID_CANVAS
+    if _PATCH_ID_CANVAS is None:
+        from predict_full_domain import get_patch_bounds
+        canvas = np.zeros((H_FULL, W_FULL), dtype=np.int64)
+        for patch in range(1, N_PATCHES + 1):
+            r0, r1, c0, c1 = get_patch_bounds(patch)
+            canvas[r0:r1, c0:c1] = patch - 1
+        _PATCH_ID_CANVAS = canvas
+    return _PATCH_ID_CANVAS
+
+
+def sweep_hysteresis(score: np.ndarray, low: float, highs,
+                     gt: np.ndarray, eligible: np.ndarray | None = None,
+                     ) -> tuple[dict, dict]:
+    """Every HIGH candidate of a hysteresis sweep from one labelling.
+
+    hysteresis_binary keeps a pixel iff score >= low and its 8-connected
+    component over the `score >= low` mask holds a pixel with
+    score >= high. The components do not depend on HIGH, and "holds a
+    seed" is "the component's maximum score reaches HIGH", so the
+    labelling and the per-(component, patch) TP/FP counts are done once
+    and each candidate is a boolean over components. Results equal the
+    per-candidate reference exactly.
+
+    `gt` is the class / binary canvas with -1 marking pixels without
+    model output (excluded from every count) and > 0 the positive event.
+    `eligible` marks the pixels that count as positive when kept — for
+    rainfall the rainy-argmax pixels (rainfall_hysteresis writes 0 for
+    the rest), for lightning every pixel.
+
+    Returns ({high: (TP, FP, FN, TN)},
+             {high: {patch: (TP, FP, FN, TN)}} over patches with valid
+             pixels), the shapes _binary_confusion and
+             _accumulate_per_patch produce.
+    """
+    from scipy import ndimage as _ndi
+    from lightning_postproc import _cc_label, _STRUCT_8CONN
+
+    highs = [float(h) for h in highs]
+    valid = gt >= 0
+    gt_pos = (gt > 0) & valid
+    if eligible is None:
+        eligible = np.ones(gt.shape, dtype=bool)
+    patch = _patch_id_canvas()
+    valid_p = np.bincount(patch[valid], minlength=N_PATCHES)
+    gtpos_p = np.bincount(patch[gt_pos], minlength=N_PATCHES)
+
+    mask_low = score >= low
+    labeled, n = _cc_label(mask_low, structure=_STRUCT_8CONN)
+    if n:
+        comp_max = np.asarray(
+            _ndi.maximum(score, labeled, index=np.arange(1, n + 1)),
+            dtype=score.dtype)
+    else:
+        comp_max = np.zeros(0, dtype=score.dtype)
+
+    # TP / FP per (component, patch) over the pixels a kept component
+    # would turn positive.
+    sel = (labeled > 0) & eligible & valid
+    key = labeled[sel] * N_PATCHES + patch[sel]
+    is_tp = gt_pos[sel]
+    size = (n + 1) * N_PATCHES
+    tp_cp = np.bincount(key[is_tp], minlength=size).reshape(n + 1, N_PATCHES)
+    fp_cp = np.bincount(key[~is_tp], minlength=size).reshape(n + 1, N_PATCHES)
+
+    conf: dict = {}
+    per_patch: dict = {}
+    scored_patches = [q for q in range(N_PATCHES) if valid_p[q] > 0]
+    for h in highs:
+        kept = np.zeros(n + 1, dtype=bool)
+        kept[1:] = comp_max >= h
+        tp_p = tp_cp[kept].sum(axis=0)
+        fp_p = fp_cp[kept].sum(axis=0)
+        fn_p = gtpos_p - tp_p
+        tn_p = valid_p - gtpos_p - fp_p
+        conf[h] = (int(tp_p.sum()), int(fp_p.sum()),
+                   int(fn_p.sum()), int(tn_p.sum()))
+        per_patch[h] = {q + 1: (int(tp_p[q]), int(fp_p[q]),
+                                int(fn_p[q]), int(tn_p[q]))
+                        for q in scored_patches}
+    return conf, per_patch
+
+
+def _merge_patch_counts(acc: dict, lead_idx: int, per_patch: dict) -> None:
+    """Add one sample's per-patch (TP, FP, FN, TN) into the pooled
+    accumulator, the structure _accumulate_per_patch builds."""
+    for patch, (tp, fp, fn, tn) in per_patch.items():
+        cell = acc.setdefault(patch, {}).setdefault(
+            lead_idx, {"TP": 0, "FP": 0, "FN": 0, "TN": 0, "n": 0})
+        cell["TP"] += tp
+        cell["FP"] += fp
+        cell["FN"] += fn
+        cell["TN"] += tn
+        cell["n"] += 1
+
+
+def _prefetch(items, load, ahead: int = 2):
+    """Yield (item, load(item)) in order, with `load` of the next `ahead`
+    items running in a background thread. The loader does disk reads,
+    decompression and numpy work only, so it overlaps with the GPU call
+    in the main thread."""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        it = iter(items)
+        pending: deque = deque()
+        for item in it:
+            pending.append((item, ex.submit(load, item)))
+            if len(pending) >= ahead:
+                break
+        while pending:
+            item, fut = pending.popleft()
+            for nxt in it:
+                pending.append((nxt, ex.submit(load, nxt)))
+                break
+            yield item, fut.result()
+
+
+
+def _predict_batches(model, inputs: dict, batch_size: int) -> np.ndarray:
+    """model.predict_on_batch over explicit chunks of a dict of arrays.
+
+    Keras' predict() wraps every call in a data adapter and traces a
+    new graph the first time; on a single 18-patch batch that costs
+    more than the network does. predict_on_batch is the plain forward
+    pass, so the loop calls it chunk by chunk and concatenates.
+    """
+    n = len(next(iter(inputs.values())))
+    outs = []
+    for start in range(0, n, batch_size):
+        chunk = {k: a[start:start + batch_size] for k, a in inputs.items()}
+        outs.append(np.asarray(model.predict_on_batch(chunk)))
+    return outs[0] if len(outs) == 1 else np.concatenate(outs, axis=0)
+
 def _accumulate_per_patch(gt_bin: np.ndarray, pred_bin: np.ndarray,
                           acc: dict, lead_idx: int) -> None:
     """Pool contingency counts per patch for one lead time.
@@ -946,9 +1085,7 @@ def run_extraction(track: str, year: int, month: int,
     # (lead, candidate high); `patch_acc` pools per-patch counts on the
     # post-processed canvases so the ensemble scorer judges the shipped
     # product, not raw argmax.
-    from visualize_gt_vs_pred import (
-        build_full_soft_pred, rainfall_hysteresis, DEFAULT_RAIN_LOW,
-    )
+    from visualize_gt_vs_pred import build_full_soft_pred, DEFAULT_RAIN_LOW
     rain_low = (rainfall_low if rainfall_low is not None
                 else DEFAULT_RAIN_LOW)
     if baseline:
@@ -970,15 +1107,31 @@ def run_extraction(track: str, year: int, month: int,
     # to columns once the winning HIGH is known.
     sample_conf: list[dict] = []
 
+    def _load_sample(sel):
+        """Inputs and the ground-truth field of every lead for one
+        reference timestep; runs in the loader thread."""
+        date_str, hhmm = sel
+        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+        inputs, valid_patches = build_inputs_for_reference(
+            data_root, mode_config, date_str, ref_utc, step_minutes,
+        )
+        gt_fields = []
+        if valid_patches:
+            for offset in LEAD_STEP_OFFSETS:
+                gt_hhmm, gt_day = _resolve_gt(
+                    ref_utc, offset * step_minutes, date_str,
+                )
+                gt_fields.append(
+                    _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm))
+        return inputs, valid_patches, gt_fields
+
     print(f"\nRunning inference on {len(selected)} samples ...")
-    for k, (date_str, hhmm) in enumerate(selected, 1):
+    for k, ((date_str, hhmm), (inputs, valid_patches, gt_fields)) in enumerate(
+            _prefetch(selected, _load_sample), 1):
         ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
         if k == 1 or k % 20 == 0 or k == len(selected):
             print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
 
-        inputs, valid_patches = build_inputs_for_reference(
-            data_root, mode_config, date_str, ref_utc, step_minutes,
-        )
         if not valid_patches:
             n_skipped += 1
             continue
@@ -993,7 +1146,7 @@ def run_extraction(track: str, year: int, month: int,
                 classes, valid_patches, len(LEAD_STEP_OFFSETS))
             soft_canvases = None
         else:
-            preds = model.predict(inputs, batch_size=18, verbose=0)
+            preds = _predict_batches(model, inputs, batch_size=18)
             pred_canvases = paste_predictions_to_canvas(
                 preds, valid_patches, label_type="radar",
             )
@@ -1006,13 +1159,8 @@ def run_extraction(track: str, year: int, month: int,
         row = {"date": date_str, "reference_utc": ref_utc}
         conf_this: dict = {}
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            gt_hhmm, gt_day = _resolve_gt(
-                ref_utc, offset * step_minutes, date_str,
-            )
-            gt_field = _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm)
-            gt_canvas = _paste_gt_class_canvas(gt_field, valid_patches)
+            gt_canvas = _paste_gt_class_canvas(gt_fields[i], valid_patches)
             pred_canvas = pred_canvases[i]
-            valid = gt_canvas != -1
 
             row[f"iou_mask_t+{offset}"] = _iou_binary(gt_canvas, pred_canvas)
             row[f"class_wt_t+{offset}"] = _per_class_weighted(
@@ -1026,16 +1174,30 @@ def run_extraction(track: str, year: int, month: int,
 
             # Sweep every candidate HIGH on this sample, so the choice is
             # made once at the end over pooled counts rather than per
-            # sample. The baseline has one candidate: its class map.
+            # sample. One labelling serves every candidate. The baseline
+            # has one candidate: its class map.
             conf_this[i] = {}
+            if baseline:
+                htp, hfp, hfn, htn = _binary_confusion(gt_canvas, pred_canvas)
+                sweep_conf = {None: (htp, hfp, hfn, htn)}
+                acc = {}
+                _accumulate_per_patch(gt_canvas, pred_canvas, acc, i)
+                sweep_patch = {None: {
+                    q: (c[i]["TP"], c[i]["FP"], c[i]["FN"], c[i]["TN"])
+                    for q, c in acc.items()}}
+            else:
+                soft = soft_canvases[i]
+                argmax = np.argmax(soft, axis=-1)
+                p_argmax = np.take_along_axis(
+                    soft, argmax[..., None], axis=-1).squeeze(-1)
+                # rainfall_hysteresis: only rainy-argmax pixels are
+                # eligible; the rest score 0 and never enter the mask.
+                score = np.where(argmax > 0, p_argmax, 0.0).astype(np.float32)
+                sweep_conf, sweep_patch = sweep_hysteresis(
+                    score, rain_low, high_grid, gt_canvas,
+                    eligible=argmax > 0)
             for h in high_grid:
-                if h is None:
-                    hyst = pred_canvas
-                else:
-                    hyst = rainfall_hysteresis(soft_canvases[i],
-                                               low=rain_low, high=h)
-                    hyst = np.where(gt_canvas < 0, -1, hyst)  # keep empty slots
-                htp, hfp, hfn, htn = _binary_confusion(gt_canvas, hyst)
+                htp, hfp, hfn, htn = sweep_conf[h]
                 cell = tuning[i][h]
                 cell["TP"] += htp
                 cell["FP"] += hfp
@@ -1044,8 +1206,8 @@ def run_extraction(track: str, year: int, month: int,
                 # Per-patch counts are pooled for EVERY candidate, so the
                 # winning threshold's per-patch table is already available
                 # once the sweep picks it - no second inference pass.
-                _accumulate_per_patch(gt_canvas, hyst,
-                                      patch_acc.setdefault(h, {}), i)
+                _merge_patch_counts(patch_acc.setdefault(h, {}), i,
+                                    sweep_patch[h])
                 conf_this[i][h] = (htp, hfp, hfn)
         rows.append(row)
         sample_conf.append(conf_this)
@@ -2245,45 +2407,60 @@ def run_extraction_lightning(
     patch_acc: dict = {}
     n_skipped = 0
 
-    print(f"\nRunning inference on {len(selected)} samples "
-          f"(Hann overlap, stride={stride}) ...")
-    for k, (date_str, hhmm) in enumerate(selected, 1):
+    def _load_sample(sel):
+        """Overlapped inputs and the ground truth of every lead for one
+        reference timestep; runs in the loader thread."""
+        date_str, hhmm = sel
         ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-        if k == 1 or k % 20 == 0 or k == len(selected):
-            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
-
         inputs, positions = build_inputs_for_reference_overlapped(
             data_root, mode_config, date_str, ref_utc, step_minutes,
             stride=stride,
         )
+        gt_bins = []
+        if positions:
+            for offset in LEAD_STEP_OFFSETS:
+                gt_hhmm, gt_day = _resolve_gt(
+                    ref_utc, offset * step_minutes, date_str,
+                )
+                gt_bins.append(
+                    _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm))
+        return inputs, positions, gt_bins
+
+    print(f"\nRunning inference on {len(selected)} samples "
+          f"(Hann overlap, stride={stride}) ...")
+    for k, ((date_str, hhmm), (inputs, positions, gt_bins)) in enumerate(
+            _prefetch(selected, _load_sample), 1):
+        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+        if k == 1 or k % 20 == 0 or k == len(selected):
+            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
+
         if not positions:
             n_skipped += 1
             continue
-        preds = model.predict(inputs, batch_size=batch_size, verbose=0)
+        preds = _predict_batches(model, inputs, batch_size=batch_size)
         prob_canvases = paste_predictions_hann_blended(preds, positions)
 
         sample_confusion: dict[tuple[int, float], tuple[int, int, int, int]] = {}
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            gt_hhmm, gt_day = _resolve_gt(
-                ref_utc, offset * step_minutes, date_str,
-            )
-            gt_bin = _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            gt_bin = gt_bins[i]
             if gt_bin is None:
                 # No GT for this lead -> can't score this sample at this lead.
                 # Store zero-confusion so the row exists but IoU stays 0.
                 for h in high_grid:
                     sample_confusion[(i, h)] = (0, 0, 0, H_FULL * W_FULL)
                 continue
+            # One labelling of the Hann-blended canvas serves every
+            # candidate HIGH (see sweep_hysteresis).
+            sweep_conf, sweep_patch = sweep_hysteresis(
+                prob_canvases[i], low_threshold, [float(h) for h in high_grid],
+                gt_bin.astype(np.int32))
             for h in high_grid:
-                pred_bin = hysteresis_binary(
-                    prob_canvases[i], low=low_threshold, high=float(h),
-                )
-                sample_confusion[(i, h)] = _binary_confusion_lightning(gt_bin, pred_bin)
+                sample_confusion[(i, h)] = sweep_conf[float(h)]
                 # Per-patch counts on the POST-PROCESSED (Hann-blended +
                 # hysteresis) canvas, pooled for every candidate so the
                 # winning threshold's table needs no second inference pass.
-                _accumulate_per_patch(gt_bin, pred_bin,
-                                      patch_acc.setdefault(float(h), {}), i)
+                _merge_patch_counts(patch_acc.setdefault(float(h), {}), i,
+                                    sweep_patch[float(h)])
         per_sample_confusion.append({
             "date": date_str,
             "reference_utc": ref_utc,

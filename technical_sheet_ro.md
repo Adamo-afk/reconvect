@@ -390,6 +390,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Scrie** — `…_samples.csv`, cu `csi_t+<k>` și procentele de detecții / ratări / alarme false per orizont la pragul HIGH calibrat.
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
 - **Separat** — baleiajul HIGH parcurge implicit `low+0,01 … low+marjă` în pași de 0,01; `--rainfall_high_min`, `--rainfall_high_max` și `--rainfall_sweep_step` stabilesc explicit intervalul și pasul. Primul candidat trebuie să fie peste LOW (`--rainfall_low_threshold`).
+- **Cost** — o singură etichetare a componentelor conexe per eșantion și orizont deservește toți candidații HIGH (rezultate identice cu pragul aplicat fiecăruia); un fir de încărcare pregătește eșantionul următor cât timp GPU-ul îl procesează pe cel curent. Aproximativ 4–5 s per eșantion pe întreaga suprafață.
 - **Consemnează** — `representative_timesteps` în rezumat: eșantionul cel mai bun, cel mai slab și cel median după CSI-ul mediu pe orizonturi. A4 și A6 le preiau prin `--pick`.
 - **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă, linie roșie la 50 %); suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
