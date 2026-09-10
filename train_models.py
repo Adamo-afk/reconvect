@@ -86,14 +86,7 @@ from pipeline_config import (
     resolve_model_dir,
 )
 from periods import Period, require_no_overlap
-from compress_datasets import (
-    DEFAULT_LEVEL as _ARCHIVE_LEVEL,
-    DEFAULT_MAX_CONCURRENT as _ARCHIVE_MAX_CONCURRENT,
-    default_workers as _default_archive_workers,
-    ensure_available,
-    inuse_for,
-    spawn_job as _spawn_archive_job,
-)
+from compress_datasets import ensure_available, inuse_for
 from ensemble_plan import (
     check_member_datasets,
     format_dataset_check,
@@ -1739,8 +1732,8 @@ def train(mode, data_root, epochs, batch_size, output_dir,
         dataset_dir = datasets_root / run_tag
         # An archived dataset is extracted first. Blocking on purpose:
         # training cannot start without the bytes, so there is nothing
-        # useful to overlap with. The archive is kept, which makes the
-        # post-training reclaim a delete rather than a recompression.
+        # useful to overlap with. The archive is kept; reclaiming the
+        # on-disk copy afterwards is a manual compress_datasets step.
         ensure_available(run_tag, datasets_root)
 
     train_dir = dataset_dir / "train"
@@ -2396,28 +2389,6 @@ def main():
              "exit without training.",
     )
     parser.add_argument(
-        "--no-archive", dest="no_archive", action="store_true",
-        help="Do not spawn the background reclaim job after training. By "
-             "default the on-disk copy is dropped once its archive is "
-             "verified, since training does not modify the dataset.",
-    )
-    parser.add_argument(
-        "--archive_level", type=int, default=_ARCHIVE_LEVEL,
-        choices=[0, 1, 3, 5, 7, 9],
-        help=f"7-Zip -mx level used if the reclaim job has to compress "
-             f"from scratch (default: {_ARCHIVE_LEVEL}).",
-    )
-    parser.add_argument(
-        "--archive_workers", type=int, default=_default_archive_workers(),
-        help=f"7-Zip threads for the background job (default: "
-             f"{_default_archive_workers()} = half the logical cores).",
-    )
-    parser.add_argument(
-        "--max_concurrent", type=int, default=_ARCHIVE_MAX_CONCURRENT,
-        help=f"Maximum simultaneous background archive jobs "
-             f"(default: {_ARCHIVE_MAX_CONCURRENT}).",
-    )
-    parser.add_argument(
         "--allow_period_overlap", action="store_true",
         help="Proceed with the finetune stage even when the frozen feature "
              "extractor was trained on dates the dataset also covers. "
@@ -2597,19 +2568,7 @@ def main():
                     allow_period_overlap=args.allow_period_overlap,
                 )
         finally:
-            # Released before the reclaim job starts, or the job would see
-            # its own caller as the holder and refuse to delete.
             inuse.release()
-
-        # Reclaim: with an archive already on disk this is a verify plus a
-        # delete, not another compression pass. Detached so the next mode
-        # starts straight away.
-        if not args.no_archive and args.dataset_dir is None:
-            _spawn_archive_job(
-                "reclaim", run_tag_for_mode, datasets_root,
-                level=args.archive_level, workers=args.archive_workers,
-                max_concurrent=args.max_concurrent,
-            )
 
     print("\nAll requested training runs completed.")
 

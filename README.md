@@ -190,8 +190,10 @@ create_datasets --period 2025warm
 
 train_models --period 2025warm
   ├─ restores the dataset if it is archive-only  (blocking — needs the bytes)
-  ├─ holds an in-use marker for the run
-  └─ spawns a detached RECLAIM job → returns immediately
+  └─ holds an in-use marker for the run; the on-disk copy stays afterwards
+
+compress_datasets --reclaim TAG      (by hand, once training is done)
+  └─ verifies the archive, then drops the on-disk copy
 ```
 
 | Command | Effect |
@@ -203,7 +205,7 @@ train_models --period 2025warm
 | `--reclaim-all` | Sweep every dataset that is archived, still on disk, and not in use — the cleanup for leftovers from an interrupted run. |
 | `--jobs` | Background job state: running, ok, failed, or `pending-delete`. |
 
-Opt out of the automatic jobs with `--no-archive` on either `create_datasets.py` or `train_models.py`.
+Opt out of the automatic archive job with `--no-archive` on `create_datasets.py`. Training never archives or reclaims; that is a manual `compress_datasets.py` step.
 
 **Concurrency.** Each dataset gets a PID-stamped lock in `our_data/datasets/_archive_jobs/`; training takes an `.inuse` marker on the dataset, and an archive job that finds one keeps the archive and records `pending-delete` for a later reclaim, so a member can be built and trained back to back.
 
