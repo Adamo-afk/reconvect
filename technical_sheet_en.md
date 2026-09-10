@@ -359,7 +359,7 @@ python predict_full_domain.py --mode ... --pick best worst median --validation_s
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
-- **Alone** — `--pick` runs the timesteps a validation run recorded as best, worst and median (mean CSI over leads); no ground truth is needed.
+- **Alone** — `--pick` runs the timesteps a validation run recorded as best, worst and median (mean CSI over leads); no ground truth is needed. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
 
 ### A5. Validation and threshold tuning
 ```bash
