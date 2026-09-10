@@ -121,7 +121,7 @@ cold = 10,11,12,1,2,3
 | **5. Verify** | `python train_models.py --mode <mode> --check-ensemble` | Reads the registry's last state and reports which member datasets exist and which are missing. Exits non-zero when any are missing. |
 | **6. Train** | `python train_models.py --mode <mode> --period 2025warm --stage base` | Artefacts land as `coalition_<mode>_<source>_2025warm.keras`, plus a `.meta.json` sidecar recording the training period. |
 | **7. Validate** | `python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period 2025warm` | Per member. Tunes the hysteresis threshold and writes the `per_patch` CSI table. Manual — nothing triggers it. |
-| **8. Select** | `python build_patch_ensemble.py --mode <mode> --track rainfall --year Y --month M --min_samples N` | Reads every member's `per_patch` block and writes the selection manifest. Patches with fewer than N validated samples take the overall best member. |
+| **8. Select** | `python build_patch_ensemble.py --mode <mode> --track rainfall --split test --min_samples N` | Reads every member's `per_patch` block (from their `--split test` or `--year --month` validation, named the same way here) and writes the selection manifest. Patches with fewer than N validated samples take the overall best member. |
 
 The registry is append-only, so an earlier ensemble stays reconstructable and a result produced against a previous plan can still be explained.
 
@@ -151,7 +151,7 @@ python validate_predictions.py --track rainfall --year 2025 --month 07 \
 
 # then select
 python build_patch_ensemble.py --mode mtg_opera_mtgmr_rainfall \
-    --track rainfall --year 2025 --month 07 --min_samples 20
+    --track rainfall --split test --min_samples 20
 ```
 
 ### Rainfall hysteresis sweep
