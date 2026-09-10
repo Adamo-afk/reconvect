@@ -173,6 +173,60 @@ RAINFALL_HIGH_MARGIN = 0.30
 N_PATCHES = 18
 
 
+def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
+                 kd: bool = False, baseline: bool = False) -> str:
+    """The name every output of one model carries.
+
+    <mode>_<source>[_<period>] plus _finetuned / _kd, or sepconv_<run_tag>
+    for the baseline. build_patch_ensemble resolves member summaries by
+    the same string, and a comparison across models keys on it.
+    """
+    from train_models import build_run_tag
+    tag = build_run_tag(mode, source, period)
+    if baseline:
+        return f"sepconv_{tag}"
+    return tag + ("_finetuned" if finetuned else "_kd" if kd else "")
+
+
+def hit_threshold_sweep(base: float, step: float = 1.0,
+                        factor: float = 1.5) -> list[float]:
+    """base, base+step, ... up to base*factor inclusive: 8 -> [8..12]."""
+    out, t = [], float(base)
+    top = float(base) * float(factor) + 1e-9
+    while t <= top:
+        out.append(round(t, 6))
+        t += step
+    return out
+
+
+def _hit_counts(gt_mmh: np.ndarray, valid: np.ndarray, pred_pos: np.ndarray,
+                thresholds: list[float]) -> tuple[list[int], list[int]]:
+    """Per threshold T: (hits, ground-truth pixels) where GT >= T on the
+    valid patches and the post-processed prediction is positive."""
+    nums, dens = [], []
+    for T in thresholds:
+        gt_pos = valid & (gt_mmh >= T)
+        dens.append(int(gt_pos.sum()))
+        nums.append(int((gt_pos & pred_pos).sum()))
+    return nums, dens
+
+
+def _paste_class_canvases(classes_by_step: dict, valid_patches: list[int],
+                          n_lead: int) -> list[np.ndarray]:
+    """SepConv class maps (step -> (N, 256, 256)) onto full canvases,
+    -1 where no patch was predicted, one canvas per lead."""
+    canvases = []
+    for i in range(n_lead):
+        canvas = np.full((H_FULL, W_FULL), -1, dtype=np.int32)
+        arr = classes_by_step.get(i + 1)
+        if arr is not None:
+            for p_pos, patch_num in enumerate(valid_patches):
+                r0, r1, c0, c1 = get_patch_bounds(patch_num)
+                canvas[r0:r1, c0:c1] = arr[p_pos]
+        canvases.append(canvas)
+    return canvases
+
+
 def lead_palette(n: int) -> tuple[list[str], list[str]]:
     """(colours, markers) for n leads; the window decides n, not a constant."""
     import matplotlib.cm as _cm
@@ -407,9 +461,10 @@ def _summarise_confusion(counts: dict) -> dict:
     }
 
 
-def _write_csv(rows: list[dict], path: Path):
+def _write_csv(rows: list[dict], path: Path, hit_thresholds=None):
     """Per-sample CSV with one row per (date, reference_utc) and
-    columns for both metrics x each lead time."""
+    columns for both metrics x each lead time, plus the hit share at
+    every swept threshold."""
     if not rows:
         print(f"  No rows to write for {path}")
         return
@@ -417,6 +472,8 @@ def _write_csv(rows: list[dict], path: Path):
     for offset in LEAD_STEP_OFFSETS:
         fieldnames.append(f"iou_mask_t+{offset}")
         fieldnames.append(f"class_wt_t+{offset}")
+        for T in (hit_thresholds or []):
+            fieldnames.append(f"hit_pct_t+{offset}_ge{T:g}")
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -433,7 +490,10 @@ def _write_json(track: str, year: int, month: int,
                 rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                 high_coverage_pct: float = HIGH_COVERAGE_PCT,
                 post_processing: dict | None = None,
-                per_patch: dict | None = None):
+                per_patch: dict | None = None,
+                model_tag: str | None = None,
+                hit_thresholds: list[float] | None = None,
+                hit_pooled: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
     lists of (date, reference_utc) that met the high-coverage threshold.
     Both thresholds are recorded in the JSON so a run's outputs are
@@ -481,7 +541,10 @@ def _write_json(track: str, year: int, month: int,
         "track": track,
         "year": year,
         "month": month,
+        "model": model_tag,
         "threshold_mmh": rainfall_threshold_mmh,
+        "hit_thresholds_mmh": hit_thresholds or [],
+        "hit_pct_pooled_per_lead": hit_pooled or {},
         "high_coverage_threshold_pct": high_coverage_pct,
         "total_selected_samples": total,
         "initial_selection": [[d, h] for d, h in selected],
@@ -578,7 +641,9 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                    high_coverage_pct: float = HIGH_COVERAGE_PCT,
                    rainfall_low: float | None = None,
-                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN, period=None):
+                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN, period=None,
+                   baseline: bool = False,
+                   hit_thresholds: list[float] | None = None):
     """Extraction mode for the rainfall track.
 
     IMPORTANT scope note for `rainfall_threshold_mmh`: this override
@@ -595,10 +660,24 @@ def run_extraction(track: str, year: int, month: int,
     print("=" * 70)
     print(f"Validation extraction - track={track}  {year:04d}-{month:02d}")
     print("=" * 70)
+    if baseline:
+        # The SepConv-ens baseline reads its own mode and window; the
+        # period names the dataset it was trained on (w44).
+        from sepconv_ensemble_training import SEPCONV_MODE
+        mode = SEPCONV_MODE
+        if period is None:
+            raise SystemExit("--baseline needs --period (the window the "
+                             "baseline was trained on, e.g. w44)")
+    tag = artifact_tag(mode, source, period, finetuned, baseline=baseline)
+    if hit_thresholds is None:
+        hit_thresholds = hit_threshold_sweep(rainfall_threshold_mmh)
     print(f"  Data root: {data_root}")
-    print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
+    print(f"  Model:     {mode} ({source}"
+          f"{' finetuned' if finetuned else ''}"
+          f"{' - SepConv-ens baseline' if baseline else ''})  -> {tag}")
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
+    print(f"  Hit sweep : {[f'{t:g}' for t in hit_thresholds]} mm/h")
 
     init_sequence_config(str(data_root), source, period=period)
     sync_window_from_sequence_config()
@@ -617,9 +696,22 @@ def run_extraction(track: str, year: int, month: int,
         return
 
     print(f"\nLoading model ...")
-    model = load_model_artifact(model_dir, mode, source, finetuned,
-                                period=period)
-    print(f"  Loaded: {model.count_params():,} parameters")
+    if baseline:
+        from sepconv_predict import load_base_models, predict_classes
+        from sepconv_compose import MAX_STEP as _SEPCONV_MAX_STEP
+        from train_models import build_run_tag
+        if len(LEAD_STEP_OFFSETS) != _SEPCONV_MAX_STEP:
+            raise SystemExit(
+                f"the {period} window has {len(LEAD_STEP_OFFSETS)} future "
+                f"steps but the composition forecasts {_SEPCONV_MAX_STEP}")
+        base_models = load_base_models(model_dir,
+                                       build_run_tag(mode, source, period))
+        print(f"  Loaded base models: {sorted(base_models)}")
+        model = None
+    else:
+        model = load_model_artifact(model_dir, mode, source, finetuned,
+                                    period=period)
+        print(f"  Loaded: {model.count_params():,} parameters")
 
     rows: list[dict] = []
     confusion_per_lead = {
@@ -637,13 +729,22 @@ def run_extraction(track: str, year: int, month: int,
     )
     rain_low = (rainfall_low if rainfall_low is not None
                 else DEFAULT_RAIN_LOW)
-    high_grid = rainfall_high_grid(rain_low, rainfall_high_margin)
-    print(f"  Hysteresis sweep: low={rain_low:.2f} fixed, high "
-          f"{high_grid[0]:.2f}..{high_grid[-1]:.2f} "
-          f"step {RAINFALL_SWEEP_STEP:.2f} ({len(high_grid)} candidates)")
+    if baseline:
+        # A class map is the baseline's product: no hysteresis, and one
+        # candidate (None) so the bookkeeping below stays one shape.
+        high_grid = [None]
+        print("  Post-processing: none (SepConv-ens class map)")
+    else:
+        high_grid = rainfall_high_grid(rain_low, rainfall_high_margin)
+        print(f"  Hysteresis sweep: low={rain_low:.2f} fixed, high "
+              f"{high_grid[0]:.2f}..{high_grid[-1]:.2f} "
+              f"step {RAINFALL_SWEEP_STEP:.2f} ({len(high_grid)} candidates)")
     tuning = {i: {h: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for h in high_grid}
               for i in range(len(LEAD_STEP_OFFSETS))}
     patch_acc: dict = {}
+    # Per sample, lead and candidate HIGH: hit counts at every swept
+    # threshold, resolved to columns once the winning HIGH is known.
+    sample_hits: list[dict] = []
 
     print(f"\nRunning inference on {len(selected)} samples ...")
     for k, (date_str, hhmm) in enumerate(selected, 1):
@@ -657,17 +758,29 @@ def run_extraction(track: str, year: int, month: int,
         if not valid_patches:
             n_skipped += 1
             continue
-        preds = model.predict(inputs, batch_size=18, verbose=0)
-        pred_canvases = paste_predictions_to_canvas(
-            preds, valid_patches, label_type="radar",
-        )
-        # Soft canvases keep p(argmax), which the hysteresis needs; the
-        # argmax canvases above have already discarded it.
-        soft_canvases = build_full_soft_pred(
-            preds, valid_patches, n_classes=preds.shape[-1],
-        )
+        if baseline:
+            past = np.asarray(inputs["past_hr"])          # (N, T, H, W, 1)
+            frames = [past[:, t, :, :, 0] for t in range(past.shape[1])]
+            classes, _mmh = predict_classes(
+                base_models, frames, period, max_step=len(LEAD_STEP_OFFSETS),
+                data_root=str(data_root), source=source,
+                batch_size=18, batched=True)
+            pred_canvases = _paste_class_canvases(
+                classes, valid_patches, len(LEAD_STEP_OFFSETS))
+            soft_canvases = None
+        else:
+            preds = model.predict(inputs, batch_size=18, verbose=0)
+            pred_canvases = paste_predictions_to_canvas(
+                preds, valid_patches, label_type="radar",
+            )
+            # Soft canvases keep p(argmax), which the hysteresis needs;
+            # the argmax canvases above have already discarded it.
+            soft_canvases = build_full_soft_pred(
+                preds, valid_patches, n_classes=preds.shape[-1],
+            )
 
         row = {"date": date_str, "reference_utc": ref_utc}
+        hits_this: dict = {}
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             gt_hhmm, gt_day = _resolve_gt(
                 ref_utc, offset * step_minutes, date_str,
@@ -675,6 +788,9 @@ def run_extraction(track: str, year: int, month: int,
             gt_field = _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm)
             gt_canvas = _paste_gt_class_canvas(gt_field, valid_patches)
             pred_canvas = pred_canvases[i]
+            valid = gt_canvas != -1
+            gt_mmh = (gt_field if gt_field is not None
+                      else np.zeros_like(gt_canvas, dtype=np.float32))
 
             row[f"iou_mask_t+{offset}"] = _iou_binary(gt_canvas, pred_canvas)
             row[f"class_wt_t+{offset}"] = _per_class_weighted(
@@ -688,11 +804,15 @@ def run_extraction(track: str, year: int, month: int,
 
             # Sweep every candidate HIGH on this sample, so the choice is
             # made once at the end over pooled counts rather than per
-            # sample.
+            # sample. The baseline has one candidate: its class map.
+            hits_this[i] = {}
             for h in high_grid:
-                hyst = rainfall_hysteresis(soft_canvases[i],
-                                           low=rain_low, high=h)
-                hyst = np.where(gt_canvas < 0, -1, hyst)  # keep empty slots
+                if h is None:
+                    hyst = pred_canvas
+                else:
+                    hyst = rainfall_hysteresis(soft_canvases[i],
+                                               low=rain_low, high=h)
+                    hyst = np.where(gt_canvas < 0, -1, hyst)  # keep empty slots
                 htp, hfp, hfn, htn = _binary_confusion(gt_canvas, hyst)
                 cell = tuning[i][h]
                 cell["TP"] += htp
@@ -704,7 +824,10 @@ def run_extraction(track: str, year: int, month: int,
                 # once the sweep picks it - no second inference pass.
                 _accumulate_per_patch(gt_canvas, hyst,
                                       patch_acc.setdefault(h, {}), i)
+                hits_this[i][h] = _hit_counts(gt_mmh, valid, hyst >= 1,
+                                              hit_thresholds)
         rows.append(row)
+        sample_hits.append(hits_this)
 
     print(f"\nDone. {len(rows)} samples processed, {n_skipped} skipped "
           f"(missing inputs).")
@@ -712,7 +835,8 @@ def run_extraction(track: str, year: int, month: int,
     # ---- Pick the per-lead HIGH that maximises aggregate CSI -----------
     eps = 1e-7
     best_high: dict[int, float] = {}
-    print("\nHysteresis tuning (rainfall):")
+    print("\nHysteresis tuning (rainfall):" if not baseline
+          else "\nBaseline: class map scored as is (no tuning):")
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
         scored = {
             h: c["TP"] / (c["TP"] + c["FP"] + c["FN"] + eps)
@@ -720,14 +844,35 @@ def run_extraction(track: str, year: int, month: int,
         }
         # max() on ties returns the first; sorting by (-csi, high) makes
         # the lower threshold win, which is the conservative choice.
-        chosen = sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
+        chosen = sorted(scored.items(),
+                        key=lambda kv: (-kv[1], kv[0] if kv[0] is not None
+                                        else 0.0))[0][0]
         best_high[i] = chosen
         raw_csi = (confusion_per_lead[i]["TP"]
                    / (confusion_per_lead[i]["TP"]
                       + confusion_per_lead[i]["FP"]
                       + confusion_per_lead[i]["FN"] + eps))
-        print(f"  t+{offset}: high={chosen:.2f}  CSI={scored[chosen]:.4f}  "
-              f"(raw argmax CSI={raw_csi:.4f})")
+        print(f"  t+{offset}: high={chosen if chosen is None else f'{chosen:.2f}'}  "
+              f"CSI={scored[chosen]:.4f}  (raw argmax CSI={raw_csi:.4f})")
+
+    # Resolve the hit sweep at the winning HIGH: per-sample columns, and
+    # pooled per lead for the summary.
+    hit_pooled: dict = {}
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        h = best_high[i]
+        num_tot = np.zeros(len(hit_thresholds), dtype=np.int64)
+        den_tot = np.zeros(len(hit_thresholds), dtype=np.int64)
+        for row, hits in zip(rows, sample_hits):
+            nums, dens = hits[i][h]
+            for j, T in enumerate(hit_thresholds):
+                row[f"hit_pct_t+{offset}_ge{T:g}"] = (
+                    100.0 * nums[j] / dens[j] if dens[j] else 0.0)
+            num_tot += np.asarray(nums)
+            den_tot += np.asarray(dens)
+        hit_pooled[f"t+{offset * step_minutes}"] = {
+            f"{T:g}": (100.0 * int(num_tot[j]) / int(den_tot[j])
+                       if den_tot[j] else 0.0)
+            for j, T in enumerate(hit_thresholds)}
 
     # Per-patch table assembled from each lead's winning threshold.
     chosen_patch_acc: dict = {}
@@ -736,33 +881,43 @@ def run_extraction(track: str, year: int, month: int,
             if i in leads:
                 chosen_patch_acc.setdefault(patch, {})[i] = leads[i]
 
-    post_processing = {
-        "method": "rainfall_hysteresis on p(argmax)",
-        "low_threshold": rain_low,
-        "high_grid": high_grid,
-        "sweep_step": RAINFALL_SWEEP_STEP,
-        "high_margin": rainfall_high_margin,
-        "high_threshold_per_lead": {
-            f"t+{off}": best_high[i]
-            for i, off in enumerate(LEAD_STEP_OFFSETS)
-        },
-        "tuning_scores": {
-            f"t+{off}": {
-                f"{h:.2f}": _summarise_confusion(tuning[i][h])
-                for h in high_grid
-            }
-            for i, off in enumerate(LEAD_STEP_OFFSETS)
-        },
-    }
+    if baseline:
+        post_processing = {
+            "method": "none - SepConv-ens class map is the product",
+            "high_threshold_per_lead": {
+                f"t+{off}": None for off in LEAD_STEP_OFFSETS},
+        }
+    else:
+        post_processing = {
+            "method": "rainfall_hysteresis on p(argmax)",
+            "low_threshold": rain_low,
+            "high_grid": high_grid,
+            "sweep_step": RAINFALL_SWEEP_STEP,
+            "high_margin": rainfall_high_margin,
+            "high_threshold_per_lead": {
+                f"t+{off}": best_high[i]
+                for i, off in enumerate(LEAD_STEP_OFFSETS)
+            },
+            "tuning_scores": {
+                f"t+{off}": {
+                    f"{h:.2f}": _summarise_confusion(tuning[i][h])
+                    for h in high_grid
+                }
+                for i, off in enumerate(LEAD_STEP_OFFSETS)
+            },
+        }
 
-    stem = f"{track}_{year:04d}_{month:02d}"
-    _write_csv(rows, output_dir / f"{stem}_samples.csv")
+    stem = f"{track}_{year:04d}_{month:02d}_{tag}"
+    _write_csv(rows, output_dir / f"{stem}_samples.csv",
+               hit_thresholds=hit_thresholds)
     _write_json(track, year, month, selected, rows, confusion_per_lead,
                 step_minutes, output_dir / f"{stem}_summary.json",
                 rainfall_threshold_mmh=rainfall_threshold_mmh,
                 high_coverage_pct=high_coverage_pct,
                 post_processing=post_processing,
-                per_patch=per_patch_scores(chosen_patch_acc))
+                per_patch=per_patch_scores(chosen_patch_acc),
+                model_tag=tag, hit_thresholds=hit_thresholds,
+                hit_pooled=hit_pooled)
     _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
                          step_minutes, output_dir / f"{stem}_metrics.png",
                          rainfall_threshold_mmh=rainfall_threshold_mmh,
@@ -1332,7 +1487,8 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
                       mode: str, source: str, finetuned: bool,
                       data_root: Path, model_dir: Path, output_dir: Path, period=None):
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{track}_{year:04d}_{month:02d}"
+    stem = (f"{track}_{year:04d}_{month:02d}_"
+            f"{artifact_tag(mode, source, period, finetuned)}")
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
 
     date_in_selection = _date_is_in(date_str, summary["initial_selection"])
@@ -1964,10 +2120,8 @@ def run_extraction_lightning(
 
     # Variant suffix so base / finetuned / kd runs don't overwrite each
     # other's outputs. Matches predict_full_domain's output_dir naming.
-    variant_suffix = ("_finetuned" if finetuned
-                      else "_kd" if kd
-                      else "")
-    stem = f"lightning_{year:04d}_{month:02d}{variant_suffix}"
+    stem = (f"lightning_{year:04d}_{month:02d}_"
+            f"{artifact_tag(mode, source, period, finetuned, kd)}")
     _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
                           step_minutes)
     _write_json_lightning(
@@ -2009,10 +2163,8 @@ def run_visualization_lightning(
     (base / _finetuned / _kd suffix chosen by the corresponding flag) so
     visualisation reads the same JSON its own extraction produced."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    variant_suffix = ("_finetuned" if finetuned
-                      else "_kd" if kd
-                      else "")
-    stem = f"lightning_{year:04d}_{month:02d}{variant_suffix}"
+    stem = (f"lightning_{year:04d}_{month:02d}_"
+            f"{artifact_tag(mode, source, period, finetuned, kd)}")
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "post_processing" not in summary:
         raise SystemExit(
@@ -2853,6 +3005,19 @@ def main() -> int:
                              f"low+{RAINFALL_HIGH_MARGIN:g}, which spans the "
                              f"operational 0.55 so the sweep can only "
                              f"improve on it.")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Rainfall track: validate the SepConv-ens "
+                             "baseline instead of a RECONVECT model. Its "
+                             "class map is scored as is (no hysteresis). "
+                             "Needs --period (the baseline's window, e.g. "
+                             "w44); --mode is ignored.")
+    parser.add_argument("--hit_threshold_step", type=float, default=1.0,
+                        help="Step of the hit-rate threshold sweep, in "
+                             "mm/h (default 1).")
+    parser.add_argument("--hit_threshold_factor", type=float, default=1.5,
+                        help="The sweep runs from --rainfall_threshold_mmh "
+                             "up to that value times this factor, "
+                             "inclusive (default 1.5: 8 -> 8..12).")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Cap the selected references at N, for a "
                              "trial run on a small subset.")
@@ -2902,6 +3067,10 @@ def main() -> int:
                 rainfall_low=args.rainfall_low_threshold,
                 rainfall_high_margin=args.rainfall_high_margin,
                 period=args.period,
+                baseline=args.baseline,
+                hit_thresholds=hit_threshold_sweep(
+                    args.rainfall_threshold_mmh,
+                    args.hit_threshold_step, args.hit_threshold_factor),
             )
         else:
             # Visualization mode reads high-coverage lists from the JSON
