@@ -284,32 +284,72 @@ def parse_seasons(specs: list[str] | None) -> dict[str, list[int]]:
     return out
 
 
+SPLITS = ("train", "validation", "test")
+
+
+def scope_name(split: str | None, year: int | None, month: int | None) -> str:
+    """`test`, `2026_06`, `test_2026_06`, or `all_months`: names the
+    hit-level output folder after the validation files it was built from."""
+    parts = []
+    if split:
+        parts.append(split)
+    if year is not None and month is not None:
+        parts.append(f"{year:04d}_{month:02d}")
+    return "_".join(parts) or "all_months"
+
+
 def load_samples(validation_dir: Path, track: str, include_baseline: bool,
-                 only: set[str] | None) -> dict[str, list[dict]]:
-    """{tag: rows}, every month's per-sample CSV of every model, each row
-    carrying its month. Legacy untagged files are reported and skipped."""
-    pattern = re.compile(rf"^{track}_(\d{{4}})_(\d{{2}})_(.+)_samples\.csv$")
+                 only: set[str] | None, split: str | None = None,
+                 year: int | None = None, month: int | None = None,
+                 ) -> dict[str, list[dict]]:
+    """{tag: rows} from the per-sample CSVs that match the scope.
+
+    File names are <track>_[<split>_][<yyyy>_<mm>_]<tag>_samples.csv.
+    With `split`, only that split's files (of the given month when one
+    is named); without it, only whole-month files (of the given month,
+    or every month). Each row carries its own year and month, read
+    from its date. Legacy untagged files are reported and skipped."""
+    pattern = re.compile(
+        rf"^{track}_(?:(train|validation|test)_)?"
+        rf"(?:(\d{{4}})_(\d{{2}})_)?(.+)_samples\.csv$")
     per_model: dict[str, list[dict]] = defaultdict(list)
     legacy = 0
+    used: list[str] = []
     for path in sorted(validation_dir.glob(f"{track}_*_samples.csv")):
         m = pattern.match(path.name)
         if not m:
             legacy += 1
             continue
-        year, month, tag = int(m.group(1)), int(m.group(2)), m.group(3)
+        f_split, f_year, f_month, tag = m.groups()
         if tag in ("finetuned", "kd"):
             # The pre-tag naming put only the variant in the name.
             legacy += 1
+            continue
+        if f_split != split:
+            continue
+        if year is not None and month is not None:
+            if f_year is None or (int(f_year), int(f_month)) != (year, month):
+                continue
+        elif f_year is not None and split:
+            # A whole-split run asked for; month-restricted split files
+            # would double count its samples.
             continue
         if tag.startswith("sepconv_") and not include_baseline:
             continue
         if only and tag not in only:
             continue
+        used.append(path.name)
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                row["_month"] = month
-                row["_year"] = year
+                date = (row.get("date") or "").strip()
+                if len(date) >= 7 and date[4] == "-":
+                    row["_year"], row["_month"] = int(date[:4]), int(date[5:7])
+                else:
+                    row["_year"] = int(f_year) if f_year else 0
+                    row["_month"] = int(f_month) if f_month else 0
                 per_model[tag].append(row)
+    for name in used:
+        print(f"   read {name}")
     if legacy:
         print(f"  NOTE: {legacy} untagged {track}_*_samples.csv file(s) "
               f"(written before per-model naming) were skipped.")
@@ -465,7 +505,8 @@ def main() -> int:
     parser.add_argument("--eval_root", default="./evaluation",
                         help="Root holding eval_<tag>/evaluation_results.json.")
     parser.add_argument("--validation_dir", default="./validation",
-                        help="Root holding <track>_<yyyy>_<mm>_<tag>_samples.csv.")
+                        help="Root holding <track>_[<split>_][<yyyy>_<mm>_]"
+                             "<tag>_samples.csv.")
     parser.add_argument("--output_dir", default="./comparison")
     parser.add_argument("--include_baseline", action="store_true",
                         help="Add the SepConv-ens baseline (tags starting "
@@ -481,7 +522,19 @@ def main() -> int:
                         metavar="NAME=M,M,...",
                         help="Season definition, repeatable (default DJF, "
                              "MAM, JJA, SON).")
+    parser.add_argument("--split", default=None, choices=SPLITS,
+                        help="Build the hit-level figures from the "
+                             "validation runs on this dataset split "
+                             "(<track>_<split>_<tag>_samples.csv).")
+    parser.add_argument("--year", type=int, default=None)
+    parser.add_argument("--month", type=int, default=None,
+                        help="With --year: use the validation runs on this "
+                             "month (of the split with --split). Without "
+                             "either, every whole-month run is pooled.")
     args = parser.parse_args()
+    if (args.year is None) != (args.month is None):
+        parser.error("--year and --month go together")
+    scope = scope_name(args.split, args.year, args.month)
 
     out_dir = Path(args.output_dir) / args.track
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -507,13 +560,17 @@ def main() -> int:
     write_table(models, metrics, labels, out_dir, args.track)
 
     print(f"\n2. Validation samples under {args.validation_dir}")
+    print(f"   scope: {scope}")
     per_model = load_samples(Path(args.validation_dir), args.track,
-                             args.include_baseline, only)
+                             args.include_baseline, only,
+                             split=args.split, year=args.year, month=args.month)
     for tag, rows in sorted(per_model.items()):
         months = sorted({(r["_year"], r["_month"]) for r in rows})
         print(f"   {tag:55s} {len(rows):6d} samples over {len(months)} month(s)")
+    hit_dir = out_dir / f"hit_levels_{scope}"
+    hit_dir.mkdir(parents=True, exist_ok=True)
     plot_hit_levels(per_model, args.track, parse_seasons(args.seasons),
-                    args.hit_levels, labels, out_dir,
+                    args.hit_levels, labels, hit_dir,
                     step_minutes=master_step_minutes())
 
     summary = {"track": args.track, "include_baseline": args.include_baseline,
@@ -521,6 +578,8 @@ def main() -> int:
                               "leads": m["leads"], "path": m["path"]} for m in models],
                "validated": {t: len(r) for t, r in per_model.items()},
                "hit_levels": args.hit_levels,
+               "scope": {"split": args.split, "year": args.year,
+                         "month": args.month, "name": scope},
                "seasons": parse_seasons(args.seasons)}
     (out_dir / "comparison_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")

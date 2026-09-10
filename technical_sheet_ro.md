@@ -378,11 +378,13 @@ python predict_full_domain.py --mode ... --date YYYY-MM-DD
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
+python validate_predictions.py --track rainfall --split test --mode <mode> --period f34
 python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period f34
-python validate_predictions.py --track rainfall --year Y --month M --baseline --period w44
+python validate_predictions.py --track rainfall --split test --baseline --period w44
 ```
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
-- **Scrie** — `validation/rainfall_<Y>_<M>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe aceeași lună pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
+- **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul apare în numele fiecărui fișier: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
+- **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
 - **Scrie** — `…_samples.csv`, cu `hit_pct_t+<k>_ge<T>` pentru fiecare prag al baleiajului (`--hit_threshold_step`, `--hit_threshold_factor`; bază … bază × 1,5).
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
 - **Grafic** — `…_metrics.png`; suprapuneri pe zile cu `--date`
@@ -483,11 +485,12 @@ python feature_importance_analysis.py --model ... --data ... --methods gradcam_x
 
 ### B7. Compararea tuturor modelelor unei categorii
 ```bash
-python compare_models.py --track rainfall --include_baseline
-python compare_models.py --track lightning
+python compare_models.py --track rainfall --split test --include_baseline
+python compare_models.py --track rainfall --year Y --month M
+python compare_models.py --track lightning --split test
 ```
 - **Descriere** — citește `evaluation_results.json` și fișierele de validare `_samples.csv` etichetate ale fiecărui model dintr-o categorie și le reprezintă împreună: curbele metricilor per orizont de prognoză (câte o figură per metrică plus o grilă), un tabel în stil de articol științific cu cea mai bună valoare evidențiată și, pentru fiecare prag de intensitate al baleiajului, proporția eșantioanelor al căror procent de detecție depășește 50…90 % per orizont, per anotimp și pe întreaga fereastră.
-- **Scrie** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_ge<T>.png`, `hit_levels.csv`, `comparison_summary.json` (livrabile; nu sunt citite de alt script).
+- **Scrie** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_<domeniu>/hit_levels_ge<T>.png`, `hit_levels_<domeniu>/hit_levels.csv`, `comparison_summary.json` (livrabile; nu sunt citite de alt script). `<domeniu>` urmează `--split` / `--year --month`: `test`, `<Y>_<M>`, `test_<Y>_<M>` sau `all_months` atunci când toate execuțiile pe luni întregi sunt cumulate.
 - **Notă** — `--include_baseline` are efect numai pentru categoria precipitațiilor: nu există încă un model de referință pentru fulgere. `--models`, `--label`, `--hit_levels` și `--seasons` restrâng sau redenumesc ceea ce se reprezintă.
 
 ---
