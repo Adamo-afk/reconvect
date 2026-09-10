@@ -75,19 +75,45 @@ KD_STEM_TEMPLATE = "kd_{year:04d}_{month:02d}"
 # ============================================================================
 # Artefact discovery (scaffold only - full parsing added in the next step)
 # ============================================================================
+def resolve_stem(validation_dir: Path, base: str, tag: str | None) -> str:
+    """The stem of one track's outputs for a month.
+
+    Validation writes <track>_<yyyy>_<mm>_<artifact_tag>_*. With `tag`
+    the stem is exact; without it, exactly one tagged set may exist for
+    the month (the untagged legacy stem is accepted too). Several means
+    several models were validated, and the report will not guess which.
+    """
+    if tag:
+        return f"{base}_{tag}"
+    tagged = sorted(validation_dir.glob(f"{base}_*_summary.json"))
+    # `<base>_<date>_...` per-date PNGs never end in _summary.json, but a
+    # legacy untagged summary is exactly `<base>_summary.json`.
+    tagged = [q for q in tagged if q.name != f"{base}_summary.json"]
+    if not tagged:
+        return base
+    if len(tagged) == 1:
+        return tagged[0].name[:-len("_summary.json")]
+    names = ", ".join(q.name[len(base) + 1:-len("_summary.json")]
+                      for q in tagged)
+    raise SystemExit(
+        f"{len(tagged)} models were validated for {base}: {names}. "
+        f"Name one with --{base.split('_')[0]}_tag.")
+
+
 def _discover_track_artefacts(validation_dir: Path, track: str,
-                              year: int, month: int) -> dict:
+                              year: int, month: int,
+                              tag: str | None = None) -> dict:
     """Return a dict describing what's on disk for one (track, year, month).
 
-    This is the SCAFFOLD version: it only reports which paths exist. The
-    next step turns the JSON/CSV into typed dicts + the per-date PNG list.
+    `tag` is the validated model's artifact tag; see resolve_stem.
     """
     if track == "rainfall":
-        stem = RAINFALL_STEM_TEMPLATE.format(year=year, month=month)
+        base = RAINFALL_STEM_TEMPLATE.format(year=year, month=month)
     elif track == "lightning":
-        stem = LIGHTNING_STEM_TEMPLATE.format(year=year, month=month)
+        base = LIGHTNING_STEM_TEMPLATE.format(year=year, month=month)
     else:
         raise ValueError(f"unknown track: {track!r}")
+    stem = resolve_stem(validation_dir, base, tag)
 
     samples_csv = validation_dir / f"{stem}_samples.csv"
     summary_json = validation_dir / f"{stem}_summary.json"
@@ -3057,6 +3083,13 @@ def main() -> int:
                         help=f"Ollama model tag. Default {DEFAULT_MODEL_TAG}. "
                              f"Must be vision-capable if per-figure "
                              f"captioning is requested.")
+    parser.add_argument("--rainfall_tag", type=str, default=None,
+                        help="Artifact tag of the validated rainfall model "
+                             "(e.g. mtg_lightning_opera_rainfall_dbscan_f34). "
+                             "Needed only when several models were "
+                             "validated for the month.")
+    parser.add_argument("--lightning_tag", type=str, default=None,
+                        help="Artifact tag of the validated lightning model.")
     parser.add_argument("--validation_dir", type=str,
                         default=str(DEFAULT_VALIDATION_DIR),
                         help=f"Directory containing the extraction / "
@@ -3171,6 +3204,8 @@ def main() -> int:
     for track in tracks_to_load:
         artefacts = _discover_track_artefacts(
             validation_dir, track, args.year, args.month,
+            tag=(args.rainfall_tag if track == "rainfall"
+                 else args.lightning_tag),
         )
         per_track_paths[track] = artefacts
         _print_discovery(artefacts)
