@@ -147,26 +147,38 @@ MAX_SAMPLES = None
 # and figure titles read it.
 SPLITS = ("train", "validation", "test")
 SPLIT: str | None = None
+# The selection threshold (--rainfall_threshold_mmh) is a property of
+# the scored population too, so it is part of the scope and of every
+# output name; runs at different thresholds never overwrite each other.
+THRESHOLD_MMH: float = RAINFALL_THRESHOLD_MMH
+
+
+def threshold_tag(mmh: float) -> str:
+    """`thr8mmh`, `thr8.5mmh`."""
+    return f"thr{mmh:g}mmh"
 
 
 def scope_stem(year: int | None, month: int | None) -> str:
-    """`2026_06`, `test`, or `test_2026_06`: the piece of every output
-    name that says which samples a run scored."""
+    """`2026_06_thr8mmh`, `test_thr8mmh`, `test_2026_06_thr8mmh`: the
+    piece of every output name that says which samples a run scored."""
     parts = []
     if SPLIT:
         parts.append(SPLIT)
     if year is not None and month is not None:
         parts.append(f"{year:04d}_{month:02d}")
+    parts.append(threshold_tag(THRESHOLD_MMH))
     return "_".join(parts)
 
 
 def scope_label(year: int | None, month: int | None) -> str:
     """Human form of scope_stem for titles and messages."""
     if SPLIT and year is not None and month is not None:
-        return f"{SPLIT} split, {year:04d}-{month:02d}"
-    if SPLIT:
-        return f"{SPLIT} split"
-    return f"{year:04d}-{month:02d}"
+        base = f"{SPLIT} split, {year:04d}-{month:02d}"
+    elif SPLIT:
+        base = f"{SPLIT} split"
+    else:
+        base = f"{year:04d}-{month:02d}"
+    return f"{base}, >= {THRESHOLD_MMH:g} mm/h"
 
 # Class boundaries mirror create_datasets.label_transform_opera_rainfall_multiclass:
 #   class 0: R < 10  (below threshold)
@@ -3293,8 +3305,9 @@ def main() -> int:
         parser.error("give --split, or --year and --month, or both")
     if args.month is not None and not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
-    global SPLIT
+    global SPLIT, THRESHOLD_MMH
     SPLIT = args.split
+    THRESHOLD_MMH = float(args.rainfall_threshold_mmh)
 
     # Prime the border cache once at process start (visualization uses it,
     # extraction ignores it but the cost is a few ms).

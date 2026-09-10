@@ -254,6 +254,10 @@ def main():
     parser.add_argument("--validation_dir", default="./validation",
                         help="Where validate_predictions.py wrote its "
                              "summaries (default: ./validation).")
+    parser.add_argument("--rainfall_threshold_mmh", type=float, default=10.0,
+                        help="Selection threshold the members were validated "
+                             "at (the thr<T>mmh piece of the summary names; "
+                             "default 10).")
     parser.add_argument("--min_samples", type=int, required=True,
                         help="Validated samples a patch needs before its own "
                              "per-patch CSI chooses the member; below it the "
@@ -281,7 +285,8 @@ def main():
     # names them: 2026_06, test, test_2026_06.
     scope = "_".join(
         ([args.split] if args.split else [])
-        + ([f"{args.year:04d}_{args.month:02d}"] if args.year is not None else []))
+        + ([f"{args.year:04d}_{args.month:02d}"] if args.year is not None else [])
+        + [f"thr{args.rainfall_threshold_mmh:g}mmh"])
     scope_label = scope.replace("_", "-") if not args.split else scope
 
     from train_models import build_run_tag, load_model_period
@@ -320,6 +325,7 @@ def main():
                 + (f" --split {args.split}" if args.split else "")
                 + (f" --year {args.year} --month {args.month}"
                    if args.year is not None else "")
+                + f" --rainfall_threshold_mmh {args.rainfall_threshold_mmh:g}"
                 + f" --mode {args.mode} --period {label}"
             )
             continue

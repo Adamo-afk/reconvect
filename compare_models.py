@@ -9,7 +9,7 @@ Two sources, two outputs each.
    one table - rows models, columns metric x lead - as CSV, Markdown and
    LaTeX, the shape a paper prints.
 
-2. validation/<track>_<yyyy>_<mm>_<tag>_samples.csv, written by
+2. validation/<track>_<scope>_thr<T>mmh_<tag>_samples.csv, written by
    validate_predictions.py, become the hit-level figures: for each lead
    and each season, the share of samples whose post-processed map hit at
    least L % of the ground-truth pixels, for L = 50 .. 90. Rainfall
@@ -288,40 +288,49 @@ def parse_seasons(specs: list[str] | None) -> dict[str, list[int]]:
 SPLITS = ("train", "validation", "test")
 
 
-def scope_name(split: str | None, year: int | None, month: int | None) -> str:
-    """`test`, `2026_06`, `test_2026_06`, or `all_months`: names the
+def scope_name(split: str | None, year: int | None, month: int | None,
+               threshold_mmh: float | None = None) -> str:
+    """`test_thr8mmh`, `2026_06_thr8mmh`, `all_months_thr8mmh`: names the
     hit-level output folder after the validation files it was built from."""
     parts = []
     if split:
         parts.append(split)
     if year is not None and month is not None:
         parts.append(f"{year:04d}_{month:02d}")
-    return "_".join(parts) or "all_months"
+    name = "_".join(parts) or "all_months"
+    if threshold_mmh is not None:
+        name += f"_thr{threshold_mmh:g}mmh"
+    return name
 
 
 def load_samples(validation_dir: Path, track: str, include_baseline: bool,
                  only: set[str] | None, split: str | None = None,
                  year: int | None = None, month: int | None = None,
+                 threshold_mmh: float | None = None,
                  ) -> dict[str, list[dict]]:
     """{tag: rows} from the per-sample CSVs that match the scope.
 
-    File names are <track>_[<split>_][<yyyy>_<mm>_]<tag>_samples.csv.
+    File names are <track>_[<split>_][<yyyy>_<mm>_]thr<T>mmh_<tag>_samples.csv.
     With `split`, only that split's files (of the given month when one
     is named); without it, only whole-month files (of the given month,
-    or every month). Each row carries its own year and month, read
-    from its date. Legacy untagged files are reported and skipped."""
+    or every month). `threshold_mmh` picks the runs at that selection
+    threshold; when several thresholds are on disk and none is named,
+    the call refuses rather than mixing populations. Each row carries
+    its own year and month, read from its date. Files without the
+    threshold piece (or untagged) are legacy and skipped."""
     pattern = re.compile(
         rf"^{track}_(?:(train|validation|test)_)?"
-        rf"(?:(\d{{4}})_(\d{{2}})_)?(.+)_samples\.csv$")
+        rf"(?:(\d{{4}})_(\d{{2}})_)?thr([\d.]+)mmh_(.+)_samples\.csv$")
     per_model: dict[str, list[dict]] = defaultdict(list)
     legacy = 0
     used: list[str] = []
+    seen_thresholds: set[float] = set()
     for path in sorted(validation_dir.glob(f"{track}_*_samples.csv")):
         m = pattern.match(path.name)
         if not m:
             legacy += 1
             continue
-        f_split, f_year, f_month, tag = m.groups()
+        f_split, f_year, f_month, f_thr, tag = m.groups()
         if tag in ("finetuned", "kd"):
             # The pre-tag naming put only the variant in the name.
             legacy += 1
@@ -339,6 +348,9 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
             continue
         if only and tag not in only:
             continue
+        seen_thresholds.add(float(f_thr))
+        if threshold_mmh is not None and float(f_thr) != float(threshold_mmh):
+            continue
         used.append(path.name)
         with open(path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -349,11 +361,16 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
                     row["_year"] = int(f_year) if f_year else 0
                     row["_month"] = int(f_month) if f_month else 0
                 per_model[tag].append(row)
+    if threshold_mmh is None and len(seen_thresholds) > 1:
+        raise SystemExit(
+            f"validation runs at several selection thresholds are on disk "
+            f"for this scope ({sorted(seen_thresholds)} mm/h); name one "
+            f"with --rainfall_threshold_mmh.")
     for name in used:
         print(f"   read {name}")
     if legacy:
-        print(f"  NOTE: {legacy} untagged {track}_*_samples.csv file(s) "
-              f"(written before per-model naming) were skipped.")
+        print(f"  NOTE: {legacy} {track}_*_samples.csv file(s) without the "
+              f"per-model and threshold naming were skipped.")
     return dict(per_model)
 
 
@@ -526,10 +543,14 @@ def main() -> int:
                         help="With --year: use the validation runs on this "
                              "month (of the split with --split). Without "
                              "either, every whole-month run is pooled.")
+    parser.add_argument("--rainfall_threshold_mmh", type=float, default=None,
+                        help="Use the validation runs made at this selection "
+                             "threshold (the thr<T>mmh piece of their names). "
+                             "Needed only when runs at several thresholds "
+                             "exist for the scope.")
     args = parser.parse_args()
     if (args.year is None) != (args.month is None):
         parser.error("--year and --month go together")
-    scope = scope_name(args.split, args.year, args.month)
 
     out_dir = Path(args.output_dir) / args.track
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -555,10 +576,20 @@ def main() -> int:
     write_table(models, metrics, labels, out_dir, args.track)
 
     print(f"\n2. Validation samples under {args.validation_dir}")
-    print(f"   scope: {scope}")
     per_model = load_samples(Path(args.validation_dir), args.track,
                              args.include_baseline, only,
-                             split=args.split, year=args.year, month=args.month)
+                             split=args.split, year=args.year, month=args.month,
+                             threshold_mmh=args.rainfall_threshold_mmh)
+    thr_used = args.rainfall_threshold_mmh
+    if thr_used is None:
+        # One threshold on disk (load_samples refused otherwise): read it
+        # back from any file name so the folder says which.
+        rx = re.compile(r"_thr([\d.]+)mmh_")
+        found = {float(m.group(1)) for p in Path(args.validation_dir).glob(
+            f"{args.track}_*_samples.csv") for m in [rx.search(p.name)] if m}
+        thr_used = found.pop() if len(found) == 1 else None
+    scope = scope_name(args.split, args.year, args.month, thr_used)
+    print(f"   scope: {scope}")
     for tag, rows in sorted(per_model.items()):
         months = sorted({(r["_year"], r["_month"]) for r in rows})
         print(f"   {tag:55s} {len(rows):6d} samples over {len(months)} month(s)")
@@ -574,7 +605,8 @@ def main() -> int:
                "validated": {t: len(r) for t, r in per_model.items()},
                "hit_levels": args.hit_levels,
                "scope": {"split": args.split, "year": args.year,
-                         "month": args.month, "name": scope},
+                         "month": args.month, "threshold_mmh": thr_used,
+                         "name": scope},
                "seasons": parse_seasons(args.seasons)}
     (out_dir / "comparison_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")

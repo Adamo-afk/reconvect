@@ -385,7 +385,7 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 python validate_predictions.py --track rainfall --split test --baseline --period w44
 ```
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
-- **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul apare în numele fiecărui fișier: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
+- **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul, inclusiv pragul de selecție, apare în numele fiecărui fișier: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; execuțiile la praguri diferite nu se suprascriu niciodată.
 - **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
 - **Scrie** — `…_samples.csv`, cu `csi_t+<k>` și procentele de detecții / ratări / alarme false per orizont la pragul HIGH calibrat.
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
@@ -535,7 +535,7 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 python build_patch_ensemble.py --mode <mode> --track rainfall --split test --min_samples N
 ```
 - **Descriere** — alege membrul cu cel mai bun scor pentru fiecare dintre cele 18 patch-uri. Exclusiv selecție — evaluarea a fost efectuată la C3.
-- **Domeniu** — `--split test` sau `--year --month` desemnează execuțiile de validare ale membrilor la fel cum le-a denumit validate_predictions.
+- **Domeniu** — `--split test` sau `--year --month`, împreună cu `--rainfall_threshold_mmh` (implicit 10), desemnează execuțiile de validare ale membrilor la fel cum le-a denumit validate_predictions.
 - **Regulă** — `--min_samples N` este obligatoriu. Un patch validat pe cel puțin N eșantioane își alege propriul membru cu cel mai bun scor; sub N preia membrul cel mai bun per ansamblu (CSI-ul cel mai ridicat cumulat pe toate patch-urile). Dacă niciun patch nu atinge N, patch-urile cu eșantioane își păstrează propriul membru optim, iar numai cele fără eșantioane preiau membrul cel mai bun per ansamblu. Manifestul consemnează regula aplicată fiecărui patch.
 - **Scrie** — `our_data/ensemble_manifest_<mode>_<source>.json` **CRITIC** — tabela de rutare, cu variante de rezervă pe sezon și pe modelul global pentru fiecare alocare.
 - **Citit de** — `ensemble_inference`
