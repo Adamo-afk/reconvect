@@ -115,12 +115,42 @@ _VARIABLE_TO_GROUP: dict[str, str] = {
     # MTG FCI
     "vis_06": "satellite_MTG", "ir_38": "satellite_MTG",
     "ir_105": "satellite_MTG", "wv_63": "satellite_MTG", "wv_73": "satellite_MTG",
-    # OPERA composite
+    # OPERA composite. `opera_rainfall_rate_hr` is the same reprojected
+    # field kept at 1 km / 256 px (the label's form, and the input of the
+    # radar-only and SepConv modes); it resolves to the rainfall_rate file.
     "opera_reflectivity": "opera", "opera_rainfall_rate": "opera",
+    "opera_rainfall_rate_hr": "opera",
 }
 
-INPUT_STEP_OFFSETS = [-2, -1, 0]      # t-2, t-1, t0 relative to reference
-LEAD_STEP_OFFSETS = [1, 2, 3]         # t+1, t+2, t+3 (labels on the output side)
+# The sequence window. These hold the first models' 3 / 3 window as a
+# fallback only; sync_window_from_sequence_config() rewrites them IN
+# PLACE from sequence_meta once init_sequence_config has run, and every
+# module that imports the list objects sees the change.
+INPUT_STEP_OFFSETS = [-2, -1, 0]      # t-N .. t0 relative to the reference
+LEAD_STEP_OFFSETS = [1, 2, 3]         # t+1 .. t+M (labels on the output side)
+
+
+def sync_window_from_sequence_config():
+    """Make the offsets follow the initialised sequence config.
+
+    The window is a property of the dataset the model was trained on -
+    past_steps / future_steps in sequence_meta_<source>[_<period>].json.
+    Call right after init_sequence_config(); lists are mutated in place
+    so importers (validate_predictions, visualize_gt_vs_pred,
+    lightning_postproc, generate_report) follow without re-importing.
+    """
+    import create_datasets as _cd
+    past = getattr(_cd, "PAST_STEPS", None)
+    future = getattr(_cd, "FUTURE_STEPS", None)
+    if past is None or future is None:
+        return
+    INPUT_STEP_OFFSETS[:] = list(range(-int(past), 1))
+    LEAD_STEP_OFFSETS[:] = list(range(1, int(future) + 1))
+    try:
+        import visualize_gt_vs_pred as _vz
+        _vz.sync_window_from_sequence_config(past, future)
+    except ImportError:
+        pass
 
 
 # ============================================================================
@@ -191,8 +221,9 @@ def _load_and_slice_patches(data_root: Path, variable: str, date_str: str,
     if group is None:
         return None
     hhmm_snapped = snap_hhmm_to_product(hhmm, group)
+    file_variable = variable[:-3] if variable.endswith("_hr") else variable
     path = find_reprojected_file(
-        str(data_root), variable, group, date_str, hhmm_snapped,
+        str(data_root), file_variable, group, date_str, hhmm_snapped,
     )
     if path is None:
         return None
@@ -521,8 +552,9 @@ def _plot_lightning_2x3(
     c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
     gt_kwargs = _gt_kwargs_for("lightning")
 
-    fig, axes = plt.subplots(2, 3, figsize=(21, 8.5),
-                             constrained_layout=True)
+    n_lead = len(LEAD_STEP_OFFSETS)
+    fig, axes = plt.subplots(2, n_lead, figsize=(7 * n_lead, 8.5),
+                             constrained_layout=True, squeeze=False)
 
     def _apply_frame(ax):
         ax.set_xticks([]); ax.set_yticks([])
@@ -645,8 +677,10 @@ def _plot_lightning_hits_1x3(
     _ensure_view_cached()
     c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
 
-    fig, axes = plt.subplots(1, 3, figsize=(21, 5.5),
-                             constrained_layout=True)
+    n_lead = len(LEAD_STEP_OFFSETS)
+    fig, axes = plt.subplots(1, n_lead, figsize=(7 * n_lead, 5.5),
+                             constrained_layout=True, squeeze=False)
+    axes = axes[0]
 
     def _apply_frame(ax):
         ax.set_xticks([]); ax.set_yticks([])
@@ -758,8 +792,9 @@ def _plot_rainfall_zone_prepost_3x3(
         _gt_kwargs_for, _plot_patch_grid, RADAR_CLASS_NAMES,
     )
 
-    fig, axes = plt.subplots(3, 3, figsize=(21, 15),
-                             constrained_layout=True)
+    n_lead = len(LEAD_STEP_OFFSETS)
+    fig, axes = plt.subplots(3, n_lead, figsize=(7 * n_lead, 15),
+                             constrained_layout=True, squeeze=False)
     gt_kwargs = _gt_kwargs_for("radar")  # viridis-5, vmin=0, vmax=4
 
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
@@ -899,8 +934,9 @@ def _plot_rainfall_perclass_hits_2x3(
     )
     from visualize_gt_vs_pred import RADAR_CLASS_NAMES
 
-    fig, axes = plt.subplots(2, 3, figsize=(21, 10),
-                             constrained_layout=True)
+    n_lead = len(LEAD_STEP_OFFSETS)
+    fig, axes = plt.subplots(2, n_lead, figsize=(7 * n_lead, 10),
+                             constrained_layout=True, squeeze=False)
 
     row_labels = [
         ("Per-class hits (pre post-proc)", pred_canvases, ""),
@@ -1092,6 +1128,7 @@ def main() -> int:
 
     # 1. Init sequence config + normalization stats (per-source paths)
     init_sequence_config(str(data_root), SOURCE, period=args.period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(SOURCE, args.period)
     )

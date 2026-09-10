@@ -114,6 +114,8 @@ ROMANIA_EXTENT_UTM = (-177324.0, 1331353.0, 77148.0, 723370.0)
 # offsets - the schema is stable across step_minutes values. The actual
 # minute offsets are derived at runtime by multiplying by step_minutes
 # from our_data/timestep_config.json.
+# Fallback 3 / 3 window; sync_window_from_sequence_config() rewrites
+# these in place from sequence_meta once the sequence config is loaded.
 INPUT_STEP_OFFSETS = [-2, -1, 0]
 LABEL_STEP_OFFSETS = [1, 2, 3]
 
@@ -129,6 +131,25 @@ def _step_column_name(offset: int) -> str:
 
 INPUT_TIME_COLS = [_step_column_name(o) for o in INPUT_STEP_OFFSETS]
 LABEL_TIME_COLS = [_step_column_name(o) for o in LABEL_STEP_OFFSETS]
+
+
+def sync_window_from_sequence_config(past_steps=None, future_steps=None):
+    """Follow the sequence window: N past frames and M leads, in place.
+
+    Without arguments the values are read from create_datasets' globals,
+    which init_sequence_config populates; predict_full_domain's
+    sync passes them through when it runs first.
+    """
+    if past_steps is None or future_steps is None:
+        import create_datasets as _cd
+        past_steps = getattr(_cd, "PAST_STEPS", None)
+        future_steps = getattr(_cd, "FUTURE_STEPS", None)
+        if past_steps is None or future_steps is None:
+            return
+    INPUT_STEP_OFFSETS[:] = list(range(-int(past_steps), 1))
+    LABEL_STEP_OFFSETS[:] = list(range(1, int(future_steps) + 1))
+    INPUT_TIME_COLS[:] = [_step_column_name(o) for o in INPUT_STEP_OFFSETS]
+    LABEL_TIME_COLS[:] = [_step_column_name(o) for o in LABEL_STEP_OFFSETS]
 RADAR_CLASS_NAMES = ["R<10", "10≤R<20", "20≤R<30",
                      "30≤R<40", "R≥40"]
 
@@ -1014,14 +1035,15 @@ def plot_full_domain(
     has_row3 = row3_canvases is not None
     n_rows = 3 if has_row3 else 2
     fig_height = 14 if has_row3 else 10
-    fig, axes = plt.subplots(n_rows, 3, figsize=(20, fig_height),
+    fig, axes = plt.subplots(n_rows, len(LABEL_STEP_OFFSETS),
+                             figsize=(6.7 * len(LABEL_STEP_OFFSETS), fig_height),
                              constrained_layout=True)
 
     gt_kwargs = _gt_kwargs_for(label_type)
     pred_kwargs = _pred_kwargs_for(label_type, threshold)
 
     im_gt = im_pred = None
-    for t in range(3):
+    for t in range(len(LABEL_STEP_OFFSETS)):
         lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
         im_gt = _render_gt_axes(
             axes[0, t], gt_canvases[t], label_type,
@@ -1160,12 +1182,14 @@ def plot_full_domain_predictions_only(
     lead_titles = [f"t+{o * step_minutes}" for o in LABEL_STEP_OFFSETS]
     label_offsets_min = [o * step_minutes for o in LABEL_STEP_OFFSETS]
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6.5),
-                             constrained_layout=True)
+    n_lead = len(LABEL_STEP_OFFSETS)
+    fig, axes = plt.subplots(1, n_lead, figsize=(6.7 * n_lead, 6.5),
+                             constrained_layout=True, squeeze=False)
+    axes = axes[0]
     pred_kwargs = _pred_kwargs_for(label_type, threshold)
 
     im_pred = None
-    for t in range(3):
+    for t in range(n_lead):
         lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
         im_pred = _render_pred_axes(
             axes[t], pred_canvases[t], valid_patches, label_type,
@@ -1282,8 +1306,9 @@ def plot_zoom_patch(
     has_row3 = row3_canvases is not None
     n_rows = 3 if has_row3 else 2
     fig_height = 13 if has_row3 else 9.5
-    fig, axes = plt.subplots(n_rows, 3, figsize=(15, fig_height),
-                             constrained_layout=True)
+    fig, axes = plt.subplots(n_rows, len(LABEL_STEP_OFFSETS),
+                             figsize=(5 * len(LABEL_STEP_OFFSETS), fig_height),
+                             constrained_layout=True, squeeze=False)
 
     # GT styling identical to plot_full_domain so the zoom reads as a
     # consistent panel of the same figure.
@@ -1302,7 +1327,7 @@ def plot_zoom_patch(
                          aspect="equal", interpolation="nearest",
                          extent=(c0, c1, r1, r0))
 
-    for t in range(3):
+    for t in range(len(LABEL_STEP_OFFSETS)):
         ax = axes[0, t]
         canvas = gt_canvases[t]
         tile = canvas[r0:r1, c0:c1]
@@ -1335,7 +1360,7 @@ def plot_zoom_patch(
                            aspect="equal", interpolation="nearest",
                            extent=(c0, c1, r1, r0))
 
-    for t in range(3):
+    for t in range(len(LABEL_STEP_OFFSETS)):
         ax = axes[1, t]
         canvas = pred_canvases[t]
         tile = canvas[r0:r1, c0:c1]
@@ -1371,7 +1396,7 @@ def plot_zoom_patch(
 
     # Row 3 (post-processed) — cropped to the patch via extent + xlim.
     if has_row3:
-        for t in range(3):
+        for t in range(len(LABEL_STEP_OFFSETS)):
             ax = axes[2, t]
             lead_hhmm = _ref_to_hhmm(ref_utc, label_offsets_min[t])
             row3_tile = row3_canvases[t][r0:r1, c0:c1]
@@ -1465,7 +1490,7 @@ def plot_zoom_patch(
 
 
 # ============================================================================
-# Aggregate rainfall comparison graphs (top-N timesteps × 3 leads)
+# Aggregate rainfall comparison graphs (top-N timesteps × {len(LABEL_STEP_OFFSETS)} leads)
 # ============================================================================
 def _per_patch_class_counts(canvas: np.ndarray, n_classes: int = 5) -> np.ndarray:
     """Return an (N_PATCHES, n_classes) int64 count matrix. Slots that
@@ -1758,7 +1783,7 @@ def plot_rainfall_pc_hist(
         )
         fig.suptitle(
             f"Rainfall — per-class p(c) histogram ({source_name} pred)  "
-            f"|  top-{top_n} timesteps × 3 leads = {n_samples} samples",
+            f"|  top-{top_n} timesteps × {len(LABEL_STEP_OFFSETS)} leads = {n_samples} samples",
             fontsize=14, fontweight="bold",
         )
         out_path = output_dir / f"aggregate_pc_hist_{source_name}.png"
@@ -1856,7 +1881,7 @@ def plot_rainfall_pc_hist_3d(
                     f"Rainfall — p(class {c} - {RADAR_CLASS_NAMES[c]}) "
                     f"histogram per patch — {source_name} pred  |  "
                     f"total class-{c} pixels: {denom_total:,}  |  "
-                    f"top-{top_n} timesteps × 3 leads = {n_samples} "
+                    f"top-{top_n} timesteps × {len(LABEL_STEP_OFFSETS)} leads = {n_samples} "
                     f"samples"
                 ),
                 scene=dict(
@@ -1944,7 +1969,7 @@ def plot_rainfall_class_count_distribution(
         ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
     fig.suptitle(
         f"Rainfall — whole-domain class-count distribution  |  "
-        f"top-{top_n} timesteps × 3 leads = "
+        f"top-{top_n} timesteps × {len(LABEL_STEP_OFFSETS)} leads = "
         f"{len(raw_samples)} samples",
         fontsize=14, fontweight="bold",
     )
@@ -2260,7 +2285,8 @@ def main() -> int:
     # from sequence_meta_<source>.json; set_normalization_stats_path
     # points the lazy stats loader at normalization_stats_<source>.json
     # (required - the transforms in create_datasets read those stats).
-    init_sequence_config(str(data_root), SOURCE)
+    init_sequence_config(str(data_root), SOURCE, period=args.period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(SOURCE, args.period)
     )
@@ -2512,7 +2538,7 @@ def main() -> int:
     if is_rainfall and not args.no_aggregate_graphs and agg_raw:
         n_samples = len(agg_raw)
         print(f"\nBuilding aggregate rainfall graphs over {n_samples} samples "
-              f"({args.top_n} timesteps × 3 leads)...")
+              f"({args.top_n} timesteps × {len(LABEL_STEP_OFFSETS)} leads)...")
         pc_paths = plot_rainfall_pc_hist(
             agg_raw_soft, agg_raw, agg_hyst,
             output_dir=output_dir, top_n=args.top_n,
