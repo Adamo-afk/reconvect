@@ -555,6 +555,8 @@ def _write_csv(rows: list[dict], path: Path, hit_thresholds=None):
     for offset in LEAD_STEP_OFFSETS:
         fieldnames.append(f"iou_mask_t+{offset}")
         fieldnames.append(f"class_wt_t+{offset}")
+        for name in HMF_NAMES:
+            fieldnames.append(f"{name}_pct_t+{offset}")
         for T in (hit_thresholds or []):
             fieldnames.append(f"hit_pct_t+{offset}_ge{T:g}")
     with open(path, "w", newline="") as f:
@@ -576,7 +578,8 @@ def _write_json(track: str, year: int, month: int,
                 per_patch: dict | None = None,
                 model_tag: str | None = None,
                 hit_thresholds: list[float] | None = None,
-                hit_pooled: dict | None = None):
+                hit_pooled: dict | None = None,
+                hmf_pooled: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
     lists of (date, reference_utc) that met the high-coverage threshold.
     Both thresholds are recorded in the JSON so a run's outputs are
@@ -629,6 +632,7 @@ def _write_json(track: str, year: int, month: int,
         "threshold_mmh": rainfall_threshold_mmh,
         "hit_thresholds_mmh": hit_thresholds or [],
         "hit_pct_pooled_per_lead": hit_pooled or {},
+        "hits_misses_false_alarms_pooled_per_lead": hmf_pooled or {},
         "high_coverage_threshold_pct": high_coverage_pct,
         "total_selected_samples": total,
         "initial_selection": [[d, h] for d, h in selected],
@@ -649,6 +653,78 @@ def _write_json(track: str, year: int, month: int,
 # ============================================================================
 # Metrics figure (extraction mode side-effect)
 # ============================================================================
+HMF_NAMES = ("hits", "misses", "false_alarms")
+
+
+def _hmf_percentages(tp: int, fp: int, fn: int) -> dict[str, float | None]:
+    """hits % and misses % over the GT-active pixels, false alarms % over
+    the predicted-active pixels — the denominators _format_hmf_pct uses
+    on the per-date figures. None where the denominator is empty."""
+    gt_active = tp + fn
+    pred_active = tp + fp
+    return {
+        "hits": (100.0 * tp / gt_active) if gt_active else None,
+        "misses": (100.0 * fn / gt_active) if gt_active else None,
+        "false_alarms": (100.0 * fp / pred_active) if pred_active else None,
+    }
+
+
+def _plot_hmf_figure(track: str, year: int, month: int,
+                     rows: list[dict],
+                     pooled: dict[int, dict[str, float | None]],
+                     step_minutes: int, path: Path,
+                     *,
+                     high_coverage_pct: float = HIGH_COVERAGE_PCT):
+    """Three panels — hits %, misses %, false alarms % — each a
+    per-sample scatter in chronological order with one marker per lead,
+    like the coverage scatter of the metrics figure. The pooled value
+    per lead (from the summed pixel counts at the tuned HIGH) is drawn
+    as a thin line in the lead's colour; samples where the quantity is
+    undefined (no GT-active or no predicted-active pixels) are left out."""
+    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+    n_lead = len(lead_titles)
+    colors, markers = lead_palette(n_lead)
+    titles = {"hits": "Hits (% of GT-active pixels detected)",
+              "misses": "Misses (% of GT-active pixels missed)",
+              "false_alarms": "False alarms (% of predicted-active pixels)"}
+
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6), constrained_layout=True)
+    x_all = np.arange(len(rows))
+    for ax, name in zip(axes, HMF_NAMES):
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            col = f"{name}_pct_t+{offset}"
+            xs = [x for x, r in zip(x_all, rows) if r.get(col) is not None]
+            ys = [r[col] for r in rows if r.get(col) is not None]
+            ax.scatter(xs, ys, marker=markers[i], color=colors[i],
+                       alpha=0.55, s=25, edgecolor="none",
+                       label=lead_titles[i])
+            v = pooled.get(i, {}).get(name)
+            if v is not None:
+                ax.axhline(v, color=colors[i], linestyle="--",
+                           alpha=0.7, linewidth=1)
+        if name == "hits":
+            ax.axhline(high_coverage_pct, color="gray", linestyle=":",
+                       alpha=0.6, linewidth=1)
+        ax.axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+        ax.set_title(titles[name])
+        ax.set_xlabel("Sample (chronological)")
+        ax.set_ylabel("%")
+        ax.set_ylim(-2, 102)
+        ax.grid(alpha=0.3)
+        ax.legend(title="lead (dashed = pooled)", fontsize=8)
+
+    fig.suptitle(
+        f"Validation — {track} — {scope_label(year, month)}  |  "
+        f"{len(rows)} selected samples  |  post-processed map at the tuned HIGH",
+        fontsize=13, fontweight="bold",
+    )
+    fig.text(0.01, -0.02, _hmf_legend_text(), fontsize=8, family="monospace",
+             va="top")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote hits/misses/false-alarms figure to {path}")
+
+
 def _plot_metrics_figure(track: str, year: int, month: int,
                          rows: list[dict],
                          confusion_per_lead: dict[int, dict],
@@ -682,7 +758,10 @@ def _plot_metrics_figure(track: str, year: int, month: int,
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(metric_names)
     axes[0].set_ylabel("Score")
-    axes[0].set_title(f"FAR / POD / CSI on the >= {rainfall_threshold_mmh:g} mm/h event")
+    # The event is class >= 1, i.e. the model's own 10 mm/h boundary; the
+    # selection threshold only decides which timesteps are scored.
+    axes[0].set_title("FAR / POD / CSI on the >= 10 mm/h event (class >= 1)\n"
+                      f"samples selected at >= {rainfall_threshold_mmh:g} mm/h")
     axes[0].set_ylim(0.0, 1.0)
     axes[0].grid(axis="y", alpha=0.3)
     axes[0].legend()
@@ -698,7 +777,10 @@ def _plot_metrics_figure(track: str, year: int, month: int,
                     alpha=0.6, linewidth=1)
     axes[1].axvline(high_coverage_pct, color="gray", linestyle=":",
                     alpha=0.6, linewidth=1)
-    axes[1].set_xlabel(f"IoU on >={rainfall_threshold_mmh:g} mm/h binary mask (%)")
+    # The 50 % mark on both coverage axes.
+    axes[1].axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+    axes[1].axvline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+    axes[1].set_xlabel("IoU on the >= 10 mm/h binary mask (%)")
     axes[1].set_ylabel("Per-class weighted overlap (%)")
     axes[1].set_title("Per-sample coverage scatter")
     axes[1].set_xlim(-2, 102); axes[1].set_ylim(-2, 102)
@@ -828,8 +910,10 @@ def run_extraction(track: str, year: int, month: int,
               for i in range(len(LEAD_STEP_OFFSETS))}
     patch_acc: dict = {}
     # Per sample, lead and candidate HIGH: hit counts at every swept
-    # threshold, resolved to columns once the winning HIGH is known.
+    # threshold, and the binary confusion, resolved to columns once the
+    # winning HIGH is known.
     sample_hits: list[dict] = []
+    sample_conf: list[dict] = []
 
     print(f"\nRunning inference on {len(selected)} samples ...")
     for k, (date_str, hhmm) in enumerate(selected, 1):
@@ -866,6 +950,7 @@ def run_extraction(track: str, year: int, month: int,
 
         row = {"date": date_str, "reference_utc": ref_utc}
         hits_this: dict = {}
+        conf_this: dict = {}
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             gt_hhmm, gt_day = _resolve_gt(
                 ref_utc, offset * step_minutes, date_str,
@@ -891,6 +976,7 @@ def run_extraction(track: str, year: int, month: int,
             # made once at the end over pooled counts rather than per
             # sample. The baseline has one candidate: its class map.
             hits_this[i] = {}
+            conf_this[i] = {}
             for h in high_grid:
                 if h is None:
                     hyst = pred_canvas
@@ -911,8 +997,10 @@ def run_extraction(track: str, year: int, month: int,
                                       patch_acc.setdefault(h, {}), i)
                 hits_this[i][h] = _hit_counts(gt_mmh, valid, hyst >= 1,
                                               hit_thresholds)
+                conf_this[i][h] = (htp, hfp, hfn)
         rows.append(row)
         sample_hits.append(hits_this)
+        sample_conf.append(conf_this)
 
     print(f"\nDone. {len(rows)} samples processed, {n_skipped} skipped "
           f"(missing inputs).")
@@ -959,6 +1047,18 @@ def run_extraction(track: str, year: int, month: int,
                        if den_tot[j] else 0.0)
             for j, T in enumerate(hit_thresholds)}
 
+    # Hits / misses / false alarms per sample and pooled, at the winning
+    # HIGH, on the same >= 10 mm/h event as FAR/POD/CSI.
+    hmf_pooled: dict[int, dict] = {}
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        h = best_high[i]
+        for row, conf in zip(rows, sample_conf):
+            pct = _hmf_percentages(*conf[i][h])
+            for name in HMF_NAMES:
+                row[f"{name}_pct_t+{offset}"] = pct[name]
+        c = tuning[i][h]
+        hmf_pooled[i] = _hmf_percentages(c["TP"], c["FP"], c["FN"])
+
     # Per-patch table assembled from each lead's winning threshold.
     chosen_patch_acc: dict = {}
     for i in range(len(LEAD_STEP_OFFSETS)):
@@ -1002,11 +1102,16 @@ def run_extraction(track: str, year: int, month: int,
                 post_processing=post_processing,
                 per_patch=per_patch_scores(chosen_patch_acc),
                 model_tag=tag, hit_thresholds=hit_thresholds,
-                hit_pooled=hit_pooled)
+                hit_pooled=hit_pooled,
+                hmf_pooled={f"t+{off * step_minutes}": hmf_pooled[i]
+                            for i, off in enumerate(LEAD_STEP_OFFSETS)})
     _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
                          step_minutes, output_dir / f"{stem}_metrics.png",
                          rainfall_threshold_mmh=rainfall_threshold_mmh,
                          high_coverage_pct=high_coverage_pct)
+    _plot_hmf_figure(track, year, month, rows, hmf_pooled, step_minutes,
+                     output_dir / f"{stem}_hmf.png",
+                     high_coverage_pct=high_coverage_pct)
 
 
 def _resolve_gt(ref_utc: str, offset_min: int,

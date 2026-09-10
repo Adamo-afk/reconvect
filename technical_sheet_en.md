@@ -370,7 +370,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Writes** — `validation/rainfall_<scope>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
 - **Writes** — `…_samples.csv`, with `hit_pct_t+<k>_ge<T>` for every threshold of the sweep (`--hit_threshold_step`, `--hit_threshold_factor`; base … base × 1.5).
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
-- **Graph** — `…_metrics.png`; per-date overlays with `--date`
+- **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed, red line at 50 %); per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figures and report
