@@ -121,7 +121,7 @@ cold = 10,11,12,1,2,3
 | **5. Verify** | `python train_models.py --mode <mode> --check-ensemble` | Reads the registry's last state and reports which member datasets exist and which are missing. Exits non-zero when any are missing. |
 | **6. Train** | `python train_models.py --mode <mode> --period 2025warm --stage base` | Artefacts land as `coalition_<mode>_<source>_2025warm.keras`, plus a `.meta.json` sidecar recording the training period. |
 | **7. Validate** | `python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period 2025warm` | Per member. Tunes the hysteresis threshold and writes the `per_patch` CSI table. Manual — nothing triggers it. |
-| **8. Select** | `python build_patch_ensemble.py --mode <mode> --track rainfall --year Y --month M` | Reads every member's `per_patch` block and writes the selection manifest. |
+| **8. Select** | `python build_patch_ensemble.py --mode <mode> --track rainfall --year Y --month M --min_samples N` | Reads every member's `per_patch` block and writes the selection manifest. Patches with fewer than N validated samples take the overall best member. |
 
 The registry is append-only, so an earlier ensemble stays reconstructable and a result produced against a previous plan can still be explained.
 
@@ -140,6 +140,8 @@ Each extraction run writes a `per_patch` block into its summary: per-patch CSI, 
 
 `build_patch_ensemble.py` is then purely the **selector**: it reads one summary per member, compares per-patch CSI, and writes the manifest. Highest wins; **ties break on the member label**, so the assignment never depends on the order members were validated in. It warns if members were scored at different LOW thresholds, since their CSI values would not be strictly comparable.
 
+A pooled CSI over a handful of samples is noise, so the selector takes a required `--min_samples N`. A patch validated on at least N samples chooses its own best member; a patch below N takes the **overall best** member, the one with the highest CSI pooled over every patch. If no patch at all reaches N, every patch with samples still keeps its own best member and only patches with zero samples go to the overall best. Every patch ends up assigned; the manifest records the rule behind each choice (`own_best`, `below_min_samples`, `no_samples`) under `patch_assignment` and the overall-best member under `selection_rule`.
+
 Both scripts are run manually after training — nothing is triggered automatically.
 
 ```bash
@@ -149,7 +151,7 @@ python validate_predictions.py --track rainfall --year 2025 --month 07 \
 
 # then select
 python build_patch_ensemble.py --mode mtg_opera_mtgmr_rainfall \
-    --track rainfall --year 2025 --month 07
+    --track rainfall --year 2025 --month 07 --min_samples 20
 ```
 
 ### Rainfall hysteresis sweep
@@ -1111,7 +1113,7 @@ optional `--period` label, `<run_tag>` is `<mode>_<source>[_<period>]`.
 | `predict_full_domain.py` | `inference/predict_<run_tag>[_finetuned\|_kd]/*.npy` · `*_hyst.npy` · `*_hits.png` · `*_perclass_hits.png` | `visualize_gt_vs_pred` · figures are **terminal** | Full-canvas prediction rasters stitched from overlapping Hann-weighted patches, plus the hysteresis-thresholded binaries. Saved as arrays so a threshold sweep never requires re-running inference. |
 | `validate_predictions.py` | `validation/<track>_<yyyy>_<mm>_<tag>_summary.json` · `..._samples.csv` · `..._metrics.png` · `..._<date>_<HHMM>.png` | `generate_report` · `build_patch_ensemble` · `bundle_eval_scores` | Per-lead POD / FAR / CSI with the hysteresis HIGH tuned by maximising aggregate CSI, plus a `per_patch` block. That block is what the ensemble selector reads to decide **which member wins each patch**. `--baseline` writes the same files for SepConv-ens under the `sepconv_<run_tag>` tag. |
 | `compare_models.py` | `comparison/<track>/metrics_per_leadtime_<metric>.png` · `comparison_table.{csv,md,tex}` · `hit_levels_ge<T>.png` · `hit_levels.csv` · `comparison_summary.json` | — (deliverable) | All models of a track on one axis: per-lead metric curves, the paper table, and the share of samples above each hit level per lead / season / whole window. |
-| `build_patch_ensemble.py` | `our_data/ensemble_manifest_<mode>_<source>.json` | `ensemble_inference` | The routing table: for each of the 18 patches, which seasonal member scored best, with the season fallback and the global fallback behind it. Selection only — scoring happens in validation. |
+| `build_patch_ensemble.py` | `our_data/ensemble_manifest_<mode>_<source>.json` | `ensemble_inference` | The routing table: for each of the 18 patches, which seasonal member scored best on at least `--min_samples` samples, the overall best member otherwise, with the season fallback and the global fallback behind it. Selection only — scoring happens in validation. |
 | `evaluate_coalition.py` · `evaluate_sepconv_ensemble.py` | `<output>/evaluation_results.json` · `confusion_matrix.png` · `csi_per_class.png` · `metrics_per_leadtime.png` · `training_loss.png` · `training_<metric>.png` · `roc_curve.png` · … | `bundle_eval_scores` · figures are **terminal** | Held-out test scoring for the two architectures, with the same metric set on both sides so the comparison table is built from like-for-like numbers. |
 | `bundle_eval_scores.py` | `<output_dir>/eval_leadtime-<prefix>-<letters>.csv` | **terminal** (tables for the write-up) | Collapses several runs' `evaluation_results.json` into one lead-time table per modality combination; the letters encode which inputs a run received (`o` = OPERA only, `om` = OPERA + MTG). |
 | `generate_report.py` | `validation/report_<yyyy>_<mm>.pdf` · `validation/rainfall_lightning_coupling/coupling_<date>_<ref>.png` | **terminal** (deliverable) | The monthly PDF: cover, contents, executive summary, per-lead metrics, per-event coupling figures, data appendix. Reads the validation summaries rather than re-running anything. |

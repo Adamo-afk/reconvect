@@ -523,9 +523,10 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 
 ### C4. Selecția per patch
 ```bash
-python build_patch_ensemble.py --mode <mode>
+python build_patch_ensemble.py --mode <mode> --track rainfall --year Y --month M --min_samples N
 ```
 - **Descriere** — alege membrul cu cel mai bun scor pentru fiecare dintre cele 18 patch-uri. Exclusiv selecție — evaluarea a fost efectuată la C3.
+- **Regulă** — `--min_samples N` este obligatoriu. Un patch validat pe cel puțin N eșantioane își alege propriul membru cu cel mai bun scor; sub N preia membrul cel mai bun per ansamblu (CSI-ul cel mai ridicat cumulat pe toate patch-urile). Dacă niciun patch nu atinge N, patch-urile cu eșantioane își păstrează propriul membru optim, iar numai cele fără eșantioane preiau membrul cel mai bun per ansamblu. Manifestul consemnează regula aplicată fiecărui patch.
 - **Scrie** — `our_data/ensemble_manifest_<mode>_<source>.json` **CRITIC** — tabela de rutare, cu variante de rezervă pe sezon și pe modelul global pentru fiecare alocare.
 - **Citit de** — `ensemble_inference`
 
