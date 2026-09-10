@@ -555,6 +555,7 @@ def _write_csv(rows: list[dict], path: Path, hit_thresholds=None):
     for offset in LEAD_STEP_OFFSETS:
         fieldnames.append(f"iou_mask_t+{offset}")
         fieldnames.append(f"class_wt_t+{offset}")
+        fieldnames.append(f"csi_t+{offset}")
         for name in HMF_NAMES:
             fieldnames.append(f"{name}_pct_t+{offset}")
         for T in (hit_thresholds or []):
@@ -579,7 +580,8 @@ def _write_json(track: str, year: int, month: int,
                 model_tag: str | None = None,
                 hit_thresholds: list[float] | None = None,
                 hit_pooled: dict | None = None,
-                hmf_pooled: dict | None = None):
+                hmf_pooled: dict | None = None,
+                representative: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
     lists of (date, reference_utc) that met the high-coverage threshold.
     Both thresholds are recorded in the JSON so a run's outputs are
@@ -645,6 +647,8 @@ def _write_json(track: str, year: int, month: int,
         doc["post_processing"] = post_processing
     if per_patch is not None:
         doc["per_patch"] = per_patch
+    if representative is not None:
+        doc["representative_timesteps"] = representative
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
@@ -654,6 +658,60 @@ def _write_json(track: str, year: int, month: int,
 # Metrics figure (extraction mode side-effect)
 # ============================================================================
 HMF_NAMES = ("hits", "misses", "false_alarms")
+PICKS = ("best", "worst", "median")
+
+
+def representative_timesteps(rows: list[dict], csi_columns: list[str],
+                             metric: str) -> dict:
+    """Best, worst and median sample by the mean CSI over the leads.
+
+    A sample's score is the mean of its per-lead CSI columns, skipping
+    leads where the value is missing. Sorted ascending by (score, date,
+    time): worst is the first, best the last, median the lower middle.
+    The block is what `--pick` reads in visualize_gt_vs_pred and
+    predict_full_domain, so a run's telling cases can be drawn without
+    hunting through the CSV.
+    """
+    scored = []
+    for r in rows:
+        vals = [float(r[c]) for c in csi_columns
+                if r.get(c) not in (None, "")]
+        if not vals:
+            continue
+        scored.append((sum(vals) / len(vals), r["date"], r["reference_utc"],
+                       {c: (float(r[c]) if r.get(c) not in (None, "") else None)
+                        for c in csi_columns}))
+    out = {"metric": metric, "n_scored": len(scored), "n_rows": len(rows)}
+    if not scored:
+        return out
+    scored.sort(key=lambda t: (t[0], t[1], t[2]))
+    picks = {"worst": scored[0], "best": scored[-1],
+             "median": scored[(len(scored) - 1) // 2]}
+    for name in PICKS:
+        score, date, ref, per_lead = picks[name]
+        out[name] = {"date": date, "reference_utc": ref,
+                     "score": round(score, 6), "per_lead": per_lead,
+                     "rank_ascending": scored.index(picks[name]) + 1}
+    return out
+
+
+def picks_from_summary(summary_path, picks: list[str]) -> list[tuple[str, str, str]]:
+    """(pick, date, reference_utc) for the requested picks of a summary
+    JSON written by validate_predictions. Used by the consumers."""
+    blob = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    rep = blob.get("representative_timesteps")
+    if not rep:
+        raise SystemExit(
+            f"{summary_path} has no `representative_timesteps` block; "
+            f"re-run validate_predictions in extraction mode.")
+    out = []
+    for name in picks:
+        if name not in rep:
+            raise SystemExit(f"{summary_path}: no {name!r} pick recorded "
+                             f"(scored {rep.get('n_scored', 0)} samples)")
+        out.append((name, rep[name]["date"], rep[name]["reference_utc"]))
+    return out
+
 
 
 def _hmf_percentages(tp: int, fp: int, fn: int) -> dict[str, float | None]:
@@ -1053,9 +1111,12 @@ def run_extraction(track: str, year: int, month: int,
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
         h = best_high[i]
         for row, conf in zip(rows, sample_conf):
-            pct = _hmf_percentages(*conf[i][h])
+            tp_s, fp_s, fn_s = conf[i][h]
+            pct = _hmf_percentages(tp_s, fp_s, fn_s)
             for name in HMF_NAMES:
                 row[f"{name}_pct_t+{offset}"] = pct[name]
+            row[f"csi_t+{offset}"] = (tp_s / (tp_s + fp_s + fn_s)
+                                      if (tp_s + fp_s + fn_s) else None)
         c = tuning[i][h]
         hmf_pooled[i] = _hmf_percentages(c["TP"], c["FP"], c["FN"])
 
@@ -1104,7 +1165,11 @@ def run_extraction(track: str, year: int, month: int,
                 model_tag=tag, hit_thresholds=hit_thresholds,
                 hit_pooled=hit_pooled,
                 hmf_pooled={f"t+{off * step_minutes}": hmf_pooled[i]
-                            for i, off in enumerate(LEAD_STEP_OFFSETS)})
+                            for i, off in enumerate(LEAD_STEP_OFFSETS)},
+                representative=representative_timesteps(
+                    rows, [f"csi_t+{o}" for o in LEAD_STEP_OFFSETS],
+                    "mean over leads of the per-sample CSI on the "
+                    ">= 10 mm/h event at the tuned HIGH"))
     _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
                          step_minutes, output_dir / f"{stem}_metrics.png",
                          rainfall_threshold_mmh=rainfall_threshold_mmh,
@@ -1980,6 +2045,7 @@ def _write_json_lightning(
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
     per_patch: dict | None = None,
+    representative: dict | None = None,
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
@@ -2050,6 +2116,8 @@ def _write_json_lightning(
     }
     if per_patch is not None:
         doc["per_patch"] = per_patch
+    if representative is not None:
+        doc["representative_timesteps"] = representative
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
@@ -2324,6 +2392,9 @@ def run_extraction_lightning(
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
         per_patch=per_patch_scores(chosen_patch_acc),
+        representative=representative_timesteps(
+            rows, [f"csi_t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS],
+            "mean over leads of the per-sample CSI at the tuned HIGH"),
     )
     _plot_metrics_figure_lightning(
         year, month, rows,

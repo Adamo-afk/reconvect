@@ -1009,8 +1009,16 @@ def main() -> int:
                         help="Model variant. The name states its own track: "
                              "`_rainfall` for the OPERA 5-class head, "
                              "`_occurrence` for the lightning binary head.")
-    parser.add_argument("--date", required=True, type=str,
-                        help="Reference date (YYYY-MM-DD).")
+    parser.add_argument("--date", type=str, default=None,
+                        help="Reference date (YYYY-MM-DD). Required unless "
+                             "--pick names the timesteps.")
+    parser.add_argument("--pick", nargs="+", default=None,
+                        choices=["best", "worst", "median"],
+                        help="Run on the timesteps validate_predictions "
+                             "recorded as best / worst / median (by mean "
+                             "CSI over leads) in --validation_summary. No "
+                             "ground truth is needed; --date and the time "
+                             "flags are then ignored.")
     time_group = parser.add_mutually_exclusive_group()
     time_group.add_argument("--time", type=str, default=None,
                             help="Single reference HH:MM.")
@@ -1105,11 +1113,13 @@ def main() -> int:
                         help="Rainfall hysteresis HIGH threshold. "
                              "Default 0.55.")
     args = parser.parse_args()
-
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive "
                      "(the KD student has no swin head).")
-
+    if args.pick and not args.validation_summary:
+        parser.error("--pick needs --validation_summary")
+    if not args.pick and not args.date:
+        parser.error("give --date (with a time flag), or --pick")
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
     variant_suffix = ("_finetuned" if args.finetuned
@@ -1137,7 +1147,18 @@ def main() -> int:
     label_type = mode_config["label_type"]
     step_minutes = _load_step_minutes(data_root)
 
-    ref_times = _resolve_reference_times(args, step_minutes)
+    # The (date, time) pairs to run: one date with its time flags, or
+    # the picks recorded by validation.
+    if args.pick:
+        from validate_predictions import picks_from_summary
+        jobs = [(d, r) for _, d, r in
+                picks_from_summary(args.validation_summary, args.pick)]
+        pick_names = [n for n, _, _ in
+                      picks_from_summary(args.validation_summary, args.pick)]
+    else:
+        jobs = [(args.date, t)
+                for t in _resolve_reference_times(args, step_minutes)]
+        pick_names = None
 
     print("=" * 70)
     print("COALITION-4 Inference (full-domain)")
@@ -1147,9 +1168,14 @@ def main() -> int:
                      else "base")
     print(f"  Mode:            {args.mode}  (label_type={label_type})")
     print(f"  Source:          {SOURCE}  ({variant_label})")
-    print(f"  Date:            {args.date}")
-    print(f"  Reference times: {len(ref_times)} step-aligned slots "
-          f"(step={step_minutes} min)")
+    if pick_names:
+        print("  Picked from:     " + str(args.validation_summary))
+        for n, (d, r) in zip(pick_names, jobs):
+            print(f"    {n:<6} {d} {r}")
+    else:
+        print(f"  Date:            {args.date}")
+        print(f"  Reference times: {len(jobs)} step-aligned slots "
+              f"(step={step_minutes} min)")
     print(f"  Output dir:      {output_dir}")
 
     # Country borders + view extent
@@ -1167,6 +1193,7 @@ def main() -> int:
     print("\nLoading model...")
     model = load_model_artifact(
         model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
+        period=args.period,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
@@ -1189,13 +1216,13 @@ def main() -> int:
             hysteresis_binary,
         )
 
-    for i, ref_utc in enumerate(ref_times, 1):
-        print(f"\n[{i}/{len(ref_times)}] {args.date} {ref_utc} UTC")
+    for i, (date_str, ref_utc) in enumerate(jobs, 1):
+        print(f"\n[{i}/{len(jobs)}] {date_str} {ref_utc} UTC")
 
         if is_lightning:
             # ---- Lightning: Hann-overlap inference + hysteresis + 2x3 plot
             prob_canvases = run_hann_overlapped_inference(
-                model, data_root, mode_config, args.date, ref_utc,
+                model, data_root, mode_config, date_str, ref_utc,
                 step_minutes, stride=stride, batch_size=args.batch_size,
             )
             if prob_canvases is None:
@@ -1212,7 +1239,7 @@ def main() -> int:
             gt_canvases = []
             for offset in LEAD_STEP_OFFSETS:
                 gt_hhmm, gt_day = _ref_to_hhmm(
-                    ref_utc, offset * step_minutes, args.date,
+                    ref_utc, offset * step_minutes, date_str,
                 )
                 gt_canvases.append(
                     _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
@@ -1225,11 +1252,11 @@ def main() -> int:
                               low_threshold, high_per_lead)
 
             safe_ref = ref_utc.replace(":", "")
-            out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
+            out_stem = output_dir / f"predict_{date_str}_{safe_ref}"
             if not args.no_plot:
                 _plot_lightning_2x3(
                     prob_canvases, bin_canvases, gt_canvases,
-                    date_str=args.date, ref_utc=ref_utc,
+                    date_str=date_str, ref_utc=ref_utc,
                     step_minutes=step_minutes,
                     low=low_threshold, high_per_lead=high_per_lead,
                     output_path=out_stem.with_suffix(".png"),
@@ -1244,7 +1271,7 @@ def main() -> int:
                 )
                 _plot_lightning_hits_1x3(
                     bin_canvases, gt_canvases,
-                    date_str=args.date, ref_utc=ref_utc,
+                    date_str=date_str, ref_utc=ref_utc,
                     step_minutes=step_minutes,
                     output_path=hits_out,
                 )
@@ -1268,7 +1295,7 @@ def main() -> int:
 
         # ---- Radar / rainfall: unchanged patch-based path
         inputs, valid_patches = build_inputs_for_reference(
-            data_root, mode_config, args.date, ref_utc,
+            data_root, mode_config, date_str, ref_utc,
             step_minutes, restrict_to_patches=restrict_to_patches,
         )
         if not valid_patches:
@@ -1323,7 +1350,7 @@ def main() -> int:
         gt_class_canvases: list[np.ndarray | None] = []
         for offset in LEAD_STEP_OFFSETS:
             gt_hhmm, gt_day = _ref_to_hhmm(
-                ref_utc, offset * step_minutes, args.date,
+                ref_utc, offset * step_minutes, date_str,
             )
             gt_class_canvases.append(
                 _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm)
@@ -1332,7 +1359,7 @@ def main() -> int:
         print(f"  OPERA GT panels available: {n_gt_avail}/{len(gt_class_canvases)}")
 
         safe_ref = ref_utc.replace(":", "")
-        out_stem = output_dir / f"predict_{args.date}_{safe_ref}"
+        out_stem = output_dir / f"predict_{date_str}_{safe_ref}"
         if not args.no_plot:
             if label_type == "radar" and n_gt_avail > 0:
                 # Main 3x3 figure: GT / zone overlap (raw pred) /
@@ -1341,7 +1368,7 @@ def main() -> int:
                 _plot_rainfall_zone_prepost_3x3(
                     canvases, hyst_canvases, gt_class_canvases,
                     valid_patches,
-                    date_str=args.date, ref_utc=ref_utc,
+                    date_str=date_str, ref_utc=ref_utc,
                     step_minutes=step_minutes,
                     output_path=out_stem.with_suffix(".png"),
                     rainfall_low=rainfall_low_used,
@@ -1354,7 +1381,7 @@ def main() -> int:
                 _plot_rainfall_perclass_hits_2x3(
                     canvases, hyst_canvases, gt_class_canvases,
                     valid_patches,
-                    date_str=args.date, ref_utc=ref_utc,
+                    date_str=date_str, ref_utc=ref_utc,
                     step_minutes=step_minutes,
                     output_path=hits_out,
                     rainfall_low=rainfall_low_used,
@@ -1368,7 +1395,7 @@ def main() -> int:
                 # render anyway.
                 plot_full_domain_predictions_only(
                     canvases, valid_patches, label_type,
-                    date_str=args.date, ref_utc=ref_utc,
+                    date_str=date_str, ref_utc=ref_utc,
                     step_minutes=step_minutes,
                     threshold=args.threshold,
                     output_path=out_stem.with_suffix(".png"),
@@ -1384,7 +1411,7 @@ def main() -> int:
                 np.save(hyst_npy, np.stack(hyst_canvases, axis=0))
                 print(f"  Saved hyst canvases -> {hyst_npy.name}")
 
-    print(f"\nDone. Wrote {len(ref_times)} reference time(s) to {output_dir}.")
+    print(f"\nDone. Wrote {len(jobs)} reference time(s) to {output_dir}.")
     return 0
 
 

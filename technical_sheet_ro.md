@@ -371,10 +371,12 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ### A4. Inferență pe întregul domeniu
 ```bash
 python predict_full_domain.py --mode ... --date YYYY-MM-DD
+python predict_full_domain.py --mode ... --pick best worst median --validation_summary validation/<summary>.json
 ```
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
+- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
@@ -385,16 +387,19 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
 - **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul apare în numele fiecărui fișier: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
 - **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
-- **Scrie** — `…_samples.csv`, cu `hit_pct_t+<k>_ge<T>` pentru fiecare prag al baleiajului (`--hit_threshold_step`, `--hit_threshold_factor`; bază … bază × 1,5).
+- **Scrie** — `…_samples.csv`, cu `csi_t+<k>` per orizont la pragul HIGH calibrat și `hit_pct_t+<k>_ge<T>` pentru fiecare prag al baleiajului (`--hit_threshold_step`, `--hit_threshold_factor`; bază … bază × 1,5).
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
+- **Consemnează** — `representative_timesteps` în rezumat: eșantionul cel mai bun, cel mai slab și cel median după CSI-ul mediu pe orizonturi. A4 și A6 le preiau prin `--pick`.
 - **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă, linie roșie la 50 %); suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figuri și raport
 ```bash
-python visualize_gt_vs_pred.py --mode ...
+python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
+python visualize_gt_vs_pred.py --mode ... --csv ... --pick best worst median --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
 ```
+- **Notă** — vizualizatorul construiește adevărul de teren din fișierele de patch ale rândurilor din `--csv`, astfel încât un moment selectat trebuie să fie un rând al acelui CSV (validați pe `--split test` și indicați CSV-ul de test).
 - **Scrie** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 
 ---

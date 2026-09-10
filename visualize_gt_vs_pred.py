@@ -2174,9 +2174,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Top-N reference-timestep full-domain visualisation.",
     )
-    parser.add_argument("--csv", required=True, type=str,
+    parser.add_argument("--csv", type=str, default=None,
                         help="Path to a per-source split CSV "
-                             "(train/validation/test_data_<source>.csv).")
+                             "(train/validation/test_data_<source>.csv). "
+                             "Required: the ground truth is built from the "
+                             "patch files its rows name.")
+    parser.add_argument("--pick", nargs="+", default=None,
+                        choices=["best", "worst", "median"],
+                        help="Instead of the top-N rows, draw the "
+                             "timesteps validate_predictions recorded as "
+                             "best / worst / median (by mean CSI over "
+                             "leads) in --validation_summary. Each must "
+                             "also be a row of --csv, which is where its "
+                             "ground truth comes from. Outputs are named "
+                             "<pick>_<date>_<time>.png.")
     parser.add_argument("--mode", required=True, type=str,
                         choices=_mode_choices(),
                         help="Model variant. The name states its own track: "
@@ -2269,6 +2280,10 @@ def main() -> int:
                      "(the KD student is trained fresh from scratch, "
                      "no swin head).")
 
+    if args.csv is None:
+        parser.error("--csv is required (the ground truth comes from its rows)")
+    if args.pick and not args.validation_summary:
+        parser.error("--pick needs --validation_summary")
     csv_path = Path(args.csv)
     if not csv_path.is_file():
         print(f"ERROR: csv {csv_path} not found.")
@@ -2287,6 +2302,11 @@ def main() -> int:
     # (required - the transforms in create_datasets read those stats).
     init_sequence_config(str(data_root), SOURCE, period=args.period)
     sync_window_from_sequence_config()
+    # The inputs are built by predict_full_domain, whose own window lists
+    # must follow the same sequence config or a 4-frame model is fed 3.
+    from predict_full_domain import (
+        sync_window_from_sequence_config as _sync_inference_window)
+    _sync_inference_window()
     set_normalization_stats_path(
         data_root / normalization_stats_name(SOURCE, args.period)
     )
@@ -2329,7 +2349,7 @@ def main() -> int:
     print(f"\nLoading model...")
     model = load_model_artifact(
         Path(args.model_dir), args.mode, SOURCE, args.finetuned,
-        kd=args.kd,
+        kd=args.kd, period=args.period,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
@@ -2342,8 +2362,32 @@ def main() -> int:
     print(f"  Border src:  {_BORDERS_SOURCE}  "
           f"({len(countries)} countries: {', '.join(countries)})")
 
-    print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
-    df_top = load_top_n_rows(csv_path, args.top_n)
+    if args.pick:
+        from validate_predictions import picks_from_summary
+        picks = picks_from_summary(args.validation_summary, args.pick)
+        print(f"\nPicked timesteps from {args.validation_summary}:")
+        df_all = pd.read_csv(csv_path)
+        df_all["reference_utc"] = df_all["reference_utc"].str.strip()
+        df_all["n_patches"] = df_all["patch_numbers"].apply(
+            lambda s: len(ast.literal_eval(s)))
+        chosen = []
+        for name, date_str, ref_utc in picks:
+            hit = df_all[(df_all["date"] == date_str)
+                         & (df_all["reference_utc"] == ref_utc)]
+            if hit.empty:
+                print(f"  {name:<6} {date_str} {ref_utc}: not a row of "
+                      f"{csv_path.name}, no ground truth for it - skipped")
+                continue
+            row = hit.iloc[0].copy()
+            row["pick"] = name
+            chosen.append(row)
+            print(f"  {name:<6} {date_str} {ref_utc}")
+        if not chosen:
+            raise SystemExit("none of the picked timesteps is in the CSV")
+        df_top = pd.DataFrame(chosen).reset_index(drop=True)
+    else:
+        print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
+        df_top = load_top_n_rows(csv_path, args.top_n)
     print(df_top[["date", "reference_utc", "n_patches"]].to_string(index=False))
 
     # Lazy import: predict_full_domain pulls TF, but we're already past
@@ -2397,8 +2441,11 @@ def main() -> int:
     for rank, (_, row) in enumerate(df_top.iterrows(), start=1):
         date_str = row["date"]
         ref_utc = row["reference_utc"].strip()
+        # Picked timesteps are named after the pick, top-N after the rank.
+        prefix = str(row["pick"]) if "pick" in row.index else f"ts{rank:02d}"
         print(f"\n[{rank}/{len(df_top)}] {date_str} {ref_utc} UTC  "
-              f"({row['n_patches']} qualifying patches)")
+              f"({row['n_patches']} qualifying patches)"
+              + (f"  [{row['pick']}]" if "pick" in row.index else ""))
 
         # DBSCAN-selected patches from the CSV — drives green/red
         # numbering only; every patch still gets a model prediction.
@@ -2494,7 +2541,7 @@ def main() -> int:
                 agg_raw_soft.append(raw_soft_canvases[t])
 
         safe_ref = ref_utc.replace(":", "")
-        out_png = output_dir / f"ts{rank:02d}_{date_str}_{safe_ref}.png"
+        out_png = output_dir / f"{prefix}_{date_str}_{safe_ref}.png"
         plot_full_domain(
             gt_canvases, pred_canvases, csv_active, label_type,
             date_str=date_str, ref_utc=ref_utc,
@@ -2516,7 +2563,7 @@ def main() -> int:
             )
             zoom_png = (
                 output_dir
-                / f"ts{rank:02d}_{date_str}_{safe_ref}_zoom_p{best_patch:02d}.png"
+                / f"{prefix}_{date_str}_{safe_ref}_zoom_p{best_patch:02d}.png"
             )
             plot_zoom_patch(
                 gt_canvases, pred_canvases, best_patch, best_score,
