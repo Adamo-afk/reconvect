@@ -283,10 +283,9 @@ python our_data/satellite_data/store_registry.py              # summary
 python our_data/satellite_data/store_registry.py --verify     # index vs disk
 python our_data/satellite_data/store_registry.py --chart      # per-month volume by disk
 python our_data/satellite_data/store_registry.py --scan ROOT… # rebuild from disk
-python our_data/satellite_data/store_registry.py --relocate G:\nowcasting\mtg_store G:\nowcasting\coalition4-rcnn\our_data\satellite_data\MTG
 ```
 
-Every store follows one layout, `<drive>:\nowcasting\coalition4-rcnn\our_data\satellite_data\MTG`. `--relocate` moves a store into it — a rename when source and destination share a volume — creates the tree, re-points the index and verifies.
+Every store follows one layout, `<drive>:\nowcasting\coalition4-rcnn\our_data\satellite_data\MTG`.
 
 The index is a claim; disk is the authority, so `resolve` checks the file exists before trusting it. `reproject.py` walks **every registered root** when `--mtg_dir` is absent, rebuilding the KD-tree per store from that store's own constants and writing into the single canonical `reprojected_data/` — so the split is invisible downstream. `summarize_mtg.py --npy_dir` likewise takes several roots and scans them as one archive.
 
