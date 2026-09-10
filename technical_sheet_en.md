@@ -376,7 +376,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Cost** — one component labelling per sample and lead serves every HIGH candidate (identical results to thresholding each one); a loader thread assembles the next sample while the GPU runs the current one. About 4–5 s per sample on the full canvas.
 - **Graph** — `…_tuning.png`: CSI against the swept HIGH, one line per lead, winner dashed (rainfall gets the panel the lightning figure has). `python validate_predictions.py --plot_tuning <summary.json>` redraws it from the saved summary.
 - **Records** — `representative_timesteps` in the summary: the best, worst and median sample by mean CSI over leads. A4 and A6 take them with `--pick`.
-- **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed, red line at 50 %); per-date overlays with `--date`
+- **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed and stated, red line at 50 %; `--plot_hmf <summary.json>` redraws it from the saved files); per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figures and report

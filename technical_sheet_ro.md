@@ -393,7 +393,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Cost** — o singură etichetare a componentelor conexe per eșantion și orizont deservește toți candidații HIGH (rezultate identice cu pragul aplicat fiecăruia); un fir de încărcare pregătește eșantionul următor cât timp GPU-ul îl procesează pe cel curent. Aproximativ 4–5 s per eșantion pe întreaga suprafață.
 - **Grafic** — `…_tuning.png`: CSI în funcție de pragul HIGH baleiat, câte o linie per orizont, câștigătorul cu linie întreruptă (precipitațiile primesc panoul pe care îl are figura pentru fulgere). `python validate_predictions.py --plot_tuning <summary.json>` îl regenerează din rezumatul salvat.
 - **Consemnează** — `representative_timesteps` în rezumat: eșantionul cel mai bun, cel mai slab și cel median după CSI-ul mediu pe orizonturi. A4 și A6 le preiau prin `--pick`.
-- **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă, linie roșie la 50 %); suprapuneri pe zile cu `--date`
+- **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă și afișată, linie roșie la 50 %; `--plot_hmf <summary.json>` o regenerează din fișierele salvate); suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figuri și raport

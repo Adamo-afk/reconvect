@@ -972,6 +972,49 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
     print(f"  Wrote tuning figure to {out_path}")
 
 
+def plot_hmf_from_summary(summary_path: Path, out_path: Path) -> None:
+    """The hits / misses / false-alarms figure from saved data alone:
+    per-sample percentages from <stem>_samples.csv, pooled values,
+    scope and threshold from <stem>_summary.json. Rainfall runs only
+    (the columns exist there)."""
+    global SPLIT, THRESHOLD_MMH
+    summary_path = Path(summary_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    pooled_named = summary.get("hits_misses_false_alarms_pooled_per_lead") or {}
+    if not pooled_named:
+        raise SystemExit(f"{summary_path} has no hits/misses/false-alarms "
+                         f"block (not a rainfall extraction summary)")
+    stem = summary_path.name[:-len("_summary.json")]
+    csv_path = summary_path.with_name(f"{stem}_samples.csv")
+    if not csv_path.is_file():
+        raise SystemExit(f"samples CSV not found next to the summary: {csv_path}")
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        raw_rows = list(csv.DictReader(f))
+    # Leads from the CSV columns, minutes from the pooled block's keys.
+    offsets = sorted({int(c[len("hits_pct_t+"):]) for c in raw_rows[0]
+                      if c.startswith("hits_pct_t+")}) if raw_rows else []
+    minutes = sorted(int(k[2:]) for k in pooled_named)
+    if not offsets or len(minutes) != len(offsets):
+        raise SystemExit("the samples CSV and the summary disagree on the leads")
+    step_minutes = minutes[0] // offsets[0]
+    rows = []
+    for r in raw_rows:
+        row = dict(r)
+        for c, v in r.items():
+            if c.endswith(tuple(f"_pct_t+{o}" for o in offsets)) or c.startswith("csi_t+"):
+                row[c] = float(v) if v not in ("", None) else None
+        rows.append(row)
+    pooled = {i: pooled_named[f"t+{o * step_minutes}"] for i, o in enumerate(offsets)}
+    LEAD_STEP_OFFSETS[:] = offsets
+    SPLIT = summary.get("split")
+    if summary.get("threshold_mmh") is not None:
+        THRESHOLD_MMH = float(summary["threshold_mmh"])
+    _plot_hmf_figure(summary.get("track", "rainfall"), summary.get("year"),
+                     summary.get("month"), rows, pooled, step_minutes, out_path,
+                     high_coverage_pct=float(summary.get(
+                         "high_coverage_threshold_pct", HIGH_COVERAGE_PCT)))
+
+
 def _plot_metrics_figure(track: str, year: int, month: int,
                          rows: list[dict],
                          confusion_per_lead: dict[int, dict],
@@ -3396,6 +3439,12 @@ def main() -> int:
                              "from a saved summary (either track) and exit; "
                              "writes <stem>_tuning.png next to it. No model, "
                              "no data. Every other flag is ignored.")
+    parser.add_argument("--plot_hmf", type=str, default=None,
+                        metavar="SUMMARY_JSON",
+                        help="Draw the hits / misses / false-alarms figure "
+                             "from a saved rainfall summary and its sibling "
+                             "samples CSV, then exit; writes <stem>_hmf.png "
+                             "next to them. Every other flag is ignored.")
     parser.add_argument("--track", type=str, default=None,
                         choices=["rainfall", "lightning", "kd"],
                         help="Validation track. 'rainfall' is the OPERA "
@@ -3535,6 +3584,14 @@ def main() -> int:
         name = (src.name[:-len("_summary.json")]
                 if src.name.endswith("_summary.json") else src.stem)
         plot_tuning_from_summary(src, src.with_name(f"{name}_tuning.png"))
+        return 0
+    if args.plot_hmf:
+        src = Path(args.plot_hmf)
+        if not src.is_file():
+            parser.error(f"--plot_hmf: {src} not found")
+        name = (src.name[:-len("_summary.json")]
+                if src.name.endswith("_summary.json") else src.stem)
+        plot_hmf_from_summary(src, src.with_name(f"{name}_hmf.png"))
         return 0
     if args.track is None:
         parser.error("--track is required")
