@@ -613,9 +613,17 @@ def false_neg(y_true, y_pred):
 # Lead time labels
 # ============================================================================
 
+# Fallback only. sync_leads() rewrites both lists in place from the
+# dataset's label depth and the master step once a split is read, so
+# a 3 / 4 window scores four leads and a 3 / 3 window three.
 LEAD_TIMES = [15, 30, 45]  # minutes
 LEAD_LABELS = ["t+15", "t+30", "t+45"]
-N_LEAD = len(LEAD_TIMES)
+
+
+def sync_leads(n_future: int, step_minutes: int) -> None:
+    """Lead times follow label_shape[0] of the split being scored."""
+    LEAD_TIMES[:] = [step_minutes * (k + 1) for k in range(int(n_future))]
+    LEAD_LABELS[:] = [f"t+{m}" for m in LEAD_TIMES]
 
 
 # ============================================================================
@@ -745,23 +753,23 @@ def collect_predictions_gpu(model, dataset):
     """Collect all predictions and labels per lead time using GPU.
     Returns dict of tf.Tensors per lead time + aggregated.
     """
-    all_true = {t: [] for t in range(N_LEAD)}
-    all_pred = {t: [] for t in range(N_LEAD)}
+    all_true = {t: [] for t in range(len(LEAD_TIMES))}
+    all_pred = {t: [] for t in range(len(LEAD_TIMES))}
 
     for inputs, labels in dataset:
         preds = model(inputs, training=False)
-        for t in range(N_LEAD):
+        for t in range(len(LEAD_TIMES)):
             all_true[t].append(tf.reshape(labels[:, t, :, :, 0], [-1]))
             all_pred[t].append(tf.reshape(preds[:, t, :, :, 0], [-1]))
 
     # Concatenate per lead time
-    for t in range(N_LEAD):
+    for t in range(len(LEAD_TIMES)):
         all_true[t] = tf.concat(all_true[t], axis=0)
         all_pred[t] = tf.concat(all_pred[t], axis=0)
 
     # Aggregate across all lead times
-    all_true_agg = tf.concat([all_true[t] for t in range(N_LEAD)], axis=0)
-    all_pred_agg = tf.concat([all_pred[t] for t in range(N_LEAD)], axis=0)
+    all_true_agg = tf.concat([all_true[t] for t in range(len(LEAD_TIMES))], axis=0)
+    all_pred_agg = tf.concat([all_pred[t] for t in range(len(LEAD_TIMES))], axis=0)
 
     return all_true, all_pred, all_true_agg, all_pred_agg
 
@@ -824,7 +832,7 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     METRIC_NAMES = ["CSI", "POD", "FAR", "FPR", "ETS", "HSS", "PSS",
                     "TP", "FP", "FN", "TN"]
 
-    for t in range(N_LEAD):
+    for t in range(len(LEAD_TIMES)):
         vals = tf_metrics_at_threshold(all_true[t], all_pred[t], threshold_tf)
         lt_metrics = {name: float(v.numpy()) for name, v in
                       zip(METRIC_NAMES, vals)}
@@ -854,7 +862,7 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     results["aggregate"]["ROC_AUC"] = float(roc_auc)
 
     # Per-leadtime PR AUC
-    for t in range(N_LEAD):
+    for t in range(len(LEAD_TIMES)):
         r, p, _, _ = tf_pr_roc_curves(all_true[t], all_pred[t], curve_thresholds)
         results["per_leadtime"][LEAD_LABELS[t]]["PR_AUC"] = float(
             compute_auc(r.numpy(), p.numpy()))
@@ -970,13 +978,13 @@ def evaluate_radar(model, test_ds, output_dir):
 
     # Per-leadtime confusion matrices
     conf_matrices = {t: np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
-                     for t in range(N_LEAD)}
+                     for t in range(len(LEAD_TIMES))}
 
     for inputs, labels in test_ds:
         preds = model.predict(inputs, verbose=0)
         labels_np = labels.numpy()
 
-        for t in range(N_LEAD):
+        for t in range(len(LEAD_TIMES)):
             y_true_cls = np.argmax(labels_np[:, t, :, :, :], axis=-1).ravel()
             y_pred_cls = np.argmax(preds[:, t, :, :, :], axis=-1).ravel()
             for i in range(N_CLASSES):
@@ -988,7 +996,7 @@ def evaluate_radar(model, test_ds, output_dir):
     results = {"per_leadtime": {}, "aggregate": {}}
     conf_agg = np.zeros((N_CLASSES, N_CLASSES), dtype=np.int64)
 
-    for t in range(N_LEAD):
+    for t in range(len(LEAD_TIMES)):
         cm = conf_matrices[t]
         conf_agg += cm
         total = cm.sum()
@@ -1062,8 +1070,8 @@ def evaluate_radar(model, test_ds, output_dir):
     plt.close()
 
     # 2. Confusion matrices
-    fig, axes = plt.subplots(1, N_LEAD + 1, figsize=(5 * (N_LEAD + 1), 5))
-    all_cms = [conf_matrices[t] for t in range(N_LEAD)] + [conf_agg]
+    fig, axes = plt.subplots(1, len(LEAD_TIMES) + 1, figsize=(5 * (len(LEAD_TIMES) + 1), 5))
+    all_cms = [conf_matrices[t] for t in range(len(LEAD_TIMES))] + [conf_agg]
     all_titles = LEAD_LABELS + ["Aggregate"]
 
     for ax, cm, title in zip(axes, all_cms, all_titles):
@@ -1346,11 +1354,11 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
 
             if label_type == "lightning":
                 # 2 rows: GT binary, Pred thresholded
-                fig, axes = plt.subplots(2, N_LEAD, figsize=(16, 10))
+                fig, axes = plt.subplots(2, len(LEAD_TIMES), figsize=(16, 10))
                 fig.subplots_adjust(left=0.03, right=0.88, top=0.88,
                                     bottom=0.03, hspace=0.25, wspace=0.08)
 
-                for t in range(N_LEAD):
+                for t in range(len(LEAD_TIMES)):
                     ax = axes[0, t]
                     gt_frame = gt[t, :, :, 0]
                     ax.imshow(gt_frame, cmap='Reds', vmin=0, vmax=1,
@@ -1394,11 +1402,11 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
                 n_classes = len(RADAR_CLASS_NAMES)
                 class_cmap = matplotlib.colormaps.get_cmap('RdYlGn_r').resampled(n_classes)
 
-                fig, axes = plt.subplots(3, N_LEAD, figsize=(16, 14))
+                fig, axes = plt.subplots(3, len(LEAD_TIMES), figsize=(16, 14))
                 fig.subplots_adjust(left=0.03, right=0.88, top=0.91,
                                     bottom=0.03, hspace=0.22, wspace=0.08)
 
-                for t in range(N_LEAD):
+                for t in range(len(LEAD_TIMES)):
                     ax = axes[0, t]
                     im_gt = ax.imshow(gt_cls[t], cmap=class_cmap,
                                       vmin=-0.5, vmax=n_classes - 0.5,
@@ -1642,12 +1650,22 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     meta_path = dataset_root / split / "metadata.json"
     if meta_path.is_file():
         with open(meta_path) as f:
-            label_type = json.load(f).get(
-                "label_type",
-                "lightning" if "lightning" in mode else "radar",
-            )
+            _meta = json.load(f)
+        label_type = _meta.get(
+            "label_type", "lightning" if "lightning" in mode else "radar")
+        # The window is the dataset's: score every lead its label holds.
+        label_shape = _meta.get("label_shape") or []
+        if label_shape:
+            _cfg = data_root / "timestep_config.json"
+            try:
+                with open(_cfg) as f:
+                    _step = int(json.load(f)["step_minutes"])
+            except (OSError, ValueError, KeyError):
+                _step = 15
+            sync_leads(int(label_shape[0]), _step)
     else:
         label_type = "lightning" if "lightning" in mode else "radar"
+    print(f"  Leads:         {LEAD_LABELS}")
 
     variant_label = ("finetuned" if finetuned
                      else "KD student" if kd
