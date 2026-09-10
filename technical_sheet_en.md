@@ -354,10 +354,12 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ### A4. Full-domain inference
 ```bash
 python predict_full_domain.py --mode ... --date YYYY-MM-DD
+python predict_full_domain.py --mode ... --pick best worst median --validation_summary validation/<summary>.json
 ```
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
+- **Alone** — `--pick` runs the timesteps a validation run recorded as best, worst and median (mean CSI over leads); no ground truth is needed.
 
 ### A5. Validation and threshold tuning
 ```bash
@@ -368,16 +370,19 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
 - **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope is in every output name: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
 - **Writes** — `validation/rainfall_<scope>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
-- **Writes** — `…_samples.csv`, with `hit_pct_t+<k>_ge<T>` for every threshold of the sweep (`--hit_threshold_step`, `--hit_threshold_factor`; base … base × 1.5).
+- **Writes** — `…_samples.csv`, with `csi_t+<k>` per lead at the tuned HIGH and `hit_pct_t+<k>_ge<T>` for every threshold of the sweep (`--hit_threshold_step`, `--hit_threshold_factor`; base … base × 1.5).
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
+- **Records** — `representative_timesteps` in the summary: the best, worst and median sample by mean CSI over leads. A4 and A6 take them with `--pick`.
 - **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed, red line at 50 %); per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figures and report
 ```bash
-python visualize_gt_vs_pred.py --mode ...
+python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
+python visualize_gt_vs_pred.py --mode ... --csv ... --pick best worst median --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
 ```
+- **Note** — the visualiser builds its ground truth from the patch files of the `--csv` rows, so a picked timestep must be a row of that CSV (validate on `--split test` and pass the test CSV).
 - **Writes** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 
 ---
