@@ -368,7 +368,7 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 python validate_predictions.py --track rainfall --split test --baseline --period w44
 ```
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
-- **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope is in every output name: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
+- **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope, including the selection threshold, is in every output name: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; runs at different thresholds never overwrite each other.
 - **Writes** — `validation/rainfall_<scope>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
 - **Writes** — `…_samples.csv`, with `csi_t+<k>` and the hits / misses / false-alarm percentages per lead at the tuned HIGH.
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
@@ -519,7 +519,7 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 python build_patch_ensemble.py --mode <mode> --track rainfall --split test --min_samples N
 ```
 - **Does** — chooses the best-scoring member for each of the 18 patches. Selection only — scoring happened in C3.
-- **Scope** — `--split test`, or `--year --month`, names the members' validation runs the same way validate_predictions did.
+- **Scope** — `--split test`, or `--year --month`, plus `--rainfall_threshold_mmh` (default 10), name the members' validation runs the same way validate_predictions did.
 - **Rule** — `--min_samples N` is required. A patch validated on at least N samples takes its own best member; below N it takes the overall best member (highest CSI pooled over every patch). If no patch reaches N, patches with samples keep their own best member and only patches with zero samples take the overall best. The manifest records the rule per patch.
 - **Writes** — `our_data/ensemble_manifest_<mode>_<source>.json` **CRITICAL** — the routing table, with season and global fallbacks behind each assignment.
 - **Read by** — `ensemble_inference`
