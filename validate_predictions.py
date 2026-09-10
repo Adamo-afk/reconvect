@@ -889,13 +889,22 @@ def _plot_hmf_figure(track: str, year: int, month: int,
             col = f"{name}_pct_t+{offset}"
             xs = [x for x, r in zip(x_all, rows) if r.get(col) is not None]
             ys = [r[col] for r in rows if r.get(col) is not None]
-            ax.scatter(xs, ys, marker=markers[i], color=colors[i],
-                       alpha=0.55, s=25, edgecolor="none",
-                       label=lead_titles[i])
             v = pooled.get(i, {}).get(name)
+            # The legend carries both rates: pooled (summed pixel counts
+            # over all samples) and the plain mean of the per-sample
+            # percentages; the dashed line is the pooled one.
+            label = lead_titles[i]
+            if v is not None:
+                label += f"  pooled {v:.1f} %"
+            if ys:
+                label += f"  mean {sum(ys) / len(ys):.1f} %"
+            ax.scatter(xs, ys, marker=markers[i], color=colors[i],
+                       alpha=0.55, s=25, edgecolor="none", label=label)
             if v is not None:
                 ax.axhline(v, color=colors[i], linestyle="--",
                            alpha=0.7, linewidth=1)
+                ax.text(len(rows) - 0.5, v, f"{v:.1f} %", color=colors[i],
+                        fontsize=8, ha="right", va="bottom")
         if name == "hits":
             ax.axhline(high_coverage_pct, color="gray", linestyle=":",
                        alpha=0.6, linewidth=1)
