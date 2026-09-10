@@ -84,7 +84,7 @@ from pathlib import Path
 
 import numpy as np
 
-from compress_datasets import list_arrays, load_array
+from compress_datasets import array_exists, list_arrays, load_array
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Rectangle
@@ -140,6 +140,33 @@ RAINFALL_THRESHOLD_MMH = 10.0
 # --max_samples: cap on the selected references per run, for trial runs
 # on a small subset. None = every sample the month holds.
 MAX_SAMPLES = None
+
+# Scope of a run: a dataset split (train / validation / test, read from
+# the split CSV), a month scanned from the reprojected archive, or a
+# split restricted to one month. Set once in main(); the output stems
+# and figure titles read it.
+SPLITS = ("train", "validation", "test")
+SPLIT: str | None = None
+
+
+def scope_stem(year: int | None, month: int | None) -> str:
+    """`2026_06`, `test`, or `test_2026_06`: the piece of every output
+    name that says which samples a run scored."""
+    parts = []
+    if SPLIT:
+        parts.append(SPLIT)
+    if year is not None and month is not None:
+        parts.append(f"{year:04d}_{month:02d}")
+    return "_".join(parts)
+
+
+def scope_label(year: int | None, month: int | None) -> str:
+    """Human form of scope_stem for titles and messages."""
+    if SPLIT and year is not None and month is not None:
+        return f"{SPLIT} split, {year:04d}-{month:02d}"
+    if SPLIT:
+        return f"{SPLIT} split"
+    return f"{year:04d}-{month:02d}"
 
 # Class boundaries mirror create_datasets.label_transform_opera_rainfall_multiclass:
 #   class 0: R < 10  (below threshold)
@@ -329,15 +356,71 @@ def _iter_opera_files(data_root: Path, year: int, month: int):
             yield m.group(1), m.group(2), day_folder / name
 
 
-def select_samples(data_root: Path, year: int, month: int,
+def _opera_file_for(data_root: Path, date_str: str, hhmm: str) -> Path:
+    """The reprojected OPERA rain-rate file of one reference timestep."""
+    return (data_root / "reprojected_data" / "opera_data" / "rainfall_rate"
+            / f"nc4_{date_str}-Romania_rainfall_rate"
+            / f"nc4_{date_str}-Romania_{hhmm}_rainfall_rate.npy")
+
+
+def split_references(data_root: Path, source: str, period,
+                     split: str, year: int | None = None,
+                     month: int | None = None) -> list[tuple[str, str]]:
+    """Distinct (date, hhmm) reference timesteps of a dataset split,
+    read from its CSV (<split>_data_<source>[_<period>].csv), optionally
+    restricted to one month. These are the timesteps the split's
+    samples were cut from, so scoring them is scoring the split."""
+    from periods import split_csv_name
+    path = data_root / split_csv_name(split, source, period)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"split CSV not found: {path}. Build the datasets for this "
+            f"source/period first (create_datasets.py).")
+    refs: set[tuple[str, str]] = set()
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            date_str = row["date"].strip()
+            if year is not None and month is not None:
+                if not date_str.startswith(f"{year:04d}-{month:02d}-"):
+                    continue
+            refs.add((date_str, row["reference_utc"].strip().replace(":", "")))
+    print(f"  {split} split: {len(refs)} reference timesteps in {path.name}"
+          + (f" for {year:04d}-{month:02d}" if year is not None and month is not None
+             else ""))
+    return sorted(refs)
+
+
+def select_samples(data_root: Path, year: int | None, month: int | None,
                    threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
+                   *, source: str | None = None, period=None,
                    ) -> list[tuple[str, str]]:
-    """Iterate every OPERA sample in the month, keep those with at
-    least one pixel >= threshold. Returns list of (date_str, hhmm)
-    tuples sorted chronologically."""
+    """The reference timesteps a run scores, with at least one pixel
+    >= threshold: every OPERA sample of the month, or, when SPLIT is
+    set, the split's own timesteps (within the month if one is given).
+    Returns (date_str, hhmm) tuples sorted chronologically."""
+    if SPLIT:
+        if source is None:
+            raise ValueError("select_samples needs `source` on a split run")
+        candidates = []
+        missing = 0
+        for date_str, hhmm in split_references(data_root, source, period,
+                                               SPLIT, year, month):
+            path = _opera_file_for(data_root, date_str, hhmm)
+            if array_exists(path):
+                candidates.append((date_str, hhmm, path))
+            else:
+                missing += 1
+        if missing:
+            print(f"  NOTE: {missing} split timestep(s) have no reprojected "
+                  f"OPERA file and are skipped.")
+    else:
+        if year is None or month is None:
+            raise ValueError("select_samples needs a year and month "
+                             "without a split")
+        candidates = _iter_opera_files(data_root, year, month)
     kept: list[tuple[str, str]] = []
     scanned = 0
-    for date_str, hhmm, path in _iter_opera_files(data_root, year, month):
+    for date_str, hhmm, path in candidates:
         scanned += 1
         data = load_array(path)
         if data.ndim == 3:
@@ -541,6 +624,7 @@ def _write_json(track: str, year: int, month: int,
         "track": track,
         "year": year,
         "month": month,
+        "split": SPLIT,
         "model": model_tag,
         "threshold_mmh": rainfall_threshold_mmh,
         "hit_thresholds_mmh": hit_thresholds or [],
@@ -622,7 +706,7 @@ def _plot_metrics_figure(track: str, year: int, month: int,
     axes[1].legend()
 
     fig.suptitle(
-        f"Validation — {track} — {year:04d}-{month:02d}  |  "
+        f"Validation — {track} — {scope_label(year, month)}  |  "
         f"{len(rows)} selected samples",
         fontsize=13, fontweight="bold",
     )
@@ -658,7 +742,7 @@ def run_extraction(track: str, year: int, month: int,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"Validation extraction - track={track}  {year:04d}-{month:02d}")
+    print(f"Validation extraction - track={track}  {scope_label(year, month)}")
     print("=" * 70)
     if baseline:
         # The SepConv-ens baseline reads its own mode and window; the
@@ -690,7 +774,8 @@ def run_extraction(track: str, year: int, month: int,
     print(f"\nSelecting OPERA samples with >= "
           f"{rainfall_threshold_mmh:g} mm/h ...")
     selected = select_samples(data_root, year, month,
-                              threshold_mmh=rainfall_threshold_mmh)
+                              threshold_mmh=rainfall_threshold_mmh,
+                              source=source, period=period)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -907,7 +992,7 @@ def run_extraction(track: str, year: int, month: int,
             },
         }
 
-    stem = f"{track}_{year:04d}_{month:02d}_{tag}"
+    stem = f"{track}_{scope_stem(year, month)}_{tag}"
     _write_csv(rows, output_dir / f"{stem}_samples.csv",
                hit_thresholds=hit_thresholds)
     _write_json(track, year, month, selected, rows, confusion_per_lead,
@@ -1487,7 +1572,7 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
                       mode: str, source: str, finetuned: bool,
                       data_root: Path, model_dir: Path, output_dir: Path, period=None):
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = (f"{track}_{year:04d}_{month:02d}_"
+    stem = (f"{track}_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned)}")
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
 
@@ -1495,7 +1580,7 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
     if not date_in_selection:
         raise SystemExit(
             f"Date {date_str} not present in the initial selection for "
-            f"{year:04d}-{month:02d}. Nothing to visualise. "
+            f"{scope_label(year, month)}. Nothing to visualise. "
             f"Check {output_dir / (stem + '_summary.json')} for the "
             f"list of selected dates."
         )
@@ -1837,6 +1922,7 @@ def _write_json_lightning(
         "track": "lightning",
         "year": year,
         "month": month,
+        "split": SPLIT,
         "selection_criterion": (
             f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
             f"768x1536 canvas at the reference timestep (shared with the "
@@ -1925,7 +2011,7 @@ def _plot_metrics_figure_lightning(
     axes[1].legend()
 
     fig.suptitle(
-        f"Validation - lightning - {year:04d}-{month:02d}  |  "
+        f"Validation - lightning - {scope_label(year, month)}  |  "
         f"{len(rows)} selected samples",
         fontsize=13, fontweight="bold",
     )
@@ -1965,7 +2051,7 @@ def run_extraction_lightning(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"Validation extraction - track=lightning  {year:04d}-{month:02d}")
+    print(f"Validation extraction - track=lightning  {scope_label(year, month)}")
     print("=" * 70)
     print(f"  Data root: {data_root}")
     print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
@@ -1992,7 +2078,8 @@ def run_extraction_lightning(
 
     print(f"\nSelecting samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
     selected = select_samples(data_root, year, month,
-                              threshold_mmh=rainfall_threshold_mmh)
+                              threshold_mmh=rainfall_threshold_mmh,
+                              source=source, period=period)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -2120,7 +2207,7 @@ def run_extraction_lightning(
 
     # Variant suffix so base / finetuned / kd runs don't overwrite each
     # other's outputs. Matches predict_full_domain's output_dir naming.
-    stem = (f"lightning_{year:04d}_{month:02d}_"
+    stem = (f"lightning_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned, kd)}")
     _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
                           step_minutes)
@@ -2163,7 +2250,7 @@ def run_visualization_lightning(
     (base / _finetuned / _kd suffix chosen by the corresponding flag) so
     visualisation reads the same JSON its own extraction produced."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = (f"lightning_{year:04d}_{month:02d}_"
+    stem = (f"lightning_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned, kd)}")
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "post_processing" not in summary:
@@ -2186,7 +2273,7 @@ def run_visualization_lightning(
     if not date_in_selection:
         raise SystemExit(
             f"Date {date_str} is not in the initial selection for "
-            f"{year:04d}-{month:02d}. Nothing to visualise."
+            f"{scope_label(year, month)}. Nothing to visualise."
         )
 
     init_sequence_config(str(data_root), source, period=period)
@@ -2404,7 +2491,7 @@ def _write_json_kd(
 
     doc = {
         "track": "kd",
-        "year": year, "month": month,
+        "year": year, "month": month, "split": SPLIT,
         "selection_criterion": (
             f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
             f"768x1536 canvas at the reference timestep (shared with rainfall + "
@@ -2449,7 +2536,7 @@ def _plot_metrics_figure_kd_per_metric(
        kd_{yyyy}_{mm}_{FAR,POD,CSI,IoU}.png
     """
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
-    stem = f"kd_{year:04d}_{month:02d}"
+    stem = f"kd_{scope_stem(year, month)}"
 
     # Bar values per (metric, model, lead).
     t_agg = [_summarise_confusion(teacher_conf_per_lead[i])
@@ -2500,7 +2587,7 @@ def _plot_metrics_figure_kd_per_metric(
         ax.legend(loc="best", fontsize=10)
         ax.set_title(
             f"{metric} - teacher vs student (KD) - "
-            f"{year:04d}-{month:02d}  |  {len(rows)} selected samples",
+            f"{scope_label(year, month)}  |  {len(rows)} selected samples",
             fontsize=12, fontweight="bold",
         )
         out = output_dir / f"{stem}_metrics_{metric}.png"
@@ -2622,7 +2709,7 @@ def run_extraction_kd(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"Validation extraction - track=kd  {year:04d}-{month:02d}")
+    print(f"Validation extraction - track=kd  {scope_label(year, month)}")
     print("=" * 70)
     print(f"  Teacher: {teacher_mode} ({source}"
           f"{' finetuned' if teacher_finetuned else ''})")
@@ -2648,7 +2735,8 @@ def run_extraction_kd(
 
     print(f"\nSelecting samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
     selected = select_samples(data_root, year, month,
-                              threshold_mmh=rainfall_threshold_mmh)
+                              threshold_mmh=rainfall_threshold_mmh,
+                              source=source, period=period)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
@@ -2773,7 +2861,7 @@ def run_extraction_kd(
                 row[f"csi_{out_key}_t+{m}"] = per["CSI"]
         rows.append(row)
 
-    stem = f"kd_{year:04d}_{month:02d}"
+    stem = f"kd_{scope_stem(year, month)}"
     _write_csv_kd(rows, output_dir / f"{stem}_samples.csv", step_minutes)
     _write_json_kd(
         year, month, selected, rows,
@@ -2805,7 +2893,7 @@ def run_visualization_kd(
     Per-lead high thresholds come from the KD summary JSON (tuned during
     the extraction run)."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"kd_{year:04d}_{month:02d}"
+    stem = f"kd_{scope_stem(year, month)}"
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "teacher" not in summary or "student" not in summary:
         raise SystemExit(
@@ -2832,7 +2920,7 @@ def run_visualization_kd(
     if not _date_is_in(date_str, summary["initial_selection"]):
         raise SystemExit(
             f"Date {date_str} not in the initial selection for "
-            f"{year:04d}-{month:02d}. Nothing to visualise."
+            f"{scope_label(year, month)}. Nothing to visualise."
         )
 
     init_sequence_config(str(data_root), source, period=period)
@@ -2914,8 +3002,10 @@ def run_visualization_kd(
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="COALITION-4 validation branch. Extraction mode "
-                    "scans a (year, month) for OPERA samples with any "
-                    "pixel >= 10 mm/h, runs inference, computes per-"
+                    "takes the reference timesteps of a dataset split "
+                    "(--split) or of a calendar month (--year --month), "
+                    "keeps those with any OPERA pixel at or above the "
+                    "selected threshold, runs inference, computes per-"
                     "sample coverage, and emits CSV + JSON + metrics "
                     "figure. Visualization mode reads the JSON and "
                     "plots structure-overlay + zoom for a given date.",
@@ -2931,9 +3021,18 @@ def main() -> int:
                              "loaded from the _kd checkpoint) on the same "
                              "OPERA-selected samples and tunes each model's "
                              "per-lead high threshold independently.")
-    parser.add_argument("--year", type=int, required=True)
-    parser.add_argument("--month", type=int, required=True,
-                        help="Month as an integer 1..12.")
+    parser.add_argument("--split", type=str, default=None, choices=SPLITS,
+                        help="Score the reference timesteps of this dataset "
+                             "split (read from <split>_data_<source>"
+                             "[_<period>].csv) instead of scanning a month. "
+                             "With --year/--month, only the split's "
+                             "timesteps of that month. Outputs are named "
+                             "<track>_<split>[_<yyyy>_<mm>]_<tag>_*.")
+    parser.add_argument("--year", type=int, default=None)
+    parser.add_argument("--month", type=int, default=None,
+                        help="Month as an integer 1..12. Required without "
+                             "--split; with --split it restricts the split "
+                             "to that month.")
     parser.add_argument("--date", type=str, default=None,
                         help="If given (YYYY-MM-DD), switches to "
                              "visualization mode against the JSON "
@@ -3049,8 +3148,14 @@ def main() -> int:
     global MAX_SAMPLES
     MAX_SAMPLES = args.max_samples
 
-    if not (1 <= args.month <= 12):
+    if (args.year is None) != (args.month is None):
+        parser.error("--year and --month go together")
+    if args.split is None and args.year is None:
+        parser.error("give --split, or --year and --month, or both")
+    if args.month is not None and not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
+    global SPLIT
+    SPLIT = args.split
 
     # Prime the border cache once at process start (visualization uses it,
     # extraction ignores it but the cost is a few ms).

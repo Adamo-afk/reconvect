@@ -238,10 +238,17 @@ def main():
     parser.add_argument("--track", default="rainfall",
                         choices=["rainfall", "lightning"],
                         help="Which validation summaries to read.")
-    parser.add_argument("--year", type=int, required=True,
+    parser.add_argument("--split", default=None,
+                        choices=["train", "validation", "test"],
+                        help="Read the summaries of the members' validation "
+                             "on this dataset split (validate_predictions "
+                             "--split). With --year/--month, the split "
+                             "restricted to that month.")
+    parser.add_argument("--year", type=int, default=None,
                         help="Validation year the summaries cover.")
-    parser.add_argument("--month", type=int, required=True,
-                        help="Validation month the summaries cover.")
+    parser.add_argument("--month", type=int, default=None,
+                        help="Validation month the summaries cover. "
+                             "Required without --split.")
     parser.add_argument("--data_root", default=str(resolve_data_root()))
     parser.add_argument("--model_dir", default=str(resolve_model_dir()))
     parser.add_argument("--validation_dir", default="./validation",
@@ -266,6 +273,16 @@ def main():
     args = parser.parse_args()
     if args.min_samples < 1:
         parser.error("--min_samples must be at least 1")
+    if (args.year is None) != (args.month is None):
+        parser.error("--year and --month go together")
+    if args.split is None and args.year is None:
+        parser.error("give --split, or --year and --month, or both")
+    # The scope piece of the validation stems, as validate_predictions
+    # names them: 2026_06, test, test_2026_06.
+    scope = "_".join(
+        ([args.split] if args.split else [])
+        + ([f"{args.year:04d}_{args.month:02d}"] if args.year is not None else []))
+    scope_label = scope.replace("_", "-") if not args.split else scope
 
     from train_models import build_run_tag, load_model_period
 
@@ -294,14 +311,16 @@ def main():
         run_tag = build_run_tag(args.mode, SOURCE, label)
         model_path = model_dir / f"coalition_{run_tag}{suffix}.keras"
         summary = (validation_dir
-                   / f"{args.track}_{args.year:04d}_{args.month:02d}"
-                     f"_{run_tag}{suffix}_summary.json")
+                   / f"{args.track}_{scope}_{run_tag}{suffix}_summary.json")
         if not summary.is_file():
             problems.append(
                 f"  {label}: no summary at {summary}\n"
                 f"           run: python validate_predictions.py --track "
-                f"{args.track} --year {args.year} --month {args.month} "
-                f"--mode {args.mode} --period {label}"
+                f"{args.track}"
+                + (f" --split {args.split}" if args.split else "")
+                + (f" --year {args.year} --month {args.month}"
+                   if args.year is not None else "")
+                + f" --mode {args.mode} --period {label}"
             )
             continue
         resolved[label] = {
@@ -314,7 +333,7 @@ def main():
 
     print("=" * 70)
     print(f"Patch ensemble - mode {args.mode}, track {args.track}, "
-          f"{args.year:04d}-{args.month:02d}")
+          f"{scope_label}")
     print("=" * 70)
     print(f"Registered members : {registered}")
     print(f"Summaries found    : {sorted(resolved) or 'none'}")
@@ -368,7 +387,10 @@ def main():
         "mode": args.mode,
         "source": SOURCE,
         "track": args.track,
-        "validation_period": f"{args.year:04d}-{args.month:02d}",
+        "validation_period": (
+            f"{args.year:04d}-{args.month:02d}" if args.year is not None else None),
+        "validation_split": args.split,
+        "validation_scope": scope,
         "stage": "finetuned" if args.finetuned else "base",
         "built_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "knowledge_cutoff": cutoff,
