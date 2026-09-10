@@ -1006,9 +1006,10 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
         scope.append(f"{summary['year']:04d}-{summary['month']:02d}")
     if summary.get("threshold_mmh") is not None:
         scope.append(f">= {summary['threshold_mmh']:g} mm/h")
-    fig.suptitle(f"Hysteresis tuning - {track} - {', '.join(scope)}  |  "
-                 f"{summary.get('model', '')}  |  "
-                 f"{summary.get('total_selected_samples', '?')} samples",
+    parts = [f"Hysteresis tuning - {track}" + (f" - {', '.join(scope)}" if scope else ""),
+             summary.get("model") or "",
+             f"{summary.get('total_selected_samples', '?')} samples"]
+    fig.suptitle("  |  ".join(p for p in parts if p),
                  fontsize=12, fontweight="bold")
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
