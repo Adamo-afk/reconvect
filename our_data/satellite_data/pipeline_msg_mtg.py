@@ -1726,7 +1726,8 @@ if __name__ == "__main__":
             f"given.{chr(10)}"
             f"Pass --output_dir explicitly to say which disk the store "
             f"should live on, e.g.{chr(10)}"
-            f"    --output_dir G:{os.sep}nowcasting{os.sep}mtg_store"
+            f"    --output_dir G:{os.sep}nowcasting{os.sep}coalition4-rcnn"
+            f"{os.sep}our_data{os.sep}satellite_data{os.sep}MTG"
             f"{chr(10)}"
             f"If the default path is a junction, check that its target "
             f"drive is mounted rather than creating a second store.")

@@ -335,6 +335,99 @@ def scan(root_list, index_path=None) -> dict:
     return blob
 
 
+STORE_LAYOUT = Path("nowcasting") / "coalition4-rcnn" / "our_data" / "satellite_data" / "MTG"
+
+
+def canonical_store_root(drive: str) -> Path:
+    """The layout every MTG store follows: <drive>/nowcasting/coalition4-rcnn/our_data/satellite_data/MTG."""
+    d = drive.rstrip(":\\/")
+    return Path(f"{d}:/") / STORE_LAYOUT
+
+
+def relocate(src, dst, index_path=None, dry_run=False) -> bool:
+    """Move a store from `src` to `dst` and re-point the index.
+
+    Everything a store holds travels: `_raw_chunks`, each channel's date
+    folders, `mtg_constants.json`, `provenance.json`. On one volume this
+    is a rename per entry, so a terabyte moves in seconds; across
+    volumes it is a copy. The destination tree is created; a destination
+    that already holds dates is refused rather than merged, so two
+    stores are never silently folded into one. Afterwards every date the
+    index had at `src` points at `dst`, and `verify` is run.
+    """
+    import shutil
+    src = Path(src).resolve()
+    dst = Path(dst).resolve()
+    if not src.is_dir():
+        print(f"ERROR: source store not found: {src}", file=sys.stderr)
+        return False
+    if src == dst:
+        print("ERROR: source and destination are the same path.",
+              file=sys.stderr)
+        return False
+    if dst.is_dir() and dates_in(dst):
+        print(f"ERROR: {dst} already holds {len(dates_in(dst))} date(s); "
+              f"refusing to merge two stores.", file=sys.stderr)
+        return False
+
+    entries = []
+    for name in ["_raw_chunks", "mtg_constants.json", "provenance.json"]:
+        if (src / name).exists():
+            entries.append(name)
+    for ch in CHANNELS:
+        if (src / ch).is_dir():
+            entries.append(ch)
+    n_dates = len(dates_in(src))
+    print(f"Relocating store")
+    print(f"  from : {src}")
+    print(f"  to   : {dst}")
+    print(f"  {n_dates} date(s), entries: {', '.join(entries)}")
+    same_volume = (src.drive.upper() == dst.drive.upper())
+    print(f"  {'same volume: renames' if same_volume else 'across volumes: copies'}")
+    if dry_run:
+        print("  --dry-run: nothing moved.")
+        return True
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in entries:
+        s_path, d_path = src / name, dst / name
+        if d_path.exists() and s_path.is_dir():
+            # channel dir present but empty at dst: move its children
+            for child in os.scandir(s_path):
+                shutil.move(child.path, str(d_path / child.name))
+            try:
+                s_path.rmdir()
+            except OSError:
+                pass
+        else:
+            shutil.move(str(s_path), str(d_path))
+        print(f"    moved {name}")
+    try:
+        src.rmdir()
+        print(f"  removed empty {src}")
+    except OSError:
+        print(f"  NOTE: {src} not empty, left in place")
+
+    blob = load(index_path)
+    moved = [d for d, r in blob["dates"].items() if r == str(src)]
+    for d in moved:
+        blob["dates"][d] = str(dst)
+    blob["roots"] = [str(dst) if r == str(src) else r for r in blob["roots"]]
+    if str(dst) not in blob["roots"]:
+        blob["roots"].append(str(dst))
+    # Dates the index did not know about at src are registered from disk.
+    for d in dates_in(dst):
+        blob["dates"].setdefault(d, str(dst))
+    save(blob, index_path)
+    print(f"  index: {len(moved)} date(s) re-pointed, roots = {blob['roots']}")
+
+    ok, bad = verify(index_path)
+    print(f"  verified {ok} date(s)" + (f", {len(bad)} problem(s)" if bad else ""))
+    for line in bad[:10]:
+        print(f"    MISSING: {line}")
+    return not bad
+
+
 def verify(index_path=None) -> tuple[int, list[str]]:
     """Check every registered date is where the index says. Returns
     (n_ok, list_of_problems)."""
@@ -393,7 +486,20 @@ def main() -> int:
                         default=None, metavar="PATH",
                         help=f"Render monthly stored volume, one colour per "
                              f"disk (default: {DEFAULT_CHART}).")
+    parser.add_argument("--relocate", nargs=2, metavar=("SRC", "DST"),
+                        default=None,
+                        help="Move the store at SRC to DST (the tree is "
+                             "created; a rename when both sit on one "
+                             "volume) and re-point the index. The canonical "
+                             "layout is <drive>:/nowcasting/coalition4-rcnn/"
+                             "our_data/satellite_data/MTG.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --relocate: show the plan, move nothing.")
     args = parser.parse_args()
+
+    if args.relocate:
+        src, dst = args.relocate
+        return 0 if relocate(src, dst, args.index, dry_run=args.dry_run) else 1
 
     if args.scan:
         print("Scanning stores:")
