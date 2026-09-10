@@ -18,9 +18,9 @@ Usage:
         --source lightning
 
 Outputs (saved to output_dir/eval_{mode}_{source}[_finetuned]/):
-    - training_curves_{mode}.png       — loss and metrics vs epoch
+    - training_loss.png, training_<metric>.png — one figure per curve, with
+      the restored (best) epoch and the last epoch run marked
     - metrics_per_leadtime_{mode}.png  — CSI, POD, FAR etc. vs lead time
-    - calibration_{mode}.png           — reliability diagram
     - pr_curve_{mode}.png              — precision-recall curve
     - roc_curve_{mode}.png             — ROC curve
     - confusion_matrix_{mode}.png      — for radar multi-class
@@ -737,28 +737,6 @@ def compute_auc(x, y):
     return trapz_fn(y[sorted_idx], x[sorted_idx])
 
 
-def compute_calibration_gpu(y_true_flat, y_pred_flat, n_bins=100):
-    """Calibration on GPU."""
-    y_true = tf.constant(y_true_flat, dtype=tf.float64)
-    y_pred = tf.constant(y_pred_flat, dtype=tf.float64)
-    bin_edges = tf.linspace(0.0, 1.0, n_bins + 1)
-    bin_edges = tf.cast(bin_edges, tf.float64)
-
-    observed = np.zeros(n_bins)
-    counts = np.zeros(n_bins)
-
-    for i in range(n_bins):
-        mask = (y_pred >= bin_edges[i]) & (y_pred < bin_edges[i + 1])
-        c = tf.reduce_sum(tf.cast(mask, tf.float64))
-        counts[i] = c.numpy()
-        if counts[i] > 0:
-            observed[i] = tf.reduce_mean(
-                tf.boolean_mask(y_true, mask)).numpy()
-
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    return bin_centers.numpy(), observed, counts
-
-
 # ============================================================================
 # Evaluation runners
 # ============================================================================
@@ -881,11 +859,6 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
         results["per_leadtime"][LEAD_LABELS[t]]["PR_AUC"] = float(
             compute_auc(r.numpy(), p.numpy()))
 
-    # --- Calibration (GPU) ---
-    print("  Computing calibration (GPU)...")
-    cal_centers, cal_observed, cal_counts = compute_calibration_gpu(
-        all_true_agg.numpy(), all_pred_agg.numpy())
-
     print(f"    Aggregate: CSI={results['aggregate']['CSI']:.4f}, "
           f"PR_AUC={pr_auc:.4f}, ROC_AUC={roc_auc:.4f}")
 
@@ -945,32 +918,10 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     plt.savefig(output_dir / "roc_curve.png", dpi=150, bbox_inches='tight')
     plt.close()
 
-    # 4. Calibration
-    fig, ax = plt.subplots(figsize=(7, 6))
-    valid_mask = cal_counts > 10  # only plot bins with enough samples
-    ax.plot(cal_centers[valid_mask], cal_observed[valid_mask], 'o-',
-            linewidth=2, markersize=4, color='#2ca02c', label="Model")
-    ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label="Perfect calibration")
-    ax.set_xlabel("Predicted probability")
-    ax.set_ylabel("Observed occurrence rate")
-    ax.set_title("Calibration (Reliability Diagram)")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim([0, 1])
-    ax.set_ylim([0, 1])
-    plt.tight_layout()
-    plt.savefig(output_dir / "calibration.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
     # Store curves for JSON
     results["curves"] = {
         "pr": {"recalls": recalls_np.tolist(), "precisions": precisions_np.tolist()},
         "roc": {"fprs": fprs_np.tolist(), "tprs": tprs_np.tolist()},
-        "calibration": {
-            "bin_centers": cal_centers.tolist(),
-            "observed": cal_observed.tolist(),
-            "counts": cal_counts.tolist(),
-        },
     }
 
     return results
@@ -1503,99 +1454,92 @@ def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
 # Training history plotting
 # ============================================================================
 
-def plot_training_history(history_path, output_dir):
-    """Load and plot training history from JSON.
+def training_cutoffs(history, sidecar_path=None):
+    """(best_epoch, last_epoch, n_logged) for one training history.
 
-    Supports both the base/finetuned schema (mode/wall_times/total_wall_time)
-    and the KD-student schema written by train_lightning_kd.py
-    (student_mode/epoch_wall_times/wall_time_sec) — the plotter itself
-    doesn't need to know which one; it just picks up whatever keys are
-    present so both curve families come out looking the same.
+    The final save holds the weights of the epoch with the lowest
+    val_loss - what early stopping restored - so that is the `best`
+    epoch. The last epoch that actually ran outlives the restore only in
+    the per-epoch checkpoint sidecar (`completed_epoch`, 0-based), so it
+    is read from there; without a sidecar it is the length of the
+    history. Both are 1-based.
+    """
+    n = len(history.get("loss", []))
+    best = None
+    if history.get("val_loss"):
+        best = int(np.argmin(history["val_loss"])) + 1
+    last = None
+    if sidecar_path is not None and Path(sidecar_path).is_file():
+        try:
+            with open(sidecar_path) as f:
+                last = int(json.load(f).get("completed_epoch", -1)) + 1
+        except (OSError, ValueError, TypeError):
+            last = None
+    if not last or last <= 0:
+        last = n
+    return best, last, n
+
+
+def draw_cutoffs(ax, best, last):
+    """The two vertical lines every training curve carries."""
+    if best is not None and best == last:
+        ax.axvline(best, color='#444', linestyle=':', linewidth=1.6,
+                   label=f"best = last epoch {best}")
+        return
+    if best is not None:
+        ax.axvline(best, color='#444', linestyle=':', linewidth=1.6,
+                   label=f"best epoch {best} (weights restored)")
+    if last:
+        ax.axvline(last, color='#999', linestyle='--', linewidth=1.2,
+                   label=f"stopped after epoch {last}")
+
+
+def plot_training_history(history_path, output_dir, sidecar_path=None):
+    """One figure per training curve, each with the cut-off lines.
+
+    Supports both the base/finetuned schema (mode/wall_times/...) and
+    the KD-student schema (student_mode/epoch_wall_times/...): whatever
+    keys the history holds are plotted, train and val paired. Writes
+    training_loss.png and training_<metric>.png; no wall-time figure.
+    `sidecar_path` is the per-epoch checkpoint's `_latest.json`, which
+    records the last epoch that ran.
     """
     with open(history_path) as f:
         data = json.load(f)
 
     history = data["history"]
-    mode = data.get("mode") or data.get("student_mode", "?")
-    wall_times = data.get("wall_times") or data.get("epoch_wall_times", [])
-    total_wall = data.get("total_wall_time") or data.get("wall_time_sec", 0)
+    best, last, n = training_cutoffs(history, sidecar_path)
+    epochs = range(1, n + 1)
 
-    # Determine which metrics to plot
-    loss_keys = [k for k in history if "loss" in k]
-    metric_keys = [k for k in history if "loss" not in k and not k.startswith("val_")]
-    # Pair train/val metrics
-    metric_pairs = []
-    for k in metric_keys:
-        val_k = f"val_{k}"
-        if val_k in history:
-            metric_pairs.append((k, val_k))
-        else:
-            metric_pairs.append((k, None))
+    metric_keys = [k for k in history
+                   if "loss" not in k and not k.startswith("val_")]
+    curves = [("loss", "val_loss", "Loss")] + [
+        (k, f"val_{k}" if f"val_{k}" in history else None, k)
+        for k in metric_keys]
 
-    n_plots = 1 + len(metric_pairs) + (1 if wall_times else 0)
-    n_cols = min(3, n_plots)
-    n_rows = (n_plots + n_cols - 1) // n_cols
-
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 4.5 * n_rows))
-    if n_plots == 1:
-        axes = [axes]
-    else:
-        axes = axes.ravel()
-
-    epochs = range(1, len(history.get("loss", [])) + 1)
-    plot_idx = 0
-
-    # Plot 1: Loss
-    ax = axes[plot_idx]
-    if "loss" in history:
-        ax.plot(epochs, history["loss"], 'b-', linewidth=2, label="Train loss")
-    if "val_loss" in history:
-        ax.plot(epochs, history["val_loss"], 'r-', linewidth=2, label="Val loss")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.set_title("Training & Validation Loss")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plot_idx += 1
-
-    # Plot metrics
-    for train_k, val_k in metric_pairs:
-        if plot_idx >= len(axes):
-            break
-        ax = axes[plot_idx]
-        ax.plot(epochs, history[train_k], 'b-', linewidth=2,
-                label=f"Train {train_k}")
+    written = []
+    for train_k, val_k, ylabel in curves:
+        if train_k not in history:
+            continue
+        fig, ax = plt.subplots(figsize=(7, 4.6))
+        ax.plot(epochs, history[train_k][:n], 'b-', linewidth=2,
+                label=f"train {train_k}")
         if val_k and val_k in history:
-            ax.plot(epochs, history[val_k], 'r-', linewidth=2,
-                    label=f"Val {train_k}")
+            ax.plot(epochs, history[val_k][:n], 'r-', linewidth=2,
+                    label=f"val {train_k}")
+        draw_cutoffs(ax, best, last)
         ax.set_xlabel("Epoch")
-        ax.set_ylabel(train_k)
-        ax.set_title(train_k)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"Training {train_k}")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
-        plot_idx += 1
-
-    # Plot wall time per epoch
-    if wall_times and plot_idx < len(axes):
-        ax = axes[plot_idx]
-        ax.bar(range(1, len(wall_times) + 1), wall_times, color='#2ca02c',
-               alpha=0.7)
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel("Wall time (s)")
-        ax.set_title(f"Wall Time per Epoch (total: {total_wall:.0f}s)")
-        ax.grid(True, alpha=0.3, axis='y')
-        plot_idx += 1
-
-    # Hide unused axes
-    for i in range(plot_idx, len(axes)):
-        axes[i].set_visible(False)
-
-    plt.suptitle("Training history", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_dir / f"training_curves.png", dpi=150,
-                bbox_inches='tight')
-    plt.close()
-    print(f"  Saved training curves plot")
+        plt.tight_layout()
+        path = output_dir / f"training_{train_k}.png"
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        written.append(path.name)
+    print(f"  Saved {len(written)} training figure(s): {', '.join(written)}"
+          + (f"  [best epoch {best}, stopped after {last}]" if best else ""))
 
 
 # ============================================================================
@@ -1731,7 +1675,12 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     history_path = model_dir / f"history_{artifact_tag}.json"
     if history_path.is_file():
         print(f"\n1. Plotting training history from {history_path}")
-        plot_training_history(history_path, output_dir)
+        # The per-epoch checkpoint sidecar records the last epoch that
+        # ran; the history alone cannot tell that from the restored one.
+        sidecar = (model_dir / "checkpoints"
+                   / (f"{run_tag}_finetune_latest.json" if finetuned
+                      else f"{run_tag}_latest.json"))
+        plot_training_history(history_path, output_dir, sidecar_path=sidecar)
     else:
         print(f"\n1. WARNING: History file not found: {history_path}")
 

@@ -36,7 +36,9 @@ from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, Callbac
 
 from sepconv_compose import (BASE_LEADS, COMPOSITION, LEAD_MINUTES, MAX_STEP,
                              OBSERVED_ONLY_STEPS, REAL_FRAME_OFFSETS)
+from periods import data_tag
 from create_datasets import (
+    RAINFALL_CLASS_EDGES,
     dataset_n_samples,
     get_mode_config,
     load_tfrecord_dataset,
@@ -91,7 +93,6 @@ LEAD_NAMES = {k: f"t+{v}" for k, v in LEAD_MINUTES.items()}
 
 # Post-processing thresholds to recover 5 classes (used in evaluation)
 # Raw rain rate normalized by /70: thresholds at 10, 20, 30, 40 mm/h
-THRESHOLDS_NORM = [10.0 / 70.0, 20.0 / 70.0, 30.0 / 70.0, 40.0 / 70.0]
 
 
 # ============================================================================
@@ -393,7 +394,10 @@ def train_base_model(lead_steps, data_root, model_dir, epochs, batch_size,
     JSON alongside the sweep that chose them.
     """
     data_root = Path(data_root)
-    lead_name = LEAD_NAMES[lead_steps]
+    # Named by the lead in steps and the target step it supplies; a base
+    # lead is never quoted in minutes (see training_pair).
+    _target = training_pair(lead_steps)[1] + 1
+    lead_name = f"Bm{lead_steps} -> t+{_target} ({LEAD_MINUTES[_target]} min)"
 
     print(f"\n{'-' * 60}")
     _slice, _label_idx = training_pair(lead_steps)
@@ -622,22 +626,40 @@ def train(data_root, model_dir, epochs=50, batch_size=32, lead=None,
         "batch_size": batch_size, "n_train": n_train, "n_val": n_val,
         "total_params": sum(r["model_params"] for r in all_results.values()),
         "label_info": {
-            "type": "continuous",
-            "normalization": "opera_rainfall_rate / 70 → [0, 1]",
-            "thresholds_for_classification": THRESHOLDS_NORM,
+            "type": "log_zscore",
+            "normalization": f"log_zscore, statistics of {data_tag(SOURCE, period)}",
+            "class_edges_mmh": list(RAINFALL_CLASS_EDGES),
         },
         "config": {
             "kernel": list(KERNEL), "activation": ACTIVATION,
-            "loss": "weighted_MSE [15,1,2,7,15,30,1000]",
-            "optimizer": "Adam(AMSGrad)",
+            "loss": "weighted MSE in log_zscore space, weights from the "
+                    "measured class frequencies",
+            "optimizer": "Adam(AMSGrad), ReduceLROnPlateau",
         },
     }
 
     # Tagged like the weights beside it: several windows are trained
     # from the same mode, and one filename for all of them would keep
-    # only the last run's history.
+    # only the last run's history. Merged, not replaced: a --lead run
+    # trains one base model and must not discard the other two's curves.
     history_path = (Path(model_dir)
                     / f"history_sepconv_{build_run_tag(SEPCONV_MODE, SOURCE, period)}.json")
+    if history_path.is_file() and lead is not None:
+        try:
+            with open(history_path) as f:
+                previous = json.load(f)
+            merged = dict(previous.get("base_models", {}))
+            merged.update(all_results)
+            history_data["base_models"] = merged
+            history_data["total_params"] = sum(
+                r["model_params"] for r in merged.values())
+            history_data["total_wall_time"] = (
+                float(previous.get("total_wall_time", 0.0)) + total_time)
+            print(f"  History merged with {history_path.name}: "
+                  f"{sorted(merged)}")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"  NOTE: could not merge {history_path.name} ({exc}); "
+                  f"writing this run alone.")
     with open(history_path, 'w') as f:
         json.dump(history_data, f, indent=2)
 
