@@ -376,7 +376,7 @@ python predict_full_domain.py --mode ... --pick best worst median --validation_s
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
-- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren.
+- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
