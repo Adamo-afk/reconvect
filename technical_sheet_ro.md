@@ -380,7 +380,7 @@ python predict_full_domain.py --mode ... --date YYYY-MM-DD
 ```bash
 python validate_predictions.py --track rainfall --year Y --month M
 ```
-- **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel ≥ 10 mm/h, execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
+- **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
 - **Scrie** — `validation/rainfall_<Y>_<M>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`.
 - **Scrie** — `…_samples.csv`
 - **Grafic** — `…_metrics.png`; suprapuneri pe zile cu `--date`
@@ -391,7 +391,7 @@ python validate_predictions.py --track rainfall --year Y --month M
 python visualize_gt_vs_pred.py --mode ...
 python generate_report.py --year Y --month M
 ```
-- **Scrie** — `full_domain_plots/…`, `validation/report_<Y>_<M>.pdf`
+- **Scrie** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 
 ---
 
@@ -583,7 +583,7 @@ citește; scriptul care le-a generat le regenerează:
 | `intersect_summary.png` | `intersect_product_coverage` |
 | `patch_index/plots/{dbscan_<rule>_patch_selection,patch_highlight}/<date>.gif` și `plots/nc/` | `identify_patches --plot` |
 | `mtg_store_distribution.png` | `store_registry --chart` |
-| figurile din `inference/`, `full_domain_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
+| figurile din `inference/`, `visualize_gt_vs_pred_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | figurile din `evaluation/` | `evaluate_*` |
 | `results/feature_importance/` | `feature_importance_analysis` |
 | `validation/report_<Y>_<M>.pdf` | `generate_report` (livrabil) |
