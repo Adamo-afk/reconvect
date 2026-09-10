@@ -851,6 +851,7 @@ def render_pred_coupling_figure(
     from predict_full_domain import (
         build_inputs_for_reference,
         paste_predictions_to_canvas,
+        sync_window_from_sequence_config,
         LEAD_STEP_OFFSETS,
     )
     from visualize_gt_vs_pred import (
@@ -872,6 +873,7 @@ def render_pred_coupling_figure(
 
     # Init sequence config + normalization stats before any transform runs.
     init_sequence_config(str(data_root), rainfall_source)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / f"normalization_stats_{rainfall_source}.json"
     )

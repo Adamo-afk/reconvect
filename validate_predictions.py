@@ -115,6 +115,7 @@ import visualize_gt_vs_pred as _vf
 from predict_full_domain import (
     build_inputs_for_reference,
     paste_predictions_to_canvas,
+    sync_window_from_sequence_config,
     LEAD_STEP_OFFSETS,
     _load_step_minutes,
     _ref_to_hhmm,
@@ -135,6 +136,10 @@ from pipeline_config import SOURCE, resolve_data_root, resolve_model_dir
 # Threshold above which a rainfall pixel is considered "active" convection.
 # Same value across selection, coverage IoU, and the binary FAR/POD/CSI event.
 RAINFALL_THRESHOLD_MMH = 10.0
+
+# --max_samples: cap on the selected references per run, for trial runs
+# on a small subset. None = every sample the month holds.
+MAX_SAMPLES = None
 
 # Class boundaries mirror create_datasets.label_transform_opera_rainfall_multiclass:
 #   class 0: R < 10  (below threshold)
@@ -166,6 +171,15 @@ RAINFALL_HIGH_MARGIN = 0.30
 
 # The 18-patch grid the ensemble scorer accumulates over.
 N_PATCHES = 18
+
+
+def lead_palette(n: int) -> tuple[list[str], list[str]]:
+    """(colours, markers) for n leads; the window decides n, not a constant."""
+    import matplotlib.cm as _cm
+    cmap = _cm.get_cmap("tab10")
+    colours = [_cm.colors.to_hex(cmap(i % 10)) for i in range(n)]
+    markers = [["o", "s", "^", "D", "v", "P", "X", "*"][i % 8] for i in range(n)]
+    return colours, markers
 
 
 def rainfall_high_grid(low: float,
@@ -280,6 +294,10 @@ def select_samples(data_root: Path, year: int, month: int,
             kept.append((date_str, hhmm))
     print(f"  Scanned {scanned} OPERA files; "
           f"kept {len(kept)} with >= {threshold_mmh:g} mm/h")
+    if MAX_SAMPLES is not None and len(kept) > MAX_SAMPLES:
+        print(f"  --max_samples {MAX_SAMPLES}: keeping the first "
+              f"{MAX_SAMPLES} of {len(kept)}")
+        kept = kept[:MAX_SAMPLES]
     return kept
 
 
@@ -507,11 +525,12 @@ def _plot_metrics_figure(track: str, year: int, month: int,
         for j, m in enumerate(metric_names):
             metric_values[i, j] = agg[m]
     x = np.arange(len(metric_names))
-    width = 0.25
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    n_lead = len(lead_titles)
+    width = 0.8 / n_lead
+    colors, markers = lead_palette(n_lead)
     for i, lt in enumerate(lead_titles):
-        axes[0].bar(x + (i - 1) * width, metric_values[i], width,
-                    label=lt, color=colors[i], edgecolor="white",
+        axes[0].bar(x + (i - (n_lead - 1) / 2) * width, metric_values[i],
+                    width, label=lt, color=colors[i], edgecolor="white",
                     linewidth=0.5)
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(metric_names)
@@ -522,7 +541,6 @@ def _plot_metrics_figure(track: str, year: int, month: int,
     axes[0].legend()
 
     # Right: scatter
-    markers = ["o", "s", "^"]
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
         ious = [r[f"iou_mask_t+{offset}"] for r in rows]
         cwts = [r[f"class_wt_t+{offset}"] for r in rows]
@@ -582,7 +600,8 @@ def run_extraction(track: str, year: int, month: int,
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
 
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -1326,7 +1345,8 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
         )
 
     # Load prediction pipeline the same way extraction does.
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -1711,11 +1731,12 @@ def _plot_metrics_figure_lightning(
         for j, m in enumerate(metric_names):
             metric_values[i, j] = agg[m]
     x = np.arange(len(metric_names))
-    width = 0.25
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+    n_lead = len(lead_titles)
+    width = 0.8 / n_lead
+    colors, markers = lead_palette(n_lead)
     for i, lt in enumerate(lead_titles):
         offset = LEAD_STEP_OFFSETS[i]
-        axes[0].bar(x + (i - 1) * width, metric_values[i], width,
+        axes[0].bar(x + (i - (n_lead - 1) / 2) * width, metric_values[i], width,
                     label=f"{lt} (high={best_high_per_lead[offset]:.2f})",
                     color=colors[i], edgecolor="white", linewidth=0.5)
     axes[0].set_xticks(x)
@@ -1799,7 +1820,8 @@ def run_extraction_lightning(
     print(f"  Sample selection: OPERA-driven (>= {rainfall_threshold_mmh:g} mm/h) "
           f"- shared with rainfall track for parity")
 
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -2015,7 +2037,8 @@ def run_visualization_lightning(
             f"{year:04d}-{month:02d}. Nothing to visualise."
         )
 
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -2356,8 +2379,9 @@ def _plot_kd_3x3(
     c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
     gt_kwargs = _gt_kwargs_for("lightning")
 
-    fig, axes = plt.subplots(3, 3, figsize=(21, 12.5),
-                             constrained_layout=True)
+    n_lead = len(LEAD_STEP_OFFSETS)
+    fig, axes = plt.subplots(3, n_lead, figsize=(7 * n_lead, 12.5),
+                             constrained_layout=True, squeeze=False)
 
     def _apply_frame(ax):
         ax.set_xticks([]); ax.set_yticks([])
@@ -2457,7 +2481,8 @@ def run_extraction_kd(
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
 
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -2658,7 +2683,8 @@ def run_visualization_kd(
             f"{year:04d}-{month:02d}. Nothing to visualise."
         )
 
-    init_sequence_config(str(data_root), source)
+    init_sequence_config(str(data_root), source, period=period)
+    sync_window_from_sequence_config()
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -2827,6 +2853,9 @@ def main() -> int:
                              f"low+{RAINFALL_HIGH_MARGIN:g}, which spans the "
                              f"operational 0.55 so the sweep can only "
                              f"improve on it.")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Cap the selected references at N, for a "
+                             "trial run on a small subset.")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
@@ -2852,6 +2881,8 @@ def main() -> int:
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
     output_dir = Path(args.output_dir)
+    global MAX_SAMPLES
+    MAX_SAMPLES = args.max_samples
 
     if not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
