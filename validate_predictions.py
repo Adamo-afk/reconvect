@@ -919,6 +919,50 @@ def _plot_hmf_figure(track: str, year: int, month: int,
     print(f"  Wrote hits/misses/false-alarms figure to {path}")
 
 
+def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
+    """CSI against the swept HIGH threshold, one line per lead, a dashed
+    line at each lead's winner - the panel the lightning metrics figure
+    carries, as its own figure for either track, drawn from the saved
+    summary alone (post_processing.tuning_scores)."""
+    summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    pp = summary.get("post_processing") or {}
+    scores = pp.get("tuning_scores") or {}
+    if not scores:
+        raise SystemExit(f"{summary_path} has no post_processing.tuning_scores "
+                         f"(a baseline run, or written before tuning existed)")
+    winners = pp.get("high_threshold_per_lead") or {}
+    low = pp.get("low_threshold")
+    leads = list(scores)
+    colors, _markers = lead_palette(len(leads))
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    for i, lead in enumerate(leads):
+        highs = sorted(float(h) for h in scores[lead])
+        csis = [scores[lead][f"{h:.2f}"]["CSI"] for h in highs]
+        ax.plot(highs, csis, marker="o", color=colors[i], label=lead,
+                linewidth=1.5)
+        if winners.get(lead) is not None:
+            ax.axvline(float(winners[lead]), color=colors[i], linestyle="--",
+                       alpha=0.5, linewidth=1)
+    ax.set_xlabel("High threshold")
+    ax.set_ylabel("Aggregate CSI over selected samples")
+    ax.set_title("CSI vs high-threshold sweep  "
+                 + (f"(low={float(low):.2f} fixed)" if low is not None else ""))
+    ax.grid(alpha=0.3)
+    ax.legend()
+    parts = [f"Validation - {summary.get('track', '')}"]
+    if summary.get("split"):
+        parts[0] += f" - {summary['split']} split"
+    if summary.get("year") and summary.get("month"):
+        parts[0] += f" - {summary['year']:04d}-{summary['month']:02d}"
+    if summary.get("model"):
+        parts.append(summary["model"])
+    parts.append(f"{summary.get('total_selected_samples', '?')} selected samples")
+    fig.suptitle("  |  ".join(parts), fontsize=12, fontweight="bold")
+    fig.savefig(out_path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote tuning figure to {out_path}")
+
+
 def _plot_metrics_figure(track: str, year: int, month: int,
                          rows: list[dict],
                          confusion_per_lead: dict[int, dict],
@@ -1310,6 +1354,9 @@ def run_extraction(track: str, year: int, month: int,
     _plot_hmf_figure(track, year, month, rows, hmf_pooled, step_minutes,
                      output_dir / f"{stem}_hmf.png",
                      high_coverage_pct=high_coverage_pct)
+    if not baseline:
+        plot_tuning_from_summary(output_dir / f"{stem}_summary.json",
+                                 output_dir / f"{stem}_tuning.png")
 
 
 def _resolve_gt(ref_utc: str, offset_min: int,
@@ -3334,7 +3381,13 @@ def main() -> int:
                     "figure. Visualization mode reads the JSON and "
                     "plots structure-overlay + zoom for a given date.",
     )
-    parser.add_argument("--track", type=str, required=True,
+    parser.add_argument("--plot_tuning", type=str, default=None,
+                        metavar="SUMMARY_JSON",
+                        help="Draw the CSI-vs-high-threshold sweep figure "
+                             "from a saved summary (either track) and exit; "
+                             "writes <stem>_tuning.png next to it. No model, "
+                             "no data. Every other flag is ignored.")
+    parser.add_argument("--track", type=str, default=None,
                         choices=["rainfall", "lightning", "kd"],
                         help="Validation track. 'rainfall' is the OPERA "
                              "multiclass pipeline; 'lightning' runs the "
@@ -3465,6 +3518,17 @@ def main() -> int:
                              ".keras (plain, no _kd suffix). Default is to load "
                              "the KD-trained student produced by train_lightning_kd.py.")
     args = parser.parse_args()
+
+    if args.plot_tuning:
+        src = Path(args.plot_tuning)
+        if not src.is_file():
+            parser.error(f"--plot_tuning: {src} not found")
+        name = (src.name[:-len("_summary.json")]
+                if src.name.endswith("_summary.json") else src.stem)
+        plot_tuning_from_summary(src, src.with_name(f"{name}_tuning.png"))
+        return 0
+    if args.track is None:
+        parser.error("--track is required")
 
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive "
