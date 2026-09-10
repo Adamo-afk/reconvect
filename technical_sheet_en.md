@@ -363,7 +363,7 @@ python predict_full_domain.py --mode ... --date YYYY-MM-DD
 ```bash
 python validate_predictions.py --track rainfall --year Y --month M
 ```
-- **Does** — scans the month for samples with a pixel ≥ 10 mm/h, runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
+- **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
 - **Writes** — `validation/rainfall_<Y>_<M>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block.
 - **Writes** — `…_samples.csv`
 - **Graph** — `…_metrics.png`; per-date overlays with `--date`
@@ -374,7 +374,7 @@ python validate_predictions.py --track rainfall --year Y --month M
 python visualize_gt_vs_pred.py --mode ...
 python generate_report.py --year Y --month M
 ```
-- **Writes** — `full_domain_plots/…`, `validation/report_<Y>_<M>.pdf`
+- **Writes** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 
 ---
 
@@ -564,7 +564,7 @@ made them will make them again:
 | `intersect_summary.png` | `intersect_product_coverage` |
 | `patch_index/plots/{dbscan_<rule>_patch_selection,patch_highlight}/<date>.gif` and `plots/nc/` | `identify_patches --plot` |
 | `mtg_store_distribution.png` | `store_registry --chart` |
-| `inference/` figures, `full_domain_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
+| `inference/` figures, `visualize_gt_vs_pred_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | `evaluation/` figures | `evaluate_*` |
 | `results/feature_importance/` | `feature_importance_analysis` |
 | `validation/report_<Y>_<M>.pdf` | `generate_report` (deliverable) |

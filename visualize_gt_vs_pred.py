@@ -59,7 +59,7 @@ Example commands
         --source lightning --top_n 3
 
 Outputs land under
-    <output_dir>/full_domain_<run_tag>[_finetuned]/
+    <output_dir>/visualize_gt_vs_pred_<run_tag>[_finetuned]/
         ts01_<date>_<HHMM>.png
         ts02_<date>_<HHMM>.png
         ...
@@ -2168,7 +2168,8 @@ def main() -> int:
                              "metadata together. Omit for an untagged "
                              "whole-archive run.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
-    parser.add_argument("--output_dir", type=str, default="./full_domain_plots")
+    parser.add_argument("--output_dir", type=str,
+                        default="./visualize_gt_vs_pred_plots")
     parser.add_argument("--finetuned", action="store_true",
                         help="Use coalition_<run_tag>_finetuned.keras "
                              "(rebuilt + load_weights, same trick as "
@@ -2274,7 +2275,9 @@ def main() -> int:
                       else "_kd" if args.kd
                       else "")
     artifact_tag = f"{run_tag}{variant_suffix}"
-    output_dir = Path(args.output_dir) / f"full_domain_{artifact_tag}"
+    # Named after this script, not after predict_full_domain, which
+    # writes its own tree under inference/.
+    output_dir = Path(args.output_dir) / f"visualize_gt_vs_pred_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     variant_label = ("finetuned" if args.finetuned
