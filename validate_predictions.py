@@ -242,15 +242,29 @@ def lead_palette(n: int) -> tuple[list[str], list[str]]:
 
 def rainfall_high_grid(low: float,
                        margin: float = RAINFALL_HIGH_MARGIN,
-                       step: float = RAINFALL_SWEEP_STEP) -> list[float]:
-    """Candidate HIGH thresholds: low+step .. low+margin, inclusive.
+                       step: float = RAINFALL_SWEEP_STEP,
+                       high_min: float | None = None,
+                       high_max: float | None = None) -> list[float]:
+    """Candidate HIGH thresholds, inclusive at both ends.
 
-    HIGH must exceed LOW for hysteresis to mean anything - at equality the
-    connected-component seeding degenerates to a plain threshold - so the
-    grid starts one step above.
+    By default low+step .. low+margin. With `high_min` / `high_max` the
+    range is named outright (either end may be given; the other keeps
+    its default). HIGH must exceed LOW for hysteresis to mean anything -
+    at equality the connected-component seeding degenerates to a plain
+    threshold - so a range that starts at or below LOW is refused.
     """
-    n = int(round(margin / step))
-    return [round(low + step * k, 4) for k in range(1, n + 1)]
+    lo = float(high_min) if high_min is not None else low + step
+    hi = float(high_max) if high_max is not None else low + margin
+    if lo <= low + 1e-9:
+        raise SystemExit(
+            f"the HIGH sweep must start above LOW: high_min={lo:g} with "
+            f"low={low:g}. Lower LOW (--rainfall_low_threshold) or raise "
+            f"--rainfall_high_min.")
+    if hi < lo:
+        raise SystemExit(f"--rainfall_high_max {hi:g} is below the sweep "
+                         f"start {lo:g}")
+    n = int(round((hi - lo) / step))
+    return [round(lo + step * k, 4) for k in range(0, n + 1)]
 
 
 def _accumulate_per_patch(gt_bin: np.ndarray, pred_bin: np.ndarray,
@@ -836,7 +850,11 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                    high_coverage_pct: float = HIGH_COVERAGE_PCT,
                    rainfall_low: float | None = None,
-                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN, period=None,
+                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN,
+                   rainfall_high_min: float | None = None,
+                   rainfall_high_max: float | None = None,
+                   rainfall_sweep_step: float = RAINFALL_SWEEP_STEP,
+                   period=None,
                    baseline: bool = False):
     """Extraction mode for the rainfall track.
 
@@ -927,10 +945,12 @@ def run_extraction(track: str, year: int, month: int,
         high_grid = [None]
         print("  Post-processing: none (SepConv-ens class map)")
     else:
-        high_grid = rainfall_high_grid(rain_low, rainfall_high_margin)
+        high_grid = rainfall_high_grid(rain_low, rainfall_high_margin,
+                                       rainfall_sweep_step,
+                                       rainfall_high_min, rainfall_high_max)
         print(f"  Hysteresis sweep: low={rain_low:.2f} fixed, high "
               f"{high_grid[0]:.2f}..{high_grid[-1]:.2f} "
-              f"step {RAINFALL_SWEEP_STEP:.2f} ({len(high_grid)} candidates)")
+              f"step {rainfall_sweep_step:.2f} ({len(high_grid)} candidates)")
     tuning = {i: {h: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for h in high_grid}
               for i in range(len(LEAD_STEP_OFFSETS))}
     patch_acc: dict = {}
@@ -1077,8 +1097,10 @@ def run_extraction(track: str, year: int, month: int,
             "method": "rainfall_hysteresis on p(argmax)",
             "low_threshold": rain_low,
             "high_grid": high_grid,
-            "sweep_step": RAINFALL_SWEEP_STEP,
+            "sweep_step": rainfall_sweep_step,
             "high_margin": rainfall_high_margin,
+            "high_min": rainfall_high_min,
+            "high_max": rainfall_high_max,
             "high_threshold_per_lead": {
                 f"t+{off}": best_high[i]
                 for i, off in enumerate(LEAD_STEP_OFFSETS)
@@ -3216,7 +3238,18 @@ def main() -> int:
                              f"{RAINFALL_HIGH_MARGIN:g}, i.e. low+0.01 .. "
                              f"low+{RAINFALL_HIGH_MARGIN:g}, which spans the "
                              f"operational 0.55 so the sweep can only "
-                             f"improve on it.")
+                             f"improve on it. --rainfall_high_min / "
+                             f"--rainfall_high_max override it.")
+    parser.add_argument("--rainfall_high_min", type=float, default=None,
+                        help="First HIGH candidate of the sweep (must be "
+                             "above LOW). Overrides the margin's start.")
+    parser.add_argument("--rainfall_high_max", type=float, default=None,
+                        help="Last HIGH candidate of the sweep, inclusive. "
+                             "Overrides the margin's end.")
+    parser.add_argument("--rainfall_sweep_step", type=float,
+                        default=RAINFALL_SWEEP_STEP,
+                        help=f"Spacing of the HIGH candidates (default "
+                             f"{RAINFALL_SWEEP_STEP:g}).")
     parser.add_argument("--baseline", action="store_true",
                         help="Rainfall track: validate the SepConv-ens "
                              "baseline instead of a RECONVECT model. Its "
@@ -3277,6 +3310,9 @@ def main() -> int:
                 high_coverage_pct=args.high_coverage_pct,
                 rainfall_low=args.rainfall_low_threshold,
                 rainfall_high_margin=args.rainfall_high_margin,
+                rainfall_high_min=args.rainfall_high_min,
+                rainfall_high_max=args.rainfall_high_max,
+                rainfall_sweep_step=args.rainfall_sweep_step,
                 period=args.period,
                 baseline=args.baseline,
             )

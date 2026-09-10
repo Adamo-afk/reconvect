@@ -156,13 +156,14 @@ python build_patch_ensemble.py --mode mtg_opera_mtgmr_rainfall \
 
 ### Rainfall hysteresis sweep
 
-The lightning track already tuned its HIGH threshold over a 0.91–0.99 grid and persisted the result. The rainfall track now does the same, but shaped to its own scale: **LOW is held fixed and HIGH sweeps upward from it in 0.01 steps until a set margin.**
+The lightning track already tuned its HIGH threshold over a 0.91–0.99 grid and persisted the result. The rainfall track now does the same, but shaped to its own scale: **LOW is held fixed and HIGH sweeps upward from it in 0.01 steps until a set margin**, or over an explicit range and step when one is given.
 
 | | |
 |---|---|
 | LOW | `--rainfall_low_threshold`, default `0.35` (`DEFAULT_RAIN_LOW`) |
 | HIGH grid | `low + 0.01 … low + margin`, step `0.01` |
 | Margin | `--rainfall_high_margin`, default `0.30` → 30 candidates, `0.36 … 0.65` |
+| Explicit range | `--rainfall_high_min` `--rainfall_high_max` name the first and last candidate outright (either overrides the margin's end); `--rainfall_sweep_step` sets the spacing. The first candidate must sit above LOW, so a range starting at 0.25 needs `--rainfall_low_threshold` below it. |
 
 The default margin spans the operational `DEFAULT_RAIN_HIGH` of 0.55, so the currently shipped setting is always inside the swept range and the sweep can only improve on it. The per-lead winner maximises aggregate CSI; on a tie the **lower** threshold wins, which is the conservative choice. Results land in `post_processing` in the rainfall summary, mirroring the lightning schema.
 
@@ -1261,8 +1262,8 @@ Tune these to change behaviour without touching the architecture.
 | `LIGHTNING_HIGH_GRID` | `0.91 … 0.99` step `0.01` | — | Sweep grid; the per-lead HIGH is tuned by maximising aggregate CSI and persisted in `summary.json → post_processing`. | Narrower → faster tuning, fewer operating points. |
 | `DEFAULT_HIGH_THRESHOLD` | `0.95` | `--lightning_high_threshold` | Fallback HIGH when no `--validation_summary` is given. | Only affects inference without a tuned summary. |
 | `DEFAULT_RAIN_LOW` / `DEFAULT_RAIN_HIGH` | `0.35` / `0.55` | `--rainfall_low_threshold` / `--rainfall_high_threshold` | Hysteresis on `p(argmax)` when the argmax is a rainy class. Lower than the lightning pair because probability is split across 5 classes. Rejected pixels drop to class 0. | Lower → more marginal rainy pixels survive. Higher → tighter blobs. |
-| `RAINFALL_SWEEP_STEP` | `0.01` | — | Increment of the rainfall HIGH sweep in `validate_predictions.py`. | Coarser → faster tuning, blunter operating point. |
-| `RAINFALL_HIGH_MARGIN` | `0.30` | `--rainfall_high_margin` | How far above LOW the HIGH sweep runs: `low+0.01 … low+margin`. The default spans the operational `0.55`, so the sweep can only improve on the shipped setting. | Wider → more candidates, longer tuning. Narrower → may exclude the optimum. |
+| `RAINFALL_SWEEP_STEP` | `0.01` | `--rainfall_sweep_step` | Increment of the rainfall HIGH sweep in `validate_predictions.py`. | Coarser → faster tuning, blunter operating point. |
+| `RAINFALL_HIGH_MARGIN` | `0.30` | `--rainfall_high_margin` (or `--rainfall_high_min` / `--rainfall_high_max` for an explicit range) | How far above LOW the HIGH sweep runs: `low+0.01 … low+margin`. The default spans the operational `0.55`, so the sweep can only improve on the shipped setting. | Wider → more candidates, longer tuning. Narrower → may exclude the optimum. |
 | `RAINFALL_CLASS_EDGES` | `10, 20, 30, 40` mm/h | — | The 5-class boundaries. The SepConv baseline is binned at these too, after denormalisation. | Changing requires retraining. |
 | `DEFAULT_KD_ALPHA` | `0.7` | `--kd_alpha` | Weight on the soft-teacher loss. | Higher → student mimics teacher more, weaker GT anchoring. |
 | `DEFAULT_KD_TEMPERATURE` | `4.0` | `--kd_temperature` | Softening temperature for both models' sigmoid outputs. | Higher → softer targets. `T=1` disables softening. |
