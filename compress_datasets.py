@@ -815,6 +815,79 @@ def restore(info: DatasetInfo, exe: Path, dry_run: bool) -> bool:
     return True
 
 
+def move_dataset(info: DatasetInfo, dest_root: Path, exe: Path,
+                 dry_run: bool) -> bool:
+    """Move an archive-only dataset to another datasets root and restore it.
+
+    Only the archive travels: a dataset that is still on disk here is
+    refused, since moving its archive alone would leave two copies with
+    different owners. The copy is verified by size and `7z t` before the
+    source archive is deleted, then extracted at the destination, so the
+    dataset is usable there without a second command. Every later
+    command must be given the new root via --datasets_root.
+    """
+    import shutil
+    dest_root = Path(dest_root)
+    print("=" * 78)
+    print(f"Moving {info.run_tag} -> {dest_root}")
+    print("=" * 78)
+
+    if not info.archived:
+        print(f"  ERROR: not archived: {info.run_tag} has no archive at "
+              f"{info.archive}. --move works on compressed datasets only; "
+              f"run --compress first.")
+        return False
+    if info.on_disk:
+        print(f"  ERROR: {info.run_tag} is still on disk at {info.path}. "
+              f"Run --reclaim first so exactly one copy exists, then move.")
+        return False
+    if info.in_use_by is not None:
+        print(f"  ERROR: in use by pid {info.in_use_by}.")
+        return False
+    if info.job_pid is not None:
+        print(f"  ERROR: a background job (pid {info.job_pid}) is working "
+              f"on it.")
+        return False
+    if dest_root.resolve() == info.datasets_root.resolve():
+        print("  ERROR: destination is the current datasets root.")
+        return False
+    dest = DatasetInfo(info.run_tag, dest_root)
+    if dest.archived or dest.on_disk:
+        print(f"  ERROR: {info.run_tag} already exists under {dest_root} "
+              f"({dest.state}).")
+        return False
+
+    print(f"  Archive : {info.archive} ({human(info.archive_size)})")
+    print(f"  To      : {dest.archive}")
+    if dry_run:
+        print("  --dry-run: nothing moved.")
+        return False
+
+    dest_root.mkdir(parents=True, exist_ok=True)
+    tmp = dest.archive.with_suffix(dest.archive.suffix + ".tmp")
+    started = time.time()
+    shutil.copy2(info.archive, tmp)
+    if tmp.stat().st_size != info.archive.stat().st_size:
+        tmp.unlink(missing_ok=True)
+        print("  ERROR: copied size differs from the source; source kept.")
+        return False
+    if _run_7z(exe, ["t", str(tmp)]).returncode != 0:
+        tmp.unlink(missing_ok=True)
+        print("  ERROR: `7z t` failed on the copy; source kept.")
+        return False
+    os.replace(tmp, dest.archive)
+    info.archive.unlink()
+    print(f"  Copied and verified in {(time.time() - started) / 60:.1f} min; "
+          f"source archive removed.")
+    write_status(info.datasets_root, info.run_tag, "move", "ok",
+                 f"-> {dest_root}")
+
+    ok = restore(DatasetInfo(info.run_tag, dest_root), exe, dry_run=False)
+    if ok:
+        print(f"\n  Pass to every later command:  --datasets_root {dest_root}")
+    return ok
+
+
 def ensure_available(run_tag: str, datasets_root, exe: Path | None = None,
                      auto_restore: bool = True) -> Path | None:
     """Make a dataset usable, extracting it first if it is archive-only.
@@ -1320,6 +1393,16 @@ def main() -> int:
                         help="Drop the on-disk copy of a dataset that is "
                              "already archived (verifying the archive "
                              "first). Compresses if no archive exists.")
+    parser.add_argument("--move", nargs="+", metavar="DATASET",
+                        help="Move archive-only dataset(s) to the datasets "
+                             "root given by --to and restore them there. "
+                             "The copy is verified before the source "
+                             "archive is deleted. A dataset still on disk "
+                             "here is refused: reclaim it first.")
+    parser.add_argument("--to", default=None, metavar="ROOT",
+                        help="Destination datasets root for --move, e.g. "
+                             "D:/nowcasting/datasets. Pass the same path as "
+                             "--datasets_root to every later command.")
     parser.add_argument("--reclaim-all", action="store_true",
                         help="Sweep every dataset that is archived, still on "
                              "disk and not in use. The cleanup for leftovers "
@@ -1418,11 +1501,18 @@ def main() -> int:
                 return 0
         reclaim_tags.extend(t for t in sweep if t not in reclaim_tags)
 
-    if not args.compress and not args.restore and not reclaim_tags:
+    if args.move and not args.to:
+        parser.error("--move needs --to ROOT")
+    if args.to and not args.move:
+        parser.error("--to only makes sense with --move")
+
+    if (not args.compress and not args.restore and not reclaim_tags
+            and not args.move):
         print_listing(infos, datasets_root)
         return 0
 
-    requested = (args.compress or []) + (args.restore or []) + reclaim_tags
+    requested = ((args.compress or []) + (args.restore or []) + reclaim_tags
+                 + (args.move or []))
     unknown = [t for t in requested if t not in by_tag]
     if unknown:
         print(f"ERROR: unknown dataset(s): {unknown}")
@@ -1461,6 +1551,10 @@ def main() -> int:
         print()
     for tag in (args.restore or []):
         if not restore(by_tag[tag], exe, args.dry_run):
+            failures += 1
+        print()
+    for tag in (args.move or []):
+        if not move_dataset(by_tag[tag], Path(args.to), exe, args.dry_run):
             failures += 1
         print()
 
