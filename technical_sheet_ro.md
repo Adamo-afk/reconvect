@@ -387,7 +387,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
 - **Scrie** — `…_samples.csv`, cu `hit_pct_t+<k>_ge<T>` pentru fiecare prag al baleiajului (`--hit_threshold_step`, `--hit_threshold_factor`; bază … bază × 1,5).
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
-- **Grafic** — `…_metrics.png`; suprapuneri pe zile cu `--date`
+- **Grafic** — `…_metrics.png` (barele FAR/POD/CSI și diagrama de acoperire, linii roșii la 50 %); `…_hmf.png` (detecții / ratări / alarme false per eșantion, în procente, câte un panou pentru fiecare, marcator per orizont, valoarea cumulată cu linie întreruptă, linie roșie la 50 %); suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figuri și raport
