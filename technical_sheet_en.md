@@ -510,9 +510,10 @@ python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 
 ### C4. Select per patch
 ```bash
-python build_patch_ensemble.py --mode <mode> --track rainfall --year Y --month M --min_samples N
+python build_patch_ensemble.py --mode <mode> --track rainfall --split test --min_samples N
 ```
 - **Does** — chooses the best-scoring member for each of the 18 patches. Selection only — scoring happened in C3.
+- **Scope** — `--split test`, or `--year --month`, names the members' validation runs the same way validate_predictions did.
 - **Rule** — `--min_samples N` is required. A patch validated on at least N samples takes its own best member; below N it takes the overall best member (highest CSI pooled over every patch). If no patch reaches N, patches with samples keep their own best member and only patches with zero samples take the overall best. The manifest records the rule per patch.
 - **Writes** — `our_data/ensemble_manifest_<mode>_<source>.json` **CRITICAL** — the routing table, with season and global fallbacks behind each assignment.
 - **Read by** — `ensemble_inference`
