@@ -12,9 +12,10 @@ Two sources, two outputs each.
 2. validation/<track>_<yyyy>_<mm>_<tag>_samples.csv, written by
    validate_predictions.py, become the hit-level figures: for each lead
    and each season, the share of samples whose post-processed map hit at
-   least L % of the ground-truth pixels, for L = 50 .. 90. The rainfall
-   track carries a threshold sweep (hit_pct_t+k_ge<T>), so it gets one
-   figure per T; lightning carries per-sample POD, one figure.
+   least L % of the ground-truth pixels, for L = 50 .. 90. Rainfall
+   reads hits_pct_t+<k> (share of GT-active pixels detected on the
+   post-processed map at the tuned HIGH, the >= 10 mm/h event);
+   lightning reads pod_t+<min>. One figure per scope.
 
 The baseline joins only with --include_baseline: it is a different
 architecture scored on its own class map, and the comparison should
@@ -357,26 +358,20 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
 
 
 def hit_columns(rows: list[dict], track: str) -> dict:
-    """{threshold_or_None: {lead_key: column}} from the CSV header.
-    Rainfall: hit_pct_t+<k>_ge<T>, in percent. Lightning: pod_t+<min>,
-    a ratio, scaled to percent when read."""
+    """{lead_key: column} from the CSV header. Rainfall: hits_pct_t+<k>
+    (percent of GT-active pixels detected at the tuned HIGH). Lightning:
+    pod_t+<min>, a ratio, scaled to percent when read."""
     if not rows:
         return {}
     cols = rows[0].keys()
-    out: dict = defaultdict(dict)
-    if track == "rainfall":
-        rx = re.compile(r"^hit_pct_t\+(\d+)_ge([\d.]+)$")
-        for c in cols:
-            m = rx.match(c)
-            if m:
-                out[float(m.group(2))][int(m.group(1))] = c
-    else:
-        rx = re.compile(r"^pod_t\+(\d+)$")
-        for c in cols:
-            m = rx.match(c)
-            if m:
-                out[None][int(m.group(1))] = c
-    return dict(out)
+    rx = re.compile(r"^hits_pct_t\+(\d+)$" if track == "rainfall"
+                    else r"^pod_t\+(\d+)$")
+    out: dict = {}
+    for c in cols:
+        m = rx.match(c)
+        if m:
+            out[int(m.group(1))] = c
+    return out
 
 
 def share_above(rows: list[dict], column: str, level: float,
@@ -409,24 +404,24 @@ def plot_hit_levels(per_model: dict[str, list[dict]], track: str,
                     seasons: dict[str, list[int]], levels: list[int],
                     labels: dict[str, str], out_dir: Path,
                     step_minutes: int = 15):
-    """For each threshold (rainfall) or once (lightning): a grid with one
-    row per season plus "all", one column per lead; each panel is the
-    share of samples whose hit rate reached at least L, over L, one line
-    per model. Also a long-form CSV of every number plotted."""
+    """A grid with one row per season plus "all", one column per lead;
+    each panel is the share of samples whose hit rate reached at least
+    L, over L, one line per model. Also a long-form CSV of every number
+    plotted."""
     if not per_model:
         print("  No per-sample validation files for this track.")
         return
     tags = sorted(per_model)
     scale = 1.0 if track == "rainfall" else 100.0
     columns = {t: hit_columns(per_model[t], track) for t in tags}
-    thresholds = sorted({T for t in tags for T in columns[t]}, key=lambda x: (x is None, x))
     groups = list(seasons.items()) + [("all", None)]
     records = []
 
-    for T in thresholds:
-        lead_keys = sorted({k for t in tags for k in columns[t].get(T, {})})
-        if not lead_keys:
-            continue
+    lead_keys = sorted({k for t in tags for k in columns[t]})
+    if not lead_keys:
+        print("  No hit columns in the validation files.")
+        return
+    if True:
         fig, axes = plt.subplots(len(groups), len(lead_keys),
                                  figsize=(4.6 * len(lead_keys), 3.6 * len(groups)),
                                  squeeze=False)
@@ -434,7 +429,7 @@ def plot_hit_levels(per_model: dict[str, list[dict]], track: str,
             for li, lead in enumerate(lead_keys):
                 ax = axes[gi][li]
                 for j, tag in enumerate(tags):
-                    col = columns[tag].get(T, {}).get(lead)
+                    col = columns[tag].get(lead)
                     if col is None:
                         continue
                     rows = [r for r in per_model[tag]
@@ -447,8 +442,7 @@ def plot_hit_levels(per_model: dict[str, list[dict]], track: str,
                             linestyle="--" if tag.startswith("sepconv_") else "-",
                             label=f"{labels.get(tag, tag)} (n={len(rows)})")
                     for L, y in zip(levels, ys):
-                        records.append({"threshold_mmh": "" if T is None else f"{T:g}",
-                                        "season": gname, "lead": lead,
+                        records.append({"season": gname, "lead": lead,
                                         "model": tag, "level_pct": L,
                                         "share_of_samples_pct": "" if y is None else f"{y:.2f}",
                                         "n_samples": len(rows)})
@@ -474,12 +468,13 @@ def plot_hit_levels(per_model: dict[str, list[dict]], track: str,
                 fig.legend(handles, [n.split(" (n=")[0] for n in names],
                            loc="upper right", fontsize=9, ncol=min(3, len(handles)))
                 break
-        what = ("post-processed rainfall map, GT at or above "
-                f"{T:g} mm/h" if T is not None else "post-processed lightning map")
-        fig.suptitle(f"{track}: samples whose {what} was hit at least L %",
+        what = ("post-processed rainfall map (>= 10 mm/h event, tuned HIGH)"
+                if track == "rainfall" else "post-processed lightning map")
+        fig.suptitle(f"{track}: samples whose {what} hit at least L % "
+                     f"of the GT-active pixels",
                      fontsize=13, fontweight="bold")
         fig.tight_layout(rect=(0, 0, 1, 0.97))
-        name = f"hit_levels_ge{T:g}.png" if T is not None else "hit_levels.png"
+        name = "hit_levels.png"
         fig.savefig(out_dir / name, dpi=140, bbox_inches="tight")
         plt.close(fig)
         print(f"  Wrote {name}")

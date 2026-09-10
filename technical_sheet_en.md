@@ -370,7 +370,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
 - **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope is in every output name: `rainfall_test_<tag>_*`, `rainfall_<Y>_<M>_<tag>_*`, `rainfall_test_<Y>_<M>_<tag>_*`.
 - **Writes** — `validation/rainfall_<scope>_<tag>_summary.json` **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
-- **Writes** — `…_samples.csv`, with `csi_t+<k>` per lead at the tuned HIGH and `hit_pct_t+<k>_ge<T>` for every threshold of the sweep (`--hit_threshold_step`, `--hit_threshold_factor`; base … base × 1.5).
+- **Writes** — `…_samples.csv`, with `csi_t+<k>` and the hits / misses / false-alarm percentages per lead at the tuned HIGH.
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run.
 - **Records** — `representative_timesteps` in the summary: the best, worst and median sample by mean CSI over leads. A4 and A6 take them with `--pick`.
 - **Graph** — `…_metrics.png` (FAR/POD/CSI bars and the coverage scatter, red lines at 50 %); `…_hmf.png` (per-sample hits / misses / false alarms in percent, one panel each, marker per lead, pooled value dashed, red line at 50 %); per-date overlays with `--date`
@@ -478,8 +478,8 @@ python compare_models.py --track rainfall --split test --include_baseline
 python compare_models.py --track rainfall --year Y --month M
 python compare_models.py --track lightning --split test
 ```
-- **Does** — reads every model's `evaluation_results.json` and tagged validation `_samples.csv` for one track and draws them together: per-lead metric curves (one figure per metric plus a grid), a paper-style table with the best value in bold, and, for each rain-rate threshold of the sweep, the share of samples whose hit percentage clears 50…90 % per lead, per season and over the whole window.
-- **Writes** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_<scope>/hit_levels_ge<T>.png`, `hit_levels_<scope>/hit_levels.csv`, `comparison_summary.json` (deliverables; nothing reads them). `<scope>` follows `--split` / `--year --month`: `test`, `<Y>_<M>`, `test_<Y>_<M>`, or `all_months` when every whole-month run is pooled.
+- **Does** — reads every model's `evaluation_results.json` and tagged validation `_samples.csv` for one track and draws them together: per-lead metric curves (one figure per metric plus a grid), a paper-style table with the best value in bold, and the share of samples whose hit percentage (rainfall: GT-active pixels detected at the tuned HIGH; lightning: per-sample POD) clears 50…90 % per lead, per season and over the whole window.
+- **Writes** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_<scope>/hit_levels.png`, `hit_levels_<scope>/hit_levels.csv`, `comparison_summary.json` (deliverables; nothing reads them). `<scope>` follows `--split` / `--year --month`: `test`, `<Y>_<M>`, `test_<Y>_<M>`, or `all_months` when every whole-month run is pooled.
 - **Note** — `--include_baseline` has an effect on the rainfall track only: no lightning baseline exists yet. `--models`, `--label`, `--hit_levels` and `--seasons` narrow or rename what is drawn.
 
 ---
