@@ -58,6 +58,7 @@ from pipeline_config import (
 )
 from sepconv_compose import STEP_MINUTES
 from sepconv_ensemble_training import SEPCONV_MODE
+from evaluate_coalition import training_cutoffs, draw_cutoffs
 from sepconv_predict import load_base_models, predict_classes, to_mmh
 from train_models import build_run_tag
 
@@ -171,9 +172,17 @@ def evaluate_radar(models, test_ds, stats_period, data_root, output_dir,
             }
 
         label = LEAD_LABELS[step - 1]
+        # The same summary numbers evaluate_coalition writes for the
+        # RECONVECT modes, so a comparison reads one schema from both.
         results["per_leadtime"][label] = {
             "lead_minutes": LEAD_MINUTES[step - 1],
             "accuracy": float(accuracy),
+            "balanced_accuracy": float(np.mean(
+                [per_class[c]["recall"] for c in CLASS_NAMES])),
+            "macro_f1": float(np.mean(
+                [per_class[c]["f1"] for c in CLASS_NAMES])),
+            "macro_csi": float(np.mean(
+                [per_class[c]["csi"] for c in CLASS_NAMES])),
             "per_class": per_class,
             "confusion_matrix": cm.tolist(),
         }
@@ -182,8 +191,28 @@ def evaluate_radar(models, test_ds, stats_period, data_root, output_dir,
               f"accuracy={accuracy:.4f}  mean wet-class CSI={wet:.4f}")
 
     total = agg.sum()
+    agg_per_class = {}
+    for c in range(N_CLASSES):
+        tp = agg[c, c]
+        fp = agg[:, c].sum() - tp
+        fn = agg[c, :].sum() - tp
+        precision = tp / (tp + fp + 1e-10)
+        recall = tp / (tp + fn + 1e-10)
+        agg_per_class[CLASS_NAMES[c]] = {
+            "precision": float(precision), "recall": float(recall),
+            "f1": float(2 * precision * recall / (precision + recall + 1e-10)),
+            "csi": float(tp / (tp + fp + fn + 1e-10)),
+            "support": int(agg[c, :].sum()),
+        }
     results["aggregate"] = {
         "accuracy": float(agg.trace() / (total + 1e-10)),
+        "balanced_accuracy": float(np.mean(
+            [agg_per_class[c]["recall"] for c in CLASS_NAMES])),
+        "macro_f1": float(np.mean(
+            [agg_per_class[c]["f1"] for c in CLASS_NAMES])),
+        "macro_csi": float(np.mean(
+            [agg_per_class[c]["csi"] for c in CLASS_NAMES])),
+        "per_class": agg_per_class,
         "confusion_matrix": agg.tolist(),
     }
 
@@ -238,8 +267,14 @@ def plot_metrics(results, agg, output_dir):
     print(f"  Wrote {output_dir / 'metrics_per_leadtime.png'}")
 
 
-def plot_training_history(history_path, output_dir):
-    """Loss curves for each base model, from the training history JSON."""
+def plot_training_history(history_path, output_dir, model_dir=None,
+                          run_tag=None):
+    """One loss figure per base model, each with its cut-off lines.
+
+    The best epoch is the argmin of val_loss (what the final save
+    holds); the last epoch run comes from that model's own per-epoch
+    checkpoint sidecar, `checkpoints/sepconv_<run_tag>_bm<k>_latest.json`.
+    """
     with open(history_path) as f:
         hist = json.load(f)
 
@@ -248,23 +283,33 @@ def plot_training_history(history_path, output_dir):
         print("  History has no per-base-model curves; skipping.")
         return
 
-    fig, axes = plt.subplots(1, len(base), figsize=(5 * len(base), 4),
-                            squeeze=False)
-    for ax, (name, blk) in zip(axes[0], sorted(base.items())):
+    for name, blk in sorted(base.items()):
         h = blk.get("history", {})
-        if "loss" in h:
-            ax.plot(h["loss"], label="train")
+        if "loss" not in h:
+            continue
+        sidecar = None
+        if model_dir is not None and run_tag is not None:
+            sidecar = (Path(model_dir) / "checkpoints"
+                       / f"sepconv_{run_tag}_{name}_latest.json")
+        best, last, n = training_cutoffs(h, sidecar)
+        epochs = range(1, n + 1)
+        fig, ax = plt.subplots(figsize=(7, 4.6))
+        ax.plot(epochs, h["loss"][:n], 'b-', linewidth=2, label="train loss")
         if "val_loss" in h:
-            ax.plot(h["val_loss"], label="val")
-        ax.set_title(f"{name} ({blk.get('lead_name', '')})")
+            ax.plot(epochs, h["val_loss"][:n], 'r-', linewidth=2,
+                    label="val loss")
+        draw_cutoffs(ax, best, last)
+        ax.set_title(f"Training loss - {name} ({blk.get('lead_name', '')})")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Weighted MSE (log_zscore)")
         ax.grid(alpha=0.3)
-        ax.legend()
-    plt.tight_layout()
-    fig.savefig(output_dir / "training_curves.png", dpi=150)
-    plt.close(fig)
-    print(f"  Wrote {output_dir / 'training_curves.png'}")
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+        path = output_dir / f"training_loss_{name}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"  Wrote {path}"
+              + (f"  [best epoch {best}, stopped after {last}]" if best else ""))
 
 
 def plot_samples(models, test_ds, stats_period, data_root, output_dir,
@@ -380,7 +425,8 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=8,
     print("\n1. Training history")
     history_path = model_dir / f"history_sepconv_{run_tag}.json"
     if history_path.is_file():
-        plot_training_history(history_path, output_dir)
+        plot_training_history(history_path, output_dir,
+                              model_dir=model_dir, run_tag=run_tag)
     else:
         print(f"  WARNING: not found: {history_path}")
 
