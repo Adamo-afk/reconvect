@@ -215,29 +215,6 @@ def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
     return tag + ("_finetuned" if finetuned else "_kd" if kd else "")
 
 
-def hit_threshold_sweep(base: float, step: float = 1.0,
-                        factor: float = 1.5) -> list[float]:
-    """base, base+step, ... up to base*factor inclusive: 8 -> [8..12]."""
-    out, t = [], float(base)
-    top = float(base) * float(factor) + 1e-9
-    while t <= top:
-        out.append(round(t, 6))
-        t += step
-    return out
-
-
-def _hit_counts(gt_mmh: np.ndarray, valid: np.ndarray, pred_pos: np.ndarray,
-                thresholds: list[float]) -> tuple[list[int], list[int]]:
-    """Per threshold T: (hits, ground-truth pixels) where GT >= T on the
-    valid patches and the post-processed prediction is positive."""
-    nums, dens = [], []
-    for T in thresholds:
-        gt_pos = valid & (gt_mmh >= T)
-        dens.append(int(gt_pos.sum()))
-        nums.append(int((gt_pos & pred_pos).sum()))
-    return nums, dens
-
-
 def _paste_class_canvases(classes_by_step: dict, valid_patches: list[int],
                           n_lead: int) -> list[np.ndarray]:
     """SepConv class maps (step -> (N, 256, 256)) onto full canvases,
@@ -544,10 +521,10 @@ def _summarise_confusion(counts: dict) -> dict:
     }
 
 
-def _write_csv(rows: list[dict], path: Path, hit_thresholds=None):
+def _write_csv(rows: list[dict], path: Path):
     """Per-sample CSV with one row per (date, reference_utc) and
-    columns for both metrics x each lead time, plus the hit share at
-    every swept threshold."""
+    columns for both metrics x each lead time, plus CSI and the hits /
+    misses / false-alarm percentages at the tuned HIGH."""
     if not rows:
         print(f"  No rows to write for {path}")
         return
@@ -558,8 +535,6 @@ def _write_csv(rows: list[dict], path: Path, hit_thresholds=None):
         fieldnames.append(f"csi_t+{offset}")
         for name in HMF_NAMES:
             fieldnames.append(f"{name}_pct_t+{offset}")
-        for T in (hit_thresholds or []):
-            fieldnames.append(f"hit_pct_t+{offset}_ge{T:g}")
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -578,8 +553,6 @@ def _write_json(track: str, year: int, month: int,
                 post_processing: dict | None = None,
                 per_patch: dict | None = None,
                 model_tag: str | None = None,
-                hit_thresholds: list[float] | None = None,
-                hit_pooled: dict | None = None,
                 hmf_pooled: dict | None = None,
                 representative: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
@@ -632,8 +605,6 @@ def _write_json(track: str, year: int, month: int,
         "split": SPLIT,
         "model": model_tag,
         "threshold_mmh": rainfall_threshold_mmh,
-        "hit_thresholds_mmh": hit_thresholds or [],
-        "hit_pct_pooled_per_lead": hit_pooled or {},
         "hits_misses_false_alarms_pooled_per_lead": hmf_pooled or {},
         "high_coverage_threshold_pct": high_coverage_pct,
         "total_selected_samples": total,
@@ -866,8 +837,7 @@ def run_extraction(track: str, year: int, month: int,
                    high_coverage_pct: float = HIGH_COVERAGE_PCT,
                    rainfall_low: float | None = None,
                    rainfall_high_margin: float = RAINFALL_HIGH_MARGIN, period=None,
-                   baseline: bool = False,
-                   hit_thresholds: list[float] | None = None):
+                   baseline: bool = False):
     """Extraction mode for the rainfall track.
 
     IMPORTANT scope note for `rainfall_threshold_mmh`: this override
@@ -893,15 +863,12 @@ def run_extraction(track: str, year: int, month: int,
             raise SystemExit("--baseline needs --period (the window the "
                              "baseline was trained on, e.g. w44)")
     tag = artifact_tag(mode, source, period, finetuned, baseline=baseline)
-    if hit_thresholds is None:
-        hit_thresholds = hit_threshold_sweep(rainfall_threshold_mmh)
     print(f"  Data root: {data_root}")
     print(f"  Model:     {mode} ({source}"
           f"{' finetuned' if finetuned else ''}"
           f"{' - SepConv-ens baseline' if baseline else ''})  -> {tag}")
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
-    print(f"  Hit sweep : {[f'{t:g}' for t in hit_thresholds]} mm/h")
 
     init_sequence_config(str(data_root), source, period=period)
     sync_window_from_sequence_config()
@@ -967,10 +934,8 @@ def run_extraction(track: str, year: int, month: int,
     tuning = {i: {h: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for h in high_grid}
               for i in range(len(LEAD_STEP_OFFSETS))}
     patch_acc: dict = {}
-    # Per sample, lead and candidate HIGH: hit counts at every swept
-    # threshold, and the binary confusion, resolved to columns once the
-    # winning HIGH is known.
-    sample_hits: list[dict] = []
+    # Per sample, lead and candidate HIGH: the binary confusion, resolved
+    # to columns once the winning HIGH is known.
     sample_conf: list[dict] = []
 
     print(f"\nRunning inference on {len(selected)} samples ...")
@@ -1007,7 +972,6 @@ def run_extraction(track: str, year: int, month: int,
             )
 
         row = {"date": date_str, "reference_utc": ref_utc}
-        hits_this: dict = {}
         conf_this: dict = {}
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             gt_hhmm, gt_day = _resolve_gt(
@@ -1017,8 +981,6 @@ def run_extraction(track: str, year: int, month: int,
             gt_canvas = _paste_gt_class_canvas(gt_field, valid_patches)
             pred_canvas = pred_canvases[i]
             valid = gt_canvas != -1
-            gt_mmh = (gt_field if gt_field is not None
-                      else np.zeros_like(gt_canvas, dtype=np.float32))
 
             row[f"iou_mask_t+{offset}"] = _iou_binary(gt_canvas, pred_canvas)
             row[f"class_wt_t+{offset}"] = _per_class_weighted(
@@ -1033,7 +995,6 @@ def run_extraction(track: str, year: int, month: int,
             # Sweep every candidate HIGH on this sample, so the choice is
             # made once at the end over pooled counts rather than per
             # sample. The baseline has one candidate: its class map.
-            hits_this[i] = {}
             conf_this[i] = {}
             for h in high_grid:
                 if h is None:
@@ -1053,11 +1014,8 @@ def run_extraction(track: str, year: int, month: int,
                 # once the sweep picks it - no second inference pass.
                 _accumulate_per_patch(gt_canvas, hyst,
                                       patch_acc.setdefault(h, {}), i)
-                hits_this[i][h] = _hit_counts(gt_mmh, valid, hyst >= 1,
-                                              hit_thresholds)
                 conf_this[i][h] = (htp, hfp, hfn)
         rows.append(row)
-        sample_hits.append(hits_this)
         sample_conf.append(conf_this)
 
     print(f"\nDone. {len(rows)} samples processed, {n_skipped} skipped "
@@ -1085,25 +1043,6 @@ def run_extraction(track: str, year: int, month: int,
                       + confusion_per_lead[i]["FN"] + eps))
         print(f"  t+{offset}: high={chosen if chosen is None else f'{chosen:.2f}'}  "
               f"CSI={scored[chosen]:.4f}  (raw argmax CSI={raw_csi:.4f})")
-
-    # Resolve the hit sweep at the winning HIGH: per-sample columns, and
-    # pooled per lead for the summary.
-    hit_pooled: dict = {}
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        h = best_high[i]
-        num_tot = np.zeros(len(hit_thresholds), dtype=np.int64)
-        den_tot = np.zeros(len(hit_thresholds), dtype=np.int64)
-        for row, hits in zip(rows, sample_hits):
-            nums, dens = hits[i][h]
-            for j, T in enumerate(hit_thresholds):
-                row[f"hit_pct_t+{offset}_ge{T:g}"] = (
-                    100.0 * nums[j] / dens[j] if dens[j] else 0.0)
-            num_tot += np.asarray(nums)
-            den_tot += np.asarray(dens)
-        hit_pooled[f"t+{offset * step_minutes}"] = {
-            f"{T:g}": (100.0 * int(num_tot[j]) / int(den_tot[j])
-                       if den_tot[j] else 0.0)
-            for j, T in enumerate(hit_thresholds)}
 
     # Hits / misses / false alarms per sample and pooled, at the winning
     # HIGH, on the same >= 10 mm/h event as FAR/POD/CSI.
@@ -1154,16 +1093,14 @@ def run_extraction(track: str, year: int, month: int,
         }
 
     stem = f"{track}_{scope_stem(year, month)}_{tag}"
-    _write_csv(rows, output_dir / f"{stem}_samples.csv",
-               hit_thresholds=hit_thresholds)
+    _write_csv(rows, output_dir / f"{stem}_samples.csv")
     _write_json(track, year, month, selected, rows, confusion_per_lead,
                 step_minutes, output_dir / f"{stem}_summary.json",
                 rainfall_threshold_mmh=rainfall_threshold_mmh,
                 high_coverage_pct=high_coverage_pct,
                 post_processing=post_processing,
                 per_patch=per_patch_scores(chosen_patch_acc),
-                model_tag=tag, hit_thresholds=hit_thresholds,
-                hit_pooled=hit_pooled,
+                model_tag=tag,
                 hmf_pooled={f"t+{off * step_minutes}": hmf_pooled[i]
                             for i, off in enumerate(LEAD_STEP_OFFSETS)},
                 representative=representative_timesteps(
@@ -3286,13 +3223,6 @@ def main() -> int:
                              "class map is scored as is (no hysteresis). "
                              "Needs --period (the baseline's window, e.g. "
                              "w44); --mode is ignored.")
-    parser.add_argument("--hit_threshold_step", type=float, default=1.0,
-                        help="Step of the hit-rate threshold sweep, in "
-                             "mm/h (default 1).")
-    parser.add_argument("--hit_threshold_factor", type=float, default=1.5,
-                        help="The sweep runs from --rainfall_threshold_mmh "
-                             "up to that value times this factor, "
-                             "inclusive (default 1.5: 8 -> 8..12).")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Cap the selected references at N, for a "
                              "trial run on a small subset.")
@@ -3349,9 +3279,6 @@ def main() -> int:
                 rainfall_high_margin=args.rainfall_high_margin,
                 period=args.period,
                 baseline=args.baseline,
-                hit_thresholds=hit_threshold_sweep(
-                    args.rainfall_threshold_mmh,
-                    args.hit_threshold_step, args.hit_threshold_factor),
             )
         else:
             # Visualization mode reads high-coverage lists from the JSON
