@@ -378,11 +378,13 @@ python predict_full_domain.py --mode ... --date YYYY-MM-DD
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
-python validate_predictions.py --track rainfall --year Y --month M
+python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period f34
+python validate_predictions.py --track rainfall --year Y --month M --baseline --period w44
 ```
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
-- **Scrie** — `validation/rainfall_<Y>_<M>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`.
-- **Scrie** — `…_samples.csv`
+- **Scrie** — `validation/rainfall_<Y>_<M>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe aceeași lună pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
+- **Scrie** — `…_samples.csv`, cu `hit_pct_t+<k>_ge<T>` pentru fiecare prag al baleiajului (`--hit_threshold_step`, `--hit_threshold_factor`; bază … bază × 1,5).
+- **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
 - **Grafic** — `…_metrics.png`; suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
@@ -448,6 +450,7 @@ python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34
 - **Descriere** — compune t+1…t+4 prin `sepconv_compose`, denormalizează cu statisticile propriei ferestre și discretizează în mm/h la aceleași limite de clasă utilizate de RECONVECT — astfel, cele două modele nu pot fi diferențiate prin praguri.
 - **Scrie** — `evaluation/eval_sepconv_<run_tag>/evaluation_results.json`
 - **Grafic** — `metrics_per_leadtime.png`; `--plot_samples N` reprezintă clasa observată față de cea estimată și valorile mm/h estimate.
+- **Grafic** — curbele de antrenare, câte o figură per mărime (`training_loss.png`, `training_<metric>.png`; `training_loss_bm<k>.png` pentru modelul de referință), cu liniile de delimitare ale celei mai bune epoci și ale ultimei epoci preluate din istoric și din fișierul asociat ultimului checkpoint. Orizonturile urmează adâncimea etichetelor din setul de date.
 - **Separat** — `--weights best|latest` alege care dintre cele două stări salvate este evaluată. `best` este fișierul final, iar `latest` este checkpoint-ul per epocă. Compararea lor arată dacă epocile ulterioare celei mai bune au condus la supraînvățare sau dacă oprirea timpurie a întrerupt o execuție care încă se îmbunătățea.
 
 **Ambii evaluatori trebuie să primească același set de chei fixat.** **CRITIC**
@@ -477,6 +480,15 @@ python feature_importance_analysis.py --model ... --data ... --methods gradcam_x
 - **Descriere** — consolidează mai multe execuții în fișiere CSV per orizont de prognoză, apoi aplică Grad-CAM/Xi, SHAP și Shapley clasic. Perechea de ablație compară două matrice Xi pentru a evidenția modul în care intrările rămase preiau rolul grupului eliminat.
 - **Scrie** — `eval_leadtime-<prefix>-<letters>.csv`, `results/feature_importance/…`
 - **Notă** — literele codifică intrările utilizate de o execuție: `o` = exclusiv OPERA, `om` = OPERA + MTG IR/WV.
+
+### B7. Compararea tuturor modelelor unei categorii
+```bash
+python compare_models.py --track rainfall --include_baseline
+python compare_models.py --track lightning
+```
+- **Descriere** — citește `evaluation_results.json` și fișierele de validare `_samples.csv` etichetate ale fiecărui model dintr-o categorie și le reprezintă împreună: curbele metricilor per orizont de prognoză (câte o figură per metrică plus o grilă), un tabel în stil de articol științific cu cea mai bună valoare evidențiată și, pentru fiecare prag de intensitate al baleiajului, proporția eșantioanelor al căror procent de detecție depășește 50…90 % per orizont, per anotimp și pe întreaga fereastră.
+- **Scrie** — `comparison/<track>/metrics_per_leadtime_<metric>.png`, `comparison_table.{csv,md,tex}`, `hit_levels_ge<T>.png`, `hit_levels.csv`, `comparison_summary.json` (livrabile; nu sunt citite de alt script).
+- **Notă** — `--include_baseline` are efect numai pentru categoria precipitațiilor: nu există încă un model de referință pentru fulgere. `--models`, `--label`, `--hit_levels` și `--seasons` restrâng sau redenumesc ceea ce se reprezintă.
 
 ---
 
@@ -585,6 +597,7 @@ citește; scriptul care le-a generat le regenerează:
 | `mtg_store_distribution.png` | `store_registry --chart` |
 | figurile din `inference/`, `visualize_gt_vs_pred_plots/` | `predict_full_domain`, `visualize_gt_vs_pred` |
 | figurile din `evaluation/` | `evaluate_*` |
+| `comparison/<track>/` | `compare_models` (livrabil) |
 | `results/feature_importance/` | `feature_importance_analysis` |
 | `validation/report_<Y>_<M>.pdf` | `generate_report` (livrabil) |
 | `our_data/data_statistics/` | `data_statistics` |
@@ -658,6 +671,7 @@ restaurare înaintea unei execuții**.
 python compress_datasets.py --npy-stats our_data/reprojected_data     # estimare prealabilă
 python compress_datasets.py --compress-npy our_data/reprojected_data our_data/patches
 python compress_datasets.py --restore-npy DIR                         # și revenirea
+python compress_datasets.py --move TAG --to ROOT      # mută un set de date comprimat și îl decomprimă acolo
 ```
 
 | Destinație | Pe disc | Raport | După |
