@@ -64,11 +64,20 @@ RECONVECT_TAG = None   # None = the unsuffixed whole-archive split
 FROZEN_NAME = "verification_keys_{source}_{reconvect}_vs_{sepconv}.json"
 
 
+def _as_tags(reconvect_tag) -> list:
+    """One tag, several tags, or None (the unsuffixed split) as a list."""
+    if reconvect_tag is None or isinstance(reconvect_tag, str):
+        return [reconvect_tag]
+    return list(reconvect_tag)
+
+
 def frozen_name(source: str, reconvect_tag, sepconv_tag) -> str:
-    """Filename for a frozen key set, naming the pair it was built from."""
-    return FROZEN_NAME.format(source=source,
-                              reconvect=reconvect_tag or "base",
-                              sepconv=sepconv_tag)
+    """Filename for a frozen key set, naming every split it was built
+    from: verification_keys_dbscan_f34_w34_vs_w44.json."""
+    return FROZEN_NAME.format(
+        source=source,
+        reconvect="_".join(t or "base" for t in _as_tags(reconvect_tag)),
+        sepconv=sepconv_tag)
 
 
 def load_keys(csv_path: Path) -> set[tuple[str, str, int]]:
@@ -96,32 +105,45 @@ def _splits(data_root: Path, tag) -> dict[str, set]:
 
 def build(data_root: Path, reconvect_tag=RECONVECT_TAG,
           sepconv_tag=None) -> dict:
-    """Compute the verification key set and everything worth reporting."""
-    r = _splits(data_root, reconvect_tag)
+    """Compute the verification key set and everything worth reporting.
+
+    `reconvect_tag` may name several RECONVECT windows (f34, w34, ...):
+    the set is then the intersection of every test split, minus every
+    key that any of the splits' train or validation sets holds, so all
+    models are scored on one population.
+    """
+    tags = _as_tags(reconvect_tag)
+    rs = {t: _splits(data_root, t) for t in tags}
     s = _splits(data_root, sepconv_tag)
 
-    naive = r["test"] & s["test"]
-    seen = r["train"] | r["validation"] | s["train"] | s["validation"]
+    naive = set(s["test"])
+    for r in rs.values():
+        naive &= r["test"]
+    seen = s["train"] | s["validation"]
+    for r in rs.values():
+        seen |= r["train"] | r["validation"]
     contaminated = naive & seen
     clean = naive - seen
 
     # Reported even though it does not affect the result: it is the
-    # measure of how far the two splits actually disagree, and it is the
-    # number that would grow silently if either window changed.
-    cross = {
-        "sepconv_test_in_reconvect_train": len(s["test"] & r["train"]),
-        "sepconv_test_in_reconvect_val": len(s["test"] & r["validation"]),
-        "reconvect_test_in_sepconv_train": len(r["test"] & s["train"]),
-        "reconvect_test_in_sepconv_val": len(r["test"] & s["validation"]),
-    }
+    # measure of how far the splits actually disagree, and it is the
+    # number that would grow silently if any window changed.
+    cross = {}
+    for t, r in rs.items():
+        name = t or "base"
+        cross[f"sepconv_test_in_{name}_train"] = len(s["test"] & r["train"])
+        cross[f"sepconv_test_in_{name}_val"] = len(s["test"] & r["validation"])
+        cross[f"{name}_test_in_sepconv_train"] = len(r["test"] & s["train"])
+        cross[f"{name}_test_in_sepconv_val"] = len(r["test"] & s["validation"])
 
     patches = Counter(k[2] for k in clean)
     return {
         "source": SOURCE,
-        "reconvect_tag": reconvect_tag,
+        "reconvect_tag": tags[0] if len(tags) == 1 else None,
+        "reconvect_tags": tags,
         "sepconv_tag": sepconv_tag,
         "counts": {
-            "reconvect_test": len(r["test"]),
+            "reconvect_test": {(t or "base"): len(r["test"]) for t, r in rs.items()},
             "sepconv_test": len(s["test"]),
             "naive_intersection": len(naive),
             "contaminated_dropped": len(contaminated),
@@ -146,13 +168,16 @@ def format_report(blob: dict) -> str:
         "=" * 70,
         "Verification key set — RECONVECT vs SepConv-ens",
         "=" * 70,
-        f"  RECONVECT test        : {c['reconvect_test']:>6}",
+    ]
+    for name, n in c["reconvect_test"].items():
+        lines.append(f"  RECONVECT test ({name:<4}) : {n:>6}")
+    lines += [
         f"  SepConv   test        : {c['sepconv_test']:>6}",
         f"  naive intersection    : {c['naive_intersection']:>6}",
         f"  dropped as contaminated: {c['contaminated_dropped']:>5}",
         f"  CLEAN verification set: {c['clean']:>6}",
         "",
-        "  Cross-split contamination between the two windows:",
+        "  Cross-split contamination between the windows:",
     ]
     for k, v in blob["cross_split_contamination"].items():
         flag = "  <-- why the subtraction exists" if v else ""
@@ -175,9 +200,10 @@ def main() -> int:
         description="Build the leakage-free verification key set shared by "
                     "RECONVECT and the SepConv-ens baseline.")
     parser.add_argument("--data_root", default=str(resolve_data_root()))
-    parser.add_argument("--reconvect_tag", default=None,
-                        help="Window tag of the RECONVECT split. "
-                             "Omit for the unsuffixed split.")
+    parser.add_argument("--reconvect_tag", nargs="*", default=None,
+                        help="Window tag(s) of the RECONVECT split(s), e.g. "
+                             "`f34 w34` to freeze one set every model is "
+                             "scored on. Omit for the unsuffixed split.")
     parser.add_argument("--sepconv_tag", required=True,
                         help="Window tag of the baseline split, e.g. "
                              "w44. Required: with several windows on "
@@ -190,14 +216,14 @@ def main() -> int:
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
-    blob = build(data_root, reconvect_tag=args.reconvect_tag,
+    reconvect = args.reconvect_tag if args.reconvect_tag else None
+    blob = build(data_root, reconvect_tag=reconvect,
                  sepconv_tag=args.sepconv_tag)
     print(format_report(blob))
 
     if args.write:
         out = Path(args.output) if args.output else (
-            data_root / frozen_name(SOURCE, args.reconvect_tag,
-                                    args.sepconv_tag))
+            data_root / frozen_name(SOURCE, reconvect, args.sepconv_tag))
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(blob, fh, indent=2)
         print(f"\n  Frozen -> {out}  ({blob['counts']['clean']} keys)")
