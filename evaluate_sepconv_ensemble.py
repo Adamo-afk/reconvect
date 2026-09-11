@@ -273,7 +273,13 @@ def plot_training_history(history_path, output_dir, model_dir=None,
             ax.plot(epochs, h["val_loss"][:n], 'r-', linewidth=2,
                     label="val loss")
         draw_cutoffs(ax, best, last)
-        ax.set_title(f"Training loss - {name} ({blk.get('lead_name', '')})")
+        # The lead is read off the composition, never off the stored
+        # string: histories written before the horizon cap say t+75.
+        from sepconv_ensemble_training import training_pair, LEAD_MINUTES
+        k = int(name[2:])
+        target = training_pair(k)[1] + 1
+        ax.set_title(f"Training loss - Bm{k} -> t+{target} "
+                     f"({LEAD_MINUTES[target]} min)")
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Weighted MSE (log_zscore)")
         ax.grid(alpha=0.3)
