@@ -2138,7 +2138,7 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
 def resolve_threshold(label_type: str, mode: str, source: str,
                       finetuned: bool, override: float | None,
                       eval_results_path: Path | None,
-                      kd: bool = False) -> float | None:
+                      kd: bool = False, period=None) -> float | None:
     """Pick the operative threshold for the lightning prediction map.
 
     Order:
@@ -2381,7 +2381,7 @@ def main() -> int:
         label_type, args.mode, SOURCE, args.finetuned,
         args.threshold,
         Path(args.eval_results) if args.eval_results else None,
-        kd=args.kd,
+        kd=args.kd, period=args.period,
     )
 
     print(f"\nLoading model...")
