@@ -453,12 +453,16 @@ keys were seen by RECONVECT while fitting). Scoring restricted to the
 intersection is what makes the numbers comparable:
 
 ```bash
-python verification_keys.py --write --reconvect_tag w34 --sepconv_tag w44
+python verification_keys.py --write --reconvect_tag f34 w34 --sepconv_tag w44
 python evaluate_sepconv_ensemble.py --period w44 \
-    --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
+python evaluate_coalition.py --mode mtg_lightning_opera_rainfall --period f34 \
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
 python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34 \
-    --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
 ```
+
+`--reconvect_tag` takes several windows: the set is then the intersection of every named test split minus every key any train or validation split holds, so the full model, the ablation and the baseline are all scored on one population. With one window it is the pairwise set of before.
 
 The filter matches on `(date, reference_utc, patch)` recorded in each shard,
 so it is exact rather than positional. Datasets built before those fields

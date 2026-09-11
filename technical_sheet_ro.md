@@ -469,12 +469,16 @@ de test ale modelului de referință au fost utilizate de RECONVECT la antrenare
 restrânsă la intersecție este ceea ce face cifrele comparabile:
 
 ```bash
-python verification_keys.py --write --reconvect_tag w34 --sepconv_tag w44
+python verification_keys.py --write --reconvect_tag f34 w34 --sepconv_tag w44
 python evaluate_sepconv_ensemble.py --period w44 \
-    --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
+python evaluate_coalition.py --mode mtg_lightning_opera_rainfall --period f34 \
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
 python evaluate_coalition.py --mode opera_radar_only_rainfall --period w34 \
-    --verification_keys our_data/verification_keys_dbscan_w34_vs_w44.json
+    --verification_keys our_data/verification_keys_dbscan_f34_w34_vs_w44.json
 ```
+
+`--reconvect_tag` acceptă mai multe ferestre: setul devine intersecția tuturor partițiilor de test indicate, din care se scad toate cheile prezente în oricare partiție de antrenare sau de validare, astfel încât modelul complet, ablația și modelul de referință sunt evaluate pe aceeași populație. Cu o singură fereastră se obține setul pereche de până acum.
 
 Filtrarea se realizează pe `(date, reference_utc, patch)`, valori consemnate în fiecare
 shard, deci este exactă, nu pozițională. Seturile de date construite înainte de existența
