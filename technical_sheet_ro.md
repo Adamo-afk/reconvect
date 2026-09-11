@@ -386,7 +386,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 ```
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
 - **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul, inclusiv pragul de selecție, apare în numele fiecărui fișier: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; execuțiile la praguri diferite nu se suprascriu niciodată.
-- **Scrie** — `validation/rainfall_<domeniu>_<tag>_summary.json` **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
+- **Scrie** — `validation/<stem>/<stem>_summary.json` (`<stem>` = `rainfall_<domeniu>_<tag>`; câte un director per execuție, fiecare fișier din el purtând stem-ul ca prefix) **CRITIC** — pragurile calibrate și blocul `per_patch`. `<tag>` este eticheta de artefact a modelului, astfel încât mai multe modele validate pe același domeniu pot coexista; `generate_report` primește `--rainfall_tag` atunci când există mai multe.
 - **Scrie** — `…_samples.csv`, cu `csi_t+<k>` și procentele de detecții / ratări / alarme false per orizont la pragul HIGH calibrat.
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă.
 - **Separat** — baleiajul HIGH parcurge implicit `low+0,01 … low+marjă` în pași de 0,01; `--rainfall_high_min`, `--rainfall_high_max` și `--rainfall_sweep_step` stabilesc explicit intervalul și pasul. Primul candidat trebuie să fie peste LOW (`--rainfall_low_threshold`).
@@ -529,7 +529,7 @@ python train_models.py --config training.config --mode <mode> --period 2025warm 
 python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 ```
 - **Descriere** — produce blocul `per_patch` citit de mecanismul de selecție. Se execută o dată per membru.
-- **Scrie** — `validation/…_summary.json` cu `per_patch` **CRITIC**
+- **Scrie** — `validation/<stem>/<stem>_summary.json` cu `per_patch` **CRITIC**
 
 ### C4. Selecția per patch
 ```bash
