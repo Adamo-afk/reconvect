@@ -376,7 +376,7 @@ python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_sum
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
-- **Separat** — `--pick csi` rulează momentele selectate de o execuție de validare: cel mai bun, medianul și cel mai slab după CSI-ul mediu pe orizonturi, sau primele N cu `--top_n`; nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
+- **Separat** — `--pick csi` rulează primele `--top_n` eșantioane (implicit 5) după CSI-ul mediu pe orizonturi ale unei execuții de validare; nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
@@ -391,7 +391,6 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă; `--weights latest` evaluează checkpoint-ul per epocă în locul salvării finale (eticheta primește sufixul `_latest`). Același indicator există la A4 și A6.
 - **Separat** — baleiajul HIGH parcurge implicit `low+0,01 … low+marjă` în pași de 0,01; `--rainfall_high_min`, `--rainfall_high_max` și `--rainfall_sweep_step` stabilesc explicit intervalul și pasul. Primul candidat trebuie să fie peste LOW (`--rainfall_low_threshold`).
 - **Cost** — o singură etichetare a componentelor conexe per eșantion și orizont deservește toți candidații HIGH (rezultate identice cu pragul aplicat fiecăruia); un fir de încărcare pregătește eșantionul următor cât timp GPU-ul îl procesează pe cel curent. Aproximativ 4–5 s per eșantion pe întreaga suprafață.
-- **Consemnează** — `representative_timesteps` în rezumat: eșantionul cel mai bun, cel mai slab și cel median după CSI-ul mediu pe orizonturi. A4 și A6 le preiau prin `--pick`.
 - **Grafic** — `…_metrics.png` (barele FAR/POD/CSI), `…_coverage.png` (IoU în raport cu suprapunerea ponderată pe clase, precipitații), `…_hmf.png` (detecții / ratări / alarme false per eșantion, marcator per orizont, linie roșie la 50 %, primul / medianul / ultimul eșantion datate pe axa x), `…_hmf_percentiles.png` (per orizont p10–p90 / p25–p75 / mediana acestor rate și proporția eșantioanelor peste și sub 50 %), `…_tuning.png` (CSI în funcție de pragul HIGH baleiat). Toate sunt generate din rezumatul și CSV-ul salvate; `python validate_predictions.py --plots <summary.json>` le regenerează pentru oricare categorie. Suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 

@@ -559,11 +559,17 @@ def _resolve_rainfall_thresholds(args: argparse.Namespace, step_minutes: int
 
 def _fmt_low_high(low, high, offset=None) -> str:
     """`low=0.20, high=0.25` for scalars or one lead of the per-lead
-    dicts; every lead listed when no lead is named."""
+    dicts. With no lead named the dicts collapse to one pair when every
+    lead shares it, else `low=0.20, high=0.25/0.25/0.26/0.30`."""
     if isinstance(low, dict):
         if offset is not None:
             return f"low={low[offset]:.2f}, high={high[offset]:.2f}"
-        return ", ".join(f"t+{o}: {low[o]:.2f}/{high[o]:.2f}" for o in low)
+        lows, highs = list(low.values()), list(high.values())
+        lo_s = (f"{lows[0]:.2f}" if len(set(lows)) == 1
+                else "/".join(f"{x:.2f}" for x in lows))
+        hi_s = (f"{highs[0]:.2f}" if len(set(highs)) == 1
+                else "/".join(f"{x:.2f}" for x in highs))
+        return f"low={lo_s}, high={hi_s}"
     return f"low={low:.2f}, high={high:.2f}"
 
 
@@ -989,7 +995,7 @@ def _plot_rainfall_perclass_hits_2x3(
     row_labels = [
         ("Per-class hits (pre post-proc)", pred_canvases, ""),
         ("Per-class hits (post-processing / hysteresis)", hyst_canvases,
-         f"  ({_fmt_low_high(rainfall_low, rainfall_high)})"),
+         f"\n{_fmt_low_high(rainfall_low, rainfall_high)}"),
     ]
 
     for row_idx, (row_title, canvases_for_row, extra) in enumerate(row_labels):
@@ -1014,8 +1020,10 @@ def _plot_rainfall_perclass_hits_2x3(
             red_stats = _plot_red_hits_axis(
                 ax, gt_canvas, canvases_for_row[i],
             )
+            # Title lines: row + lead, the thresholds (row 2 only), the
+            # per-class breakdown.
             ax.set_title(
-                f"{row_title}{extra} - t+{lead_min} ({lead_wall} UTC)\n"
+                f"{row_title} - t+{lead_min} ({lead_wall} UTC){extra}\n"
                 f"{_format_per_class_pct(red_stats['per_class_pct'])}",
                 fontsize=9,
             )
@@ -1061,15 +1069,13 @@ def main() -> int:
                         help="Reference date (YYYY-MM-DD). Required unless "
                              "--pick names the timesteps.")
     parser.add_argument("--pick", type=str, default=None, choices=["csi"],
-                        help="Run the timesteps the validation run in "
-                             "--validation_summary singles out: `csi` gives "
-                             "the best, median and worst sample by mean CSI "
-                             "over leads, or the top N with --top_n. No "
-                             "ground truth is needed; --date and the time "
-                             "flags are then ignored.")
+                        help="Run the --top_n best samples (default 5) by "
+                             "mean CSI over leads of the validation run in "
+                             "--validation_summary. No ground truth is "
+                             "needed; --date and the time flags are then "
+                             "ignored.")
     parser.add_argument("--top_n", type=int, default=None,
-                        help="With --pick csi: the N best samples by CSI "
-                             "instead of best / median / worst.")
+                        help="With --pick csi: how many samples (default 5).")
     time_group = parser.add_mutually_exclusive_group()
     time_group.add_argument("--time", type=str, default=None,
                             help="Single reference HH:MM.")

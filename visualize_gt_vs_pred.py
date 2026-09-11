@@ -2215,11 +2215,20 @@ def main() -> int:
     parser.add_argument("--pick", type=str, default=None, choices=["csi"],
                         help="Choose the timesteps by the validation run in "
                              "--validation_summary instead of by patch "
-                             "count: `csi` draws the best, median and worst "
-                             "sample by mean CSI over leads, or the top N "
-                             "with --top_n. Each must be a row of --csv, "
-                             "where its ground truth comes from. Outputs "
-                             "are named <pick>_<date>_<time>.png.")
+                             "count: `csi` draws the --top_n best samples "
+                             "(default 5) by mean CSI over leads. Each must "
+                             "be a row of --csv, where its ground truth "
+                             "comes from. Outputs are named "
+                             "csi_top<NN>_<date>_<time>.png.")
+    parser.add_argument("--mode", required=True, type=str,
+                        choices=_mode_choices(),
+                        help="Model variant. The name states its own track: "
+                             "`_rainfall` for the OPERA 5-class head, "
+                             "`_occurrence` for the lightning binary head.")
+    parser.add_argument("--top_n", type=int, default=None,
+                        help="How many timesteps to draw (default 5): the "
+                             "rows with the most DBSCAN patches, or with "
+                             "--pick csi the best samples by CSI.")
     parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
     parser.add_argument("--period", type=str, default=None, metavar="LABEL",
                         help="Period label the model was trained under, "

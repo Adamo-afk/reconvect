@@ -359,7 +359,7 @@ python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_sum
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
-- **Alone** — `--pick csi` runs the timesteps a validation run singled out: best, median and worst by mean CSI over leads, or the top N with `--top_n`; no ground truth is needed. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
+- **Alone** — `--pick csi` runs the `--top_n` best samples (default 5) by mean CSI over leads of a validation run; no ground truth is needed. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
 
 ### A5. Validation and threshold tuning
 ```bash
@@ -374,7 +374,6 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run; `--weights latest` scores the per-epoch checkpoint instead of the final save (tag suffixed `_latest`). The same flag exists on A4 and A6.
 - **Alone** — the HIGH sweep runs `low+0.01 … low+margin` in 0.01 steps by default; `--rainfall_high_min`, `--rainfall_high_max` and `--rainfall_sweep_step` name the range and spacing outright. The first candidate must sit above LOW (`--rainfall_low_threshold`).
 - **Cost** — one component labelling per sample and lead serves every HIGH candidate (identical results to thresholding each one); a loader thread assembles the next sample while the GPU runs the current one. About 4–5 s per sample on the full canvas.
-- **Records** — `representative_timesteps` in the summary: the best, worst and median sample by mean CSI over leads. A4 and A6 take them with `--pick`.
 - **Graph** — `…_metrics.png` (FAR/POD/CSI bars), `…_coverage.png` (IoU against class-weighted overlap, rainfall), `…_hmf.png` (per-sample hits / misses / false alarms, marker per lead, red line at 50 %, first / median / last sample dated on the x axis), `…_hmf_percentiles.png` (per lead the p10–p90 / p25–p75 / median of those rates and the share of samples above and below 50 %), `…_tuning.png` (CSI against the swept HIGH). All drawn from the saved summary and CSV; `python validate_predictions.py --plots <summary.json>` redraws them for either track. Per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
