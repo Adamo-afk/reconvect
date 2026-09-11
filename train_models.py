@@ -85,7 +85,7 @@ from pipeline_config import (
     resolve_datasets_root,
     resolve_model_dir,
 )
-from periods import Period, require_no_overlap
+from periods import Period, data_tag, require_no_overlap
 from compress_datasets import ensure_available, inuse_for
 from ensemble_plan import (
     check_member_datasets,
@@ -978,7 +978,6 @@ def load_sepconv_class_weights(data_root, source, period=None,
     baseline with the wrong weighting silently produces the dry-collapse
     this whole mechanism exists to prevent.
     """
-    from periods import data_tag
     path = (Path(data_root)
             / f"opera_rainfall_fraction_{data_tag(source, period)}.json")
     if not path.is_file():
@@ -1579,7 +1578,6 @@ def load_class_fractions(data_root, source, period=None):
     would then correct for an imbalance that is not present - silently,
     because a fractions list from any window is structurally valid.
     """
-    from periods import data_tag
     tag = data_tag(source, period)
     json_path = Path(data_root) / f"opera_rainfall_fraction_{tag}.json"
     if not json_path.is_file():
