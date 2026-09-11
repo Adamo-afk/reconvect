@@ -966,6 +966,145 @@ def _per_class_from_cm(cm, class_names):
     return per_class
 
 
+def plot_radar_figures(results: dict, class_names: list, lead_times: list,
+                       lead_labels: list, conf_matrices: list, conf_agg,
+                       output_dir: Path, title_prefix: str = "Radar") -> None:
+    """The five rainfall figures: accuracy per lead, confusion matrices
+    (per lead + aggregate, row-normalised), per-class F1, per-class CSI,
+    macro summary. Shared with evaluate_sepconv_ensemble so the baseline
+    and RECONVECT come out of the same code and look the same."""
+    output_dir = Path(output_dir)
+    # 1. Accuracy per lead time
+    fig, ax = plt.subplots(figsize=(7, 5))
+    accs = [results["per_leadtime"][lt]["accuracy"] for lt in lead_labels]
+    ax.plot(lead_times, accs, 'o-', linewidth=2, markersize=8, color='#1f77b4')
+    ax.axhline(y=results["aggregate"]["accuracy"], color='gray',
+               linestyle='--', alpha=0.5,
+               label=f"agg={results['aggregate']['accuracy']:.3f}")
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("Accuracy")
+    ax.set_title(f"{title_prefix} Classification Accuracy per Lead Time")
+    ax.set_xticks(lead_times)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(output_dir / "accuracy_per_leadtime.png", dpi=150,
+                bbox_inches='tight')
+    plt.close()
+
+    # 2. Confusion matrices
+    fig, axes = plt.subplots(1, len(lead_times) + 1, figsize=(5 * (len(lead_times) + 1), 5))
+    all_cms = [conf_matrices[t] for t in range(len(lead_times))] + [conf_agg]
+    all_titles = lead_labels + ["Aggregate"]
+
+    for ax, cm, title in zip(axes, all_cms, all_titles):
+        # Normalize per row
+        cm_norm = cm.astype(np.float64)
+        row_sums = cm_norm.sum(axis=1, keepdims=True)
+        cm_norm = np.where(row_sums > 0, cm_norm / row_sums, 0)
+
+        im = ax.imshow(cm_norm, cmap='Blues', vmin=0, vmax=1)
+        ax.set_xticks(range(len(class_names)))
+        ax.set_yticks(range(len(class_names)))
+        ax.set_xticklabels(class_names, rotation=45, ha='right', fontsize=8)
+        ax.set_yticklabels(class_names, fontsize=8)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("True")
+        ax.set_title(title)
+
+        # Add text annotations
+        for i in range(len(class_names)):
+            for j in range(len(class_names)):
+                ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha='center', va='center',
+                        fontsize=7,
+                        color='white' if cm_norm[i, j] > 0.5 else 'black')
+
+    plt.suptitle("Confusion matrices (row-normalized)", fontsize=13,
+                 fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_dir / "confusion_matrix.png", dpi=150,
+                bbox_inches='tight')
+    plt.close()
+
+    # 3. Per-class F1 per lead time
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c, name in enumerate(class_names):
+        f1s = [results["per_leadtime"][lt]["per_class"][name]["f1"]
+               for lt in lead_labels]
+        ax.plot(lead_times, f1s, 'o-', linewidth=2, markersize=6, label=name)
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("F1 Score")
+    ax.set_title("Per-class F1 Score vs Lead Time")
+    ax.set_xticks(lead_times)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "f1_per_class.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # 4. Per-class CSI per lead time
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for c, name in enumerate(class_names):
+        csis = [results["per_leadtime"][lt]["per_class"][name]["csi"]
+                for lt in lead_labels]
+        ax.plot(lead_times, csis, 'o-', linewidth=2, markersize=6, label=name)
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("CSI")
+    ax.set_title("Per-class CSI vs Lead Time")
+    ax.set_xticks(lead_times)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "csi_per_class.png", dpi=150, bbox_inches='tight')
+    plt.close()
+
+    # 5. Macro summary per lead time (accuracy / balanced_accuracy /
+    # macro_F1 / macro_CSI). Accuracy vs balanced accuracy makes the
+    # class-0 dominance immediately visible.
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for key, label, style in [
+        ("accuracy",          "Accuracy",          "o-"),
+        ("balanced_accuracy", "Balanced accuracy", "s-"),
+        ("macro_f1",          "Macro F1",          "^-"),
+        ("macro_csi",         "Macro CSI",         "d-"),
+    ]:
+        vals = [results["per_leadtime"][lt][key] for lt in lead_labels]
+        ax.plot(lead_times, vals, style, linewidth=2, markersize=6, label=label)
+    ax.set_xlabel("Lead time (min)")
+    ax.set_ylabel("Score")
+    ax.set_title("Macro summary vs Lead Time")
+    ax.set_xticks(lead_times)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_dir / "macro_summary_per_leadtime.png", dpi=150,
+                bbox_inches='tight')
+    plt.close()
+
+
+def plot_radar_figures_from_json(results_path: Path) -> None:
+    """Redraw the five rainfall figures next to a saved
+    evaluation_results.json (per-lead and aggregate confusion matrices
+    are in it). Lightning results have a different figure set and are
+    refused."""
+    results_path = Path(results_path)
+    results = json.loads(results_path.read_text(encoding="utf-8"))
+    if results.get("label_type") == "lightning":
+        raise SystemExit("--plots redraws the rainfall figure set; this is a "
+                         "lightning evaluation")
+    class_names = ["R<10", "10≤R<20", "20≤R<30", "30≤R<40", "R≥40"]
+    labels = list(results["per_leadtime"])
+    minutes = [int(lt[2:]) for lt in labels]
+    conf = [np.asarray(results["per_leadtime"][lt]["confusion_matrix"], dtype=np.int64)
+            for lt in labels]
+    agg = np.asarray(results["aggregate"]["confusion_matrix"], dtype=np.int64)
+    plot_radar_figures(results, class_names, minutes, labels, conf, agg,
+                       results_path.parent)
+    for name in ("accuracy_per_leadtime", "confusion_matrix", "f1_per_class",
+                 "csi_per_class", "macro_summary_per_leadtime"):
+        print(f"  Wrote {results_path.parent / (name + '.png')}")
+
+
 def evaluate_radar(model, test_ds, output_dir):
     """Run evaluation for radar (multi-class) mode.
 
@@ -1050,113 +1189,8 @@ def evaluate_radar(model, test_ds, output_dir):
               f"support={pc['support']:,}")
 
     # ==================== PLOTS ====================
-
-    # 1. Accuracy per lead time
-    fig, ax = plt.subplots(figsize=(7, 5))
-    accs = [results["per_leadtime"][lt]["accuracy"] for lt in LEAD_LABELS]
-    ax.plot(LEAD_TIMES, accs, 'o-', linewidth=2, markersize=8, color='#1f77b4')
-    ax.axhline(y=results["aggregate"]["accuracy"], color='gray',
-               linestyle='--', alpha=0.5,
-               label=f"agg={results['aggregate']['accuracy']:.3f}")
-    ax.set_xlabel("Lead time (min)")
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Radar Classification Accuracy per Lead Time")
-    ax.set_xticks(LEAD_TIMES)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / "accuracy_per_leadtime.png", dpi=150,
-                bbox_inches='tight')
-    plt.close()
-
-    # 2. Confusion matrices
-    fig, axes = plt.subplots(1, len(LEAD_TIMES) + 1, figsize=(5 * (len(LEAD_TIMES) + 1), 5))
-    all_cms = [conf_matrices[t] for t in range(len(LEAD_TIMES))] + [conf_agg]
-    all_titles = LEAD_LABELS + ["Aggregate"]
-
-    for ax, cm, title in zip(axes, all_cms, all_titles):
-        # Normalize per row
-        cm_norm = cm.astype(np.float64)
-        row_sums = cm_norm.sum(axis=1, keepdims=True)
-        cm_norm = np.where(row_sums > 0, cm_norm / row_sums, 0)
-
-        im = ax.imshow(cm_norm, cmap='Blues', vmin=0, vmax=1)
-        ax.set_xticks(range(N_CLASSES))
-        ax.set_yticks(range(N_CLASSES))
-        ax.set_xticklabels(CLASS_NAMES, rotation=45, ha='right', fontsize=8)
-        ax.set_yticklabels(CLASS_NAMES, fontsize=8)
-        ax.set_xlabel("Predicted")
-        ax.set_ylabel("True")
-        ax.set_title(title)
-
-        # Add text annotations
-        for i in range(N_CLASSES):
-            for j in range(N_CLASSES):
-                ax.text(j, i, f"{cm_norm[i, j]:.2f}", ha='center', va='center',
-                        fontsize=7,
-                        color='white' if cm_norm[i, j] > 0.5 else 'black')
-
-    plt.suptitle("Confusion matrices (row-normalized)", fontsize=13,
-                 fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_dir / "confusion_matrix.png", dpi=150,
-                bbox_inches='tight')
-    plt.close()
-
-    # 3. Per-class F1 per lead time
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for c, name in enumerate(CLASS_NAMES):
-        f1s = [results["per_leadtime"][lt]["per_class"][name]["f1"]
-               for lt in LEAD_LABELS]
-        ax.plot(LEAD_TIMES, f1s, 'o-', linewidth=2, markersize=6, label=name)
-    ax.set_xlabel("Lead time (min)")
-    ax.set_ylabel("F1 Score")
-    ax.set_title("Per-class F1 Score vs Lead Time")
-    ax.set_xticks(LEAD_TIMES)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / "f1_per_class.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # 4. Per-class CSI per lead time
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for c, name in enumerate(CLASS_NAMES):
-        csis = [results["per_leadtime"][lt]["per_class"][name]["csi"]
-                for lt in LEAD_LABELS]
-        ax.plot(LEAD_TIMES, csis, 'o-', linewidth=2, markersize=6, label=name)
-    ax.set_xlabel("Lead time (min)")
-    ax.set_ylabel("CSI")
-    ax.set_title("Per-class CSI vs Lead Time")
-    ax.set_xticks(LEAD_TIMES)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / "csi_per_class.png", dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # 5. Macro summary per lead time (accuracy / balanced_accuracy /
-    # macro_F1 / macro_CSI). Accuracy vs balanced accuracy makes the
-    # class-0 dominance immediately visible.
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for key, label, style in [
-        ("accuracy",          "Accuracy",          "o-"),
-        ("balanced_accuracy", "Balanced accuracy", "s-"),
-        ("macro_f1",          "Macro F1",          "^-"),
-        ("macro_csi",         "Macro CSI",         "d-"),
-    ]:
-        vals = [results["per_leadtime"][lt][key] for lt in LEAD_LABELS]
-        ax.plot(LEAD_TIMES, vals, style, linewidth=2, markersize=6, label=label)
-    ax.set_xlabel("Lead time (min)")
-    ax.set_ylabel("Score")
-    ax.set_title("Macro summary vs Lead Time")
-    ax.set_xticks(LEAD_TIMES)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / "macro_summary_per_leadtime.png", dpi=150,
-                bbox_inches='tight')
-    plt.close()
+    plot_radar_figures(results, CLASS_NAMES, LEAD_TIMES, LEAD_LABELS,
+                       conf_matrices, conf_agg, output_dir)
 
     return results
 
@@ -1992,7 +2026,7 @@ def main():
         description="Evaluate trained COALITION-4 model on test set."
     )
     parser.add_argument(
-        "--mode", type=str, required=True,
+        "--mode", type=str, required=False,  # checked below: --plots needs none
         # Derived, not restated. This list used to be a hardcoded literal
         # claiming to mirror TRAINING_MODES; it had drifted to include
         # three retired names and omit opera_radar_only_rainfall, so the
@@ -2027,6 +2061,10 @@ def main():
              "evaluation, and past_hr is sliced to student_hr_channels "
              "before batching. Mutually exclusive with --finetuned."
     )
+    parser.add_argument(
+        "--plots", type=str, default=None, metavar="RESULTS_JSON",
+        help="Redraw the rainfall figure set from a saved "
+             "evaluation_results.json next to it and exit; no model, no data.")
     parser.add_argument(
         "--weights", type=str, default="best", choices=["best", "latest"],
         help="Which of the two saved states to score. 'best' is the final "
@@ -2096,6 +2134,14 @@ def main():
         help="Which dataset split to evaluate on (default: test)"
     )
     args = parser.parse_args()
+    if args.plots:
+        src = Path(args.plots)
+        if not src.is_file():
+            parser.error(f"--plots: {src} not found")
+        plot_radar_figures_from_json(src)
+        return 0
+    if args.mode is None:
+        parser.error("the following arguments are required: --mode")
 
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive.")
