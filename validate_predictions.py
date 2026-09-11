@@ -863,76 +863,243 @@ def _hmf_percentages(tp: int, fp: int, fn: int) -> dict[str, float | None]:
     }
 
 
-def _plot_hmf_figure(track: str, year: int, month: int,
-                     rows: list[dict],
-                     pooled: dict[int, dict[str, float | None]],
-                     step_minutes: int, path: Path,
-                     *,
-                     high_coverage_pct: float = HIGH_COVERAGE_PCT):
-    """Three panels — hits %, misses %, false alarms % — each a
-    per-sample scatter in chronological order with one marker per lead,
-    like the coverage scatter of the metrics figure. The pooled value
-    per lead (from the summed pixel counts at the tuned HIGH) is drawn
-    as a thin line in the lead's colour; samples where the quantity is
-    undefined (no GT-active or no predicted-active pixels) are left out."""
-    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
+def _load_run(summary_path: Path):
+    """(summary, rows, offsets, step_minutes, stem) from a saved run.
+
+    Rows come from the sibling <stem>_samples.csv with numbers parsed
+    (empty cells -> None); the leads and the step from the summary's
+    metrics_per_lead keys (t+15, t+30, ...)."""
+    import math
+    summary_path = Path(summary_path)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    stem = (summary_path.name[:-len("_summary.json")]
+            if summary_path.name.endswith("_summary.json") else summary_path.stem)
+    csv_path = summary_path.with_name(f"{stem}_samples.csv")
+    rows: list[dict] = []
+    if csv_path.is_file():
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                row = {}
+                for k, v in r.items():
+                    if k in ("date", "reference_utc"):
+                        row[k] = v
+                        continue
+                    try:
+                        row[k] = float(v) if v not in ("", None) else None
+                    except ValueError:
+                        row[k] = v
+                rows.append(row)
+    minutes = sorted(int(k[2:]) for k in (summary.get("metrics_per_lead") or {}))
+    if not minutes:
+        raise SystemExit(f"{summary_path} has no metrics_per_lead block")
+    step = math.gcd(*minutes)
+    offsets = [m // step for m in minutes]
+    return summary, rows, offsets, step, stem
+
+
+def _run_title(summary: dict) -> str:
+    """`Validation - rainfall - test split, 2026-06, >= 8 mm/h  |  <model>  |  N samples`."""
+    parts = [f"Validation - {summary.get('track', '')} - "
+             f"{scope_label(summary.get('year'), summary.get('month'))}"]
+    if summary.get("model"):
+        parts.append(str(summary["model"]))
+    parts.append(f"{summary.get('total_selected_samples', len(summary.get('initial_selection', [])))} selected samples")
+    return "  |  ".join(parts)
+
+
+def _apply_scope(summary: dict) -> None:
+    """scope_label reads module state; take it from the summary so a
+    figure redrawn later says what the run said."""
+    global SPLIT, THRESHOLD_MMH
+    SPLIT = summary.get("split")
+    if summary.get("threshold_mmh") is not None:
+        THRESHOLD_MMH = float(summary["threshold_mmh"])
+
+
+def _hmf_series(rows: list[dict], track: str, offset: int, step: int
+                ) -> dict[str, list[tuple[int, float]]]:
+    """{hits|misses|false_alarms: [(sample index, percent)]} for one lead.
+    Rainfall rows carry the three columns; lightning rows carry pod and
+    far ratios, so hits = POD, misses = 1 - POD, false alarms = FAR."""
+    out: dict[str, list] = {name: [] for name in HMF_NAMES}
+    for x, r in enumerate(rows):
+        if track == "rainfall":
+            for name in HMF_NAMES:
+                v = r.get(f"{name}_pct_t+{offset}")
+                if v is not None:
+                    out[name].append((x, v))
+        else:
+            m = offset * step
+            pod, far = r.get(f"pod_t+{m}"), r.get(f"far_t+{m}")
+            if pod is not None:
+                out["hits"].append((x, 100.0 * pod))
+                out["misses"].append((x, 100.0 * (1.0 - pod)))
+            if far is not None:
+                out["false_alarms"].append((x, 100.0 * far))
+    return out
+
+
+def _date_ticks(ax, rows: list[dict]) -> None:
+    """First, median and last sample as the x-axis labels."""
+    n = len(rows)
+    if n == 0:
+        return
+    idx = sorted({0, (n - 1) // 2, n - 1})
+    ax.set_xticks(idx)
+    ax.set_xticklabels([f"{rows[i]['date']}\n{rows[i]['reference_utc']}" for i in idx],
+                       fontsize=8)
+    ax.set_xlabel("Sample (chronological)")
+
+
+def _plot_metrics_bars(summary: dict, offsets: list[int], step: int,
+                       path: Path) -> None:
+    """Grouped FAR / POD / CSI bars, one group per metric, a bar per lead."""
+    metrics_per_lead = summary["metrics_per_lead"]
+    lead_titles = [f"t+{o * step}" for o in offsets]
+    names = ["FAR", "POD", "CSI"]
     n_lead = len(lead_titles)
-    colors, markers = lead_palette(n_lead)
+    colors, _ = lead_palette(n_lead)
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    x = np.arange(len(names))
+    width = 0.8 / n_lead
+    for i, lt in enumerate(lead_titles):
+        vals = [float(metrics_per_lead.get(lt, {}).get(m, 0.0)) for m in names]
+        ax.bar(x + (i - (n_lead - 1) / 2) * width, vals, width, label=lt,
+               color=colors[i], edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names)
+    ax.set_ylabel("Score")
+    ax.set_ylim(0.0, 1.0)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend()
+    if summary.get("track") == "rainfall":
+        ax.set_title("FAR / POD / CSI on the >= 10 mm/h event (class >= 1)\n"
+                     f"samples selected at >= {THRESHOLD_MMH:g} mm/h")
+    else:
+        ax.set_title("FAR / POD / CSI at the tuned HIGH per lead")
+    fig.suptitle(_run_title(summary), fontsize=12, fontweight="bold")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {path.name}")
+
+
+def _plot_coverage_scatter(summary: dict, rows: list[dict], offsets: list[int],
+                           step: int, path: Path) -> None:
+    """Per-sample IoU against class-weighted overlap, marker per lead;
+    red lines at 50 %, gray dotted at the coverage grade."""
+    high_cov = float(summary.get("high_coverage_threshold_pct", HIGH_COVERAGE_PCT))
+    lead_titles = [f"t+{o * step}" for o in offsets]
+    colors, markers = lead_palette(len(offsets))
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    for i, offset in enumerate(offsets):
+        pts = [(r[f"iou_mask_t+{offset}"], r[f"class_wt_t+{offset}"]) for r in rows
+               if r.get(f"iou_mask_t+{offset}") is not None
+               and r.get(f"class_wt_t+{offset}") is not None]
+        if pts:
+            ax.scatter([a for a, _ in pts], [b for _, b in pts], marker=markers[i],
+                       color=colors[i], alpha=0.55, s=25, edgecolor="none",
+                       label=lead_titles[i])
+    ax.axhline(high_cov, color="gray", linestyle=":", alpha=0.6, linewidth=1)
+    ax.axvline(high_cov, color="gray", linestyle=":", alpha=0.6, linewidth=1)
+    ax.axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+    ax.axvline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+    ax.set_xlabel("IoU on the >= 10 mm/h binary mask (%)")
+    ax.set_ylabel("Per-class weighted overlap (%)")
+    ax.set_title("Per-sample coverage scatter")
+    ax.set_xlim(-2, 102)
+    ax.set_ylim(-2, 102)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.suptitle(_run_title(summary), fontsize=12, fontweight="bold")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {path.name}")
+
+
+def _plot_hmf_figure(summary: dict, rows: list[dict], offsets: list[int],
+                     step: int, path: Path) -> None:
+    """Three panels - hits %, misses %, false alarms % - each a per-sample
+    scatter in chronological order with one marker per lead and a red
+    line at 50 %. The x axis names the first, median and last sample."""
+    track = summary.get("track", "rainfall")
+    lead_titles = [f"t+{o * step}" for o in offsets]
+    colors, markers = lead_palette(len(offsets))
     titles = {"hits": "Hits (% of GT-active pixels detected)",
               "misses": "Misses (% of GT-active pixels missed)",
               "false_alarms": "False alarms (% of predicted-active pixels)"}
-
     fig, axes = plt.subplots(1, 3, figsize=(20, 6), constrained_layout=True)
-    x_all = np.arange(len(rows))
     for ax, name in zip(axes, HMF_NAMES):
-        for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            col = f"{name}_pct_t+{offset}"
-            xs = [x for x, r in zip(x_all, rows) if r.get(col) is not None]
-            ys = [r[col] for r in rows if r.get(col) is not None]
-            v = pooled.get(i, {}).get(name)
-            # The legend carries both rates: pooled (summed pixel counts
-            # over all samples) and the plain mean of the per-sample
-            # percentages; the dashed line is the pooled one.
-            label = lead_titles[i]
-            if v is not None:
-                label += f"  pooled {v:.1f} %"
-            if ys:
-                label += f"  mean {sum(ys) / len(ys):.1f} %"
-            ax.scatter(xs, ys, marker=markers[i], color=colors[i],
-                       alpha=0.55, s=25, edgecolor="none", label=label)
-            if v is not None:
-                ax.axhline(v, color=colors[i], linestyle="--",
-                           alpha=0.7, linewidth=1)
-                ax.text(len(rows) - 0.5, v, f"{v:.1f} %", color=colors[i],
-                        fontsize=8, ha="right", va="bottom")
-        if name == "hits":
-            ax.axhline(high_coverage_pct, color="gray", linestyle=":",
-                       alpha=0.6, linewidth=1)
+        for i, offset in enumerate(offsets):
+            pts = _hmf_series(rows, track, offset, step)[name]
+            ax.scatter([x for x, _ in pts], [v for _, v in pts],
+                       marker=markers[i], color=colors[i], alpha=0.55, s=25,
+                       edgecolor="none", label=lead_titles[i])
         ax.axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
         ax.set_title(titles[name])
-        ax.set_xlabel("Sample (chronological)")
         ax.set_ylabel("%")
         ax.set_ylim(-2, 102)
+        ax.set_xlim(-1, max(len(rows), 1))
         ax.grid(alpha=0.3)
-        ax.legend(title="lead (dashed = pooled)", fontsize=8)
-
-    fig.suptitle(
-        f"Validation — {track} — {scope_label(year, month)}  |  "
-        f"{len(rows)} selected samples  |  post-processed map at the tuned HIGH",
-        fontsize=13, fontweight="bold",
-    )
+        ax.legend(title="lead", fontsize=8)
+        _date_ticks(ax, rows)
+    fig.suptitle(f"{_run_title(summary)}  |  post-processed map at the tuned HIGH",
+                 fontsize=12, fontweight="bold")
     fig.text(0.01, -0.02, _hmf_legend_text(), fontsize=8, family="monospace",
              va="top")
     fig.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Wrote hits/misses/false-alarms figure to {path}")
+    print(f"  Wrote {path.name}")
+
+
+def _plot_hmf_percentiles(summary: dict, rows: list[dict], offsets: list[int],
+                          step: int, path: Path) -> None:
+    """Per panel (hits, misses, false alarms) and per lead: the p10-p90
+    whiskers, the p25-p75 box and the median of the per-sample rates,
+    the red 50 % line, and above each box the share of samples at or
+    above 50 % and below it."""
+    track = summary.get("track", "rainfall")
+    lead_titles = [f"t+{o * step}" for o in offsets]
+    colors, _ = lead_palette(len(offsets))
+    titles = {"hits": "Hits %", "misses": "Misses %", "false_alarms": "False alarms %"}
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6), constrained_layout=True)
+    for ax, name in zip(axes, HMF_NAMES):
+        data, labels = [], []
+        for i, offset in enumerate(offsets):
+            vals = [v for _, v in _hmf_series(rows, track, offset, step)[name]]
+            data.append(vals if vals else [np.nan])
+            labels.append(lead_titles[i])
+        bp = ax.boxplot(data, positions=np.arange(len(offsets)), widths=0.55,
+                        whis=(10, 90), showfliers=False, patch_artist=True,
+                        medianprops={"color": "black", "linewidth": 1.5})
+        for patch, c in zip(bp["boxes"], colors):
+            patch.set_facecolor(c)
+            patch.set_alpha(0.45)
+        for i, vals in enumerate(data):
+            vals = [v for v in vals if v == v]
+            if not vals:
+                continue
+            above = 100.0 * sum(v >= 50.0 for v in vals) / len(vals)
+            ax.text(i, 101, f">= 50 %: {above:.0f} %\n< 50 %: {100 - above:.0f} %\nn={len(vals)}",
+                    ha="center", va="bottom", fontsize=8)
+        ax.axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
+        ax.set_xticks(np.arange(len(offsets)))
+        ax.set_xticklabels(labels)
+        ax.set_ylim(-2, 118)
+        ax.set_yticks([0, 20, 40, 60, 80, 100])
+        ax.set_ylabel("%")
+        ax.set_title(f"{titles[name]} - p10 / p25 / median / p75 / p90 over samples")
+        ax.grid(axis="y", alpha=0.3)
+    fig.suptitle(f"{_run_title(summary)}  |  distribution of the per-sample rates",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {path.name}")
 
 
 def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
     """CSI against the swept HIGH threshold, one line per lead, a dashed
-    line at each lead's winner - the panel the lightning metrics figure
-    carries, as its own figure for either track, drawn from the saved
-    summary alone (post_processing.tuning_scores)."""
+    line at each lead's winner, for either track, drawn from
+    post_processing.tuning_scores of the saved summary."""
     summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
     pp = summary.get("post_processing") or {}
     scores = pp.get("tuning_scores") or {}
@@ -958,133 +1125,37 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
                  + (f"(low={float(low):.2f} fixed)" if low is not None else ""))
     ax.grid(alpha=0.3)
     ax.legend()
-    parts = [f"Validation - {summary.get('track', '')}"]
-    if summary.get("split"):
-        parts[0] += f" - {summary['split']} split"
-    if summary.get("year") and summary.get("month"):
-        parts[0] += f" - {summary['year']:04d}-{summary['month']:02d}"
-    if summary.get("model"):
-        parts.append(summary["model"])
-    parts.append(f"{summary.get('total_selected_samples', '?')} selected samples")
-    fig.suptitle("  |  ".join(parts), fontsize=12, fontweight="bold")
+    fig.suptitle(_run_title(summary), fontsize=12, fontweight="bold")
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Wrote tuning figure to {out_path}")
+    print(f"  Wrote {Path(out_path).name}")
 
 
-def plot_hmf_from_summary(summary_path: Path, out_path: Path) -> None:
-    """The hits / misses / false-alarms figure from saved data alone:
-    per-sample percentages from <stem>_samples.csv, pooled values,
-    scope and threshold from <stem>_summary.json. Rainfall runs only
-    (the columns exist there)."""
-    global SPLIT, THRESHOLD_MMH
+def make_plots(summary_path: Path) -> list[Path]:
+    """Every figure the saved run allows, next to the summary: metrics
+    bars, coverage scatter (rainfall), hits / misses / false alarms,
+    their percentiles, and the tuning curves (runs with a sweep).
+    Called at the end of an extraction and by --plots."""
     summary_path = Path(summary_path)
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    pooled_named = summary.get("hits_misses_false_alarms_pooled_per_lead") or {}
-    if not pooled_named:
-        raise SystemExit(f"{summary_path} has no hits/misses/false-alarms "
-                         f"block (not a rainfall extraction summary)")
-    stem = summary_path.name[:-len("_summary.json")]
-    csv_path = summary_path.with_name(f"{stem}_samples.csv")
-    if not csv_path.is_file():
-        raise SystemExit(f"samples CSV not found next to the summary: {csv_path}")
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        raw_rows = list(csv.DictReader(f))
-    # Leads from the CSV columns, minutes from the pooled block's keys.
-    offsets = sorted({int(c[len("hits_pct_t+"):]) for c in raw_rows[0]
-                      if c.startswith("hits_pct_t+")}) if raw_rows else []
-    minutes = sorted(int(k[2:]) for k in pooled_named)
-    if not offsets or len(minutes) != len(offsets):
-        raise SystemExit("the samples CSV and the summary disagree on the leads")
-    step_minutes = minutes[0] // offsets[0]
-    rows = []
-    for r in raw_rows:
-        row = dict(r)
-        for c, v in r.items():
-            if c.endswith(tuple(f"_pct_t+{o}" for o in offsets)) or c.startswith("csi_t+"):
-                row[c] = float(v) if v not in ("", None) else None
-        rows.append(row)
-    pooled = {i: pooled_named[f"t+{o * step_minutes}"] for i, o in enumerate(offsets)}
-    LEAD_STEP_OFFSETS[:] = offsets
-    SPLIT = summary.get("split")
-    if summary.get("threshold_mmh") is not None:
-        THRESHOLD_MMH = float(summary["threshold_mmh"])
-    _plot_hmf_figure(summary.get("track", "rainfall"), summary.get("year"),
-                     summary.get("month"), rows, pooled, step_minutes, out_path,
-                     high_coverage_pct=float(summary.get(
-                         "high_coverage_threshold_pct", HIGH_COVERAGE_PCT)))
+    summary, rows, offsets, step, stem = _load_run(summary_path)
+    _apply_scope(summary)
+    here = summary_path.parent
+    made: list[Path] = []
 
+    def out(suffix):
+        made.append(here / f"{stem}_{suffix}.png")
+        return made[-1]
 
-def _plot_metrics_figure(track: str, year: int, month: int,
-                         rows: list[dict],
-                         confusion_per_lead: dict[int, dict],
-                         step_minutes: int, path: Path,
-                         *,
-                         rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
-                         high_coverage_pct: float = HIGH_COVERAGE_PCT):
-    """Left: grouped bars for FAR/POD/CSI, one group per lead time.
-    Right: scatter of per-sample coverages (all three lead times on the
-    same axes, marker per lead time). Both threshold overrides feed the
-    axis title text and the 90%-guide lines respectively."""
-    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
-
-    # Left: bars
-    metric_names = ["FAR", "POD", "CSI"]
-    metric_values = np.zeros((len(lead_titles), len(metric_names)))
-    for i in range(len(LEAD_STEP_OFFSETS)):
-        agg = _summarise_confusion(confusion_per_lead[i])
-        for j, m in enumerate(metric_names):
-            metric_values[i, j] = agg[m]
-    x = np.arange(len(metric_names))
-    n_lead = len(lead_titles)
-    width = 0.8 / n_lead
-    colors, markers = lead_palette(n_lead)
-    for i, lt in enumerate(lead_titles):
-        axes[0].bar(x + (i - (n_lead - 1) / 2) * width, metric_values[i],
-                    width, label=lt, color=colors[i], edgecolor="white",
-                    linewidth=0.5)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(metric_names)
-    axes[0].set_ylabel("Score")
-    # The event is class >= 1, i.e. the model's own 10 mm/h boundary; the
-    # selection threshold only decides which timesteps are scored.
-    axes[0].set_title("FAR / POD / CSI on the >= 10 mm/h event (class >= 1)\n"
-                      f"samples selected at >= {rainfall_threshold_mmh:g} mm/h")
-    axes[0].set_ylim(0.0, 1.0)
-    axes[0].grid(axis="y", alpha=0.3)
-    axes[0].legend()
-
-    # Right: scatter
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        ious = [r[f"iou_mask_t+{offset}"] for r in rows]
-        cwts = [r[f"class_wt_t+{offset}"] for r in rows]
-        axes[1].scatter(ious, cwts, marker=markers[i], color=colors[i],
-                        alpha=0.55, s=25, edgecolor="none",
-                        label=lead_titles[i])
-    axes[1].axhline(high_coverage_pct, color="gray", linestyle=":",
-                    alpha=0.6, linewidth=1)
-    axes[1].axvline(high_coverage_pct, color="gray", linestyle=":",
-                    alpha=0.6, linewidth=1)
-    # The 50 % mark on both coverage axes.
-    axes[1].axhline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
-    axes[1].axvline(50.0, color="red", linestyle="-", alpha=0.8, linewidth=1)
-    axes[1].set_xlabel("IoU on the >= 10 mm/h binary mask (%)")
-    axes[1].set_ylabel("Per-class weighted overlap (%)")
-    axes[1].set_title("Per-sample coverage scatter")
-    axes[1].set_xlim(-2, 102); axes[1].set_ylim(-2, 102)
-    axes[1].grid(alpha=0.3)
-    axes[1].legend()
-
-    fig.suptitle(
-        f"Validation — {track} — {scope_label(year, month)}  |  "
-        f"{len(rows)} selected samples",
-        fontsize=13, fontweight="bold",
-    )
-    fig.savefig(path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Wrote metrics figure to {path}")
+    _plot_metrics_bars(summary, offsets, step, out("metrics"))
+    if rows and summary.get("track") == "rainfall" \
+            and f"iou_mask_t+{offsets[0]}" in rows[0]:
+        _plot_coverage_scatter(summary, rows, offsets, step, out("coverage"))
+    if rows:
+        _plot_hmf_figure(summary, rows, offsets, step, out("hmf"))
+        _plot_hmf_percentiles(summary, rows, offsets, step, out("hmf_percentiles"))
+    if (summary.get("post_processing") or {}).get("tuning_scores"):
+        plot_tuning_from_summary(summary_path, out("tuning"))
+    return made
 
 
 # ============================================================================
@@ -1399,16 +1470,9 @@ def run_extraction(track: str, year: int, month: int,
                     rows, [f"csi_t+{o}" for o in LEAD_STEP_OFFSETS],
                     "mean over leads of the per-sample CSI on the "
                     ">= 10 mm/h event at the tuned HIGH"))
-    _plot_metrics_figure(track, year, month, rows, confusion_per_lead,
-                         step_minutes, output_dir / f"{stem}_metrics.png",
-                         rainfall_threshold_mmh=rainfall_threshold_mmh,
-                         high_coverage_pct=high_coverage_pct)
-    _plot_hmf_figure(track, year, month, rows, hmf_pooled, step_minutes,
-                     output_dir / f"{stem}_hmf.png",
-                     high_coverage_pct=high_coverage_pct)
-    if not baseline:
-        plot_tuning_from_summary(output_dir / f"{stem}_summary.json",
-                                 output_dir / f"{stem}_tuning.png")
+    # Every figure is drawn from the files just written, the same way
+    # --plots draws them later.
+    make_plots(output_dir / f"{stem}_summary.json")
 
 
 def _resolve_gt(ref_utc: str, offset_min: int,
@@ -2326,6 +2390,7 @@ def _write_json_lightning(
         "year": year,
         "month": month,
         "split": SPLIT,
+        "threshold_mmh": rainfall_threshold_mmh,
         "selection_criterion": (
             f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
             f"768x1536 canvas at the reference timestep (shared with the "
@@ -2353,76 +2418,6 @@ def _write_json_lightning(
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
-
-
-def _plot_metrics_figure_lightning(
-    year: int, month: int,
-    rows: list[dict],
-    aggregate_confusion_per_lead: dict[int, dict],
-    tuning_scores: dict[int, dict[float, dict]],
-    best_high_per_lead: dict[int, float],
-    step_minutes: int, path: Path,
-):
-    """Left: grouped bars for FAR/POD/CSI at the CHOSEN high per lead.
-    Right: CSI vs high-threshold sweep, one line per lead time, vertical
-    markers at each lead's chosen best_high. Makes the tuning decision
-    visually auditable."""
-    lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), constrained_layout=True)
-
-    # Left: bars at best_high per lead
-    metric_names = ["FAR", "POD", "CSI"]
-    metric_values = np.zeros((len(lead_titles), len(metric_names)))
-    for i in range(len(LEAD_STEP_OFFSETS)):
-        agg = _summarise_confusion(aggregate_confusion_per_lead[i])
-        for j, m in enumerate(metric_names):
-            metric_values[i, j] = agg[m]
-    x = np.arange(len(metric_names))
-    n_lead = len(lead_titles)
-    width = 0.8 / n_lead
-    colors, markers = lead_palette(n_lead)
-    for i, lt in enumerate(lead_titles):
-        offset = LEAD_STEP_OFFSETS[i]
-        axes[0].bar(x + (i - (n_lead - 1) / 2) * width, metric_values[i], width,
-                    label=f"{lt} (high={best_high_per_lead[offset]:.2f})",
-                    color=colors[i], edgecolor="white", linewidth=0.5)
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(metric_names)
-    axes[0].set_ylabel("Score")
-    axes[0].set_title(
-        f"FAR / POD / CSI on binary lightning occurrence "
-        f"(post-proc: Hann + hysteresis)"
-    )
-    axes[0].set_ylim(0.0, 1.0)
-    axes[0].grid(axis="y", alpha=0.3)
-    axes[0].legend()
-
-    # Right: CSI sweep
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        highs = sorted(tuning_scores[i])
-        csis = [tuning_scores[i][h]["CSI"] for h in highs]
-        axes[1].plot(highs, csis, marker="o", color=colors[i],
-                     label=lead_titles[i], linewidth=1.5)
-        axes[1].axvline(best_high_per_lead[offset],
-                        color=colors[i], linestyle="--", alpha=0.5,
-                        linewidth=1)
-    axes[1].set_xlabel("High threshold")
-    axes[1].set_ylabel("Aggregate CSI over selected samples")
-    axes[1].set_title(
-        f"CSI vs high-threshold sweep  "
-        f"(low={LIGHTNING_LOW_THRESHOLD:.2f} fixed)"
-    )
-    axes[1].grid(alpha=0.3)
-    axes[1].legend()
-
-    fig.suptitle(
-        f"Validation - lightning - {scope_label(year, month)}  |  "
-        f"{len(rows)} selected samples",
-        fontsize=13, fontweight="bold",
-    )
-    fig.savefig(path, dpi=140, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Wrote metrics figure to {path}")
 
 
 def run_extraction_lightning(
@@ -2643,12 +2638,7 @@ def run_extraction_lightning(
             rows, [f"csi_t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS],
             "mean over leads of the per-sample CSI at the tuned HIGH"),
     )
-    _plot_metrics_figure_lightning(
-        year, month, rows,
-        aggregate_confusion_per_lead, tuning_scores,
-        best_high_per_lead, step_minutes,
-        output_dir / f"{stem}_metrics.png",
-    )
+    make_plots(output_dir / f"{stem}_summary.json")
 
 
 def run_visualization_lightning(
@@ -2915,6 +2905,7 @@ def _write_json_kd(
     doc = {
         "track": "kd",
         "year": year, "month": month, "split": SPLIT,
+        "threshold_mmh": rainfall_threshold_mmh,
         "selection_criterion": (
             f"OPERA-driven: >= {rainfall_threshold_mmh:g} mm/h anywhere on the "
             f"768x1536 canvas at the reference timestep (shared with rainfall + "
@@ -3433,18 +3424,15 @@ def main() -> int:
                     "figure. Visualization mode reads the JSON and "
                     "plots structure-overlay + zoom for a given date.",
     )
-    parser.add_argument("--plot_tuning", type=str, default=None,
+    parser.add_argument("--plots", type=str, default=None,
                         metavar="SUMMARY_JSON",
-                        help="Draw the CSI-vs-high-threshold sweep figure "
-                             "from a saved summary (either track) and exit; "
-                             "writes <stem>_tuning.png next to it. No model, "
-                             "no data. Every other flag is ignored.")
-    parser.add_argument("--plot_hmf", type=str, default=None,
-                        metavar="SUMMARY_JSON",
-                        help="Draw the hits / misses / false-alarms figure "
-                             "from a saved rainfall summary and its sibling "
-                             "samples CSV, then exit; writes <stem>_hmf.png "
-                             "next to them. Every other flag is ignored.")
+                        help="Redraw every figure of a finished run from its "
+                             "summary JSON and sibling samples CSV, then "
+                             "exit: metrics bars, coverage scatter "
+                             "(rainfall), hits / misses / false alarms, "
+                             "their percentiles, tuning curves. Either "
+                             "track. No model, no data; every other flag "
+                             "is ignored.")
     parser.add_argument("--track", type=str, default=None,
                         choices=["rainfall", "lightning", "kd"],
                         help="Validation track. 'rainfall' is the OPERA "
@@ -3577,21 +3565,11 @@ def main() -> int:
                              "the KD-trained student produced by train_lightning_kd.py.")
     args = parser.parse_args()
 
-    if args.plot_tuning:
-        src = Path(args.plot_tuning)
+    if args.plots:
+        src = Path(args.plots)
         if not src.is_file():
-            parser.error(f"--plot_tuning: {src} not found")
-        name = (src.name[:-len("_summary.json")]
-                if src.name.endswith("_summary.json") else src.stem)
-        plot_tuning_from_summary(src, src.with_name(f"{name}_tuning.png"))
-        return 0
-    if args.plot_hmf:
-        src = Path(args.plot_hmf)
-        if not src.is_file():
-            parser.error(f"--plot_hmf: {src} not found")
-        name = (src.name[:-len("_summary.json")]
-                if src.name.endswith("_summary.json") else src.stem)
-        plot_hmf_from_summary(src, src.with_name(f"{name}_hmf.png"))
+            parser.error(f"--plots: {src} not found")
+        make_plots(src)
         return 0
     if args.track is None:
         parser.error("--track is required")
