@@ -85,8 +85,10 @@ def resolve_stem(validation_dir: Path, base: str, tag: str | None) -> str:
     """
     if tag:
         return f"{base}_{tag}"
-    # One folder per run: validation/<stem>/<stem>_summary.json.
-    tagged = sorted(validation_dir.glob(f"{base}_*/{base}_*_summary.json"))
+    tagged = sorted(validation_dir.glob(f"{base}_*_summary.json"))
+    # `<base>_<date>_...` per-date PNGs never end in _summary.json, but a
+    # legacy untagged summary is exactly `<base>_summary.json`.
+    tagged = [q for q in tagged if q.name != f"{base}_summary.json"]
     if not tagged:
         return base
     if len(tagged) == 1:
@@ -113,9 +115,10 @@ def _discover_track_artefacts(validation_dir: Path, track: str,
         raise ValueError(f"unknown track: {track!r}")
     stem = resolve_stem(validation_dir, base, tag)
 
+    # Summary and CSV are flat; the run's figures sit in validation/<stem>/.
     run_dir = validation_dir / stem
-    samples_csv = run_dir / f"{stem}_samples.csv"
-    summary_json = run_dir / f"{stem}_summary.json"
+    samples_csv = validation_dir / f"{stem}_samples.csv"
+    summary_json = validation_dir / f"{stem}_summary.json"
     metrics_png = run_dir / f"{stem}_metrics.png"
 
     # Per-date visualization PNGs. Both tracks use the same {stem}_{date}_...
@@ -306,8 +309,8 @@ def discover_kd_artefacts(validation_dir: Path, year: int, month: int) -> dict:
     file is not on disk, so the caller can degrade cleanly."""
     stem = KD_STEM_TEMPLATE.format(year=year, month=month)
     run_dir = validation_dir / stem
-    summary_json = run_dir / f"{stem}_summary.json"
-    samples_csv = run_dir / f"{stem}_samples.csv"
+    summary_json = validation_dir / f"{stem}_summary.json"
+    samples_csv = validation_dir / f"{stem}_samples.csv"
 
     metric_pngs: dict[str, Path] = {}
     for metric in ("FAR", "POD", "CSI", "IoU"):

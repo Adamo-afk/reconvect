@@ -162,9 +162,10 @@ def threshold_tag(mmh: float) -> str:
 
 
 def run_dir(output_dir: Path, stem: str) -> Path:
-    """The folder of one validation run, validation/<stem>/, created on
-    demand. Everything the run writes - summary, samples, figures, the
-    per-date PNGs of visualisation mode - lands there."""
+    """The figure folder of one validation run, validation/<stem>/,
+    created on demand. Only PNGs go there - the figures and the per-date
+    overlays; the summary JSON and the samples CSV stay flat in
+    validation/ next to it."""
     d = Path(output_dir) / stem
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -1180,7 +1181,8 @@ def make_plots(summary_path: Path) -> list[Path]:
     summary_path = Path(summary_path)
     summary, rows, offsets, step, stem = _load_run(summary_path)
     _apply_scope(summary)
-    here = summary_path.parent
+    # Figures go to the run's own folder next to the summary.
+    here = run_dir(summary_path.parent, stem)
     made: list[Path] = []
 
     def out(suffix):
@@ -1497,9 +1499,9 @@ def run_extraction(track: str, year: int, month: int,
         }
 
     stem = f"{track}_{scope_stem(year, month)}_{tag}"
-    _write_csv(rows, run_dir(output_dir, stem) / f"{stem}_samples.csv")
+    _write_csv(rows, output_dir / f"{stem}_samples.csv")
     _write_json(track, year, month, selected, rows, confusion_per_lead,
-                step_minutes, run_dir(output_dir, stem) / f"{stem}_summary.json",
+                step_minutes, output_dir / f"{stem}_summary.json",
                 rainfall_threshold_mmh=rainfall_threshold_mmh,
                 high_coverage_pct=high_coverage_pct,
                 post_processing=post_processing,
@@ -1513,7 +1515,7 @@ def run_extraction(track: str, year: int, month: int,
                     ">= 10 mm/h event at the tuned HIGH"))
     # Every figure is drawn from the files just written, the same way
     # --plots draws them later.
-    make_plots(run_dir(output_dir, stem) / f"{stem}_summary.json")
+    make_plots(output_dir / f"{stem}_summary.json")
 
 
 def _resolve_gt(ref_utc: str, offset_min: int,
@@ -2081,14 +2083,14 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = (f"{track}_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned)}")
-    summary = _load_summary_json(run_dir(output_dir, stem) / f"{stem}_summary.json")
+    summary = _load_summary_json(output_dir / f"{stem}_summary.json")
 
     date_in_selection = _date_is_in(date_str, summary["initial_selection"])
     if not date_in_selection:
         raise SystemExit(
             f"Date {date_str} not present in the initial selection for "
             f"{scope_label(year, month)}. Nothing to visualise. "
-            f"Check {run_dir(output_dir, stem) / (stem + '_summary.json')} for the "
+            f"Check {output_dir / (stem + '_summary.json')} for the "
             f"list of selected dates."
         )
 
@@ -2665,13 +2667,13 @@ def run_extraction_lightning(
     # other's outputs. Matches predict_full_domain's output_dir naming.
     stem = (f"lightning_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned, kd)}")
-    _write_csv_lightning(rows, run_dir(output_dir, stem) / f"{stem}_samples.csv",
+    _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
                           step_minutes)
     _write_json_lightning(
         year, month, selected, rows,
         aggregate_confusion_per_lead, tuning_scores,
         best_high_per_lead, low_threshold, step_minutes,
-        run_dir(output_dir, stem) / f"{stem}_summary.json",
+        output_dir / f"{stem}_summary.json",
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
         per_patch=per_patch_scores(chosen_patch_acc),
@@ -2679,7 +2681,7 @@ def run_extraction_lightning(
             rows, [f"csi_t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS],
             "mean over leads of the per-sample CSI at the tuned HIGH"),
     )
-    make_plots(run_dir(output_dir, stem) / f"{stem}_summary.json")
+    make_plots(output_dir / f"{stem}_summary.json")
 
 
 def run_visualization_lightning(
@@ -2706,7 +2708,7 @@ def run_visualization_lightning(
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = (f"lightning_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned, kd)}")
-    summary = _load_summary_json(run_dir(output_dir, stem) / f"{stem}_summary.json")
+    summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "post_processing" not in summary:
         raise SystemExit(
             f"Summary {stem}_summary.json is missing the post_processing "
@@ -3317,12 +3319,12 @@ def run_extraction_kd(
         rows.append(row)
 
     stem = f"kd_{scope_stem(year, month)}"
-    _write_csv_kd(rows, run_dir(output_dir, stem) / f"{stem}_samples.csv", step_minutes)
+    _write_csv_kd(rows, output_dir / f"{stem}_samples.csv", step_minutes)
     _write_json_kd(
         year, month, selected, rows,
         t_agg, s_agg, t_tuning, s_tuning, t_best, s_best,
         low_threshold, step_minutes,
-        run_dir(output_dir, stem) / f"{stem}_summary.json",
+        output_dir / f"{stem}_summary.json",
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
     )
@@ -3349,7 +3351,7 @@ def run_visualization_kd(
     the extraction run)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"kd_{scope_stem(year, month)}"
-    summary = _load_summary_json(run_dir(output_dir, stem) / f"{stem}_summary.json")
+    summary = _load_summary_json(output_dir / f"{stem}_summary.json")
     if "teacher" not in summary or "student" not in summary:
         raise SystemExit(
             f"{stem}_summary.json is missing teacher/student blocks. "
@@ -3529,8 +3531,9 @@ def main() -> int:
                         choices=["best", "latest"],
                         help="Which saved state to load: `best`, the final save (best epoch, restored by early stopping), or `latest`, the per-epoch checkpoint under models/checkpoints/ (the last epoch run). Outputs of a `latest` run carry a _latest suffix.")
     parser.add_argument("--output_dir", type=str, default="./validation",
-                        help="Root of the validation runs; each run writes "
-                             "into <output_dir>/<stem>/ (default ./validation).")
+                        help="Where the summary JSON and samples CSV go "
+                             "(default ./validation); a run's figures go to "
+                             "<output_dir>/<stem>/.")
     # --- Lightning-only knobs (ignored when --track rainfall) ---
     parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
                         help="Overlap stride for Hann inference (lightning). "
