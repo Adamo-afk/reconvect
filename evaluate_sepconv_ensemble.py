@@ -409,7 +409,9 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=8,
     # normalization statistics together, so an evaluation cannot read one
     # window's models against another window's test split.
     run_tag = build_run_tag(mode, SOURCE, period)
-    output_dir = Path(output_dir) / f"eval_sepconv_{run_tag}"
+    # A `latest` run gets its own folder so it never replaces the `best` one.
+    output_dir = Path(output_dir) / (
+        f"eval_sepconv_{run_tag}" + ("_latest" if weights == "latest" else ""))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
