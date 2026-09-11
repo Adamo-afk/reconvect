@@ -315,8 +315,8 @@ def main():
     for label in wanted:
         run_tag = build_run_tag(args.mode, SOURCE, label)
         model_path = model_dir / f"coalition_{run_tag}{suffix}.keras"
-        summary = (validation_dir
-                   / f"{args.track}_{scope}_{run_tag}{suffix}_summary.json")
+        stem = f"{args.track}_{scope}_{run_tag}{suffix}"
+        summary = validation_dir / stem / f"{stem}_summary.json"
         if not summary.is_file():
             problems.append(
                 f"  {label}: no summary at {summary}\n"
