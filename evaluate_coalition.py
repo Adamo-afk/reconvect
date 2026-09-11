@@ -1610,7 +1610,9 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
                       else "_kd" if kd
                       else "")
     artifact_tag = f"{run_tag}{variant_suffix}"
-    output_dir = Path(output_dir) / f"eval_{artifact_tag}"
+    # A `latest` run gets its own folder so it never replaces the `best` one.
+    output_dir = Path(output_dir) / (
+        f"eval_{artifact_tag}" + ("_latest" if weights == "latest" else ""))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # KD student was trained on the TEACHER's dataset (past_hr sliced at
