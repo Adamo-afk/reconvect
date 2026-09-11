@@ -147,6 +147,9 @@ MAX_SAMPLES = None
 # and figure titles read it.
 SPLITS = ("train", "validation", "test")
 SPLIT: str | None = None
+# Which saved state the run scores: the final save or the per-epoch
+# checkpoint. Set in main(); the artifact tag says which.
+WEIGHTS: str = "best"
 # The selection threshold (--rainfall_threshold_mmh) is a property of
 # the scored population too, so it is part of the scope and of every
 # output name; runs at different thresholds never overwrite each other.
@@ -233,7 +236,8 @@ def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
     tag = build_run_tag(mode, source, period)
     if baseline:
         return f"sepconv_{tag}"
-    return tag + ("_finetuned" if finetuned else "_kd" if kd else "")
+    return (tag + ("_finetuned" if finetuned else "_kd" if kd else "")
+            + ("_latest" if WEIGHTS == "latest" else ""))
 
 
 def _paste_class_canvases(classes_by_step: dict, valid_patches: list[int],
@@ -1247,7 +1251,7 @@ def run_extraction(track: str, year: int, month: int,
         model = None
     else:
         model = load_model_artifact(model_dir, mode, source, finetuned,
-                                    period=period)
+                                    period=period, weights=WEIGHTS)
         print(f"  Loaded: {model.count_params():,} parameters")
 
     rows: list[dict] = []
@@ -2078,7 +2082,7 @@ def run_visualization(track: str, year: int, month: int, date_str: str,
 
     print(f"Loading model ...")
     model = load_model_artifact(model_dir, mode, source, finetuned,
-                                period=period)
+                                period=period, weights=WEIGHTS)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
@@ -2498,7 +2502,7 @@ def run_extraction_lightning(
                      else "base")
     print(f"\nLoading model ({variant_label}) ...")
     model = load_model_artifact(model_dir, mode, source, finetuned,
-                                kd=kd, period=period)
+                                kd=kd, period=period, weights=WEIGHTS)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     # Per-(sample, lead_idx, high) confusion tuples: we need them at
@@ -2721,7 +2725,7 @@ def run_visualization_lightning(
                      else "base")
     print(f"Loading model ({variant_label}) ...")
     model = load_model_artifact(model_dir, mode, source, finetuned,
-                                kd=kd, period=period)
+                                kd=kd, period=period, weights=WEIGHTS)
     print(f"  Loaded: {model.count_params():,} parameters")
 
     lead_titles = [f"t+{o * step_minutes}" for o in LEAD_STEP_OFFSETS]
@@ -3493,6 +3497,9 @@ def main() -> int:
                              "metadata together. Omit for an untagged "
                              "whole-archive run.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
+    parser.add_argument("--weights", type=str, default="best",
+                        choices=["best", "latest"],
+                        help="Which saved state to load: `best`, the final save (best epoch, restored by early stopping), or `latest`, the per-epoch checkpoint under models/checkpoints/ (the last epoch run). Outputs of a `latest` run carry a _latest suffix.")
     parser.add_argument("--output_dir", type=str, default="./validation",
                         help="Root of the validation runs; each run writes "
                              "into <output_dir>/<stem>/ (default ./validation).")
@@ -3601,9 +3608,10 @@ def main() -> int:
         parser.error("give --split, or --year and --month, or both")
     if args.month is not None and not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
-    global SPLIT, THRESHOLD_MMH
+    global SPLIT, THRESHOLD_MMH, WEIGHTS
     SPLIT = args.split
     THRESHOLD_MMH = float(args.rainfall_threshold_mmh)
+    WEIGHTS = args.weights
 
     # Prime the border cache once at process start (visualization uses it,
     # extraction ignores it but the cost is a few ms).

@@ -2015,7 +2015,7 @@ def _custom_objects():
 
 def load_model_artifact(model_dir: Path, mode: str, source: str,
                         finetuned: bool, kd: bool = False,
-                        period=None) -> tf.keras.Model:
+                        period=None, weights: str = "best") -> tf.keras.Model:
     """Load a saved model checkpoint. Three variants, mutually exclusive:
 
       kd=True                 -> coalition_<run_tag>_kd.keras
@@ -2044,9 +2044,22 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
         "_finetuned", "_kd", etc."""
         return model_dir / f"coalition_{run_tag}{kind_suffix}.keras"
 
-    base_path = _resolve("")
+    if weights not in ("best", "latest"):
+        raise ValueError(f"weights must be 'best' or 'latest', got {weights!r}")
+    # Two states exist per run: the final save (best epoch, restored by
+    # early stopping) and the rolling per-epoch checkpoint (last epoch).
+    # The finetune stage writes its own checkpoint under another name.
+    ckpt_dir = model_dir / "checkpoints"
+    base_path = (ckpt_dir / f"{run_tag}_latest.keras" if weights == "latest"
+                 else _resolve(""))
+    if weights == "latest":
+        print(f"  Weights: latest (last epoch run, not the best)")
 
     if kd:
+        if weights == "latest":
+            raise FileNotFoundError(
+                "the KD student has no per-epoch checkpoint; drop "
+                "--weights latest for --kd")
         # KD student is saved via .save() so a straight load_model works;
         # the custom_objects list handles ResBlock / ResGRU / ConvBlock /
         # WeightedFocalLoss registration same as the base path.
@@ -2062,12 +2075,22 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
 
     if not finetuned:
         if not base_path.is_file():
-            raise FileNotFoundError(f"Base model not found: {base_path}")
+            raise FileNotFoundError(
+                f"Base model not found: {base_path}"
+                + ("\n  No per-epoch checkpoint for --weights latest: the "
+                   "run predates checkpointing, or it finished cleanly with "
+                   "--fresh. Drop --weights latest for the final save."
+                   if weights == "latest" else ""))
         return tf.keras.models.load_model(
             str(base_path), custom_objects=_custom_objects(),
         )
 
-    ft_path = _resolve("_finetuned")
+    # The fine-tuned state is rebuilt and its weights loaded by name; the
+    # rebuild needs the *final* base save regardless of which fine-tune
+    # state is asked for.
+    ft_path = (ckpt_dir / f"{run_tag}_finetune_latest.keras"
+               if weights == "latest" else _resolve("_finetuned"))
+    base_path = _resolve("")
     # History JSON follows the same tag as the finetuned checkpoint.
     history_path = model_dir / f"history_{run_tag}_finetuned.json"
     if not ft_path.is_file():
@@ -2214,6 +2237,9 @@ def main() -> int:
                              "metadata together. Omit for an untagged "
                              "whole-archive run.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
+    parser.add_argument("--weights", type=str, default="best",
+                        choices=["best", "latest"],
+                        help="Which saved state to load: `best`, the final save (best epoch, restored by early stopping), or `latest`, the per-epoch checkpoint under models/checkpoints/ (the last epoch run). Outputs of a `latest` run carry a _latest suffix.")
     parser.add_argument("--output_dir", type=str,
                         default="./visualize_gt_vs_pred_plots")
     parser.add_argument("--finetuned", action="store_true",
@@ -2328,9 +2354,10 @@ def main() -> int:
 
     from train_models import build_run_tag  # local import: keep TF-heavy load lazy
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
-    variant_suffix = ("_finetuned" if args.finetuned
-                      else "_kd" if args.kd
-                      else "")
+    variant_suffix = (("_finetuned" if args.finetuned
+                       else "_kd" if args.kd
+                       else "")
+                      + ("_latest" if args.weights == "latest" else ""))
     artifact_tag = f"{run_tag}{variant_suffix}"
     # Named after this script, not after predict_full_domain, which
     # writes its own tree under inference/.
@@ -2360,7 +2387,7 @@ def main() -> int:
     print(f"\nLoading model...")
     model = load_model_artifact(
         Path(args.model_dir), args.mode, SOURCE, args.finetuned,
-        kd=args.kd, period=args.period,
+        kd=args.kd, period=args.period, weights=args.weights,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 

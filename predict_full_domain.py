@@ -1087,6 +1087,9 @@ def main() -> int:
                              "metadata together. Omit for an untagged "
                              "whole-archive run.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
+    parser.add_argument("--weights", type=str, default="best",
+                        choices=["best", "latest"],
+                        help="Which saved state to load: `best`, the final save (best epoch, restored by early stopping), or `latest`, the per-epoch checkpoint under models/checkpoints/ (the last epoch run). Outputs of a `latest` run carry a _latest suffix.")
     parser.add_argument("--output_dir", type=str, default="./inference")
     parser.add_argument("--finetuned", action="store_true",
                         help="Load coalition_<run_tag>_finetuned.keras "
@@ -1171,9 +1174,10 @@ def main() -> int:
         parser.error("give --date (with a time flag), or --pick")
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
-    variant_suffix = ("_finetuned" if args.finetuned
-                      else "_kd" if args.kd
-                      else "")
+    variant_suffix = (("_finetuned" if args.finetuned
+                       else "_kd" if args.kd
+                       else "")
+                      + ("_latest" if args.weights == "latest" else ""))
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
     output_dir = Path(args.output_dir) / (
         f"predict_{run_tag}{variant_suffix}"
@@ -1242,7 +1246,7 @@ def main() -> int:
     print("\nLoading model...")
     model = load_model_artifact(
         model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
-        period=args.period,
+        period=args.period, weights=args.weights,
     )
     print(f"  Loaded: {model.count_params():,} parameters")
 
