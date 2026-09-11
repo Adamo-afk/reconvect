@@ -9,7 +9,7 @@ Two sources, two outputs each.
    one table - rows models, columns metric x lead - as CSV, Markdown and
    LaTeX, the shape a paper prints.
 
-2. validation/<stem>/<stem>_samples.csv (stem = <track>_<scope>_thr<T>mmh_<tag>), written by
+2. validation/<stem>_samples.csv (stem = <track>_<scope>_thr<T>mmh_<tag>), written by
    validate_predictions.py, become the hit-level figures: for each lead
    and each season, the share of samples whose post-processed map hit at
    least L % of the ground-truth pixels, for L = 50 .. 90. Rainfall
@@ -325,8 +325,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
     legacy = 0
     used: list[str] = []
     seen_thresholds: set[float] = set()
-    # One folder per run: validation/<stem>/<stem>_samples.csv.
-    for path in sorted(validation_dir.glob(f"{track}_*/{track}_*_samples.csv")):
+    for path in sorted(validation_dir.glob(f"{track}_*_samples.csv")):
         m = pattern.match(path.name)
         if not m:
             legacy += 1
@@ -518,8 +517,7 @@ def main() -> int:
     parser.add_argument("--eval_root", default="./evaluation",
                         help="Root holding eval_<tag>/evaluation_results.json.")
     parser.add_argument("--validation_dir", default="./validation",
-                        help="Root holding one folder per run, "
-                             "<stem>/<stem>_samples.csv.")
+                        help="Root holding <stem>_samples.csv per run.")
     parser.add_argument("--output_dir", default="./comparison")
     parser.add_argument("--include_baseline", action="store_true",
                         help="Add the SepConv-ens baseline (tags starting "
@@ -587,8 +585,7 @@ def main() -> int:
         # back from any file name so the folder says which.
         rx = re.compile(r"_thr([\d.]+)mmh_")
         found = {float(m.group(1)) for p in Path(args.validation_dir).glob(
-            f"{args.track}_*/{args.track}_*_samples.csv")
-            for m in [rx.search(p.name)] if m}
+            f"{args.track}_*_samples.csv") for m in [rx.search(p.name)] if m}
         thr_used = found.pop() if len(found) == 1 else None
     scope = scope_name(args.split, args.year, args.month, thr_used)
     print(f"   scope: {scope}")

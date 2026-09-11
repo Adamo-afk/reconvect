@@ -369,7 +369,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 ```
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
 - **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope, including the selection threshold, is in every output name: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; runs at different thresholds never overwrite each other.
-- **Writes** — `validation/<stem>/<stem>_summary.json` (`<stem>` = `rainfall_<scope>_<tag>`; one folder per run, every file inside prefixed with the stem) **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
+- **Writes** — `validation/<stem>_summary.json` (`<stem>` = `rainfall_<scope>_<tag>`; the figures of the run go to `validation/<stem>/`) **CRITICAL** — tuned thresholds and the `per_patch` block. `<tag>` is the model's artifact tag, so several models validated on one scope coexist; `generate_report` takes `--rainfall_tag` when there is more than one.
 - **Writes** — `…_samples.csv`, with `csi_t+<k>` and the hits / misses / false-alarm percentages per lead at the tuned HIGH.
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run; `--weights latest` scores the per-epoch checkpoint instead of the final save (tag suffixed `_latest`). The same flag exists on A4 and A6.
 - **Alone** — the HIGH sweep runs `low+0.01 … low+margin` in 0.01 steps by default; `--rainfall_high_min`, `--rainfall_high_max` and `--rainfall_sweep_step` name the range and spacing outright. The first candidate must sit above LOW (`--rainfall_low_threshold`).
@@ -513,7 +513,7 @@ python train_models.py --config training.config --mode <mode> --period 2025warm 
 python validate_predictions.py --track rainfall --year Y --month M --mode <mode>
 ```
 - **Does** — produces the `per_patch` block the selector reads. Run once per member.
-- **Writes** — `validation/<stem>/<stem>_summary.json` with `per_patch` **CRITICAL**
+- **Writes** — `validation/<stem>_summary.json` with `per_patch` **CRITICAL**
 
 ### C4. Select per patch
 ```bash
