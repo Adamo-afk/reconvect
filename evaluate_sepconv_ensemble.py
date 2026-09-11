@@ -216,7 +216,7 @@ def evaluate_radar(models, test_ds, stats_period, data_root, output_dir,
         "confusion_matrix": agg.tolist(),
     }
 
-    plot_metrics(results, agg, output_dir)
+    plot_figures(results, output_dir)
     return results
 
 
@@ -224,47 +224,21 @@ def evaluate_radar(models, test_ds, stats_period, data_root, output_dir,
 # Plots
 # ============================================================================
 
-def plot_metrics(results, agg, output_dir):
-    """Accuracy and wet-class CSI per lead, plus the aggregate matrix."""
-    accs = [results["per_leadtime"][lt]["accuracy"] for lt in LEAD_LABELS]
-    csis = [np.mean([results["per_leadtime"][lt]["per_class"][c]["csi"]
-                     for c in CLASS_NAMES[1:]]) for lt in LEAD_LABELS]
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    axes[0].plot(LEAD_MINUTES, accs, 'o-', lw=2, ms=8, color='#1f77b4',
-                 label='Accuracy (all classes)')
-    axes[0].plot(LEAD_MINUTES, csis, 's-', lw=2, ms=8, color='#d62728',
-                 label='Mean CSI (wet classes)')
-    axes[0].set_xlabel("Lead time (min)")
-    axes[0].set_ylabel("Score")
-    axes[0].set_title("SepConv-ens skill by lead time")
-    axes[0].set_xticks(LEAD_MINUTES)
-    axes[0].set_ylim(0, 1)
-    axes[0].grid(alpha=0.3)
-    axes[0].legend()
-
-    # Row-normalised: class 0 is ~99.8% of pixels, so raw counts show one
-    # dark cell and nothing else.
-    with np.errstate(invalid='ignore', divide='ignore'):
-        norm = agg / agg.sum(axis=1, keepdims=True)
-    norm = np.nan_to_num(norm)
-    im = axes[1].imshow(norm, cmap='Blues', vmin=0, vmax=1)
-    axes[1].set_xticks(range(N_CLASSES), CLASS_NAMES, rotation=45, ha='right')
-    axes[1].set_yticks(range(N_CLASSES), CLASS_NAMES)
-    axes[1].set_xlabel("Predicted")
-    axes[1].set_ylabel("Observed")
-    axes[1].set_title("Aggregate confusion (row-normalised)")
-    for i in range(N_CLASSES):
-        for j in range(N_CLASSES):
-            axes[1].text(j, i, f"{norm[i, j]:.2f}", ha='center', va='center',
-                         fontsize=8,
-                         color='white' if norm[i, j] > 0.5 else '#333')
-    fig.colorbar(im, ax=axes[1], fraction=0.046)
-
-    plt.tight_layout()
-    fig.savefig(output_dir / "metrics_per_leadtime.png", dpi=150)
-    plt.close(fig)
-    print(f"  Wrote {output_dir / 'metrics_per_leadtime.png'}")
+def plot_figures(results: dict, output_dir: Path) -> None:
+    """The same five figures RECONVECT's evaluation writes, from this
+    evaluator's results dict (which carries the per-lead and aggregate
+    confusion matrices)."""
+    from evaluate_coalition import plot_radar_figures
+    labels = list(results["per_leadtime"])
+    minutes = [int(results["per_leadtime"][lt]["lead_minutes"]) for lt in labels]
+    conf = [np.asarray(results["per_leadtime"][lt]["confusion_matrix"], dtype=np.int64)
+            for lt in labels]
+    agg = np.asarray(results["aggregate"]["confusion_matrix"], dtype=np.int64)
+    plot_radar_figures(results, CLASS_NAMES, minutes, labels, conf, agg,
+                       Path(output_dir), title_prefix="SepConv-ens")
+    for name in ("accuracy_per_leadtime", "confusion_matrix", "f1_per_class",
+                 "csi_per_class", "macro_summary_per_leadtime"):
+        print(f"  Wrote {Path(output_dir) / (name + '.png')}")
 
 
 def plot_training_history(history_path, output_dir, model_dir=None,
@@ -532,6 +506,11 @@ def main():
                              "each model is scored on its own split, which "
                              "is a different population and overlaps the "
                              "other model's training data.")
+    parser.add_argument("--plots", type=str, default=None,
+                        metavar="RESULTS_JSON",
+                        help="Redraw the figures from a saved "
+                             "evaluation_results.json next to it and exit; "
+                             "no model, no data.")
     parser.add_argument("--weights", type=str, default="best",
                         choices=["best", "latest"],
                         help="Which of the two saved states to score. "
@@ -543,6 +522,12 @@ def main():
                         help="Render N test samples as observed vs predicted "
                              "class plus predicted mm/h.")
     args = parser.parse_args()
+    if args.plots:
+        src = Path(args.plots)
+        if not src.is_file():
+            parser.error(f"--plots: {src} not found")
+        plot_figures(json.loads(src.read_text(encoding="utf-8")), src.parent)
+        return 0
 
     evaluate(mode=args.mode, data_root=args.data_root,
              datasets_root=args.datasets_root,
