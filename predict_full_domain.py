@@ -1060,13 +1060,16 @@ def main() -> int:
     parser.add_argument("--date", type=str, default=None,
                         help="Reference date (YYYY-MM-DD). Required unless "
                              "--pick names the timesteps.")
-    parser.add_argument("--pick", nargs="+", default=None,
-                        choices=["best", "worst", "median"],
-                        help="Run on the timesteps validate_predictions "
-                             "recorded as best / worst / median (by mean "
-                             "CSI over leads) in --validation_summary. No "
+    parser.add_argument("--pick", type=str, default=None, choices=["csi"],
+                        help="Run the timesteps the validation run in "
+                             "--validation_summary singles out: `csi` gives "
+                             "the best, median and worst sample by mean CSI "
+                             "over leads, or the top N with --top_n. No "
                              "ground truth is needed; --date and the time "
                              "flags are then ignored.")
+    parser.add_argument("--top_n", type=int, default=None,
+                        help="With --pick csi: the N best samples by CSI "
+                             "instead of best / median / worst.")
     time_group = parser.add_mutually_exclusive_group()
     time_group.add_argument("--time", type=str, default=None,
                             help="Single reference HH:MM.")
@@ -1204,10 +1207,10 @@ def main() -> int:
     # the picks recorded by validation.
     if args.pick:
         from validate_predictions import picks_from_summary
-        jobs = [(d, r) for _, d, r in
-                picks_from_summary(args.validation_summary, args.pick)]
-        pick_names = [n for n, _, _ in
-                      picks_from_summary(args.validation_summary, args.pick)]
+        picks = picks_from_summary(args.validation_summary, args.pick,
+                                   top_n=args.top_n)
+        jobs = [(d, r) for _, d, r in picks]
+        pick_names = [n for n, _, _ in picks]
     else:
         jobs = [(args.date, t)
                 for t in _resolve_reference_times(args, step_minutes)]

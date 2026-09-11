@@ -371,12 +371,12 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ### A4. Inferență pe întregul domeniu
 ```bash
 python predict_full_domain.py --mode ... --date YYYY-MM-DD
-python predict_full_domain.py --mode ... --pick best worst median --validation_summary validation/<summary>.json
+python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
 ```
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
-- **Separat** — `--pick` rulează momentele consemnate de o execuție de validare drept cel mai bun, cel mai slab și median (CSI mediu pe orizonturi); nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
+- **Separat** — `--pick csi` rulează momentele selectate de o execuție de validare: cel mai bun, medianul și cel mai slab după CSI-ul mediu pe orizonturi, sau primele N cu `--top_n`; nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
@@ -398,7 +398,7 @@ python validate_predictions.py --track rainfall --split test --baseline --period
 ### A6. Figuri și raport
 ```bash
 python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
-python visualize_gt_vs_pred.py --mode ... --csv ... --pick best worst median --validation_summary validation/<summary>.json
+python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
 ```
 - **Notă** — vizualizatorul construiește adevărul de teren din fișierele de patch ale rândurilor din `--csv`, astfel încât un moment selectat trebuie să fie un rând al acelui CSV (validați pe `--split test` și indicați CSV-ul de test).

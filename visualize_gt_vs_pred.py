@@ -2212,23 +2212,14 @@ def main() -> int:
                              "(train/validation/test_data_<source>.csv). "
                              "Required: the ground truth is built from the "
                              "patch files its rows name.")
-    parser.add_argument("--pick", nargs="+", default=None,
-                        choices=["best", "worst", "median"],
-                        help="Instead of the top-N rows, draw the "
-                             "timesteps validate_predictions recorded as "
-                             "best / worst / median (by mean CSI over "
-                             "leads) in --validation_summary. Each must "
-                             "also be a row of --csv, which is where its "
-                             "ground truth comes from. Outputs are named "
-                             "<pick>_<date>_<time>.png.")
-    parser.add_argument("--mode", required=True, type=str,
-                        choices=_mode_choices(),
-                        help="Model variant. The name states its own track: "
-                             "`_rainfall` for the OPERA 5-class head, "
-                             "`_occurrence` for the lightning binary head.")
-    parser.add_argument("--top_n", type=int, default=5,
-                        help="How many of the highest-patch-count rows to "
-                             "plot (default 5).")
+    parser.add_argument("--pick", type=str, default=None, choices=["csi"],
+                        help="Choose the timesteps by the validation run in "
+                             "--validation_summary instead of by patch "
+                             "count: `csi` draws the best, median and worst "
+                             "sample by mean CSI over leads, or the top N "
+                             "with --top_n. Each must be a row of --csv, "
+                             "where its ground truth comes from. Outputs "
+                             "are named <pick>_<date>_<time>.png.")
     parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
     parser.add_argument("--period", type=str, default=None, metavar="LABEL",
                         help="Period label the model was trained under, "
@@ -2402,7 +2393,8 @@ def main() -> int:
 
     if args.pick:
         from validate_predictions import picks_from_summary
-        picks = picks_from_summary(args.validation_summary, args.pick)
+        picks = picks_from_summary(args.validation_summary, args.pick,
+                                   top_n=args.top_n)
         print(f"\nPicked timesteps from {args.validation_summary}:")
         df_all = pd.read_csv(csv_path)
         df_all["reference_utc"] = df_all["reference_utc"].str.strip()
@@ -2424,8 +2416,9 @@ def main() -> int:
             raise SystemExit("none of the picked timesteps is in the CSV")
         df_top = pd.DataFrame(chosen).reset_index(drop=True)
     else:
-        print(f"\nSelecting top {args.top_n} timesteps from {csv_path}")
-        df_top = load_top_n_rows(csv_path, args.top_n)
+        top_n = args.top_n if args.top_n is not None else 5
+        print(f"\nSelecting top {top_n} timesteps from {csv_path}")
+        df_top = load_top_n_rows(csv_path, top_n)
     print(df_top[["date", "reference_utc", "n_patches"]].to_string(index=False))
 
     # Lazy import: predict_full_domain pulls TF, but we're already past

@@ -844,24 +844,52 @@ def representative_timesteps(rows: list[dict], csi_columns: list[str],
     return out
 
 
-def picks_from_summary(summary_path, picks: list[str]) -> list[tuple[str, str, str]]:
-    """(pick, date, reference_utc) for the requested picks of a summary
-    JSON written by validate_predictions. Used by the consumers."""
-    blob = json.loads(Path(summary_path).read_text(encoding="utf-8"))
-    rep = blob.get("representative_timesteps")
-    if not rep:
-        raise SystemExit(
-            f"{summary_path} has no `representative_timesteps` block; "
-            f"re-run validate_predictions in extraction mode.")
-    out = []
-    for name in picks:
-        if name not in rep:
-            raise SystemExit(f"{summary_path}: no {name!r} pick recorded "
-                             f"(scored {rep.get('n_scored', 0)} samples)")
-        out.append((name, rep[name]["date"], rep[name]["reference_utc"]))
-    return out
+PICK_MODES = ("csi",)
 
 
+def picks_from_summary(summary_path, mode: str = "csi", top_n: int | None = None
+                       ) -> list[tuple[str, str, str]]:
+    """(label, date, reference_utc) of the timesteps a run singles out.
+
+    mode "csi": without `top_n` the best, median and worst sample by
+    mean CSI over leads, as recorded in the summary's
+    representative_timesteps; with `top_n` the N highest-scoring samples,
+    ranked from the sibling samples CSV (labels csi_top01, csi_top02,
+    ...). Used by --pick in visualize_gt_vs_pred and predict_full_domain.
+    """
+    if mode not in PICK_MODES:
+        raise SystemExit(f"unknown pick mode {mode!r}; choose from {PICK_MODES}")
+    summary_path = Path(summary_path)
+    blob = json.loads(summary_path.read_text(encoding="utf-8"))
+    if top_n is None:
+        rep = blob.get("representative_timesteps")
+        if not rep:
+            raise SystemExit(
+                f"{summary_path} has no `representative_timesteps` block; "
+                f"re-run validate_predictions in extraction mode.")
+        out = []
+        for name in ("best", "median", "worst"):
+            if name not in rep:
+                raise SystemExit(f"{summary_path}: no {name!r} pick recorded "
+                                 f"(scored {rep.get('n_scored', 0)} samples)")
+            out.append((name, rep[name]["date"], rep[name]["reference_utc"]))
+        return out
+    if top_n < 1:
+        raise SystemExit("--top_n must be at least 1")
+    _summary, rows, offsets, step, _stem = _load_run(summary_path)
+    if not rows:
+        raise SystemExit(f"no samples CSV next to {summary_path}")
+    track = blob.get("track", "rainfall")
+    cols = ([f"csi_t+{o}" for o in offsets] if track == "rainfall"
+            else [f"csi_t+{o * step}" for o in offsets])
+    scored = []
+    for r in rows:
+        vals = [r[c] for c in cols if r.get(c) is not None]
+        if vals:
+            scored.append((sum(vals) / len(vals), r["date"], r["reference_utc"]))
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+    return [(f"csi_top{i:02d}", d, ref)
+            for i, (_, d, ref) in enumerate(scored[:top_n], 1)]
 
 def _hmf_percentages(tp: int, fp: int, fn: int) -> dict[str, float | None]:
     """hits % and misses % over the GT-active pixels, false alarms % over
