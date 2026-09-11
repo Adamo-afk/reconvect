@@ -1198,7 +1198,8 @@ def evaluate_radar(model, test_ds, output_dir):
 def plot_predictions_for_date_hour(model, mode, data_root, output_dir,
                                     plot_date, plot_hour, plot_threshold=0.5,
                                     csv_name="test_data_dbscan.csv",
-                                    label_type=None, source="dbscan"):
+                                    label_type=None, source="dbscan",
+                                    period=None):
     """Plot all patches for all timesteps matching a given date and hour.
 
     Uses the already-loaded model for the current mode only.
@@ -1938,6 +1939,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
                                                 plot_threshold=plot_threshold,
                                                 csv_name=csv_name,
                                                 label_type=label_type,
+                                                period=period,
                                                 source=source)
             except Exception as e:
                 print(f"  Skipping visualization: {e}")
