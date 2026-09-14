@@ -559,15 +559,15 @@ componenta de fulgere să poată fi utilizată și la datele la care LINET nu es
 
 ### D1. Antrenarea modelului-profesor
 ```bash
-python create_datasets.py --mode mtg_lightning_opera_occurrence
-python train_models.py --config training.config --mode mtg_lightning_opera_occurrence --stage base
+python create_datasets.py --mode mtg_lightning_opera_occurrence --period f34
+python train_models.py --config training.config --mode mtg_lightning_opera_occurrence --period f34 --stage base
 ```
 - **Descriere** — modelul-profesor primește stiva completă de intrări, inclusiv LINET `density`, `current`, `occurrence`.
 - **Scrie** — `models/coalition_mtg_lightning_opera_occurrence_<source>.keras` **CRITIC**
 
 ### D2. Transferul cunoștințelor către modelul-student
 ```bash
-python train_lightning_kd.py --teacher_mode mtg_lightning_opera_occurrence --student_mode mtg_opera_occurrence
+python train_lightning_kd.py --period f34 --epochs 30 --batch_size 32 --datasets_root E:/nowcasting/datasets --model_dir E:/nowcasting/models
 ```
 - **Descriere** — antrenează pe setul de date al **modelului-profesor**, cu `past_hr` restrâns la ultimele `STUDENT_HR_CHANNELS` (= `vis_06`), astfel încât modelul-student nu vede niciodată date de fulgere. Funcția de pierdere combină țintele atenuate ale modelului-profesor la `--kd_alpha 0.7`, temperatura 4.0, cu valorile de referință.
 - **Notă** — `mtg_opera_occurrence` **nu** poate fi construit cu `create_datasets`: există exclusiv ca model-student pe datele modelului-profesor.
