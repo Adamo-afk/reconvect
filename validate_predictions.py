@@ -417,6 +417,29 @@ def _map_leads(fn, n: int):
         return list(ex.map(fn, range(n)))
 
 
+def _pad_windows(pairs_per_lead: list) -> np.ndarray:
+    """(L, max_windows, 2) float64 of the (LOW, HIGH) pairs, NaN-padded
+    where a lead near the edge of (0, 1) has fewer windows."""
+    n_max = max(len(p) for p in pairs_per_lead)
+    out = np.full((len(pairs_per_lead), n_max, 2), np.nan, dtype=np.float64)
+    for i, pairs in enumerate(pairs_per_lead):
+        if pairs:
+            out[i, :len(pairs)] = np.asarray(pairs, dtype=np.float64)
+    return out
+
+
+def _pad_window_conf(tune_window: list, n_leads: int) -> np.ndarray:
+    """(n_samples, L, max_windows, 4) int64 of the window confusions,
+    -1 where a lead has fewer windows."""
+    n_max = max((len(w[i]) for w in tune_window for i in range(n_leads)), default=0)
+    out = np.full((len(tune_window), n_leads, n_max, 4), -1, dtype=np.int64)
+    for k, w in enumerate(tune_window):
+        for i in range(n_leads):
+            if w[i]:
+                out[k, i, :len(w[i])] = np.asarray(w[i], dtype=np.int64)
+    return out
+
+
 def save_per_sample(path: Path, **arrays) -> None:
     """Every per-sample count of a run, compressed, next to the summary,
     so the figures can be redrawn and new ones made without re-running."""
@@ -1666,8 +1689,12 @@ def run_extraction(track: str, year: int, month: int,
                                      dtype=np.int64),
             tune_gt_positive=np.asarray([[h[i][2] for i in range(L)] for h in tune_hist],
                                         dtype=np.int64),
-            window_pairs=np.asarray([pairs_per_lead[i] for i in range(L)], dtype=np.float64),
-            tune_window_conf=np.asarray(tune_window, dtype=np.int64),
+            # Leads near the edge of (0, 1) have fewer windows: pad the
+            # ragged leads with NaN pairs / -1 counts and record each
+            # lead's real window count.
+            window_pairs=_pad_windows([pairs_per_lead[i] for i in range(L)]),
+            n_windows_per_lead=np.asarray([len(pairs_per_lead[i]) for i in range(L)]),
+            tune_window_conf=_pad_window_conf(tune_window, L),
         )
     save_per_sample(output_dir / f"{stem}_per_sample.npz", **per_sample)
     make_plots(output_dir / f"{stem}_summary.json")
