@@ -370,7 +370,7 @@ def train_kd(
 
     student_shapes = student_input_shapes(teacher_input_shapes,
                                            STUDENT_HR_CHANNELS)
-    ones_fraction = load_ones_fraction(data_root, source)
+    ones_fraction = load_ones_fraction(data_root, source, period)
 
     print("=" * 70)
     print("Knowledge distillation (lightning occurrence)")
