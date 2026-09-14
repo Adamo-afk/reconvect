@@ -386,15 +386,13 @@ def csi_from_histograms(pos: np.ndarray, neg: np.ndarray,
     return tp / (tp + fp + fn + 1e-7)
 
 
-def window_pairs(low: float, width: float, reach: float,
-                 step: float | None = None) -> list[tuple[float, float]]:
+def window_pairs(low: float, width: float, reach: float) -> list[tuple[float, float]]:
     """The (LOW, HIGH) candidates around a phase-1 LOW: windows of
-    `width` slid by `step` (default: the width, so they tile) to the
-    left and to the right, as far as `reach` from LOW. For 0.35, width
-    0.02, step 0.02, reach 0.10: (0.25, 0.27) ... (0.33, 0.35) on the
-    left, (0.35, 0.37) ... (0.43, 0.45) on the right. Pairs leaving
-    (0, 1) are dropped; the list is ordered by LOW."""
-    step = width if not step else step
+    `width`, tiled to the left and to the right, as far as `reach` from
+    LOW. For 0.35, width 0.02, reach 0.10: (0.25, 0.27) ... (0.33, 0.35)
+    on the left, (0.35, 0.37) ... (0.43, 0.45) on the right. Pairs
+    leaving (0, 1) are dropped; the list is ordered by LOW."""
+    step = width
     pairs = []
     k = 0
     while True:                      # left: windows ending at low - k*step
@@ -1232,8 +1230,7 @@ def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
                      + ("  - reused by every lead" if reused else ""))
         ax.grid(axis="y", alpha=0.3)
     fig.suptitle(f"{_run_title(summary)}  |  Phase 2 - (LOW, HIGH) windows, "
-                 f"width {pp['window']:g}, step {pp.get('step', pp['window']):g}, "
-                 f"reach {pp['reach']:g}",
+                 f"width {pp['window']:g}, reach {pp['reach']:g}",
                  fontsize=12, fontweight="bold")
     fig.savefig(out_high, dpi=140, bbox_inches="tight")
     plt.close(fig)
@@ -1322,7 +1319,6 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_low: float | None = None,
                    rainfall_window: float = 0.02,
                    rainfall_reach: float = 0.10,
-                   rainfall_step: float | None = None,
                    tune_leads: str = "each",
                    period=None,
                    baseline: bool = False):
@@ -1532,11 +1528,9 @@ def run_extraction(track: str, year: int, month: int,
 
         # ---- Phase 2: (LOW, HIGH) windows around each lead's LOW -------
         pairs_per_lead = {i: window_pairs(low_per_lead[i], rainfall_window,
-                                          rainfall_reach, rainfall_step)
-                          for i in range(L)}
+                                          rainfall_reach) for i in range(L)}
         print(f"\nPhase 2 - {len(pairs_per_lead[tuned[0]])} (LOW, HIGH) windows per "
-              f"tuned lead, width {rainfall_window:g}, step "
-              f"{rainfall_step or rainfall_window:g}, reach {rainfall_reach:g}")
+              f"tuned lead, width {rainfall_window:g}, reach {rainfall_reach:g}")
 
         def _phase2(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
             def one(i):
@@ -1652,7 +1646,6 @@ def run_extraction(track: str, year: int, month: int,
                 f"t+{off}": low_per_lead[i] for i, off in enumerate(LEAD_STEP_OFFSETS)},
             "low_fixed": rainfall_low,
             "window": rainfall_window,
-            "step": rainfall_step or rainfall_window,
             "reach": rainfall_reach,
             "tune_leads": tune_leads,
             "low_sweep": low_sweep,
@@ -3775,10 +3768,6 @@ def main() -> int:
     parser.add_argument("--rainfall_reach", type=float, default=0.10,
                         help="How far the windows slide on each side of "
                              "the phase-1 LOW (default 0.10).")
-    parser.add_argument("--rainfall_step", type=float, default=None,
-                        help="How far each window is shifted from the "
-                             "previous one (default: the window width, so "
-                             "the windows tile; smaller overlaps them).")
     parser.add_argument("--tune_leads", type=str, default="each",
                         choices=["each", "first"],
                         help="Tune the thresholds for every lead separately "
@@ -3914,7 +3903,6 @@ def main() -> int:
                     rainfall_low=args.rainfall_low_threshold,
                     rainfall_window=args.rainfall_window,
                     rainfall_reach=args.rainfall_reach,
-                    rainfall_step=args.rainfall_step,
                     tune_leads=args.tune_leads,
                     period=period,
                     baseline=baseline,
