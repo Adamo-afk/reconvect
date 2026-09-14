@@ -366,6 +366,8 @@ python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_sum
 python validate_predictions.py --track rainfall --split test --mode <mode> --period f34
 python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period f34
 python validate_predictions.py --track rainfall --split test --baseline --period w44
+# every rainfall model in one run: two RECONVECT models and the baseline
+python validate_predictions.py --track rainfall --split test --mode mtg_lightning_opera_rainfall opera_radar_only_rainfall --period f34 w34 --baseline_period w44
 ```
 - **Does** — scans the month for samples with a pixel at or above the selected threshold (`--rainfall_threshold_mmh`, default 10 mm/h), runs inference, and tunes the hysteresis HIGH per lead by maximising aggregate CSI.
 - **Scope** — `--split test` scores the reference timesteps of the test split (the held-out set); `--year --month` scores a calendar month; both together restrict the split to that month. The scope, including the selection threshold, is in every output name: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; runs at different thresholds never overwrite each other.

@@ -3687,10 +3687,11 @@ def main() -> int:
                         help="If given (YYYY-MM-DD), switches to "
                              "visualization mode against the JSON "
                              "produced by an earlier extraction run.")
-    parser.add_argument("--mode", type=str,
-                        default="mtg_lightning_opera_rainfall",
-                        help="Model mode name. Defaults to the heaviest "
-                             "OPERA multiclass input stack.")
+    parser.add_argument("--mode", type=str, nargs="+",
+                        default=["mtg_lightning_opera_rainfall"],
+                        help="Model mode name(s). Several run one after the "
+                             "other on the same track, each with its own "
+                             "outputs; pair them with --period.")
     parser.add_argument("--finetuned", action="store_true",
                         help="Load coalition_<mode>_<source>_finetuned.keras "
                              "(rebuilt + load_weights via train_models."
@@ -3704,12 +3705,13 @@ def main() -> int:
                              "standalone) and --mode mtg_opera_occurrence. "
                              "Mutually exclusive with --finetuned.")
     parser.add_argument("--data_root", type=str, default=str(resolve_data_root()))
-    parser.add_argument("--period", type=str, default=None, metavar="LABEL",
-                        help="Period label the model was trained under, "
-                             "e.g. --period w34. Selects the weights, the "
-                             "normalization statistics and the sequence "
-                             "metadata together. Omit for an untagged "
-                             "whole-archive run.")
+    parser.add_argument("--period", type=str, nargs="+", default=None,
+                        metavar="LABEL",
+                        help="Period label(s) the model(s) were trained "
+                             "under, e.g. --period f34 w34, one per --mode "
+                             "(one label serves every mode). Selects the "
+                             "weights, the normalization statistics and the "
+                             "sequence metadata together.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
     parser.add_argument("--weights", type=str, default="best",
                         choices=["best", "latest"],
@@ -3767,6 +3769,11 @@ def main() -> int:
                              "class map is scored as is (no hysteresis). "
                              "Needs --period (the baseline's window, e.g. "
                              "w44); --mode is ignored.")
+    parser.add_argument("--baseline_period", type=str, default=None,
+                        metavar="LABEL",
+                        help="Rainfall track: also validate the SepConv-ens "
+                             "baseline trained on this window, after the "
+                             "--mode models, in the same run.")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Cap the scored samples (and the tuning "
                              "samples) at N, drawn reproducibly per month: "
@@ -3834,20 +3841,50 @@ def main() -> int:
     # extraction ignores it but the cost is a few ms).
     _load_country_borders_pixels()
 
+    # One job per model: (mode, period, baseline). Periods are zipped
+    # with the modes; one period serves every mode.
+    periods = args.period or [None]
+    if len(periods) == 1:
+        periods = periods * len(args.mode)
+    if len(periods) != len(args.mode):
+        parser.error(f"{len(args.mode)} --mode value(s) but {len(periods)} "
+                     f"--period value(s); give one per mode or one for all")
+    if args.baseline:
+        jobs = [(args.mode[0], periods[0], True)]
+    else:
+        jobs = [(m, p, False) for m, p in zip(args.mode, periods)]
+        if args.baseline_period:
+            jobs.append((args.mode[0], args.baseline_period, True))
+    if args.date is not None and len(jobs) != 1:
+        parser.error("visualisation mode (--date) takes one model")
+
+    def _release():
+        """Free the GPU between models of one run."""
+        import gc
+        import tensorflow as tf
+        tf.keras.backend.clear_session()
+        gc.collect()
+
     if args.track == "rainfall":
         if args.date is None:
-            run_extraction(
-                args.track, args.year, args.month,
-                args.mode, SOURCE, args.finetuned,
-                data_root, model_dir, output_dir,
-                rainfall_threshold_mmh=args.rainfall_threshold_mmh,
-                high_coverage_pct=args.high_coverage_pct,
-                rainfall_low=args.rainfall_low_threshold,
-                rainfall_window=args.rainfall_window,
-                rainfall_reach=args.rainfall_reach,
-                period=args.period,
-                baseline=args.baseline,
-            )
+            for n_job, (mode, period, baseline) in enumerate(jobs, 1):
+                if len(jobs) > 1:
+                    print(f"\n##### model {n_job}/{len(jobs)}: "
+                          f"{'SepConv-ens baseline' if baseline else mode} "
+                          f"({period}) #####")
+                run_extraction(
+                    args.track, args.year, args.month,
+                    mode, SOURCE, args.finetuned,
+                    data_root, model_dir, output_dir,
+                    rainfall_threshold_mmh=args.rainfall_threshold_mmh,
+                    high_coverage_pct=args.high_coverage_pct,
+                    rainfall_low=args.rainfall_low_threshold,
+                    rainfall_window=args.rainfall_window,
+                    rainfall_reach=args.rainfall_reach,
+                    period=period,
+                    baseline=baseline,
+                )
+                _release()
         else:
             # Visualization mode reads high-coverage lists from the JSON
             # produced by extraction, so it inherits whatever
@@ -3855,35 +3892,41 @@ def main() -> int:
             # is likewise a selection-time knob and has no effect here.
             run_visualization(
                 args.track, args.year, args.month, args.date,
-                args.mode, SOURCE, args.finetuned,
+                jobs[0][0], SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
-                period=args.period,
+                period=jobs[0][1],
             )
     elif args.track == "lightning":
+        if args.baseline or args.baseline_period:
+            parser.error("there is no lightning baseline")
         if args.date is None:
-            run_extraction_lightning(
-                args.year, args.month,
-                args.mode, SOURCE, args.finetuned,
-                data_root, model_dir, output_dir,
-                stride=args.stride,
-                low_threshold=args.lightning_low_threshold,
-                batch_size=args.batch_size,
-                rainfall_threshold_mmh=args.rainfall_threshold_mmh,
-                high_coverage_pct=args.high_coverage_pct,
-                kd=args.kd,
-                period=args.period,
-                eval_root=Path(args.eval_root),
-            )
+            for n_job, (mode, period, _b) in enumerate(jobs, 1):
+                if len(jobs) > 1:
+                    print(f"\n##### model {n_job}/{len(jobs)}: {mode} ({period}) #####")
+                run_extraction_lightning(
+                    args.year, args.month,
+                    mode, SOURCE, args.finetuned,
+                    data_root, model_dir, output_dir,
+                    stride=args.stride,
+                    low_threshold=args.lightning_low_threshold,
+                    batch_size=args.batch_size,
+                    rainfall_threshold_mmh=args.rainfall_threshold_mmh,
+                    high_coverage_pct=args.high_coverage_pct,
+                    kd=args.kd,
+                    period=period,
+                    eval_root=Path(args.eval_root),
+                )
+                _release()
         else:
             run_visualization_lightning(
                 args.year, args.month, args.date,
-                args.mode, SOURCE, args.finetuned,
+                jobs[0][0], SOURCE, args.finetuned,
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
                 kd=args.kd,
-                period=args.period,
+                period=jobs[0][1],
             )
     else:  # kd
         if args.date is None:
@@ -3901,7 +3944,7 @@ def main() -> int:
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
-                period=args.period,
+                period=jobs[0][1],
             )
         else:
             run_visualization_kd(
@@ -3916,7 +3959,7 @@ def main() -> int:
                                if args.lightning_low_threshold is not None
                                else LIGHTNING_LOW_THRESHOLD),
                 batch_size=args.batch_size,
-                period=args.period,
+                period=jobs[0][1],
             )
     return 0
 
