@@ -383,6 +383,8 @@ python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_sum
 python validate_predictions.py --track rainfall --split test --mode <mode> --period f34
 python validate_predictions.py --track rainfall --year Y --month M --mode <mode> --period f34
 python validate_predictions.py --track rainfall --split test --baseline --period w44
+# toate modelele de precipitații într-o singură execuție: două modele RECONVECT și modelul de referință
+python validate_predictions.py --track rainfall --split test --mode mtg_lightning_opera_rainfall opera_radar_only_rainfall --period f34 w34 --baseline_period w44
 ```
 - **Descriere** — parcurge luna în căutarea eșantioanelor cu cel puțin un pixel la sau peste pragul selectat (`--rainfall_threshold_mmh`, implicit 10 mm/h), execută inferența și calibrează pragul superior al histerezisului per orizont de prognoză, prin maximizarea CSI-ului agregat.
 - **Domeniu** — `--split test` evaluează momentele de referință ale partiției de test (setul reținut); `--year --month` evaluează o lună calendaristică; împreună, restrâng partiția la luna respectivă. Domeniul, inclusiv pragul de selecție, apare în numele fiecărui fișier: `rainfall_test_thr8mmh_<tag>_*`, `rainfall_<Y>_<M>_thr8mmh_<tag>_*`, `rainfall_test_<Y>_<M>_thr8mmh_<tag>_*`; execuțiile la praguri diferite nu se suprascriu niciodată.
