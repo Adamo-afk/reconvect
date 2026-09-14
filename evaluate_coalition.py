@@ -630,112 +630,93 @@ def sync_leads(n_future: int, step_minutes: int) -> None:
 # GPU-accelerated binary metrics (TensorFlow)
 # ============================================================================
 
-@tf.function
-def tf_confusion_components(y_true, y_pred_binary):
-    """Compute TP, FP, FN, TN fractions on GPU."""
-    y_true = tf.cast(y_true, tf.float64)
-    y_pred = tf.cast(y_pred_binary, tf.float64)
-    N = tf.cast(tf.size(y_true), tf.float64)
-    TP = tf.reduce_sum(y_pred * y_true) / N
-    FP = tf.reduce_sum(y_pred * (1.0 - y_true)) / N
-    FN = tf.reduce_sum((1.0 - y_pred) * y_true) / N
-    TN = tf.reduce_sum((1.0 - y_pred) * (1.0 - y_true)) / N
-    return TP, FP, FN, TN
+N_PROB_BINS = 10_000
 
 
 @tf.function
-def tf_metrics_at_threshold(y_true, y_pred, threshold):
-    """Compute all binary metrics at a given threshold on GPU.
-    Returns: (CSI, POD, FAR, FPR, ETS, HSS, PSS, TP, FP, FN, TN)
-    """
-    y_pred = tf.cast(y_pred, tf.float64)
-    y_true = tf.cast(y_true, tf.float64)
-    threshold = tf.cast(threshold, tf.float64)
-    y_bin = tf.cast(y_pred >= threshold, tf.float64)
-    N = tf.cast(tf.size(y_true), tf.float64)
+def tf_prob_histograms(y_true, y_pred, n_bins):
+    """(pos, neg): int64 histograms of the predicted probability over
+    pixels whose truth is 1 / 0. One pass, no pixel kept afterwards."""
+    y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
+    y_true = tf.reshape(y_true, [-1]) > 0.5
+    idx = tf.cast(tf.clip_by_value(tf.floor(y_pred * tf.cast(n_bins, tf.float32)),
+                                   0.0, tf.cast(n_bins - 1, tf.float32)), tf.int32)
+    pos = tf.math.bincount(tf.boolean_mask(idx, y_true), minlength=n_bins,
+                           maxlength=n_bins, dtype=tf.int64)
+    neg = tf.math.bincount(tf.boolean_mask(idx, tf.logical_not(y_true)),
+                           minlength=n_bins, maxlength=n_bins, dtype=tf.int64)
+    return pos, neg
 
-    TP = tf.reduce_sum(y_bin * y_true) / N
-    FP = tf.reduce_sum(y_bin * (1.0 - y_true)) / N
-    FN = tf.reduce_sum((1.0 - y_bin) * y_true) / N
-    TN = tf.reduce_sum((1.0 - y_bin) * (1.0 - y_true)) / N
 
+def collect_histograms(model, dataset, n_bins=N_PROB_BINS):
+    """Per-lead probability histograms of a dataset's predictions.
+    Returns ({lead_idx: (pos, neg)}, (pos_agg, neg_agg)) as numpy int64."""
+    n_lead = len(LEAD_TIMES)
+    pos = [np.zeros(n_bins, dtype=np.int64) for _ in range(n_lead)]
+    neg = [np.zeros(n_bins, dtype=np.int64) for _ in range(n_lead)]
+    n_bins_tf = tf.constant(n_bins, dtype=tf.int32)
+    for inputs, labels in dataset:
+        preds = model(inputs, training=False)
+        for t in range(n_lead):
+            p_t, n_t = tf_prob_histograms(labels[:, t, :, :, 0],
+                                          preds[:, t, :, :, 0], n_bins_tf)
+            pos[t] += p_t.numpy()
+            neg[t] += n_t.numpy()
+    per_lead = {t: (pos[t], neg[t]) for t in range(n_lead)}
+    agg = (sum(pos), sum(neg))
+    return per_lead, agg
+
+
+def _counts_at(pos, neg, thresholds):
+    """TP, FP, FN, TN (pixel counts, float64 arrays) at each threshold,
+    positive iff p >= threshold, from the two histograms."""
+    n_bins = pos.shape[0]
+    thresholds = np.atleast_1d(np.asarray(thresholds, dtype=np.float64))
+    k = np.clip(np.rint(thresholds * n_bins).astype(np.int64), 0, n_bins)
+    # tail sums: pixels in bins >= k
+    pos_tail = np.concatenate([np.cumsum(pos[::-1])[::-1], [0]]).astype(np.float64)
+    neg_tail = np.concatenate([np.cumsum(neg[::-1])[::-1], [0]]).astype(np.float64)
+    tp = pos_tail[k]
+    fp = neg_tail[k]
+    fn = float(pos.sum()) - tp
+    tn = float(neg.sum()) - fp
+    return tp, fp, fn, tn
+
+
+def metrics_at_threshold(pos, neg, threshold):
+    """(CSI, POD, FAR, FPR, ETS, HSS, PSS, TP, FP, FN, TN) at one
+    threshold; the four counts as fractions of all pixels, as before."""
+    tp, fp, fn, tn = (float(v[0]) for v in _counts_at(pos, neg, [threshold]))
+    n = tp + fp + fn + tn
+    tp, fp, fn, tn = tp / n, fp / n, fn / n, tn / n
     eps = 1e-10
-    _pod = TP / (TP + FN + eps)
-    _far = FP / (TP + FP + eps)
-    _fpr = FP / (FP + TN + eps)
-    _csi = TP / (TP + FP + FN + eps)
-
-    R = (TP + FN) * (TP + FP) / (TP + FP + FN + TN + eps)
-    _ets = (TP - R) / (TP + FP + FN - R + eps)
-
-    hss_num = 2.0 * (TP * TN - FN * FP)
-    hss_den = (TP + FN) * (FN + TN) + (TP + FP) * (FP + FN)
-    _hss = hss_num / (hss_den + eps)
-
-    _pss = _pod - _fpr
-
-    return _csi, _pod, _far, _fpr, _ets, _hss, _pss, TP, FP, FN, TN
+    pod = tp / (tp + fn + eps)
+    far = fp / (tp + fp + eps)
+    fpr = fp / (fp + tn + eps)
+    csi = tp / (tp + fp + fn + eps)
+    r = (tp + fn) * (tp + fp) / (tp + fp + fn + tn + eps)
+    ets = (tp - r) / (tp + fp + fn - r + eps)
+    hss = 2.0 * (tp * tn - fn * fp) / ((tp + fn) * (fn + tn) + (tp + fp) * (fp + fn) + eps)
+    pss = pod - fpr
+    return csi, pod, far, fpr, ets, hss, pss, tp, fp, fn, tn
 
 
-@tf.function
-def tf_find_optimal_threshold(y_true, y_pred, thresholds):
-    """Find threshold maximizing CSI on GPU (vectorized over thresholds)."""
-    y_true = tf.cast(y_true, tf.float64)
-    y_pred = tf.cast(y_pred, tf.float64)
-    thresholds = tf.cast(thresholds, tf.float64)
-    N = tf.cast(tf.size(y_true), tf.float64)
-
-    best_csi = tf.constant(-1.0, dtype=tf.float64)
-    best_t = tf.constant(0.5, dtype=tf.float64)
-
-    for i in tf.range(tf.shape(thresholds)[0]):
-        t = tf.cast(thresholds[i], tf.float64)
-        y_bin = tf.cast(y_pred >= t, tf.float64)
-        TP = tf.reduce_sum(y_bin * y_true) / N
-        FP = tf.reduce_sum(y_bin * (1.0 - y_true)) / N
-        FN = tf.reduce_sum((1.0 - y_bin) * y_true) / N
-        current_csi = TP / (TP + FP + FN + 1e-10)
-        if current_csi > best_csi:
-            best_csi = current_csi
-            best_t = t
-
-    return best_t, best_csi
+def best_threshold(pos, neg, thresholds):
+    """The threshold with the highest CSI (first on ties), and that CSI."""
+    tp, fp, fn, _ = _counts_at(pos, neg, thresholds)
+    csi = tp / (tp + fp + fn + 1e-10)
+    i = int(np.argmax(csi))
+    return float(np.asarray(thresholds)[i]), float(csi[i])
 
 
-@tf.function
-def tf_pr_roc_curves(y_true, y_pred, thresholds):
-    """Compute PR and ROC curves on GPU in a single pass over thresholds."""
-    y_true = tf.cast(y_true, tf.float64)
-    y_pred = tf.cast(y_pred, tf.float64)
-    thresholds = tf.cast(thresholds, tf.float64)
-    N = tf.cast(tf.size(y_true), tf.float64)
-    n_t = tf.shape(thresholds)[0]
-
-    precisions = tf.TensorArray(dtype=tf.float64, size=n_t)
-    recalls = tf.TensorArray(dtype=tf.float64, size=n_t)
-    fprs_arr = tf.TensorArray(dtype=tf.float64, size=n_t)
-    tprs_arr = tf.TensorArray(dtype=tf.float64, size=n_t)
-
-    for i in tf.range(n_t):
-        t = tf.cast(thresholds[i], tf.float64)
-        y_bin = tf.cast(y_pred >= t, tf.float64)
-        TP = tf.reduce_sum(y_bin * y_true) / N
-        FP = tf.reduce_sum(y_bin * (1.0 - y_true)) / N
-        FN = tf.reduce_sum((1.0 - y_bin) * y_true) / N
-        TN = tf.reduce_sum((1.0 - y_bin) * (1.0 - y_true)) / N
-
-        eps = 1e-10
-        recall = TP / (TP + FN + eps)
-        precision = 1.0 - FP / (TP + FP + eps)
-        fpr_val = FP / (FP + TN + eps)
-
-        recalls = recalls.write(i, recall)
-        precisions = precisions.write(i, precision)
-        fprs_arr = fprs_arr.write(i, fpr_val)
-        tprs_arr = tprs_arr.write(i, recall)
-
-    return (recalls.stack(), precisions.stack(),
-            fprs_arr.stack(), tprs_arr.stack())
+def pr_roc_curves(pos, neg, thresholds):
+    """(recalls, precisions, fprs, tprs) over the thresholds."""
+    tp, fp, fn, tn = _counts_at(pos, neg, thresholds)
+    eps = 1e-10
+    recall = tp / (tp + fn + eps)
+    precision = tp / (tp + fp + eps)
+    fpr = fp / (fp + tn + eps)
+    return recall, precision, fpr, recall
 
 
 def compute_auc(x, y):
@@ -748,31 +729,6 @@ def compute_auc(x, y):
 # ============================================================================
 # Evaluation runners
 # ============================================================================
-
-def collect_predictions_gpu(model, dataset):
-    """Collect all predictions and labels per lead time using GPU.
-    Returns dict of tf.Tensors per lead time + aggregated.
-    """
-    all_true = {t: [] for t in range(len(LEAD_TIMES))}
-    all_pred = {t: [] for t in range(len(LEAD_TIMES))}
-
-    for inputs, labels in dataset:
-        preds = model(inputs, training=False)
-        for t in range(len(LEAD_TIMES)):
-            all_true[t].append(tf.reshape(labels[:, t, :, :, 0], [-1]))
-            all_pred[t].append(tf.reshape(preds[:, t, :, :, 0], [-1]))
-
-    # Concatenate per lead time
-    for t in range(len(LEAD_TIMES)):
-        all_true[t] = tf.concat(all_true[t], axis=0)
-        all_pred[t] = tf.concat(all_pred[t], axis=0)
-
-    # Aggregate across all lead times
-    all_true_agg = tf.concat([all_true[t] for t in range(len(LEAD_TIMES))], axis=0)
-    all_pred_agg = tf.concat([all_pred[t] for t in range(len(LEAD_TIMES))], axis=0)
-
-    return all_true, all_pred, all_true_agg, all_pred_agg
-
 
 def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     """Run full evaluation for lightning (binary) mode.
@@ -788,7 +744,7 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
 
     Returns dict with all metrics and curves.
     """
-    thresholds_array = tf.constant(np.linspace(0.01, 0.99, 99), dtype=tf.float64)
+    thresholds_array = np.linspace(0.01, 0.99, 99)
 
     # --- Determine threshold ---
     if threshold is not None:
@@ -800,28 +756,19 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
                              "Either provide --threshold or ensure validation "
                              "dataset exists.")
         print("  Optimizing threshold on validation set (GPU)...")
-        val_true, val_pred, val_true_agg, val_pred_agg = \
-            collect_predictions_gpu(model, val_ds)
-        opt_threshold, opt_csi = tf_find_optimal_threshold(
-            val_true_agg, val_pred_agg, thresholds_array)
-        opt_threshold = float(opt_threshold.numpy())
-        opt_csi = float(opt_csi.numpy())
+        _, (val_pos, val_neg) = collect_histograms(model, val_ds)
+        opt_threshold, opt_csi = best_threshold(val_pos, val_neg, thresholds_array)
         print(f"    Optimal threshold (from val): {opt_threshold:.3f} "
               f"(val CSI={opt_csi:.4f})")
-        # Free validation tensors
-        del val_true, val_pred, val_true_agg, val_pred_agg
 
-    # --- Collect test predictions on GPU ---
+    # --- Test predictions as probability histograms (GPU) ---
     print("  Collecting test predictions (GPU)...")
-    all_true, all_pred, all_true_agg, all_pred_agg = \
-        collect_predictions_gpu(model, test_ds)
-
-    n_pixels = int(all_true_agg.shape[0])
+    hist, (pos_agg, neg_agg) = collect_histograms(model, test_ds)
+    n_pixels = int(pos_agg.sum() + neg_agg.sum())
     print(f"    Total test pixels: {n_pixels:,}")
 
-    # --- Metrics per lead time (GPU) ---
-    print("  Computing metrics per lead time (GPU)...")
-    threshold_tf = tf.constant(opt_threshold, dtype=tf.float64)
+    # --- Metrics per lead time ---
+    print("  Computing metrics per lead time...")
     results = {
         "optimal_threshold": opt_threshold,
         "threshold_source": "fixed" if threshold is not None else "validation",
@@ -833,28 +780,22 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
                     "TP", "FP", "FN", "TN"]
 
     for t in range(len(LEAD_TIMES)):
-        vals = tf_metrics_at_threshold(all_true[t], all_pred[t], threshold_tf)
-        lt_metrics = {name: float(v.numpy()) for name, v in
-                      zip(METRIC_NAMES, vals)}
+        vals = metrics_at_threshold(*hist[t], opt_threshold)
+        lt_metrics = {name: float(v) for name, v in zip(METRIC_NAMES, vals)}
         results["per_leadtime"][LEAD_LABELS[t]] = lt_metrics
         print(f"    {LEAD_LABELS[t]}: CSI={lt_metrics['CSI']:.4f}, "
               f"POD={lt_metrics['POD']:.4f}, FAR={lt_metrics['FAR']:.4f}")
 
     # Aggregate metrics
-    agg_vals = tf_metrics_at_threshold(all_true_agg, all_pred_agg, threshold_tf)
+    agg_vals = metrics_at_threshold(pos_agg, neg_agg, opt_threshold)
     for name, v in zip(METRIC_NAMES, agg_vals):
-        results["aggregate"][name] = float(v.numpy())
+        results["aggregate"][name] = float(v)
 
-    # --- PR and ROC curves (GPU) ---
-    print("  Computing PR and ROC curves (GPU)...")
-    curve_thresholds = tf.constant(np.linspace(0.01, 0.99, 200), dtype=tf.float64)
-    recalls, precisions, fprs_arr, tprs_arr = tf_pr_roc_curves(
-        all_true_agg, all_pred_agg, curve_thresholds)
-
-    recalls_np = recalls.numpy()
-    precisions_np = precisions.numpy()
-    fprs_np = fprs_arr.numpy()
-    tprs_np = tprs_arr.numpy()
+    # --- PR and ROC curves ---
+    print("  Computing PR and ROC curves...")
+    curve_thresholds = np.linspace(0.01, 0.99, 200)
+    recalls_np, precisions_np, fprs_np, tprs_np = pr_roc_curves(
+        pos_agg, neg_agg, curve_thresholds)
 
     pr_auc = compute_auc(recalls_np, precisions_np)
     roc_auc = compute_auc(fprs_np, tprs_np)
@@ -863,9 +804,8 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
 
     # Per-leadtime PR AUC
     for t in range(len(LEAD_TIMES)):
-        r, p, _, _ = tf_pr_roc_curves(all_true[t], all_pred[t], curve_thresholds)
-        results["per_leadtime"][LEAD_LABELS[t]]["PR_AUC"] = float(
-            compute_auc(r.numpy(), p.numpy()))
+        r, p, _, _ = pr_roc_curves(*hist[t], curve_thresholds)
+        results["per_leadtime"][LEAD_LABELS[t]]["PR_AUC"] = float(compute_auc(r, p))
 
     print(f"    Aggregate: CSI={results['aggregate']['CSI']:.4f}, "
           f"PR_AUC={pr_auc:.4f}, ROC_AUC={roc_auc:.4f}")
@@ -898,11 +838,8 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     # The operating point: where the threshold the metrics are reported
     # at sits on both curves, whether it was fixed by --threshold or tuned
     # on the validation split.
-    op_r, op_p, op_fpr, op_tpr = tf_pr_roc_curves(
-        all_true_agg, all_pred_agg,
-        tf.constant([opt_threshold], dtype=tf.float64))
-    op_r, op_p = float(op_r.numpy()[0]), float(op_p.numpy()[0])
-    op_fpr, op_tpr = float(op_fpr.numpy()[0]), float(op_tpr.numpy()[0])
+    op_r, op_p, op_fpr, op_tpr = (float(v[0]) for v in pr_roc_curves(
+        pos_agg, neg_agg, [opt_threshold]))
     op_label = (f"threshold {opt_threshold:.2f} "
                 + ("(fixed)" if threshold is not None else "(tuned on validation)"))
 
