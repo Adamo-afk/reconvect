@@ -386,17 +386,33 @@ def csi_from_histograms(pos: np.ndarray, neg: np.ndarray,
     return tp / (tp + fp + fn + 1e-7)
 
 
-def window_pairs(low: float, width: float, reach: float) -> list[tuple[float, float]]:
+def window_pairs(low: float, width: float, reach: float,
+                 step: float | None = None) -> list[tuple[float, float]]:
     """The (LOW, HIGH) candidates around a phase-1 LOW: windows of
-    `width` sliding left and right out to `reach`. For 0.35, 0.02, 0.10:
-    (0.25, 0.27) ... (0.33, 0.35) on the left, (0.35, 0.37) ...
-    (0.43, 0.45) on the right. Pairs leaving (0, 1) are dropped."""
-    n = int(round(reach / width))
+    `width` slid by `step` (default: the width, so they tile) to the
+    left and to the right, as far as `reach` from LOW. For 0.35, width
+    0.02, step 0.02, reach 0.10: (0.25, 0.27) ... (0.33, 0.35) on the
+    left, (0.35, 0.37) ... (0.43, 0.45) on the right. Pairs leaving
+    (0, 1) are dropped; the list is ordered by LOW."""
+    step = width if not step else step
     pairs = []
-    for k in range(n, 0, -1):
-        pairs.append((round(low - k * width, 4), round(low - (k - 1) * width, 4)))
-    for k in range(1, n + 1):
-        pairs.append((round(low + (k - 1) * width, 4), round(low + k * width, 4)))
+    k = 0
+    while True:                      # left: windows ending at low - k*step
+        hi = round(low - k * step, 4)
+        lo = round(hi - width, 4)
+        if lo < round(low - reach, 4) - 1e-9:
+            break
+        pairs.append((lo, hi))
+        k += 1
+    k = 0
+    while True:                      # right: windows starting at low + k*step
+        lo = round(low + k * step, 4)
+        hi = round(lo + width, 4)
+        if hi > round(low + reach, 4) + 1e-9:
+            break
+        pairs.append((lo, hi))
+        k += 1
+    pairs = sorted(set(pairs))
     kept = [(lo, hi) for lo, hi in pairs if lo > 0.0 and hi < 1.0]
     if not kept:
         # A LOW at the very edge with a width that leaves no room: score
@@ -1168,18 +1184,24 @@ def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
     chosen pair starred. Both on the validation-split samples."""
     pp = summary["post_processing"]
     leads = list(pp["low_sweep"])
-    colors, markers = lead_palette(len(leads))
+    all_leads = list(pp["low_threshold_per_lead"])
+    colors, markers = lead_palette(len(all_leads))
+    color_of = {lead: colors[i] for i, lead in enumerate(all_leads)}
+    reused = (pp.get("tune_leads") == "first" and len(all_leads) > 1)
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
-    for i, lead in enumerate(leads):
+    for lead in leads:
         thr = sorted(float(t) for t in pp["low_sweep"][lead])
         csi = [pp["low_sweep"][lead][f"{t:.2f}"] for t in thr]
-        ax.plot(thr, csi, color=colors[i], linewidth=1.5, label=lead)
         low = pp["phase1_low_per_lead"][lead]
-        ax.plot([low], [pp["low_sweep"][lead][f"{low:.2f}"]], marker='*',
-                markersize=13, color=colors[i], linestyle='none')
+        best = pp["low_sweep"][lead][f"{low:.2f}"]
+        ax.plot(thr, csi, color=color_of[lead], linewidth=1.5,
+                label=f"{lead}: LOW {low:.2f} (CSI {best:.3f})"
+                      + ("  - reused by every lead" if reused else ""))
+        ax.axvline(low, color=color_of[lead], linestyle='--', alpha=0.7, linewidth=1)
     ax.set_xlabel("threshold on p(argmax) of rainy-argmax pixels")
     ax.set_ylabel("pooled CSI (validation split)")
-    ax.set_title("Phase 1 - LOW per lead (star = chosen)")
+    ax.set_title("Phase 1 - LOW" + (" per lead" if not reused else " from t+1")
+                 + " (dashed = chosen)")
     ax.grid(alpha=0.3)
     ax.legend()
     fig.suptitle(_run_title(summary), fontsize=12, fontweight="bold")
@@ -1187,25 +1209,31 @@ def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
     plt.close(fig)
     print(f"  Wrote {Path(out_low).name}")
 
-    fig, axes = plt.subplots(1, len(leads), figsize=(5 * len(leads), 4.8),
+    wleads = list(pp["window_sweep"])
+    fig, axes = plt.subplots(1, len(wleads), figsize=(max(9, 5 * len(wleads)), 4.8),
                              squeeze=False, constrained_layout=True)
-    for i, (ax, lead) in enumerate(zip(axes[0], leads)):
+    for ax, lead in zip(axes[0], wleads):
         table = pp["window_sweep"][lead]
         xs = np.arange(len(table))
         csi = [t["CSI"] for t in table]
-        ax.bar(xs, csi, color=colors[i], alpha=0.75)
         best = max(range(len(table)), key=lambda j: (table[j]["CSI"], -table[j]["low"]))
-        ax.plot([best], [csi[best]], marker='*', markersize=14, color='black')
+        bars = ax.bar(xs, csi, color=color_of[lead], alpha=0.45)
+        bars[best].set_alpha(1.0)
+        ax.text(best, csi[best], f"{csi[best]:.3f}", ha="center", va="bottom",
+                fontsize=9, fontweight="bold")
         ax.set_xticks(xs)
         ax.set_xticklabels([f"{t['low']:.2f}\n{t['high']:.2f}" for t in table],
                            fontsize=7)
         ax.set_xlabel("window (LOW over HIGH)")
         ax.set_ylabel("pooled CSI (validation split)")
+        ax.set_ylim(0, max(csi) * 1.15 if max(csi) > 0 else 1)
         ax.set_title(f"{lead}: chosen low={table[best]['low']:.2f} "
-                     f"high={table[best]['high']:.2f}")
+                     f"high={table[best]['high']:.2f}"
+                     + ("  - reused by every lead" if reused else ""))
         ax.grid(axis="y", alpha=0.3)
     fig.suptitle(f"{_run_title(summary)}  |  Phase 2 - (LOW, HIGH) windows, "
-                 f"width {pp['window']:g}, reach {pp['reach']:g}",
+                 f"width {pp['window']:g}, step {pp.get('step', pp['window']):g}, "
+                 f"reach {pp['reach']:g}",
                  fontsize=12, fontweight="bold")
     fig.savefig(out_high, dpi=140, bbox_inches="tight")
     plt.close(fig)
@@ -1227,14 +1255,18 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
     leads = list(scores)
     colors, _markers = lead_palette(len(leads))
     fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    tune_leads = (summary.get("tuning") or {}).get("tune_leads")
     for i, lead in enumerate(leads):
         highs = sorted(float(h) for h in scores[lead])
         csis = [scores[lead][f"{h:.2f}"]["CSI"] for h in highs]
-        ax.plot(highs, csis, marker="o", color=colors[i], label=lead,
-                linewidth=1.5)
+        label = lead
         if winners.get(lead) is not None:
-            ax.axvline(float(winners[lead]), color=colors[i], linestyle="--",
-                       alpha=0.5, linewidth=1)
+            w = float(winners[lead])
+            label = (f"{lead}: HIGH {w:.2f} (CSI {scores[lead][f'{w:.2f}']['CSI']:.3f})"
+                     + ("  - reused by every lead" if tune_leads == "first" else ""))
+            ax.axvline(w, color=colors[i], linestyle="--", alpha=0.7, linewidth=1)
+        ax.plot(highs, csis, marker="o", color=colors[i], label=label,
+                linewidth=1.5)
     ax.set_xlabel("High threshold")
     ax.set_ylabel("Pooled CSI (validation split)")
     ax.set_title("CSI vs high-threshold sweep  "
@@ -1290,6 +1322,8 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_low: float | None = None,
                    rainfall_window: float = 0.02,
                    rainfall_reach: float = 0.10,
+                   rainfall_step: float | None = None,
+                   tune_leads: str = "each",
                    period=None,
                    baseline: bool = False):
     """Extraction mode for the rainfall track, in three phases.
@@ -1448,6 +1482,10 @@ def run_extraction(track: str, year: int, month: int,
         return done
 
     low_grid = np.round(np.arange(0.01, 1.00, 0.01), 2)
+    # Which leads the tuning phases run on: every lead, or t+1 alone with
+    # its thresholds reused by the other leads.
+    tuned = list(range(L)) if tune_leads == "each" else [0]
+    print(f"  Tuning: {'per lead' if tune_leads == 'each' else 't+1 only, reused by every lead'}")
     low_per_lead: dict[int, float] = {}
     pair_per_lead: dict[int, tuple] = {}
     low_sweep: dict = {}
@@ -1461,6 +1499,8 @@ def run_extraction(track: str, year: int, month: int,
         # ---- Phase 1: LOW per lead from a plain threshold sweep --------
         def _phase1(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
             def one(i):
+                if i not in tuned:
+                    return None
                 pos, neg = score_histograms(scores[i], gts[i], eligible[i])
                 gt_pos_total = int(((gts[i] > 0) & (gts[i] >= 0)).sum())
                 return pos, neg, gt_pos_total
@@ -1475,7 +1515,8 @@ def run_extraction(track: str, year: int, month: int,
             print(f"  LOW fixed at {rainfall_low:.2f} for every lead "
                   f"(--rainfall_low_threshold)")
         print("\nPhase 1 result (plain threshold on p(argmax), pooled CSI):")
-        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        for i in tuned:
+            offset = LEAD_STEP_OFFSETS[i]
             pos = sum(h[i][0] for h in tune_hist)
             neg = sum(h[i][1] for h in tune_hist)
             gt_tot = sum(h[i][2] for h in tune_hist)
@@ -1486,15 +1527,21 @@ def run_extraction(track: str, year: int, month: int,
                 low_per_lead[i] = float(low_grid[int(np.argmax(csi))])
             print(f"  t+{offset}: LOW={low_per_lead[i]:.2f}  "
                   f"CSI={csi[int(np.argmax(csi))]:.4f}")
+        for i in range(L):
+            low_per_lead.setdefault(i, low_per_lead[tuned[0]])
 
         # ---- Phase 2: (LOW, HIGH) windows around each lead's LOW -------
         pairs_per_lead = {i: window_pairs(low_per_lead[i], rainfall_window,
-                                          rainfall_reach) for i in range(L)}
-        print(f"\nPhase 2 - {len(pairs_per_lead[0])} (LOW, HIGH) windows per "
-              f"lead, width {rainfall_window:g}, reach {rainfall_reach:g}")
+                                          rainfall_reach, rainfall_step)
+                          for i in range(L)}
+        print(f"\nPhase 2 - {len(pairs_per_lead[tuned[0]])} (LOW, HIGH) windows per "
+              f"tuned lead, width {rainfall_window:g}, step "
+              f"{rainfall_step or rainfall_window:g}, reach {rainfall_reach:g}")
 
         def _phase2(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
             def one(i):
+                if i not in tuned:
+                    return []
                 out = []
                 for lo, hi in pairs_per_lead[i]:
                     conf, _ = sweep_hysteresis(scores[i], lo, [hi], gts[i],
@@ -1506,7 +1553,8 @@ def run_extraction(track: str, year: int, month: int,
         _run(tuning_selected, "Phase 2 - window sweep on the validation "
              "split", _phase2)
         print("\nPhase 2 result (hysteresis (LOW, HIGH), pooled CSI):")
-        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        for i in tuned:
+            offset = LEAD_STEP_OFFSETS[i]
             table = []
             for j, (lo, hi) in enumerate(pairs_per_lead[i]):
                 tp = sum(w[i][j][0] for w in tune_window)
@@ -1522,6 +1570,8 @@ def run_extraction(track: str, year: int, month: int,
             pair_per_lead[i] = (table[best]["low"], table[best]["high"])
             print(f"  t+{offset}: low={table[best]['low']:.2f} "
                   f"high={table[best]['high']:.2f}  CSI={table[best]['CSI']:.4f}")
+        for i in range(L):
+            pair_per_lead.setdefault(i, pair_per_lead[tuned[0]])
 
     # ---- Phase 3: score the scope at the chosen pair per lead ----------
     rows: list[dict] = []
@@ -1602,7 +1652,9 @@ def run_extraction(track: str, year: int, month: int,
                 f"t+{off}": low_per_lead[i] for i, off in enumerate(LEAD_STEP_OFFSETS)},
             "low_fixed": rainfall_low,
             "window": rainfall_window,
+            "step": rainfall_step or rainfall_window,
             "reach": rainfall_reach,
+            "tune_leads": tune_leads,
             "low_sweep": low_sweep,
             "window_sweep": window_sweep,
         }
@@ -2534,6 +2586,8 @@ def _write_json_lightning(
     # {lead_title: {high_str: agg_dict}} so JSON keeps stable string keys.
     tuning_scores_named = {}
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        if not tuning_scores.get(i):
+            continue          # lead not tuned (--tune_leads first)
         lt = lead_titles[i]
         tuning_scores_named[lt] = {
             f"{h:.2f}": tuning_scores[i][h] for h in sorted(tuning_scores[i])
@@ -2562,7 +2616,7 @@ def _write_json_lightning(
         "high_coverage_samples_per_lead": high_cov_lists,
         "post_processing": {
             "low_threshold": low_threshold,
-            "high_grid": sorted(float(h) for h in next(iter(tuning_scores.values()), {})),
+            "high_grid": sorted(float(h) for h in next((t for t in tuning_scores.values() if t), {})),
             "high_threshold_per_lead": high_named,
             "tuning_scores": tuning_scores_named,
             "tuning_metric": "csi",
@@ -2608,6 +2662,7 @@ def run_extraction_lightning(
     kd: bool = False,
     period=None,
     eval_root: Path = Path("./evaluation"),
+    tune_leads: str = "each",
 ):
     """Extraction mode for the lightning track.
 
@@ -2714,11 +2769,13 @@ def run_extraction_lightning(
         return done
 
     # ---- Phase A: HIGH per lead on the validation-split samples --------
+    tuned = list(range(L)) if tune_leads == "each" else [0]
+    print(f"  Tuning: {'per lead' if tune_leads == 'each' else 't+1 only, reused by every lead'}")
     tune_conf: list = []   # [n_t][L][n_high] (tp, fp, fn, tn); zeros when no GT
 
     def _phase_a(n, date_str, ref_utc, probs, gts):
         def one(i):
-            if gts[i] is None:
+            if i not in tuned or gts[i] is None:
                 return [(0, 0, 0, 0)] * len(high_grid)
             conf, _ = sweep_hysteresis(probs[i], low_threshold, high_grid, gts[i])
             return [conf[h] for h in high_grid]
@@ -2731,7 +2788,8 @@ def run_extraction_lightning(
     tuning_scores: dict[int, dict[float, dict]] = {i: {} for i in range(L)}
     best_high_per_lead: dict[int, float] = {}
     print("\nPhase A result (pooled CSI on the validation split):")
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+    for i in tuned:
+        offset = LEAD_STEP_OFFSETS[i]
         for j, h in enumerate(high_grid):
             tp = sum(c[i][j][0] for c in tune_conf)
             fp = sum(c[i][j][1] for c in tune_conf)
@@ -2743,6 +2801,8 @@ def run_extraction_lightning(
         best_high_per_lead[offset] = float(best_h)
         print(f"  t+{offset * step_minutes}: high={best_h:.2f}  "
               f"CSI={tuning_scores[i][float(best_h)]['CSI']:.4f}")
+    for offset in LEAD_STEP_OFFSETS:
+        best_high_per_lead.setdefault(offset, best_high_per_lead[LEAD_STEP_OFFSETS[tuned[0]]])
 
     # ---- Phase B: score the scope at the chosen HIGH per lead ----------
     rows: list[dict] = []
@@ -2802,6 +2862,7 @@ def run_extraction_lightning(
             "sampling": {"max_samples": MAX_SAMPLES, "month_batch": MONTH_BATCH,
                          "seed": SEED},
             "tuning": {"split": "validation", "n_samples": len(tune_dates),
+                       "tune_leads": tune_leads,
                        "samples": [[d, r] for d, r in tune_dates],
                        "low_source": ("--lightning_low_threshold"
                                       if low_threshold is not None and False
@@ -3714,6 +3775,15 @@ def main() -> int:
     parser.add_argument("--rainfall_reach", type=float, default=0.10,
                         help="How far the windows slide on each side of "
                              "the phase-1 LOW (default 0.10).")
+    parser.add_argument("--rainfall_step", type=float, default=None,
+                        help="How far each window is shifted from the "
+                             "previous one (default: the window width, so "
+                             "the windows tile; smaller overlaps them).")
+    parser.add_argument("--tune_leads", type=str, default="each",
+                        choices=["each", "first"],
+                        help="Tune the thresholds for every lead separately "
+                             "(each, default), or on t+1 alone and reuse "
+                             "them for every lead (first). Both tracks.")
     parser.add_argument("--baseline", action="store_true",
                         help="Rainfall track: validate the SepConv-ens "
                              "baseline instead of a RECONVECT model. Its "
@@ -3844,6 +3914,8 @@ def main() -> int:
                     rainfall_low=args.rainfall_low_threshold,
                     rainfall_window=args.rainfall_window,
                     rainfall_reach=args.rainfall_reach,
+                    rainfall_step=args.rainfall_step,
+                    tune_leads=args.tune_leads,
                     period=period,
                     baseline=baseline,
                 )
@@ -3880,6 +3952,7 @@ def main() -> int:
                     kd=kd,
                     period=period,
                     eval_root=Path(args.eval_root),
+                    tune_leads=args.tune_leads,
                 )
                 _release()
         else:
