@@ -557,13 +557,14 @@ python train_lightning_kd.py --period f34 --epochs 30 --batch_size 32 --datasets
 - **Note** — `mtg_opera_occurrence` is **not** buildable by `create_datasets`: it exists only as a student over the teacher's data, so no second dataset is needed. `--period` names the teacher's period; the student is saved as `coalition_mtg_opera_occurrence_<source>_<period>_kd.keras`.
 - **Writes** — `models/coalition_<student_run_tag>_kd.keras`, `history_…_kd.json` **CRITICAL**
 
-### D3. Validate teacher and student together
+### D3. Evaluate and validate the student like every other model
 ```bash
-python validate_predictions.py --track kd --year Y --month M
+python evaluate_coalition.py --mode mtg_opera_occurrence --kd --period f34 --split test --datasets_root E:/nowcasting/datasets --model_dir E:/nowcasting/models
+python validate_predictions.py --track lightning --split test --mode mtg_lightning_opera_occurrence mtg_opera_occurrence:kd --period f34 --model_dir E:/nowcasting/models
 ```
-- **Does** — runs both on identical samples and tunes each one's hysteresis independently, so the comparison is not an artefact of a shared threshold.
-- **Writes** — `validation/lightning_<Y>_<M>_kd_summary.json`
-- **Graph** — `…_kd_metrics.png`
+- **Does** — evaluation reads the teacher's dataset (named in the student's history) and slices `past_hr` to the student's channels, tunes the decision threshold on the validation split and scores the test split; the lightning validation track then takes that threshold as LOW, tunes HIGH per lead and scores the scope, for the teacher and the student in one run (`mode:kd` names the variant per entry). Both land in `compare_models --track lightning` as two models.
+- **Writes** — `evaluation/eval_mtg_opera_occurrence_<source>_<period>_kd/`, `validation/lightning_<scope>_mtg_opera_occurrence_<source>_<period>_kd_*`
+- **Alone** — `--track kd` is the older paired run: both models on identical samples with each one's HIGH tuned independently, written as `validation/kd_<scope>_*`.
 
 ---
 

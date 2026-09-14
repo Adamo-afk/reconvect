@@ -573,13 +573,14 @@ python train_lightning_kd.py --period f34 --epochs 30 --batch_size 32 --datasets
 - **Notă** — `mtg_opera_occurrence` **nu** poate fi construit cu `create_datasets`: există exclusiv ca model-student pe datele modelului-profesor.
 - **Scrie** — `models/coalition_<student_run_tag>_kd.keras`, `history_…_kd.json` **CRITIC**
 
-### D3. Validarea simultană a modelului-profesor și a modelului-student
+### D3. Evaluarea și validarea modelului-student ca pentru orice alt model
 ```bash
-python validate_predictions.py --track kd --year Y --month M
+python evaluate_coalition.py --mode mtg_opera_occurrence --kd --period f34 --split test --datasets_root E:/nowcasting/datasets --model_dir E:/nowcasting/models
+python validate_predictions.py --track lightning --split test --mode mtg_lightning_opera_occurrence mtg_opera_occurrence:kd --period f34 --model_dir E:/nowcasting/models
 ```
-- **Descriere** — execută ambele modele pe eșantioane identice și calibrează histerezisul fiecăruia în mod independent, astfel încât comparația să nu fie un artefact al unui prag comun.
-- **Scrie** — `validation/lightning_<Y>_<M>_kd_summary.json`
-- **Grafic** — `…_kd_metrics.png`
+- **Descriere** — evaluarea citește setul de date al profesorului (numit în istoricul studentului) și decupează `past_hr` la canalele studentului, calibrează pragul de decizie pe partiția de validare și evaluează partiția de test; categoria de validare pentru fulgere preia apoi acel prag ca LOW, calibrează HIGH per orizont și evaluează domeniul, pentru profesor și student într-o singură execuție (`mode:kd` desemnează varianta per intrare). Ambele apar în `compare_models --track lightning` ca două modele.
+- **Scrie** — `evaluation/eval_mtg_opera_occurrence_<source>_<period>_kd/`, `validation/lightning_<domeniu>_mtg_opera_occurrence_<source>_<period>_kd_*`
+- **Separat** — `--track kd` este execuția pereche mai veche: ambele modele pe eșantioane identice, cu HIGH calibrat independent, scrise ca `validation/kd_<domeniu>_*`.
 
 ---
 

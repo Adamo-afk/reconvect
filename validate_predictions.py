@@ -3725,7 +3725,11 @@ def main() -> int:
                         default=["mtg_lightning_opera_rainfall"],
                         help="Model mode name(s). Several run one after the "
                              "other on the same track, each with its own "
-                             "outputs; pair them with --period.")
+                             "outputs; pair them with --period. An entry may "
+                             "name its variant, mode:finetuned or mode:kd, "
+                             "e.g. the teacher and its distilled student: "
+                             "mtg_lightning_opera_occurrence "
+                             "mtg_opera_occurrence:kd.")
     parser.add_argument("--finetuned", action="store_true",
                         help="Load coalition_<mode>_<source>_finetuned.keras "
                              "(rebuilt + load_weights via train_models."
@@ -3883,12 +3887,24 @@ def main() -> int:
     if len(periods) != len(args.mode):
         parser.error(f"{len(args.mode)} --mode value(s) but {len(periods)} "
                      f"--period value(s); give one per mode or one for all")
+    def _job(spec: str, period, baseline: bool = False):
+        """(mode, period, baseline, finetuned, kd) from a --mode entry;
+        `mode:kd` / `mode:finetuned` name the variant per entry, else the
+        global flags apply."""
+        mode, _, variant = spec.partition(":")
+        if variant not in ("", "kd", "finetuned", "base"):
+            parser.error(f"unknown variant {variant!r} in --mode {spec}; "
+                         f"use mode, mode:finetuned or mode:kd")
+        finetuned = variant == "finetuned" or (variant == "" and args.finetuned)
+        kd = variant == "kd" or (variant == "" and args.kd)
+        return mode, period, baseline, finetuned, kd
+
     if args.baseline:
-        jobs = [(args.mode[0], periods[0], True)]
+        jobs = [_job(args.mode[0], periods[0], True)]
     else:
-        jobs = [(m, p, False) for m, p in zip(args.mode, periods)]
+        jobs = [_job(m, p) for m, p in zip(args.mode, periods)]
         if args.baseline_period:
-            jobs.append((args.mode[0], args.baseline_period, True))
+            jobs.append(_job(args.mode[0], args.baseline_period, True))
     if args.date is not None and len(jobs) != 1:
         parser.error("visualisation mode (--date) takes one model")
 
@@ -3901,14 +3917,14 @@ def main() -> int:
 
     if args.track == "rainfall":
         if args.date is None:
-            for n_job, (mode, period, baseline) in enumerate(jobs, 1):
+            for n_job, (mode, period, baseline, finetuned, _kd) in enumerate(jobs, 1):
                 if len(jobs) > 1:
                     print(f"\n##### model {n_job}/{len(jobs)}: "
-                          f"{'SepConv-ens baseline' if baseline else mode} "
-                          f"({period}) #####")
+                          f"{'SepConv-ens baseline' if baseline else mode}"
+                          f"{' finetuned' if finetuned else ''} ({period}) #####")
                 run_extraction(
                     args.track, args.year, args.month,
-                    mode, SOURCE, args.finetuned,
+                    mode, SOURCE, finetuned,
                     data_root, model_dir, output_dir,
                     rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                     high_coverage_pct=args.high_coverage_pct,
@@ -3926,7 +3942,7 @@ def main() -> int:
             # is likewise a selection-time knob and has no effect here.
             run_visualization(
                 args.track, args.year, args.month, args.date,
-                jobs[0][0], SOURCE, args.finetuned,
+                jobs[0][0], SOURCE, jobs[0][3],
                 data_root, model_dir, output_dir,
                 period=jobs[0][1],
             )
@@ -3934,19 +3950,21 @@ def main() -> int:
         if args.baseline or args.baseline_period:
             parser.error("there is no lightning baseline")
         if args.date is None:
-            for n_job, (mode, period, _b) in enumerate(jobs, 1):
+            for n_job, (mode, period, _b, finetuned, kd) in enumerate(jobs, 1):
                 if len(jobs) > 1:
-                    print(f"\n##### model {n_job}/{len(jobs)}: {mode} ({period}) #####")
+                    print(f"\n##### model {n_job}/{len(jobs)}: {mode}"
+                          f"{' finetuned' if finetuned else ' KD student' if kd else ''}"
+                          f" ({period}) #####")
                 run_extraction_lightning(
                     args.year, args.month,
-                    mode, SOURCE, args.finetuned,
+                    mode, SOURCE, finetuned,
                     data_root, model_dir, output_dir,
                     stride=args.stride,
                     low_threshold=args.lightning_low_threshold,
                     batch_size=args.batch_size,
                     rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                     high_coverage_pct=args.high_coverage_pct,
-                    kd=args.kd,
+                    kd=kd,
                     period=period,
                     eval_root=Path(args.eval_root),
                 )
@@ -3954,12 +3972,12 @@ def main() -> int:
         else:
             run_visualization_lightning(
                 args.year, args.month, args.date,
-                jobs[0][0], SOURCE, args.finetuned,
+                jobs[0][0], SOURCE, jobs[0][3],
                 data_root, model_dir, output_dir,
                 stride=args.stride,
                 low_threshold=args.lightning_low_threshold,
                 batch_size=args.batch_size,
-                kd=args.kd,
+                kd=jobs[0][4],
                 period=jobs[0][1],
             )
     else:  # kd
