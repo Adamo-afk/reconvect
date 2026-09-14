@@ -842,6 +842,15 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
         pos_agg, neg_agg, [opt_threshold]))
     op_label = (f"threshold {opt_threshold:.2f} "
                 + ("(fixed)" if threshold is not None else "(tuned on validation)"))
+    # The best achievable point on this very split: the threshold that
+    # maximises pooled CSI on the test histograms. Reported for the
+    # distance to the operating point, never used to score anything.
+    best_t, best_csi = best_threshold(pos_agg, neg_agg, np.linspace(0.01, 0.99, 99))
+    best_r, best_p, best_fpr, best_tpr = (float(v[0]) for v in pr_roc_curves(
+        pos_agg, neg_agg, [best_t]))
+    best_label = f"best on test {best_t:.2f} (CSI {best_csi:.3f})"
+    results["aggregate"]["test_optimal_threshold"] = float(best_t)
+    results["aggregate"]["test_optimal_csi"] = float(best_csi)
 
     # 2. PR curve
     fig, ax = plt.subplots(figsize=(7, 6))
@@ -849,6 +858,8 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
             label=f"PR AUC = {pr_auc:.4f}")
     ax.plot([op_r], [op_p], marker='*', markersize=14, color='red',
             linestyle='none', label=op_label, zorder=5)
+    ax.plot([best_r], [best_p], marker='D', markersize=8, color='green',
+            linestyle='none', label=best_label, zorder=5)
     ax.set_xlabel("Recall (POD)")
     ax.set_ylabel("Precision (1 - FAR)")
     ax.set_title("Precision-Recall Curve")
@@ -867,6 +878,8 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label="Random")
     ax.plot([op_fpr], [op_tpr], marker='*', markersize=14, color='red',
             linestyle='none', label=op_label, zorder=5)
+    ax.plot([best_fpr], [best_tpr], marker='D', markersize=8, color='green',
+            linestyle='none', label=best_label, zorder=5)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate (POD)")
     ax.set_title("ROC Curve")
