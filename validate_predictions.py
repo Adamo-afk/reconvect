@@ -140,6 +140,13 @@ RAINFALL_THRESHOLD_MMH = 10.0
 # --max_samples: cap on the selected references per run, for trial runs
 # on a small subset. None = every sample the month holds.
 MAX_SAMPLES = None
+# Per-month reproducible sampling under --max_samples: every month's
+# candidates are shuffled with SEED and MONTH_BATCH are taken from each
+# month in turn, cycling until MAX_SAMPLES, never repeating a sample.
+MONTH_BATCH = 10
+SEED = 1234
+# CPU threads for the per-lead sweeps.
+WORKERS = 4
 
 # Scope of a run: a dataset split (train / validation / test, read from
 # the split CSV), a month scanned from the reprojected archive, or a
@@ -206,20 +213,12 @@ N_RAINFALL_CLASSES = 5
 HIGH_COVERAGE_PCT = 90.0
 
 # ---------------------------------------------------------------------------
-# Rainfall hysteresis sweep
+# Rainfall hysteresis tuning
 # ---------------------------------------------------------------------------
-# The rainfall track is post-processed with the same connected-component
-# hysteresis as lightning, but on p(argmax) rather than a single sigmoid.
-# The LOW threshold is held fixed and HIGH is swept upward from it in
-# `RAINFALL_SWEEP_STEP` increments until `RAINFALL_HIGH_MARGIN` above it,
-# picking the per-lead value that maximises aggregate CSI - mirroring what
-# the lightning track already does with its 0.91..0.99 grid.
-#
-# The margin default spans the operational DEFAULT_RAIN_HIGH (0.55) so the
-# current shipped setting is always inside the swept range and the sweep can
-# only ever improve on it.
-RAINFALL_SWEEP_STEP = 0.01
-RAINFALL_HIGH_MARGIN = 0.30
+# Tuned on the validation split in two phases (see run_extraction): a
+# plain-threshold sweep on p(argmax) picks LOW per lead, then (LOW, HIGH)
+# windows slid around it pick the pair per lead. The scope is scored at
+# that pair. Defaults of the window width and reach live on the CLI.
 
 # The 18-patch grid the ensemble scorer accumulates over.
 N_PATCHES = 18
@@ -264,33 +263,6 @@ def lead_palette(n: int) -> tuple[list[str], list[str]]:
     colours = [_cm.colors.to_hex(cmap(i % 10)) for i in range(n)]
     markers = [["o", "s", "^", "D", "v", "P", "X", "*"][i % 8] for i in range(n)]
     return colours, markers
-
-
-def rainfall_high_grid(low: float,
-                       margin: float = RAINFALL_HIGH_MARGIN,
-                       step: float = RAINFALL_SWEEP_STEP,
-                       high_min: float | None = None,
-                       high_max: float | None = None) -> list[float]:
-    """Candidate HIGH thresholds, inclusive at both ends.
-
-    By default low+step .. low+margin. With `high_min` / `high_max` the
-    range is named outright (either end may be given; the other keeps
-    its default). HIGH must exceed LOW for hysteresis to mean anything -
-    at equality the connected-component seeding degenerates to a plain
-    threshold - so a range that starts at or below LOW is refused.
-    """
-    lo = float(high_min) if high_min is not None else low + step
-    hi = float(high_max) if high_max is not None else low + margin
-    if lo <= low + 1e-9:
-        raise SystemExit(
-            f"the HIGH sweep must start above LOW: high_min={lo:g} with "
-            f"low={low:g}. Lower LOW (--rainfall_low_threshold) or raise "
-            f"--rainfall_high_min.")
-    if hi < lo:
-        raise SystemExit(f"--rainfall_high_max {hi:g} is below the sweep "
-                         f"start {lo:g}")
-    n = int(round((hi - lo) / step))
-    return [round(lo + step * k, 4) for k in range(0, n + 1)]
 
 
 _PATCH_ID_CANVAS: np.ndarray | None = None
@@ -379,6 +351,71 @@ def sweep_hysteresis(score: np.ndarray, low: float, highs,
                                 int(fn_p[q]), int(tn_p[q]))
                         for q in scored_patches}
     return conf, per_patch
+
+
+N_SCORE_BINS = 1000
+
+
+def score_histograms(score: np.ndarray, gt: np.ndarray, eligible: np.ndarray,
+                     n_bins: int = N_SCORE_BINS) -> tuple[np.ndarray, np.ndarray]:
+    """(pos, neg) int64 histograms of `score` over the eligible, valid
+    pixels, split by whether the event (gt > 0) occurred. A plain
+    threshold t then keeps bins >= round(t * n_bins), so every threshold
+    on the 1/n_bins grid is exact."""
+    valid = (gt >= 0) & eligible
+    idx = np.clip((score[valid] * n_bins).astype(np.int64), 0, n_bins - 1)
+    truth = gt[valid] > 0
+    pos = np.bincount(idx[truth], minlength=n_bins)
+    neg = np.bincount(idx[~truth], minlength=n_bins)
+    return pos, neg
+
+
+def csi_from_histograms(pos: np.ndarray, neg: np.ndarray,
+                        thresholds, gt_positive_total: float) -> np.ndarray:
+    """Pooled CSI at each threshold from the histograms. `gt_positive_total`
+    is the count of event pixels among ALL valid pixels (eligible or not):
+    event pixels the model called dry are misses at every threshold."""
+    n_bins = pos.shape[0]
+    k = np.clip(np.rint(np.asarray(thresholds, dtype=np.float64) * n_bins)
+                .astype(np.int64), 0, n_bins)
+    pos_tail = np.concatenate([np.cumsum(pos[::-1])[::-1], [0]]).astype(np.float64)
+    neg_tail = np.concatenate([np.cumsum(neg[::-1])[::-1], [0]]).astype(np.float64)
+    tp = pos_tail[k]
+    fp = neg_tail[k]
+    fn = float(gt_positive_total) - tp
+    return tp / (tp + fp + fn + 1e-7)
+
+
+def window_pairs(low: float, width: float, reach: float) -> list[tuple[float, float]]:
+    """The (LOW, HIGH) candidates around a phase-1 LOW: windows of
+    `width` sliding left and right out to `reach`. For 0.35, 0.02, 0.10:
+    (0.25, 0.27) ... (0.33, 0.35) on the left, (0.35, 0.37) ...
+    (0.43, 0.45) on the right. Pairs leaving (0, 1) are dropped."""
+    n = int(round(reach / width))
+    pairs = []
+    for k in range(n, 0, -1):
+        pairs.append((round(low - k * width, 4), round(low - (k - 1) * width, 4)))
+    for k in range(1, n + 1):
+        pairs.append((round(low + (k - 1) * width, 4), round(low + k * width, 4)))
+    return [(lo, hi) for lo, hi in pairs if lo > 0.0 and hi < 1.0]
+
+
+def _map_leads(fn, n: int):
+    """fn(i) for i in range(n), in WORKERS threads; returns the list of
+    results in lead order. The per-lead sweeps are numpy / scipy heavy
+    and release the interpreter lock, so they overlap."""
+    if WORKERS <= 1 or n <= 1:
+        return [fn(i) for i in range(n)]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(WORKERS, n)) as ex:
+        return list(ex.map(fn, range(n)))
+
+
+def save_per_sample(path: Path, **arrays) -> None:
+    """Every per-sample count of a run, compressed, next to the summary,
+    so the figures can be redrawn and new ones made without re-running."""
+    np.savez_compressed(path, **{k: np.asarray(v) for k, v in arrays.items()})
+    print(f"  Wrote per-sample data to {path}")
 
 
 def _merge_patch_counts(acc: dict, lead_idx: int, per_patch: dict) -> None:
@@ -546,21 +583,61 @@ def split_references(data_root: Path, source: str, period,
     return sorted(refs)
 
 
+def subsample_by_month(kept: list[tuple[str, str]], max_samples: int,
+                       month_batch: int = MONTH_BATCH, seed: int = SEED,
+                       ) -> list[tuple[str, str]]:
+    """Reproducible per-month sampling: shuffle each month's candidates
+    with `seed`, then take `month_batch` from every month in turn,
+    cycling over the months until `max_samples` are drawn. No sample is
+    drawn twice, months with fewer candidates drop out when exhausted,
+    and the result is returned in chronological order."""
+    if max_samples is None or len(kept) <= max_samples:
+        return kept
+    rng = np.random.default_rng(seed)
+    by_month: dict[str, list] = {}
+    for d, h in kept:
+        by_month.setdefault(d[:7], []).append((d, h))
+    queues = []
+    for m in sorted(by_month):
+        items = by_month[m]
+        rng.shuffle(items)
+        queues.append(items)
+    chosen: list[tuple[str, str]] = []
+    while len(chosen) < max_samples and any(queues):
+        for q in queues:
+            take = q[:month_batch]
+            del q[:month_batch]
+            chosen.extend(take)
+            if len(chosen) >= max_samples:
+                break
+    chosen = chosen[:max_samples]
+    print(f"  --max_samples {max_samples}: {len(chosen)} drawn from "
+          f"{len(by_month)} month(s), {month_batch} per month per round, "
+          f"seed {seed}")
+    return sorted(chosen)
+
+
 def select_samples(data_root: Path, year: int | None, month: int | None,
                    threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                    *, source: str | None = None, period=None,
+                   split: str | None = None, limit: int | None = -1,
                    ) -> list[tuple[str, str]]:
     """The reference timesteps a run scores, with at least one pixel
-    >= threshold: every OPERA sample of the month, or, when SPLIT is
-    set, the split's own timesteps (within the month if one is given).
-    Returns (date_str, hhmm) tuples sorted chronologically."""
-    if SPLIT:
+    >= threshold: every OPERA sample of the month, or, when a split is
+    set (`split`, else the run's SPLIT), the split's own timesteps
+    (within the month if one is given). `limit` caps them with the
+    per-month sampling; -1 means MAX_SAMPLES. Returns (date_str, hhmm)
+    tuples sorted chronologically."""
+    split = split or SPLIT
+    if limit == -1:
+        limit = MAX_SAMPLES
+    if split:
         if source is None:
             raise ValueError("select_samples needs `source` on a split run")
         candidates = []
         missing = 0
         for date_str, hhmm in split_references(data_root, source, period,
-                                               SPLIT, year, month):
+                                               split, year, month):
             path = _opera_file_for(data_root, date_str, hhmm)
             if array_exists(path):
                 candidates.append((date_str, hhmm, path))
@@ -587,11 +664,7 @@ def select_samples(data_root: Path, year: int | None, month: int | None,
             kept.append((date_str, hhmm))
     print(f"  Scanned {scanned} OPERA files; "
           f"kept {len(kept)} with >= {threshold_mmh:g} mm/h")
-    if MAX_SAMPLES is not None and len(kept) > MAX_SAMPLES:
-        print(f"  --max_samples {MAX_SAMPLES}: keeping the first "
-              f"{MAX_SAMPLES} of {len(kept)}")
-        kept = kept[:MAX_SAMPLES]
-    return kept
+    return subsample_by_month(kept, limit, MONTH_BATCH, SEED)
 
 
 # ============================================================================
@@ -732,7 +805,8 @@ def _write_json(track: str, year: int, month: int,
                 post_processing: dict | None = None,
                 per_patch: dict | None = None,
                 model_tag: str | None = None,
-                hmf_pooled: dict | None = None):
+                hmf_pooled: dict | None = None,
+                extra: dict | None = None):
     """Aggregate summary with per-lead-time counts + metrics + the
     lists of (date, reference_utc) that met the high-coverage threshold.
     Both thresholds are recorded in the JSON so a run's outputs are
@@ -796,6 +870,8 @@ def _write_json(track: str, year: int, month: int,
         doc["post_processing"] = post_processing
     if per_patch is not None:
         doc["per_patch"] = per_patch
+    if extra:
+        doc.update(extra)
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
@@ -1086,6 +1162,57 @@ def _plot_hmf_percentiles(summary: dict, rows: list[dict], offsets: list[int],
     print(f"  Wrote {path.name}")
 
 
+def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
+    """The two rainfall tuning figures from the summary: phase 1, pooled
+    CSI against the plain threshold per lead with the chosen LOW starred;
+    phase 2, pooled CSI of every (LOW, HIGH) window per lead with the
+    chosen pair starred. Both on the validation-split samples."""
+    pp = summary["post_processing"]
+    leads = list(pp["low_sweep"])
+    colors, markers = lead_palette(len(leads))
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    for i, lead in enumerate(leads):
+        thr = sorted(float(t) for t in pp["low_sweep"][lead])
+        csi = [pp["low_sweep"][lead][f"{t:.2f}"] for t in thr]
+        ax.plot(thr, csi, color=colors[i], linewidth=1.5, label=lead)
+        low = pp["phase1_low_per_lead"][lead]
+        ax.plot([low], [pp["low_sweep"][lead][f"{low:.2f}"]], marker='*',
+                markersize=13, color=colors[i], linestyle='none')
+    ax.set_xlabel("threshold on p(argmax) of rainy-argmax pixels")
+    ax.set_ylabel("pooled CSI (validation split)")
+    ax.set_title("Phase 1 - LOW per lead (star = chosen)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.suptitle(_run_title(summary), fontsize=12, fontweight="bold")
+    fig.savefig(out_low, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {Path(out_low).name}")
+
+    fig, axes = plt.subplots(1, len(leads), figsize=(5 * len(leads), 4.8),
+                             squeeze=False, constrained_layout=True)
+    for i, (ax, lead) in enumerate(zip(axes[0], leads)):
+        table = pp["window_sweep"][lead]
+        xs = np.arange(len(table))
+        csi = [t["CSI"] for t in table]
+        ax.bar(xs, csi, color=colors[i], alpha=0.75)
+        best = max(range(len(table)), key=lambda j: (table[j]["CSI"], -table[j]["low"]))
+        ax.plot([best], [csi[best]], marker='*', markersize=14, color='black')
+        ax.set_xticks(xs)
+        ax.set_xticklabels([f"{t['low']:.2f}\n{t['high']:.2f}" for t in table],
+                           fontsize=7)
+        ax.set_xlabel("window (LOW over HIGH)")
+        ax.set_ylabel("pooled CSI (validation split)")
+        ax.set_title(f"{lead}: chosen low={table[best]['low']:.2f} "
+                     f"high={table[best]['high']:.2f}")
+        ax.grid(axis="y", alpha=0.3)
+    fig.suptitle(f"{_run_title(summary)}  |  Phase 2 - (LOW, HIGH) windows, "
+                 f"width {pp['window']:g}, reach {pp['reach']:g}",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(out_high, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {Path(out_high).name}")
+
+
 def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
     """CSI against the swept HIGH threshold, one line per lead, a dashed
     line at each lead's winner, for either track, drawn from
@@ -1110,7 +1237,7 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
             ax.axvline(float(winners[lead]), color=colors[i], linestyle="--",
                        alpha=0.5, linewidth=1)
     ax.set_xlabel("High threshold")
-    ax.set_ylabel("Aggregate CSI over selected samples")
+    ax.set_ylabel("Pooled CSI (validation split)")
     ax.set_title("CSI vs high-threshold sweep  "
                  + (f"(low={float(low):.2f} fixed)" if low is not None else ""))
     ax.grid(alpha=0.3)
@@ -1144,7 +1271,10 @@ def make_plots(summary_path: Path) -> list[Path]:
     if rows:
         _plot_hmf_figure(summary, rows, offsets, step, out("hmf"))
         _plot_hmf_percentiles(summary, rows, offsets, step, out("hmf_percentiles"))
-    if (summary.get("post_processing") or {}).get("tuning_scores"):
+    pp = summary.get("post_processing") or {}
+    if pp.get("low_sweep"):
+        plot_rainfall_tuning(summary, out("tuning_low"), out("tuning_high"))
+    elif pp.get("tuning_scores"):
         plot_tuning_from_summary(summary_path, out("tuning"))
     return made
 
@@ -1159,22 +1289,28 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
                    high_coverage_pct: float = HIGH_COVERAGE_PCT,
                    rainfall_low: float | None = None,
-                   rainfall_high_margin: float = RAINFALL_HIGH_MARGIN,
-                   rainfall_high_min: float | None = None,
-                   rainfall_high_max: float | None = None,
-                   rainfall_sweep_step: float = RAINFALL_SWEEP_STEP,
+                   rainfall_window: float = 0.02,
+                   rainfall_reach: float = 0.10,
                    period=None,
                    baseline: bool = False):
-    """Extraction mode for the rainfall track.
+    """Extraction mode for the rainfall track, in three phases.
 
-    IMPORTANT scope note for `rainfall_threshold_mmh`: this override
-    affects sample SELECTION (which OPERA files get in) and label text on
-    the metrics figure. It does NOT change the per-class boundaries the
-    trained model was optimised against (10 / 20 / 30 / 40 mm/h). If you
-    push this above 10 mm/h you'll simply keep fewer samples; if you
-    lower it, you'll keep weaker samples but the binary confusion
-    (IoU / FAR / POD / CSI) is still computed on the >=10 mm/h event
-    (class >= 1), because that's the model's decision boundary.
+    1. LOW per lead, tuned on samples drawn from the VALIDATION split:
+       a plain threshold on p(argmax) of the rainy-argmax pixels, swept
+       0.01..0.99, the best pooled CSI wins. --rainfall_low_threshold
+       skips this and fixes one LOW for every lead.
+    2. (LOW, HIGH) per lead, on the same samples: windows of
+       --rainfall_window slid left and right of the phase-1 LOW out to
+       --rainfall_reach; every window is one hysteresis run; the best
+       pooled CSI wins.
+    3. The scope samples (test split, month, ...) are scored at the
+       chosen pair per lead: FAR/POD/CSI, coverage, hits / misses /
+       false alarms, per-patch CSI, and every per-sample count is saved.
+
+    The selection threshold (`rainfall_threshold_mmh`) only decides
+    which timesteps are considered; the scored event is class >= 1,
+    the model's own 10 mm/h boundary. The baseline has no
+    post-processing: its class map is scored as it is (phase 3 only).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1182,8 +1318,6 @@ def run_extraction(track: str, year: int, month: int,
     print(f"Validation extraction - track={track}  {scope_label(year, month)}")
     print("=" * 70)
     if baseline:
-        # The SepConv-ens baseline reads its own mode and window; the
-        # period names the dataset it was trained on (w44).
         from sepconv_ensemble_training import SEPCONV_MODE
         mode = SEPCONV_MODE
         if period is None:
@@ -1199,30 +1333,42 @@ def run_extraction(track: str, year: int, month: int,
 
     init_sequence_config(str(data_root), source, period=period)
     sync_window_from_sequence_config()
+    L = len(LEAD_STEP_OFFSETS)
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
     mode_config = get_mode_config(mode)
     step_minutes = _load_step_minutes(data_root)
 
-    print(f"\nSelecting OPERA samples with >= "
-          f"{rainfall_threshold_mmh:g} mm/h ...")
+    print(f"\nScope samples (>= {rainfall_threshold_mmh:g} mm/h) ...")
     selected = select_samples(data_root, year, month,
                               threshold_mmh=rainfall_threshold_mmh,
                               source=source, period=period)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
+    tuning_selected: list = []
+    if not baseline:
+        print(f"\nTuning samples from the validation split "
+              f"(>= {rainfall_threshold_mmh:g} mm/h) ...")
+        tuning_selected = select_samples(
+            data_root, year, month, threshold_mmh=rainfall_threshold_mmh,
+            source=source, period=period, split="validation")
+        if not tuning_selected:
+            raise SystemExit("no validation-split samples to tune on")
+        if SPLIT == "validation":
+            print("  NOTE: the scope IS the validation split; thresholds are "
+                  "tuned on the same population they are reported on.")
 
     print(f"\nLoading model ...")
     if baseline:
         from sepconv_predict import load_base_models, predict_classes
         from sepconv_compose import MAX_STEP as _SEPCONV_MAX_STEP
         from train_models import build_run_tag
-        if len(LEAD_STEP_OFFSETS) != _SEPCONV_MAX_STEP:
+        if L != _SEPCONV_MAX_STEP:
             raise SystemExit(
-                f"the {period} window has {len(LEAD_STEP_OFFSETS)} future "
-                f"steps but the composition forecasts {_SEPCONV_MAX_STEP}")
+                f"the {period} window has {L} future steps but the "
+                f"composition forecasts {_SEPCONV_MAX_STEP}")
         base_models = load_base_models(model_dir,
                                        build_run_tag(mode, source, period))
         print(f"  Loaded base models: {sorted(base_models)}")
@@ -1231,39 +1377,7 @@ def run_extraction(track: str, year: int, month: int,
         model = load_model_artifact(model_dir, mode, source, finetuned,
                                     period=period, weights=WEIGHTS)
         print(f"  Loaded: {model.count_params():,} parameters")
-
-    rows: list[dict] = []
-    confusion_per_lead = {
-        i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
-        for i in range(len(LEAD_STEP_OFFSETS))
-    }
-    n_skipped = 0
-
-    # Hysteresis sweep state. `tuning` holds confusion counts per
-    # (lead, candidate high); `patch_acc` pools per-patch counts on the
-    # post-processed canvases so the ensemble scorer judges the shipped
-    # product, not raw argmax.
-    from visualize_gt_vs_pred import build_full_soft_pred, DEFAULT_RAIN_LOW
-    rain_low = (rainfall_low if rainfall_low is not None
-                else DEFAULT_RAIN_LOW)
-    if baseline:
-        # A class map is the baseline's product: no hysteresis, and one
-        # candidate (None) so the bookkeeping below stays one shape.
-        high_grid = [None]
-        print("  Post-processing: none (SepConv-ens class map)")
-    else:
-        high_grid = rainfall_high_grid(rain_low, rainfall_high_margin,
-                                       rainfall_sweep_step,
-                                       rainfall_high_min, rainfall_high_max)
-        print(f"  Hysteresis sweep: low={rain_low:.2f} fixed, high "
-              f"{high_grid[0]:.2f}..{high_grid[-1]:.2f} "
-              f"step {rainfall_sweep_step:.2f} ({len(high_grid)} candidates)")
-    tuning = {i: {h: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for h in high_grid}
-              for i in range(len(LEAD_STEP_OFFSETS))}
-    patch_acc: dict = {}
-    # Per sample, lead and candidate HIGH: the binary confusion, resolved
-    # to columns once the winning HIGH is known.
-    sample_conf: list[dict] = []
+    from visualize_gt_vs_pred import build_full_soft_pred
 
     def _load_sample(sel):
         """Inputs and the ground-truth field of every lead for one
@@ -1283,182 +1397,272 @@ def run_extraction(track: str, year: int, month: int,
                     _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm))
         return inputs, valid_patches, gt_fields
 
-    print(f"\nRunning inference on {len(selected)} samples ...")
-    for k, ((date_str, hhmm), (inputs, valid_patches, gt_fields)) in enumerate(
-            _prefetch(selected, _load_sample), 1):
-        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-        if k == 1 or k % 20 == 0 or k == len(selected):
-            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
-
-        if not valid_patches:
-            n_skipped += 1
-            continue
+    def _predict(inputs, valid_patches):
+        """(argmax canvases, score canvases or None, eligible masks or
+        None) for one sample. Score = p(argmax) on rainy-argmax pixels,
+        the quantity the hysteresis thresholds act on."""
         if baseline:
-            past = np.asarray(inputs["past_hr"])          # (N, T, H, W, 1)
+            past = np.asarray(inputs["past_hr"])
             frames = [past[:, t, :, :, 0] for t in range(past.shape[1])]
             classes, _mmh = predict_classes(
-                base_models, frames, period, max_step=len(LEAD_STEP_OFFSETS),
+                base_models, frames, period, max_step=L,
                 data_root=str(data_root), source=source,
                 batch_size=18, batched=True)
-            pred_canvases = _paste_class_canvases(
-                classes, valid_patches, len(LEAD_STEP_OFFSETS))
-            soft_canvases = None
-        else:
-            preds = _predict_batches(model, inputs, batch_size=18)
-            pred_canvases = paste_predictions_to_canvas(
-                preds, valid_patches, label_type="radar",
-            )
-            # Soft canvases keep p(argmax), which the hysteresis needs;
-            # the argmax canvases above have already discarded it.
-            soft_canvases = build_full_soft_pred(
-                preds, valid_patches, n_classes=preds.shape[-1],
-            )
+            return _paste_class_canvases(classes, valid_patches, L), None, None
+        preds = _predict_batches(model, inputs, batch_size=18)
+        pred_canvases = paste_predictions_to_canvas(
+            preds, valid_patches, label_type="radar")
+        soft = build_full_soft_pred(preds, valid_patches,
+                                    n_classes=preds.shape[-1])
+        scores, eligible = [], []
+        for i in range(L):
+            argmax = np.argmax(soft[i], axis=-1)
+            p_arg = np.take_along_axis(soft[i], argmax[..., None],
+                                       axis=-1).squeeze(-1)
+            scores.append(np.where(argmax > 0, p_arg, 0.0).astype(np.float32))
+            eligible.append(argmax > 0)
+        return pred_canvases, scores, eligible
 
-        row = {"date": date_str, "reference_utc": ref_utc}
-        conf_this: dict = {}
+    def _run(samples, label, per_sample):
+        """Loop `samples` through the model, calling per_sample(k, date,
+        ref, pred_canvases, scores, eligible, gt_canvases). Returns the
+        (date, ref) of every sample that produced predictions."""
+        done = []
+        n_skipped = 0
+        print(f"\n{label}: {len(samples)} samples ...")
+        for k, ((date_str, hhmm), (inputs, valid_patches, gt_fields)) in enumerate(
+                _prefetch(samples, _load_sample), 1):
+            ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+            if k == 1 or k % 20 == 0 or k == len(samples):
+                print(f"  [{k}/{len(samples)}] {date_str} {ref_utc}")
+            if not valid_patches:
+                n_skipped += 1
+                continue
+            pred_canvases, scores, eligible = _predict(inputs, valid_patches)
+            gt_canvases = [_paste_gt_class_canvas(gt_fields[i], valid_patches)
+                           for i in range(L)]
+            per_sample(len(done), date_str, ref_utc, pred_canvases, scores,
+                       eligible, gt_canvases)
+            done.append((date_str, ref_utc))
+        print(f"  done: {len(done)} scored, {n_skipped} skipped (missing inputs)")
+        return done
+
+    low_grid = np.round(np.arange(0.01, 1.00, 0.01), 2)
+    low_per_lead: dict[int, float] = {}
+    pair_per_lead: dict[int, tuple] = {}
+    low_sweep: dict = {}
+    window_sweep: dict = {}
+    tune_dates: list = []
+    tune_hist: list = []        # [n_t][L] (pos, neg, gt_pos_total)
+    tune_window: list = []      # [n_t][L][n_pairs] (tp, fp, fn, tn)
+    pairs_per_lead: dict[int, list] = {}
+
+    if not baseline:
+        # ---- Phase 1: LOW per lead from a plain threshold sweep --------
+        def _phase1(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
+            def one(i):
+                pos, neg = score_histograms(scores[i], gts[i], eligible[i])
+                gt_pos_total = int(((gts[i] > 0) & (gts[i] >= 0)).sum())
+                return pos, neg, gt_pos_total
+            tune_hist.append(_map_leads(one, L))
+
+        tune_dates = _run(tuning_selected, "Phase 1 - LOW sweep on the "
+                          "validation split", _phase1)
+        if not tune_dates:
+            raise SystemExit("no tuning sample produced predictions")
+        if rainfall_low is not None:
+            low_per_lead = {i: float(rainfall_low) for i in range(L)}
+            print(f"  LOW fixed at {rainfall_low:.2f} for every lead "
+                  f"(--rainfall_low_threshold)")
+        print("\nPhase 1 result (plain threshold on p(argmax), pooled CSI):")
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            gt_canvas = _paste_gt_class_canvas(gt_fields[i], valid_patches)
-            pred_canvas = pred_canvases[i]
+            pos = sum(h[i][0] for h in tune_hist)
+            neg = sum(h[i][1] for h in tune_hist)
+            gt_tot = sum(h[i][2] for h in tune_hist)
+            csi = csi_from_histograms(pos, neg, low_grid, gt_tot)
+            low_sweep[f"t+{offset}"] = {f"{t:.2f}": float(c)
+                                        for t, c in zip(low_grid, csi)}
+            if rainfall_low is None:
+                low_per_lead[i] = float(low_grid[int(np.argmax(csi))])
+            print(f"  t+{offset}: LOW={low_per_lead[i]:.2f}  "
+                  f"CSI={csi[int(np.argmax(csi))]:.4f}")
 
-            row[f"iou_mask_t+{offset}"] = _iou_binary(gt_canvas, pred_canvas)
-            row[f"class_wt_t+{offset}"] = _per_class_weighted(
-                gt_canvas, pred_canvas,
-            )
-            tp, fp, fn, tn = _binary_confusion(gt_canvas, pred_canvas)
-            confusion_per_lead[i]["TP"] += tp
-            confusion_per_lead[i]["FP"] += fp
-            confusion_per_lead[i]["FN"] += fn
-            confusion_per_lead[i]["TN"] += tn
+        # ---- Phase 2: (LOW, HIGH) windows around each lead's LOW -------
+        pairs_per_lead = {i: window_pairs(low_per_lead[i], rainfall_window,
+                                          rainfall_reach) for i in range(L)}
+        print(f"\nPhase 2 - {len(pairs_per_lead[0])} (LOW, HIGH) windows per "
+              f"lead, width {rainfall_window:g}, reach {rainfall_reach:g}")
 
-            # Sweep every candidate HIGH on this sample, so the choice is
-            # made once at the end over pooled counts rather than per
-            # sample. One labelling serves every candidate. The baseline
-            # has one candidate: its class map.
-            conf_this[i] = {}
+        def _phase2(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
+            def one(i):
+                out = []
+                for lo, hi in pairs_per_lead[i]:
+                    conf, _ = sweep_hysteresis(scores[i], lo, [hi], gts[i],
+                                               eligible=eligible[i])
+                    out.append(conf[hi])
+                return out
+            tune_window.append(_map_leads(one, L))
+
+        _run(tuning_selected, "Phase 2 - window sweep on the validation "
+             "split", _phase2)
+        print("\nPhase 2 result (hysteresis (LOW, HIGH), pooled CSI):")
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            table = []
+            for j, (lo, hi) in enumerate(pairs_per_lead[i]):
+                tp = sum(w[i][j][0] for w in tune_window)
+                fp = sum(w[i][j][1] for w in tune_window)
+                fn = sum(w[i][j][2] for w in tune_window)
+                tn = sum(w[i][j][3] for w in tune_window)
+                m = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": tn})
+                table.append({"low": lo, "high": hi, "CSI": m["CSI"],
+                              "POD": m["POD"], "FAR": m["FAR"]})
+            window_sweep[f"t+{offset}"] = table
+            best = max(range(len(table)),
+                       key=lambda j: (table[j]["CSI"], -table[j]["low"]))
+            pair_per_lead[i] = (table[best]["low"], table[best]["high"])
+            print(f"  t+{offset}: low={table[best]['low']:.2f} "
+                  f"high={table[best]['high']:.2f}  CSI={table[best]['CSI']:.4f}")
+
+    # ---- Phase 3: score the scope at the chosen pair per lead ----------
+    rows: list[dict] = []
+    confusion_raw = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for i in range(L)}
+    confusion_post = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for i in range(L)}
+    patch_acc: dict = {}
+    conf_raw_rows: list = []
+    conf_post_rows: list = []
+    patch_rows: list = []
+    cover_rows: list = []
+
+    def _phase3(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
+        row = {"date": date_str, "reference_utc": ref_utc}
+
+        def one(i):
+            gt = gts[i]
+            raw = pred_canvases[i]
+            iou = _iou_binary(gt, raw)
+            cwt = _per_class_weighted(gt, raw)
+            r_conf = _binary_confusion(gt, raw)
             if baseline:
-                htp, hfp, hfn, htn = _binary_confusion(gt_canvas, pred_canvas)
-                sweep_conf = {None: (htp, hfp, hfn, htn)}
+                p_conf = r_conf
                 acc = {}
-                _accumulate_per_patch(gt_canvas, pred_canvas, acc, i)
-                sweep_patch = {None: {
-                    q: (c[i]["TP"], c[i]["FP"], c[i]["FN"], c[i]["TN"])
-                    for q, c in acc.items()}}
+                _accumulate_per_patch(gt, raw, acc, i)
+                per_patch = {q: (c[i]["TP"], c[i]["FP"], c[i]["FN"], c[i]["TN"])
+                             for q, c in acc.items()}
             else:
-                soft = soft_canvases[i]
-                argmax = np.argmax(soft, axis=-1)
-                p_argmax = np.take_along_axis(
-                    soft, argmax[..., None], axis=-1).squeeze(-1)
-                # rainfall_hysteresis: only rainy-argmax pixels are
-                # eligible; the rest score 0 and never enter the mask.
-                score = np.where(argmax > 0, p_argmax, 0.0).astype(np.float32)
-                sweep_conf, sweep_patch = sweep_hysteresis(
-                    score, rain_low, high_grid, gt_canvas,
-                    eligible=argmax > 0)
-            for h in high_grid:
-                htp, hfp, hfn, htn = sweep_conf[h]
-                cell = tuning[i][h]
-                cell["TP"] += htp
-                cell["FP"] += hfp
-                cell["FN"] += hfn
-                cell["TN"] += htn
-                # Per-patch counts are pooled for EVERY candidate, so the
-                # winning threshold's per-patch table is already available
-                # once the sweep picks it - no second inference pass.
-                _merge_patch_counts(patch_acc.setdefault(h, {}), i,
-                                    sweep_patch[h])
-                conf_this[i][h] = (htp, hfp, hfn)
-        rows.append(row)
-        sample_conf.append(conf_this)
+                lo, hi = pair_per_lead[i]
+                conf, patches = sweep_hysteresis(scores[i], lo, [hi], gt,
+                                                 eligible=eligible[i])
+                p_conf, per_patch = conf[hi], patches[hi]
+            return iou, cwt, r_conf, p_conf, per_patch
 
-    print(f"\nDone. {len(rows)} samples processed, {n_skipped} skipped "
-          f"(missing inputs).")
-
-    # ---- Pick the per-lead HIGH that maximises aggregate CSI -----------
-    eps = 1e-7
-    best_high: dict[int, float] = {}
-    print("\nHysteresis tuning (rainfall):" if not baseline
-          else "\nBaseline: class map scored as is (no tuning):")
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        scored = {
-            h: c["TP"] / (c["TP"] + c["FP"] + c["FN"] + eps)
-            for h, c in tuning[i].items()
-        }
-        # max() on ties returns the first; sorting by (-csi, high) makes
-        # the lower threshold win, which is the conservative choice.
-        chosen = sorted(scored.items(),
-                        key=lambda kv: (-kv[1], kv[0] if kv[0] is not None
-                                        else 0.0))[0][0]
-        best_high[i] = chosen
-        raw_csi = (confusion_per_lead[i]["TP"]
-                   / (confusion_per_lead[i]["TP"]
-                      + confusion_per_lead[i]["FP"]
-                      + confusion_per_lead[i]["FN"] + eps))
-        print(f"  t+{offset}: high={chosen if chosen is None else f'{chosen:.2f}'}  "
-              f"CSI={scored[chosen]:.4f}  (raw argmax CSI={raw_csi:.4f})")
-
-    # Hits / misses / false alarms per sample and pooled, at the winning
-    # HIGH, on the same >= 10 mm/h event as FAR/POD/CSI.
-    hmf_pooled: dict[int, dict] = {}
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        h = best_high[i]
-        for row, conf in zip(rows, sample_conf):
-            tp_s, fp_s, fn_s = conf[i][h]
-            pct = _hmf_percentages(tp_s, fp_s, fn_s)
+        results = _map_leads(one, L)
+        patch_arr = np.zeros((L, N_PATCHES, 4), dtype=np.int64)
+        for i, offset in enumerate(LEAD_STEP_OFFSETS):
+            iou, cwt, r_conf, p_conf, per_patch = results[i]
+            row[f"iou_mask_t+{offset}"] = iou
+            row[f"class_wt_t+{offset}"] = cwt
+            for key, val in zip(("TP", "FP", "FN", "TN"), r_conf):
+                confusion_raw[i][key] += val
+            for key, val in zip(("TP", "FP", "FN", "TN"), p_conf):
+                confusion_post[i][key] += val
+            tp, fp, fn, _ = p_conf
+            pct = _hmf_percentages(tp, fp, fn)
             for name in HMF_NAMES:
                 row[f"{name}_pct_t+{offset}"] = pct[name]
-            row[f"csi_t+{offset}"] = (tp_s / (tp_s + fp_s + fn_s)
-                                      if (tp_s + fp_s + fn_s) else None)
-        c = tuning[i][h]
-        hmf_pooled[i] = _hmf_percentages(c["TP"], c["FP"], c["FN"])
+            row[f"csi_t+{offset}"] = (tp / (tp + fp + fn) if (tp + fp + fn) else None)
+            _merge_patch_counts(patch_acc, i, per_patch)
+            for q, counts in per_patch.items():
+                patch_arr[i, q - 1] = counts
+        rows.append(row)
+        conf_raw_rows.append([results[i][2] for i in range(L)])
+        conf_post_rows.append([results[i][3] for i in range(L)])
+        patch_rows.append(patch_arr)
+        cover_rows.append([(results[i][0], results[i][1]) for i in range(L)])
 
-    # Per-patch table assembled from each lead's winning threshold.
-    chosen_patch_acc: dict = {}
-    for i in range(len(LEAD_STEP_OFFSETS)):
-        for patch, leads in patch_acc.get(best_high[i], {}).items():
-            if i in leads:
-                chosen_patch_acc.setdefault(patch, {})[i] = leads[i]
+    scored = _run(selected, "Phase 3 - scoring the scope", _phase3)
+    if not rows:
+        print("No sample produced predictions. Nothing to write.")
+        return
+
+    hmf_pooled = {i: _hmf_percentages(confusion_post[i]["TP"],
+                                      confusion_post[i]["FP"],
+                                      confusion_post[i]["FN"]) for i in range(L)}
+    print("\nScope results at the chosen thresholds:")
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        m = _summarise_confusion(confusion_post[i])
+        r = _summarise_confusion(confusion_raw[i])
+        print(f"  t+{offset}: CSI={m['CSI']:.4f} POD={m['POD']:.4f} "
+              f"FAR={m['FAR']:.4f}  (raw argmax CSI={r['CSI']:.4f})")
 
     if baseline:
         post_processing = {
             "method": "none - SepConv-ens class map is the product",
-            "high_threshold_per_lead": {
-                f"t+{off}": None for off in LEAD_STEP_OFFSETS},
+            "low_threshold_per_lead": {f"t+{off}": None for off in LEAD_STEP_OFFSETS},
+            "high_threshold_per_lead": {f"t+{off}": None for off in LEAD_STEP_OFFSETS},
         }
     else:
         post_processing = {
             "method": "rainfall_hysteresis on p(argmax)",
-            "low_threshold": rain_low,
-            "high_grid": high_grid,
-            "sweep_step": rainfall_sweep_step,
-            "high_margin": rainfall_high_margin,
-            "high_min": rainfall_high_min,
-            "high_max": rainfall_high_max,
+            "tuned_on": "validation split",
+            "low_threshold": None,
+            "low_threshold_per_lead": {
+                f"t+{off}": pair_per_lead[i][0] for i, off in enumerate(LEAD_STEP_OFFSETS)},
             "high_threshold_per_lead": {
-                f"t+{off}": best_high[i]
-                for i, off in enumerate(LEAD_STEP_OFFSETS)
-            },
-            "tuning_scores": {
-                f"t+{off}": {
-                    f"{h:.2f}": _summarise_confusion(tuning[i][h])
-                    for h in high_grid
-                }
-                for i, off in enumerate(LEAD_STEP_OFFSETS)
-            },
+                f"t+{off}": pair_per_lead[i][1] for i, off in enumerate(LEAD_STEP_OFFSETS)},
+            "phase1_low_per_lead": {
+                f"t+{off}": low_per_lead[i] for i, off in enumerate(LEAD_STEP_OFFSETS)},
+            "low_fixed": rainfall_low,
+            "window": rainfall_window,
+            "reach": rainfall_reach,
+            "low_sweep": low_sweep,
+            "window_sweep": window_sweep,
         }
+    extra = {
+        "sampling": {"max_samples": MAX_SAMPLES, "month_batch": MONTH_BATCH,
+                     "seed": SEED},
+        "tuning": {"split": "validation" if not baseline else None,
+                   "n_samples": len(tune_dates),
+                   "samples": [[d, r] for d, r in tune_dates]},
+        "metrics_per_lead_raw": {
+            f"t+{off * step_minutes}": _summarise_confusion(confusion_raw[i])
+            for i, off in enumerate(LEAD_STEP_OFFSETS)},
+    }
 
     stem = f"{track}_{scope_stem(year, month)}_{tag}"
     _write_csv(rows, output_dir / f"{stem}_samples.csv")
-    _write_json(track, year, month, selected, rows, confusion_per_lead,
+    _write_json(track, year, month, selected, rows, confusion_post,
                 step_minutes, output_dir / f"{stem}_summary.json",
                 rainfall_threshold_mmh=rainfall_threshold_mmh,
                 high_coverage_pct=high_coverage_pct,
                 post_processing=post_processing,
-                per_patch=per_patch_scores(chosen_patch_acc),
+                per_patch=per_patch_scores(patch_acc),
                 model_tag=tag,
                 hmf_pooled={f"t+{off * step_minutes}": hmf_pooled[i]
-                            for i, off in enumerate(LEAD_STEP_OFFSETS)})
-    # Every figure is drawn from the files just written, the same way
-    # --plots draws them later.
+                            for i, off in enumerate(LEAD_STEP_OFFSETS)},
+                extra=extra)
+    per_sample = dict(
+        dates=[d for d, _ in scored], refs=[r for _, r in scored],
+        lead_offsets=list(LEAD_STEP_OFFSETS),
+        conf_raw=np.asarray(conf_raw_rows, dtype=np.int64),
+        conf_post=np.asarray(conf_post_rows, dtype=np.int64),
+        patch_post=np.asarray(patch_rows, dtype=np.int64),
+        coverage=np.asarray(cover_rows, dtype=np.float64),
+    )
+    if not baseline:
+        per_sample.update(
+            tune_dates=[d for d, _ in tune_dates],
+            tune_refs=[r for _, r in tune_dates],
+            low_grid=low_grid,
+            tune_hist_pos=np.asarray([[h[i][0] for i in range(L)] for h in tune_hist],
+                                     dtype=np.int64),
+            tune_hist_neg=np.asarray([[h[i][1] for i in range(L)] for h in tune_hist],
+                                     dtype=np.int64),
+            tune_gt_positive=np.asarray([[h[i][2] for i in range(L)] for h in tune_hist],
+                                        dtype=np.int64),
+            window_pairs=np.asarray([pairs_per_lead[i] for i in range(L)], dtype=np.float64),
+            tune_window_conf=np.asarray(tune_window, dtype=np.int64),
+        )
+    save_per_sample(output_dir / f"{stem}_per_sample.npz", **per_sample)
     make_plots(output_dir / f"{stem}_summary.json")
 
 
@@ -2328,6 +2532,7 @@ def _write_json_lightning(
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
     per_patch: dict | None = None,
+    extra: dict | None = None,
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
@@ -2391,7 +2596,7 @@ def _write_json_lightning(
         "high_coverage_samples_per_lead": high_cov_lists,
         "post_processing": {
             "low_threshold": low_threshold,
-            "high_grid": list(LIGHTNING_HIGH_GRID),
+            "high_grid": sorted(float(h) for h in next(iter(tuning_scores.values()), {})),
             "high_threshold_per_lead": high_named,
             "tuning_scores": tuning_scores_named,
             "tuning_metric": "csi",
@@ -2399,9 +2604,30 @@ def _write_json_lightning(
     }
     if per_patch is not None:
         doc["per_patch"] = per_patch
+    if extra:
+        doc.update(extra)
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
     print(f"  Wrote summary to {path}")
+
+
+def lightning_low_from_evaluation(eval_root: Path, tag: str) -> float:
+    """The decision threshold the lightning evaluation tuned
+    (optimal_threshold in evaluation/eval_<tag>/evaluation_results.json);
+    it is the hysteresis LOW of the validation track."""
+    path = Path(eval_root) / f"eval_{tag}" / "evaluation_results.json"
+    if not path.is_file():
+        raise SystemExit(
+            f"no evaluation for {tag} at {path}: run evaluate_coalition.py "
+            f"for this model first (its tuned threshold is the hysteresis "
+            f"LOW), or pass --lightning_low_threshold.")
+    blob = json.loads(path.read_text(encoding="utf-8"))
+    value = blob.get("optimal_threshold")
+    if value is None:
+        raise SystemExit(f"{path} has no optimal_threshold")
+    print(f"  LOW = {float(value):.3f} from {path} "
+          f"({blob.get('threshold_source', '?')})")
+    return float(value)
 
 
 def run_extraction_lightning(
@@ -2409,45 +2635,49 @@ def run_extraction_lightning(
     data_root: Path, model_dir: Path, output_dir: Path,
     *,
     stride: int = DEFAULT_STRIDE,
-    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
-    high_grid: tuple[float, ...] = LIGHTNING_HIGH_GRID,
+    low_threshold: float | None = None,
     batch_size: int = 32,
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
     kd: bool = False,
     period=None,
+    eval_root: Path = Path("./evaluation"),
 ):
-    """Extraction mode for the lightning track. Two-phase:
-    Phase 1 - loop selected samples, run Hann-blended inference (raw prob
-    canvases), and accumulate binary-confusion counts vs LINET GT at every
-    candidate (high, lead) combination.
-    Phase 2 - pick the high that maximises aggregate CSI PER LEAD, then
-    derive per-sample IoU/FAR/POD/CSI at that chosen high from the
-    already-stored per-(sample, high, lead) confusions. No re-inference.
+    """Extraction mode for the lightning track.
 
-    Sample selection is OPERA-driven (>=10 mm/h) via select_samples, the
-    SAME criterion the rainfall track uses. This is a deliberate parity
-    choice from the spec: coupling analysis + cross-track comparison land
-    on the same reference set. select_samples_lightning (LINET-driven,
-    >=1 active pixel) remains available for anyone who deliberately
-    wants a LINET-only cut, but is not the default.
+    LOW is the threshold the evaluation tuned for this model (read from
+    its evaluation_results.json) unless --lightning_low_threshold says
+    otherwise. HIGH is swept above LOW in 0.01 steps, per lead, on
+    samples drawn from the VALIDATION split; the scope samples are then
+    scored at the chosen HIGH per lead, and every per-sample count is
+    saved. Sample selection is OPERA-driven, shared with the rainfall
+    track.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    tag = artifact_tag(mode, source, period, finetuned, kd)
 
     print("=" * 70)
     print(f"Validation extraction - track=lightning  {scope_label(year, month)}")
     print("=" * 70)
     print(f"  Data root: {data_root}")
-    print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''})")
+    print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''}"
+          f"{' KD student' if kd else ''})  -> {tag}")
+    if low_threshold is None:
+        low_threshold = lightning_low_from_evaluation(eval_root, tag)
+    else:
+        print(f"  LOW = {low_threshold:.3f} (--lightning_low_threshold)")
+    high_grid = [round(low_threshold + 0.01 * k, 2)
+                 for k in range(1, int(round((0.99 - low_threshold) / 0.01)) + 1)]
+    if not high_grid:
+        raise SystemExit(f"LOW {low_threshold:.2f} leaves no room for a HIGH sweep")
     print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
-          f"high grid={list(high_grid)}")
+          f"high {high_grid[0]:.2f}..{high_grid[-1]:.2f} ({len(high_grid)} candidates)")
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
-    print(f"  Sample selection: OPERA-driven (>= {rainfall_threshold_mmh:g} mm/h) "
-          f"- shared with rainfall track for parity")
 
     init_sequence_config(str(data_root), source, period=period)
     sync_window_from_sequence_config()
+    L = len(LEAD_STEP_OFFSETS)
     set_normalization_stats_path(
         data_root / normalization_stats_name(source, period)
     )
@@ -2455,39 +2685,32 @@ def run_extraction_lightning(
     if mode_config["label_type"] != "lightning":
         raise SystemExit(
             f"--mode {mode} has label_type={mode_config['label_type']!r}; "
-            f"--track lightning requires a lightning-headed mode "
-            f"(e.g. mtg_lightning, mtg_lightning_opera_occurrence)."
-        )
+            f"--track lightning requires a lightning-headed mode.")
     step_minutes = _load_step_minutes(data_root)
 
-    print(f"\nSelecting samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
+    print(f"\nScope samples via OPERA (>= {rainfall_threshold_mmh:g} mm/h) ...")
     selected = select_samples(data_root, year, month,
                               threshold_mmh=rainfall_threshold_mmh,
                               source=source, period=period)
     if not selected:
         print("No samples selected. Nothing to do.")
         return
+    print(f"\nTuning samples from the validation split ...")
+    tuning_selected = select_samples(
+        data_root, year, month, threshold_mmh=rainfall_threshold_mmh,
+        source=source, period=period, split="validation")
+    if not tuning_selected:
+        raise SystemExit("no validation-split samples to tune on")
+    if SPLIT == "validation":
+        print("  NOTE: the scope IS the validation split; HIGH is tuned on "
+              "the same population it is reported on.")
 
-    variant_label = ("finetuned" if finetuned
-                     else "KD student" if kd
-                     else "base")
-    print(f"\nLoading model ({variant_label}) ...")
+    print(f"\nLoading model ...")
     model = load_model_artifact(model_dir, mode, source, finetuned,
                                 kd=kd, period=period, weights=WEIGHTS)
     print(f"  Loaded: {model.count_params():,} parameters")
 
-    # Per-(sample, lead_idx, high) confusion tuples: we need them at
-    # per-sample granularity for the CSV rows, so store as a list of
-    # dicts. Aggregate (lead_idx, high) counts are computed by summing.
-    # Memory footprint: N_samples * 3 leads * 9 highs * 4 ints -> tiny.
-    per_sample_confusion: list[dict] = []  # each dict: {(lead_idx, high): (tp, fp, fn, tn)}
-    # {candidate_high: {patch: {lead: counts}}} on post-processed canvases.
-    patch_acc: dict = {}
-    n_skipped = 0
-
     def _load_sample(sel):
-        """Overlapped inputs and the ground truth of every lead for one
-        reference timestep; runs in the loader thread."""
         date_str, hhmm = sel
         ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
         inputs, positions = build_inputs_for_reference_overlapped(
@@ -2504,112 +2727,112 @@ def run_extraction_lightning(
                     _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm))
         return inputs, positions, gt_bins
 
-    print(f"\nRunning inference on {len(selected)} samples "
-          f"(Hann overlap, stride={stride}) ...")
-    for k, ((date_str, hhmm), (inputs, positions, gt_bins)) in enumerate(
-            _prefetch(selected, _load_sample), 1):
-        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-        if k == 1 or k % 20 == 0 or k == len(selected):
-            print(f"  [{k}/{len(selected)}] {date_str} {ref_utc}")
-
-        if not positions:
-            n_skipped += 1
-            continue
-        preds = _predict_batches(model, inputs, batch_size=batch_size)
-        prob_canvases = paste_predictions_hann_blended(preds, positions)
-
-        sample_confusion: dict[tuple[int, float], tuple[int, int, int, int]] = {}
-        for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            gt_bin = gt_bins[i]
-            if gt_bin is None:
-                # No GT for this lead -> can't score this sample at this lead.
-                # Store zero-confusion so the row exists but IoU stays 0.
-                for h in high_grid:
-                    sample_confusion[(i, h)] = (0, 0, 0, H_FULL * W_FULL)
+    def _run(samples, label, per_sample):
+        done = []
+        n_skipped = 0
+        print(f"\n{label}: {len(samples)} samples (Hann overlap, stride={stride}) ...")
+        for k, ((date_str, hhmm), (inputs, positions, gt_bins)) in enumerate(
+                _prefetch(samples, _load_sample), 1):
+            ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
+            if k == 1 or k % 20 == 0 or k == len(samples):
+                print(f"  [{k}/{len(samples)}] {date_str} {ref_utc}")
+            if not positions:
+                n_skipped += 1
                 continue
-            # One labelling of the Hann-blended canvas serves every
-            # candidate HIGH (see sweep_hysteresis).
-            sweep_conf, sweep_patch = sweep_hysteresis(
-                prob_canvases[i], low_threshold, [float(h) for h in high_grid],
-                gt_bin.astype(np.int32))
-            for h in high_grid:
-                sample_confusion[(i, h)] = sweep_conf[float(h)]
-                # Per-patch counts on the POST-PROCESSED (Hann-blended +
-                # hysteresis) canvas, pooled for every candidate so the
-                # winning threshold's table needs no second inference pass.
-                _merge_patch_counts(patch_acc.setdefault(float(h), {}), i,
-                                    sweep_patch[float(h)])
-        per_sample_confusion.append({
-            "date": date_str,
-            "reference_utc": ref_utc,
-            "confusion": sample_confusion,
-        })
+            preds = _predict_batches(model, inputs, batch_size=batch_size)
+            prob_canvases = paste_predictions_hann_blended(preds, positions)
+            gts = [None if g is None else g.astype(np.int32) for g in gt_bins]
+            per_sample(len(done), date_str, ref_utc, prob_canvases, gts)
+            done.append((date_str, ref_utc))
+        print(f"  done: {len(done)} scored, {n_skipped} skipped (missing inputs)")
+        return done
 
-    print(f"\nDone Phase 1. {len(per_sample_confusion)} samples scored, "
-          f"{n_skipped} skipped (missing inputs).")
-    if not per_sample_confusion:
-        print("No samples produced predictions. Nothing to write.")
-        return
+    # ---- Phase A: HIGH per lead on the validation-split samples --------
+    tune_conf: list = []   # [n_t][L][n_high] (tp, fp, fn, tn); zeros when no GT
 
-    # ---- Phase 2: aggregate over samples, pick best high per lead ----
-    tuning_scores: dict[int, dict[float, dict]] = {
-        i: {} for i in range(len(LEAD_STEP_OFFSETS))
-    }
-    for i in range(len(LEAD_STEP_OFFSETS)):
-        for h in high_grid:
-            tp = fp = fn = tn = 0
-            for s in per_sample_confusion:
-                t, f, n, tt = s["confusion"][(i, float(h))]
-                tp += t; fp += f; fn += n; tn += tt
-            tuning_scores[i][float(h)] = _summarise_confusion(
-                {"TP": tp, "FP": fp, "FN": fn, "TN": tn}
-            )
+    def _phase_a(n, date_str, ref_utc, probs, gts):
+        def one(i):
+            if gts[i] is None:
+                return [(0, 0, 0, 0)] * len(high_grid)
+            conf, _ = sweep_hysteresis(probs[i], low_threshold, high_grid, gts[i])
+            return [conf[h] for h in high_grid]
+        tune_conf.append(_map_leads(one, L))
 
+    tune_dates = _run(tuning_selected, "Phase A - HIGH sweep on the validation split",
+                      _phase_a)
+    if not tune_dates:
+        raise SystemExit("no tuning sample produced predictions")
+    tuning_scores: dict[int, dict[float, dict]] = {i: {} for i in range(L)}
     best_high_per_lead: dict[int, float] = {}
-    aggregate_confusion_per_lead: dict[int, dict] = {}
+    print("\nPhase A result (pooled CSI on the validation split):")
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        best_h = max(tuning_scores[i],
-                     key=lambda h: tuning_scores[i][h]["CSI"])
-        best_high_per_lead[offset] = best_h
-        agg = tuning_scores[i][best_h]
-        aggregate_confusion_per_lead[i] = {
-            "TP": agg["TP"], "FP": agg["FP"],
-            "FN": agg["FN"], "TN": agg["TN"],
-        }
-        print(f"  Best high for t+{offset * step_minutes}: {best_h:.2f} "
-              f"(CSI={agg['CSI']:.3f}, POD={agg['POD']:.3f}, "
-              f"FAR={agg['FAR']:.3f})")
+        for j, h in enumerate(high_grid):
+            tp = sum(c[i][j][0] for c in tune_conf)
+            fp = sum(c[i][j][1] for c in tune_conf)
+            fn = sum(c[i][j][2] for c in tune_conf)
+            tn = sum(c[i][j][3] for c in tune_conf)
+            tuning_scores[i][float(h)] = _summarise_confusion(
+                {"TP": tp, "FP": fp, "FN": fn, "TN": tn})
+        best_h = max(high_grid, key=lambda h: (tuning_scores[i][float(h)]["CSI"], -h))
+        best_high_per_lead[offset] = float(best_h)
+        print(f"  t+{offset * step_minutes}: high={best_h:.2f}  "
+              f"CSI={tuning_scores[i][float(best_h)]['CSI']:.4f}")
 
-    # Per-patch table assembled from each lead's winning threshold, so the
-    # ensemble scorer sees exactly the operating point this run selected.
-    chosen_patch_acc: dict = {}
-    for i, offset in enumerate(LEAD_STEP_OFFSETS):
-        for patch, leads in patch_acc.get(
-                float(best_high_per_lead[offset]), {}).items():
-            if i in leads:
-                chosen_patch_acc.setdefault(patch, {})[i] = leads[i]
-
-    # ---- Emit per-sample rows at chosen best_high per lead ----
+    # ---- Phase B: score the scope at the chosen HIGH per lead ----------
     rows: list[dict] = []
-    for s in per_sample_confusion:
-        row = {"date": s["date"], "reference_utc": s["reference_utc"]}
+    aggregate_confusion_per_lead = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+                                    for i in range(L)}
+    patch_acc: dict = {}
+    conf_rows: list = []
+    patch_rows: list = []
+
+    def _phase_b(n, date_str, ref_utc, probs, gts):
+        row = {"date": date_str, "reference_utc": ref_utc}
+
+        def one(i):
+            if gts[i] is None:
+                return None
+            h = best_high_per_lead[LEAD_STEP_OFFSETS[i]]
+            conf, patches = sweep_hysteresis(probs[i], low_threshold, [h], gts[i])
+            return conf[h], patches[h]
+
+        results = _map_leads(one, L)
+        patch_arr = np.zeros((L, N_PATCHES, 4), dtype=np.int64)
+        conf_arr = np.zeros((L, 4), dtype=np.int64)
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
-            best_h = best_high_per_lead[offset]
-            tp, fp, fn, _ = s["confusion"][(i, best_h)]
             m = offset * step_minutes
+            if results[i] is None:
+                for name in ("iou", "far", "pod", "csi"):
+                    row[f"{name}_t+{m}"] = None
+                continue
+            (tp, fp, fn, tn), per_patch = results[i]
+            for key, val in zip(("TP", "FP", "FN", "TN"), (tp, fp, fn, tn)):
+                aggregate_confusion_per_lead[i][key] += val
+            per = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": tn})
             row[f"iou_t+{m}"] = _iou_lightning(tp, fp, fn)
-            per = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": 0})
             row[f"far_t+{m}"] = per["FAR"]
             row[f"pod_t+{m}"] = per["POD"]
             row[f"csi_t+{m}"] = per["CSI"]
+            _merge_patch_counts(patch_acc, i, per_patch)
+            conf_arr[i] = (tp, fp, fn, tn)
+            for q, counts in per_patch.items():
+                patch_arr[i, q - 1] = counts
         rows.append(row)
+        conf_rows.append(conf_arr)
+        patch_rows.append(patch_arr)
 
-    # Variant suffix so base / finetuned / kd runs don't overwrite each
-    # other's outputs. Matches predict_full_domain's output_dir naming.
-    stem = (f"lightning_{scope_stem(year, month)}_"
-            f"{artifact_tag(mode, source, period, finetuned, kd)}")
-    _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv",
-                          step_minutes)
+    scored = _run(selected, "Phase B - scoring the scope", _phase_b)
+    if not rows:
+        print("No sample produced predictions. Nothing to write.")
+        return
+    print("\nScope results at the chosen thresholds:")
+    for i, offset in enumerate(LEAD_STEP_OFFSETS):
+        m = _summarise_confusion(aggregate_confusion_per_lead[i])
+        print(f"  t+{offset * step_minutes}: CSI={m['CSI']:.4f} POD={m['POD']:.4f} "
+              f"FAR={m['FAR']:.4f}")
+
+    stem = f"lightning_{scope_stem(year, month)}_{tag}"
+    _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv", step_minutes)
     _write_json_lightning(
         year, month, selected, rows,
         aggregate_confusion_per_lead, tuning_scores,
@@ -2617,7 +2840,26 @@ def run_extraction_lightning(
         output_dir / f"{stem}_summary.json",
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
-        per_patch=per_patch_scores(chosen_patch_acc),
+        per_patch=per_patch_scores(patch_acc),
+        extra={
+            "sampling": {"max_samples": MAX_SAMPLES, "month_batch": MONTH_BATCH,
+                         "seed": SEED},
+            "tuning": {"split": "validation", "n_samples": len(tune_dates),
+                       "samples": [[d, r] for d, r in tune_dates],
+                       "low_source": ("--lightning_low_threshold"
+                                      if low_threshold is not None and False
+                                      else "evaluation optimal_threshold")},
+        },
+    )
+    save_per_sample(
+        output_dir / f"{stem}_per_sample.npz",
+        dates=[d for d, _ in scored], refs=[r for _, r in scored],
+        lead_offsets=list(LEAD_STEP_OFFSETS),
+        conf_post=np.asarray(conf_rows, dtype=np.int64),
+        patch_post=np.asarray(patch_rows, dtype=np.int64),
+        tune_dates=[d for d, _ in tune_dates], tune_refs=[r for _, r in tune_dates],
+        high_grid=np.asarray(high_grid, dtype=np.float64),
+        tune_conf=np.asarray(tune_conf, dtype=np.int64),
     )
     make_plots(output_dir / f"{stem}_summary.json")
 
@@ -2628,7 +2870,7 @@ def run_visualization_lightning(
     data_root: Path, model_dir: Path, output_dir: Path,
     *,
     stride: int = DEFAULT_STRIDE,
-    low_threshold: float = LIGHTNING_LOW_THRESHOLD,
+    low_threshold: float | None = None,
     batch_size: int = 32,
     kd: bool = False,
     period=None,
@@ -2647,6 +2889,9 @@ def run_visualization_lightning(
     stem = (f"lightning_{scope_stem(year, month)}_"
             f"{artifact_tag(mode, source, period, finetuned, kd)}")
     summary = _load_summary_json(output_dir / f"{stem}_summary.json")
+    if low_threshold is None:
+        low_threshold = float((summary.get("post_processing") or {}).get(
+            "low_threshold", LIGHTNING_LOW_THRESHOLD))
     if "post_processing" not in summary:
         raise SystemExit(
             f"Summary {stem}_summary.json is missing the post_processing "
@@ -3395,6 +3640,7 @@ def run_visualization_kd(
 # CLI
 # ============================================================================
 def main() -> int:
+    global SPLIT, THRESHOLD_MMH, WEIGHTS, MONTH_BATCH, SEED, WORKERS
     parser = argparse.ArgumentParser(
         description="COALITION-4 validation branch. Extraction mode "
                     "takes the reference timesteps of a dataset split "
@@ -3476,10 +3722,14 @@ def main() -> int:
     parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
                         help="Overlap stride for Hann inference (lightning). "
                              f"Default {DEFAULT_STRIDE} = 50%% overlap.")
-    parser.add_argument("--lightning_low_threshold", type=float,
-                        default=LIGHTNING_LOW_THRESHOLD,
-                        help="Hysteresis LOW threshold (lightning). "
-                             f"Default {LIGHTNING_LOW_THRESHOLD}.")
+    parser.add_argument("--lightning_low_threshold", type=float, default=None,
+                        help="Hysteresis LOW threshold (lightning). Default: "
+                             "the threshold the evaluation tuned for this "
+                             "model, read from --eval_root/eval_<tag>/"
+                             "evaluation_results.json.")
+    parser.add_argument("--eval_root", type=str, default="./evaluation",
+                        help="Where evaluate_coalition wrote eval_<tag>/ "
+                             "(the lightning LOW comes from there).")
     # NOTE: --min_active_pixels was removed - lightning selection is now
     # OPERA-driven for parity with the rainfall track. select_samples_lightning
     # (LINET-driven, >=1 active pixel) remains callable from Python for anyone
@@ -3503,28 +3753,14 @@ def main() -> int:
                              f"{HIGH_COVERAGE_PCT:g}. Lowering makes the "
                              f"grading more lenient; raising is stricter.")
     parser.add_argument("--rainfall_low_threshold", type=float, default=None,
-                        help="LOW hysteresis threshold for the rainfall "
-                             "track, held fixed during the sweep. Default: "
-                             "visualize_gt_vs_pred.DEFAULT_RAIN_LOW (0.35).")
-    parser.add_argument("--rainfall_high_margin", type=float,
-                        default=RAINFALL_HIGH_MARGIN,
-                        help=f"How far above LOW the HIGH sweep runs, in "
-                             f"{RAINFALL_SWEEP_STEP:g} steps. Default "
-                             f"{RAINFALL_HIGH_MARGIN:g}, i.e. low+0.01 .. "
-                             f"low+{RAINFALL_HIGH_MARGIN:g}, which spans the "
-                             f"operational 0.55 so the sweep can only "
-                             f"improve on it. --rainfall_high_min / "
-                             f"--rainfall_high_max override it.")
-    parser.add_argument("--rainfall_high_min", type=float, default=None,
-                        help="First HIGH candidate of the sweep (must be "
-                             "above LOW). Overrides the margin's start.")
-    parser.add_argument("--rainfall_high_max", type=float, default=None,
-                        help="Last HIGH candidate of the sweep, inclusive. "
-                             "Overrides the margin's end.")
-    parser.add_argument("--rainfall_sweep_step", type=float,
-                        default=RAINFALL_SWEEP_STEP,
-                        help=f"Spacing of the HIGH candidates (default "
-                             f"{RAINFALL_SWEEP_STEP:g}).")
+                        help="Skip phase 1 and fix this LOW for every lead; "
+                             "the window sweep still runs around it.")
+    parser.add_argument("--rainfall_window", type=float, default=0.02,
+                        help="Width of the (LOW, HIGH) windows of the "
+                             "phase-2 sweep (default 0.02).")
+    parser.add_argument("--rainfall_reach", type=float, default=0.10,
+                        help="How far the windows slide on each side of "
+                             "the phase-1 LOW (default 0.10).")
     parser.add_argument("--baseline", action="store_true",
                         help="Rainfall track: validate the SepConv-ens "
                              "baseline instead of a RECONVECT model. Its "
@@ -3532,8 +3768,18 @@ def main() -> int:
                              "Needs --period (the baseline's window, e.g. "
                              "w44); --mode is ignored.")
     parser.add_argument("--max_samples", type=int, default=None,
-                        help="Cap the selected references at N, for a "
-                             "trial run on a small subset.")
+                        help="Cap the scored samples (and the tuning "
+                             "samples) at N, drawn reproducibly per month: "
+                             "--month_batch from each month in turn, "
+                             "shuffled with --seed, no repeats.")
+    parser.add_argument("--month_batch", type=int, default=MONTH_BATCH,
+                        help=f"Samples taken from each month per round of "
+                             f"the draw (default {MONTH_BATCH}).")
+    parser.add_argument("--seed", type=int, default=SEED,
+                        help=f"Seed of the draw (default {SEED}).")
+    parser.add_argument("--workers", type=int, default=WORKERS,
+                        help=f"CPU threads for the per-lead sweeps "
+                             f"(default {WORKERS}).")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="model.predict batch size. For lightning the "
                              "Hann overlap produces ~55 patches per reference "
@@ -3577,10 +3823,12 @@ def main() -> int:
         parser.error("give --split, or --year and --month, or both")
     if args.month is not None and not (1 <= args.month <= 12):
         raise SystemExit(f"--month must be 1..12, got {args.month}")
-    global SPLIT, THRESHOLD_MMH, WEIGHTS
     SPLIT = args.split
     THRESHOLD_MMH = float(args.rainfall_threshold_mmh)
     WEIGHTS = args.weights
+    MONTH_BATCH = max(1, int(args.month_batch))
+    SEED = int(args.seed)
+    WORKERS = max(1, int(args.workers))
 
     # Prime the border cache once at process start (visualization uses it,
     # extraction ignores it but the cost is a few ms).
@@ -3595,10 +3843,8 @@ def main() -> int:
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
                 rainfall_low=args.rainfall_low_threshold,
-                rainfall_high_margin=args.rainfall_high_margin,
-                rainfall_high_min=args.rainfall_high_min,
-                rainfall_high_max=args.rainfall_high_max,
-                rainfall_sweep_step=args.rainfall_sweep_step,
+                rainfall_window=args.rainfall_window,
+                rainfall_reach=args.rainfall_reach,
                 period=args.period,
                 baseline=args.baseline,
             )
@@ -3626,6 +3872,7 @@ def main() -> int:
                 high_coverage_pct=args.high_coverage_pct,
                 kd=args.kd,
                 period=args.period,
+                eval_root=Path(args.eval_root),
             )
         else:
             run_visualization_lightning(
@@ -3647,7 +3894,10 @@ def main() -> int:
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,
                 output_dir=output_dir,
-                stride=args.stride, low_threshold=args.lightning_low_threshold,
+                stride=args.stride,
+                low_threshold=(args.lightning_low_threshold
+                               if args.lightning_low_threshold is not None
+                               else LIGHTNING_LOW_THRESHOLD),
                 batch_size=args.batch_size,
                 rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                 high_coverage_pct=args.high_coverage_pct,
@@ -3661,7 +3911,10 @@ def main() -> int:
                 student_kd=(not args.no_student_kd),
                 data_root=data_root, model_dir=model_dir,
                 output_dir=output_dir,
-                stride=args.stride, low_threshold=args.lightning_low_threshold,
+                stride=args.stride,
+                low_threshold=(args.lightning_low_threshold
+                               if args.lightning_low_threshold is not None
+                               else LIGHTNING_LOW_THRESHOLD),
                 batch_size=args.batch_size,
                 period=args.period,
             )
