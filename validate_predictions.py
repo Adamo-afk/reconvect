@@ -235,7 +235,7 @@ def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
     from train_models import build_run_tag
     tag = build_run_tag(mode, source, period)
     if baseline:
-        return f"sepconv_{tag}"
+        return f"sepconv_{tag}" + ("_latest" if WEIGHTS == "latest" else "")
     return (tag + ("_finetuned" if finetuned else "_kd" if kd else "")
             + ("_latest" if WEIGHTS == "latest" else ""))
 
@@ -1370,7 +1370,8 @@ def run_extraction(track: str, year: int, month: int,
                 f"the {period} window has {L} future steps but the "
                 f"composition forecasts {_SEPCONV_MAX_STEP}")
         base_models = load_base_models(model_dir,
-                                       build_run_tag(mode, source, period))
+                                       build_run_tag(mode, source, period),
+                                       weights=WEIGHTS)
         print(f"  Loaded base models: {sorted(base_models)}")
         model = None
     else:
