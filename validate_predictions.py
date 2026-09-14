@@ -397,7 +397,13 @@ def window_pairs(low: float, width: float, reach: float) -> list[tuple[float, fl
         pairs.append((round(low - k * width, 4), round(low - (k - 1) * width, 4)))
     for k in range(1, n + 1):
         pairs.append((round(low + (k - 1) * width, 4), round(low + k * width, 4)))
-    return [(lo, hi) for lo, hi in pairs if lo > 0.0 and hi < 1.0]
+    kept = [(lo, hi) for lo, hi in pairs if lo > 0.0 and hi < 1.0]
+    if not kept:
+        # A LOW at the very edge with a width that leaves no room: score
+        # the one window that fits so the run still has a pair.
+        hi = min(0.99, round(low + width, 4))
+        kept = [(min(low, hi), hi)]
+    return kept
 
 
 def _map_leads(fn, n: int):
