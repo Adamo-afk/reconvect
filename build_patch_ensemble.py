@@ -118,7 +118,8 @@ def load_member_scores(summary_path: Path) -> dict:
         "detail": per_patch,
         "n_samples": blob.get("total_selected_samples", 0),
         "post_processing": {
-            "low_threshold": pp.get("low_threshold"),
+            "low_threshold": (pp.get("low_threshold_per_lead")
+                              or pp.get("low_threshold")),
             "high_threshold_per_lead": pp.get("high_threshold_per_lead"),
             "method": pp.get("method", "hysteresis"),
         },
@@ -372,7 +373,7 @@ def main():
 
     # Members scored at different operating points are not comparable: a
     # higher CSI could just mean a better-tuned threshold.
-    lows = {m["post_processing"]["low_threshold"]
+    lows = {json.dumps(m["post_processing"]["low_threshold"], sort_keys=True)
             for m in member_results.values()}
     if len(lows) > 1:
         print(f"\n  WARNING: members were scored at different LOW thresholds "

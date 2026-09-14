@@ -701,6 +701,12 @@ def metrics_at_threshold(pos, neg, threshold):
     return csi, pod, far, fpr, ets, hss, pss, tp, fp, fn, tn
 
 
+def csi_curve(pos, neg, thresholds):
+    """Pooled CSI at each threshold."""
+    tp, fp, fn, _ = _counts_at(pos, neg, thresholds)
+    return tp / (tp + fp + fn + 1e-10)
+
+
 def best_threshold(pos, neg, thresholds):
     """The threshold with the highest CSI (first on ties), and that CSI."""
     tp, fp, fn, _ = _counts_at(pos, neg, thresholds)
@@ -747,6 +753,7 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     thresholds_array = np.linspace(0.01, 0.99, 99)
 
     # --- Determine threshold ---
+    val_curve = None
     if threshold is not None:
         opt_threshold = float(threshold)
         print(f"  Using fixed threshold: {opt_threshold:.3f}")
@@ -758,6 +765,7 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
         print("  Optimizing threshold on validation set (GPU)...")
         _, (val_pos, val_neg) = collect_histograms(model, val_ds)
         opt_threshold, opt_csi = best_threshold(val_pos, val_neg, thresholds_array)
+        val_curve = csi_curve(val_pos, val_neg, thresholds_array)
         print(f"    Optimal threshold (from val): {opt_threshold:.3f} "
               f"(val CSI={opt_csi:.4f})")
 
@@ -851,6 +859,36 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     best_label = f"best on test {best_t:.2f} (CSI {best_csi:.3f})"
     results["aggregate"]["test_optimal_threshold"] = float(best_t)
     results["aggregate"]["test_optimal_csi"] = float(best_csi)
+
+    # 1b. CSI against the decision threshold: the sweep that chose the
+    # operating point (validation split, when tuned) and the same sweep
+    # on the test split, pooled over leads.
+    test_curve = csi_curve(pos_agg, neg_agg, thresholds_array)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    if val_curve is not None:
+        ax.plot(thresholds_array, val_curve, linewidth=2, color='#1f77b4',
+                label="validation split (threshold chosen here)")
+    ax.plot(thresholds_array, test_curve, linewidth=2, color='#ff7f0e',
+            label="test split")
+    ax.axvline(opt_threshold, color='red', linestyle='--', alpha=0.7)
+    ax.plot([opt_threshold], [float(csi_curve(pos_agg, neg_agg, [opt_threshold])[0])],
+            marker='*', markersize=14, color='red', linestyle='none', label=op_label)
+    ax.plot([best_t], [best_csi], marker='D', markersize=8, color='green',
+            linestyle='none', label=best_label)
+    ax.set_xlabel("Decision threshold")
+    ax.set_ylabel("Pooled CSI over leads")
+    ax.set_title("CSI vs decision threshold")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    plt.tight_layout()
+    plt.savefig(output_dir / "threshold_sweep.png", dpi=150, bbox_inches='tight')
+    plt.close()
+    results["threshold_sweep"] = {
+        "thresholds": [float(t) for t in thresholds_array],
+        "test_csi": [float(c) for c in test_curve],
+        "validation_csi": ([float(c) for c in val_curve]
+                           if val_curve is not None else None),
+    }
 
     # 2. PR curve
     fig, ax = plt.subplots(figsize=(7, 6))
