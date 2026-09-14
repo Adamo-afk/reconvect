@@ -261,19 +261,21 @@ class KDModel(tf.keras.Model):
 # Teacher loading (mirrors train_models.build_finetune_model's custom_objects)
 # ============================================================================
 def load_teacher(model_dir: Path, source: str,
-                 finetuned: bool = False) -> tf.keras.Model:
+                 finetuned: bool = False, period=None,
+                 teacher_mode: str = TEACHER_MODE) -> tf.keras.Model:
     """Load the frozen teacher. Uses the same custom_objects list as
     train_models.build_finetune_model so ResBlock / ResGRU / etc. round-
     trip cleanly."""
     from train_models import build_run_tag
     suffix = "_finetuned" if finetuned else ""
     path = model_dir / (
-        f"coalition_{build_run_tag(TEACHER_MODE, source)}{suffix}.keras"
+        f"coalition_{build_run_tag(teacher_mode, source, period)}{suffix}.keras"
     )
     if not path.is_file():
         raise SystemExit(
-            f"Teacher checkpoint not found: {path.name}. Train the base "
-            f"teacher first (see train_models.py --mode {TEACHER_MODE})."
+            f"Teacher checkpoint not found: {path}. Train the base "
+            f"teacher first (see train_models.py --mode {teacher_mode}"
+            f"{' --period ' + str(period) if period else ''})."
         )
     print(f"Loading teacher: {path.name}")
     teacher = tf.keras.models.load_model(
@@ -326,6 +328,10 @@ def train_kd(
     seed: int = 42,
     shuffle_buffer: int = 256,
     mixed_precision: bool = True,
+    period=None,
+    datasets_root: Path | None = None,
+    teacher_mode: str = TEACHER_MODE,
+    student_mode: str = STUDENT_MODE,
 ):
     """Full KD training run. Loads the teacher's dataset, wraps
     (student, teacher) in KDModel, fits, saves the student only."""
@@ -339,14 +345,18 @@ def train_kd(
     # the module docstring for why this is correct given the HR channel
     # ordering.
     from train_models import build_run_tag
-    dataset_dir = data_root / "datasets" / build_run_tag(TEACHER_MODE, source)
+    if datasets_root is None:
+        datasets_root = data_root / "datasets"
+    dataset_dir = Path(datasets_root) / build_run_tag(teacher_mode, source, period)
     train_dir = dataset_dir / "train"
     val_dir = dataset_dir / "validation"
     for d in (train_dir, val_dir):
         if not d.is_dir():
             raise SystemExit(
                 f"Teacher dataset split missing: {d}\n"
-                f"Run create_datasets.py --mode {TEACHER_MODE} first."
+                f"Run create_datasets.py --mode {teacher_mode}"
+                f"{' --period ' + str(period) if period else ''} first, or "
+                f"point --datasets_root at where it lives."
             )
 
     # Grab input_shapes from the teacher metadata; derive the student's.
@@ -365,9 +375,10 @@ def train_kd(
     print("=" * 70)
     print("Knowledge distillation (lightning occurrence)")
     print("=" * 70)
-    print(f"  Teacher mode:  {TEACHER_MODE}"
+    print(f"  Period:        {period or 'untagged'}")
+    print(f"  Teacher mode:  {teacher_mode}"
           f"{' (finetuned)' if teacher_finetuned else ''}")
-    print(f"  Student mode:  {STUDENT_MODE}")
+    print(f"  Student mode:  {student_mode}")
     print(f"  Source:        {source}")
     print(f"  Dataset:       {dataset_dir}")
     print(f"  Batch size:    {batch_size}   Epochs: {epochs}   LR: {learning_rate}")
@@ -384,7 +395,8 @@ def train_kd(
     configure_tf_runtime(use_mixed_precision=mixed_precision)
 
     print("Loading teacher ...")
-    teacher = load_teacher(model_dir, source, finetuned=teacher_finetuned)
+    teacher = load_teacher(model_dir, source, finetuned=teacher_finetuned,
+                           period=period, teacher_mode=teacher_mode)
 
     print("\nBuilding student ...")
     student = build_coalition_model(
@@ -433,16 +445,17 @@ def train_kd(
     )
     total_time = time.time() - t0
 
-    student_run_tag = build_run_tag(STUDENT_MODE, source)
+    student_run_tag = build_run_tag(student_mode, source, period)
     student_path = model_dir / f"coalition_{student_run_tag}_kd.keras"
     student.save(str(student_path))
     print(f"\nSaved student: {student_path}")
 
     hist_path = model_dir / f"history_{student_run_tag}_kd.json"
     hist_data = {
-        "teacher_mode": TEACHER_MODE,
-        "student_mode": STUDENT_MODE,
+        "teacher_mode": teacher_mode,
+        "student_mode": student_mode,
         "source": source,
+        "period": str(period) if period else None,
         "teacher_finetuned": teacher_finetuned,
         "kd_alpha": alpha,
         "kd_temperature": temperature,
@@ -491,6 +504,14 @@ def main() -> int:
                         "<data_root>/datasets, or "
                         "$COALITION4_DATASETS_ROOT).")
     p.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
+    p.add_argument("--period", type=str, default=None, metavar="LABEL",
+                   help="Period label the teacher was trained under (e.g. "
+                        "f34): selects its checkpoint and dataset, and tags "
+                        "the student the same way.")
+    p.add_argument("--teacher_mode", type=str, default=TEACHER_MODE,
+                   help=f"Teacher mode (default {TEACHER_MODE}).")
+    p.add_argument("--student_mode", type=str, default=STUDENT_MODE,
+                   help=f"Student mode (default {STUDENT_MODE}).")
     p.add_argument("--teacher_finetuned", action="store_true",
                    help="Distil from coalition_..._finetuned.keras instead "
                         "of the base teacher.")
@@ -539,6 +560,8 @@ def main() -> int:
         learning_rate=args.learning_rate, patience=args.patience,
         seed=args.seed, shuffle_buffer=args.shuffle_buffer,
         mixed_precision=not args.no_mixed_precision,
+        period=args.period, datasets_root=Path(args.datasets_root),
+        teacher_mode=args.teacher_mode, student_mode=args.student_mode,
     )
     return 0
 

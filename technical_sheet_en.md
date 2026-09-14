@@ -543,18 +543,18 @@ on dates where LINET is unavailable.
 
 ### D1. Train the teacher
 ```bash
-python create_datasets.py --mode mtg_lightning_opera_occurrence
-python train_models.py --config training.config --mode mtg_lightning_opera_occurrence --stage base
+python create_datasets.py --mode mtg_lightning_opera_occurrence --period f34
+python train_models.py --config training.config --mode mtg_lightning_opera_occurrence --period f34 --stage base
 ```
 - **Does** — the teacher receives the full input stack including LINET `density`, `current`, `occurrence`.
 - **Writes** — `models/coalition_mtg_lightning_opera_occurrence_<source>.keras` **CRITICAL**
 
 ### D2. Distil the student
 ```bash
-python train_lightning_kd.py --teacher_mode mtg_lightning_opera_occurrence --student_mode mtg_opera_occurrence
+python train_lightning_kd.py --period f34 --epochs 30 --batch_size 32 --datasets_root E:/nowcasting/datasets --model_dir E:/nowcasting/models
 ```
 - **Does** — trains on the **teacher's** dataset with `past_hr` sliced to the trailing `STUDENT_HR_CHANNELS` (= `vis_06`), so the student never sees lightning. Loss mixes soft teacher targets at `--kd_alpha 0.7`, temperature 4.0, with the ground truth.
-- **Note** — `mtg_opera_occurrence` is **not** buildable by `create_datasets`: it exists only as a student over the teacher's data.
+- **Note** — `mtg_opera_occurrence` is **not** buildable by `create_datasets`: it exists only as a student over the teacher's data, so no second dataset is needed. `--period` names the teacher's period; the student is saved as `coalition_mtg_opera_occurrence_<source>_<period>_kd.keras`.
 - **Writes** — `models/coalition_<student_run_tag>_kd.keras`, `history_…_kd.json` **CRITICAL**
 
 ### D3. Validate teacher and student together
