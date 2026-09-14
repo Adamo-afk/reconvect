@@ -895,10 +895,23 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     plt.savefig(output_dir / "metrics_per_leadtime.png", dpi=150, bbox_inches='tight')
     plt.close()
 
+    # The operating point: where the threshold the metrics are reported
+    # at sits on both curves, whether it was fixed by --threshold or tuned
+    # on the validation split.
+    op_r, op_p, op_fpr, op_tpr = tf_pr_roc_curves(
+        all_true_agg, all_pred_agg,
+        tf.constant([opt_threshold], dtype=tf.float64))
+    op_r, op_p = float(op_r.numpy()[0]), float(op_p.numpy()[0])
+    op_fpr, op_tpr = float(op_fpr.numpy()[0]), float(op_tpr.numpy()[0])
+    op_label = (f"threshold {opt_threshold:.2f} "
+                + ("(fixed)" if threshold is not None else "(tuned on validation)"))
+
     # 2. PR curve
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(recalls_np, precisions_np, linewidth=2, color='#1f77b4',
             label=f"PR AUC = {pr_auc:.4f}")
+    ax.plot([op_r], [op_p], marker='*', markersize=14, color='red',
+            linestyle='none', label=op_label, zorder=5)
     ax.set_xlabel("Recall (POD)")
     ax.set_ylabel("Precision (1 - FAR)")
     ax.set_title("Precision-Recall Curve")
@@ -915,6 +928,8 @@ def evaluate_lightning(model, test_ds, output_dir, threshold=None, val_ds=None):
     ax.plot(fprs_np, tprs_np, linewidth=2, color='#ff7f0e',
             label=f"ROC AUC = {roc_auc:.4f}")
     ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label="Random")
+    ax.plot([op_fpr], [op_tpr], marker='*', markersize=14, color='red',
+            linestyle='none', label=op_label, zorder=5)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate (POD)")
     ax.set_title("ROC Curve")
