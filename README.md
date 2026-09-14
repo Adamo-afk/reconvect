@@ -172,7 +172,7 @@ The summary records `low_threshold_per_lead` and `high_threshold_per_lead`; infe
 
 **Sampling.** `--max_samples N` draws the scored samples, and the tuning samples alike, reproducibly per month: every month's candidates are shuffled with `--seed` and `--month_batch` are taken from each month in turn, cycling until N, never repeating a sample. So a capped run still spans the whole period instead of its first weeks.
 
-**Everything per sample is kept.** `<stem>_per_sample.npz` next to the summary holds the raw and post-processed confusion per sample and lead, the per-patch counts, the coverages, and the tuning phases' histograms and window confusions, so figures can be redrawn (`--plots`) or new ones made without running the model again. `--workers` threads run the per-lead sweeps.
+`--workers` threads run the per-lead sweeps.
 
 ### Dataset archiving
 
@@ -1171,7 +1171,6 @@ Two coverage metrics per (sample, lead): **`iou_mask`** (IoU of the binary masks
 | `<track>_<scope>_<tag>_hmf_percentiles.png` | The same three quantities as distributions: per lead the p10–p90 whiskers, p25–p75 box and median of the per-sample rates, the red 50 % line, and above each box the share of samples at or above 50 % and below it. Both tracks. |
 | `<track>_<scope>_<tag>_tuning_low.png` · `_tuning_high.png` | Rainfall: phase 1, pooled CSI against the plain threshold per lead with the chosen LOW starred; phase 2, one panel per lead with a bar per (LOW, HIGH) window and the chosen pair starred. Both on the validation-split samples. Absent for the baseline. |
 | `<track>_<scope>_<tag>_tuning.png` | Lightning: pooled CSI on the validation-split samples against the swept HIGH, one line per lead, a dashed line at each lead's winner. |
-| `<track>_<scope>_<tag>_per_sample.npz` | Every per-sample count: raw and post-processed confusion per lead, per-patch counts, coverages, and the tuning phases' histograms and window confusions, with the sample and tuning-sample lists. |
 | `<track>_<scope>_<tag>_<date>_<HHMM>_<lead>.png` | Visualisation mode. Left: structure overlay (red = GT class == Pred class and both ≥10 mm/h). Right: 256 × 256 zoom into the most GT-active patch — red matched, blue misses, orange false alarms. |
 
 Visualisation title colour: **green** if the date cleared the coverage threshold for that lead/metric, **orange** if selected but below it.
