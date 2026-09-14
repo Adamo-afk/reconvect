@@ -417,36 +417,6 @@ def _map_leads(fn, n: int):
         return list(ex.map(fn, range(n)))
 
 
-def _pad_windows(pairs_per_lead: list) -> np.ndarray:
-    """(L, max_windows, 2) float64 of the (LOW, HIGH) pairs, NaN-padded
-    where a lead near the edge of (0, 1) has fewer windows."""
-    n_max = max(len(p) for p in pairs_per_lead)
-    out = np.full((len(pairs_per_lead), n_max, 2), np.nan, dtype=np.float64)
-    for i, pairs in enumerate(pairs_per_lead):
-        if pairs:
-            out[i, :len(pairs)] = np.asarray(pairs, dtype=np.float64)
-    return out
-
-
-def _pad_window_conf(tune_window: list, n_leads: int) -> np.ndarray:
-    """(n_samples, L, max_windows, 4) int64 of the window confusions,
-    -1 where a lead has fewer windows."""
-    n_max = max((len(w[i]) for w in tune_window for i in range(n_leads)), default=0)
-    out = np.full((len(tune_window), n_leads, n_max, 4), -1, dtype=np.int64)
-    for k, w in enumerate(tune_window):
-        for i in range(n_leads):
-            if w[i]:
-                out[k, i, :len(w[i])] = np.asarray(w[i], dtype=np.int64)
-    return out
-
-
-def save_per_sample(path: Path, **arrays) -> None:
-    """Every per-sample count of a run, compressed, next to the summary,
-    so the figures can be redrawn and new ones made without re-running."""
-    np.savez_compressed(path, **{k: np.asarray(v) for k, v in arrays.items()})
-    print(f"  Wrote per-sample data to {path}")
-
-
 def _merge_patch_counts(acc: dict, lead_idx: int, per_patch: dict) -> None:
     """Add one sample's per-patch (TP, FP, FN, TN) into the pooled
     accumulator, the structure _accumulate_per_patch builds."""
@@ -1558,10 +1528,6 @@ def run_extraction(track: str, year: int, month: int,
     confusion_raw = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for i in range(L)}
     confusion_post = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for i in range(L)}
     patch_acc: dict = {}
-    conf_raw_rows: list = []
-    conf_post_rows: list = []
-    patch_rows: list = []
-    cover_rows: list = []
 
     def _phase3(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
         row = {"date": date_str, "reference_utc": ref_utc}
@@ -1586,7 +1552,6 @@ def run_extraction(track: str, year: int, month: int,
             return iou, cwt, r_conf, p_conf, per_patch
 
         results = _map_leads(one, L)
-        patch_arr = np.zeros((L, N_PATCHES, 4), dtype=np.int64)
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             iou, cwt, r_conf, p_conf, per_patch = results[i]
             row[f"iou_mask_t+{offset}"] = iou
@@ -1601,15 +1566,9 @@ def run_extraction(track: str, year: int, month: int,
                 row[f"{name}_pct_t+{offset}"] = pct[name]
             row[f"csi_t+{offset}"] = (tp / (tp + fp + fn) if (tp + fp + fn) else None)
             _merge_patch_counts(patch_acc, i, per_patch)
-            for q, counts in per_patch.items():
-                patch_arr[i, q - 1] = counts
         rows.append(row)
-        conf_raw_rows.append([results[i][2] for i in range(L)])
-        conf_post_rows.append([results[i][3] for i in range(L)])
-        patch_rows.append(patch_arr)
-        cover_rows.append([(results[i][0], results[i][1]) for i in range(L)])
 
-    scored = _run(selected, "Phase 3 - scoring the scope", _phase3)
+    _run(selected, "Phase 3 - scoring the scope", _phase3)
     if not rows:
         print("No sample produced predictions. Nothing to write.")
         return
@@ -1670,33 +1629,6 @@ def run_extraction(track: str, year: int, month: int,
                 hmf_pooled={f"t+{off * step_minutes}": hmf_pooled[i]
                             for i, off in enumerate(LEAD_STEP_OFFSETS)},
                 extra=extra)
-    per_sample = dict(
-        dates=[d for d, _ in scored], refs=[r for _, r in scored],
-        lead_offsets=list(LEAD_STEP_OFFSETS),
-        conf_raw=np.asarray(conf_raw_rows, dtype=np.int64),
-        conf_post=np.asarray(conf_post_rows, dtype=np.int64),
-        patch_post=np.asarray(patch_rows, dtype=np.int64),
-        coverage=np.asarray(cover_rows, dtype=np.float64),
-    )
-    if not baseline:
-        per_sample.update(
-            tune_dates=[d for d, _ in tune_dates],
-            tune_refs=[r for _, r in tune_dates],
-            low_grid=low_grid,
-            tune_hist_pos=np.asarray([[h[i][0] for i in range(L)] for h in tune_hist],
-                                     dtype=np.int64),
-            tune_hist_neg=np.asarray([[h[i][1] for i in range(L)] for h in tune_hist],
-                                     dtype=np.int64),
-            tune_gt_positive=np.asarray([[h[i][2] for i in range(L)] for h in tune_hist],
-                                        dtype=np.int64),
-            # Leads near the edge of (0, 1) have fewer windows: pad the
-            # ragged leads with NaN pairs / -1 counts and record each
-            # lead's real window count.
-            window_pairs=_pad_windows([pairs_per_lead[i] for i in range(L)]),
-            n_windows_per_lead=np.asarray([len(pairs_per_lead[i]) for i in range(L)]),
-            tune_window_conf=_pad_window_conf(tune_window, L),
-        )
-    save_per_sample(output_dir / f"{stem}_per_sample.npz", **per_sample)
     make_plots(output_dir / f"{stem}_summary.json")
 
 
@@ -2817,8 +2749,6 @@ def run_extraction_lightning(
     aggregate_confusion_per_lead = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
                                     for i in range(L)}
     patch_acc: dict = {}
-    conf_rows: list = []
-    patch_rows: list = []
 
     def _phase_b(n, date_str, ref_utc, probs, gts):
         row = {"date": date_str, "reference_utc": ref_utc}
@@ -2831,8 +2761,6 @@ def run_extraction_lightning(
             return conf[h], patches[h]
 
         results = _map_leads(one, L)
-        patch_arr = np.zeros((L, N_PATCHES, 4), dtype=np.int64)
-        conf_arr = np.zeros((L, 4), dtype=np.int64)
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             m = offset * step_minutes
             if results[i] is None:
@@ -2848,14 +2776,9 @@ def run_extraction_lightning(
             row[f"pod_t+{m}"] = per["POD"]
             row[f"csi_t+{m}"] = per["CSI"]
             _merge_patch_counts(patch_acc, i, per_patch)
-            conf_arr[i] = (tp, fp, fn, tn)
-            for q, counts in per_patch.items():
-                patch_arr[i, q - 1] = counts
         rows.append(row)
-        conf_rows.append(conf_arr)
-        patch_rows.append(patch_arr)
 
-    scored = _run(selected, "Phase B - scoring the scope", _phase_b)
+    _run(selected, "Phase B - scoring the scope", _phase_b)
     if not rows:
         print("No sample produced predictions. Nothing to write.")
         return
@@ -2884,16 +2807,6 @@ def run_extraction_lightning(
                                       if low_threshold is not None and False
                                       else "evaluation optimal_threshold")},
         },
-    )
-    save_per_sample(
-        output_dir / f"{stem}_per_sample.npz",
-        dates=[d for d, _ in scored], refs=[r for _, r in scored],
-        lead_offsets=list(LEAD_STEP_OFFSETS),
-        conf_post=np.asarray(conf_rows, dtype=np.int64),
-        patch_post=np.asarray(patch_rows, dtype=np.int64),
-        tune_dates=[d for d, _ in tune_dates], tune_refs=[r for _, r in tune_dates],
-        high_grid=np.asarray(high_grid, dtype=np.float64),
-        tune_conf=np.asarray(tune_conf, dtype=np.int64),
     )
     make_plots(output_dir / f"{stem}_summary.json")
 
