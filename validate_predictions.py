@@ -1242,33 +1242,40 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
     fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, 2.6 * n_lead + 3), 9),
                                          constrained_layout=True)
 
-    # Top: change of the pixel counts, raw -> post, per lead
-    width = 0.8 / 3
+    # Top: gain (+) or loss (-) of each quantity, raw -> post, per lead,
+    # as touching bars around the zero line. Up is always the better
+    # direction: more hits, fewer misses, fewer false alarms, in % of
+    # the raw count.
+    width = 0.3
     for j, name in enumerate(HMF_NAMES):
         xs = x + (j - 1) * width
         vals = []
         for lt in lead_titles:
             a, b = _count(counts[lt]["raw"], name), _count(counts[lt]["post"], name)
-            vals.append(100.0 * (b - a) / a if a else np.nan)
+            change = 100.0 * (b - a) / a if a else np.nan
+            vals.append(change if name == "hits" else -change)
         bars = ax_top.bar(xs, [0.0 if np.isnan(v) else v for v in vals], width,
-                          color=HYSTERESIS_COLORS[name], edgecolor="white",
-                          linewidth=0.5, label=labels[name])
+                          color=HYSTERESIS_COLORS[name], edgecolor="black",
+                          linewidth=0.8, label=labels[name])
         for bar, v in zip(bars, vals):
             y = bar.get_height()
-            ax_top.annotate("n/a" if np.isnan(v) else f"{v:+.1f} %",
+            ax_top.annotate("n/a" if np.isnan(v) else f"{v + 0.0:+.1f} %",
                             (bar.get_x() + bar.get_width() / 2, y),
                             xytext=(0, 3 if y >= 0 else -3), textcoords="offset points",
                             ha="center", va="bottom" if y >= 0 else "top", fontsize=8)
-    ax_top.axhline(0.0, color="black", linewidth=0.8)
+    ax_top.axhline(0.0, color="black", linewidth=1.2)
+    ax_top.set_xlim(-0.7, n_lead - 0.3)
     ax_top.set_xticks(x)
     # The counts behind the bars, under each lead: raw -> post.
     ax_top.set_xticklabels([
         lt + "".join(f"\n{labels[name]} {_count(counts[lt]['raw'], name):,} -> "
                      f"{_count(counts[lt]['post'], name):,}" for name in HMF_NAMES)
         for lt in lead_titles], fontsize=8)
-    ax_top.set_ylabel("Change of the pixel count (%)")
-    ax_top.set_title("Raw -> post-processed: change of the pooled hit / miss / false-alarm "
-                     "pixel counts per lead (fewer misses and false alarms is the gain)")
+    ax_top.set_ylabel("Gain (+) / loss (-), % of the raw count")
+    ax_top.set_title("What the hysteresis gains (+) or loses (-) per lead: more hits, "
+                     "fewer misses, fewer false alarms count as gains")
+    for side in ("top", "right"):
+        ax_top.spines[side].set_visible(False)
     ax_top.grid(axis="y", alpha=0.3)
     ax_top.margins(y=0.25)
     ax_top.legend(loc="best", fontsize=9)
