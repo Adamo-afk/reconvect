@@ -240,6 +240,118 @@ def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
             + ("_latest" if WEIGHTS == "latest" else ""))
 
 
+def _split_dataset_dir(datasets_root: Path, mode: str, source: str, period,
+                       split: str) -> Path:
+    """<datasets_root>/<run_tag>/<split>, the TFRecords of one split."""
+    from train_models import build_run_tag
+    d = Path(datasets_root) / build_run_tag(mode, source, period) / split
+    if not (d / "metadata.json").is_file():
+        raise FileNotFoundError(
+            f"no dataset split at {d} (metadata.json missing); build it with "
+            f"create_datasets.py or point --datasets_root at it")
+    return d
+
+
+def _tfrecord_batches(split_dir: Path, allowed: set | None, batch_size: int):
+    """Batches of (inputs, label, date, reference_utc, patch_number)
+    from a split's TFRecords, in file order, so a reference's patches
+    stay contiguous. `allowed` restricts the records to a set of
+    (date, hhmm) references before the tensors are parsed."""
+    with open(split_dir / "metadata.json") as f:
+        meta = json.load(f)
+    input_shapes = meta["input_shapes"]
+    label_shape = meta["label_shape"]
+    shards = sorted(str(p) for p in split_dir.glob("shard_*.tfrecord"))
+    if not shards:
+        raise FileNotFoundError(f"no shard_*.tfrecord in {split_dir}")
+    small = {"date": tf.io.FixedLenFeature([], tf.string),
+             "reference_utc": tf.io.FixedLenFeature([], tf.string),
+             "patch_number": tf.io.FixedLenFeature([], tf.int64)}
+    full = dict(small)
+    for key in input_shapes:
+        full[key] = tf.io.FixedLenFeature([], tf.string)
+    full["label"] = tf.io.FixedLenFeature([], tf.string)
+
+    def _key(parsed):
+        return tf.strings.join([parsed["date"], "_",
+                                tf.strings.regex_replace(parsed["reference_utc"], ":", "")])
+
+    ds = tf.data.TFRecordDataset(shards)
+    if allowed is not None:
+        keys = tf.constant(sorted(f"{d}_{h.replace(':', '')}" for d, h in allowed))
+        table = tf.lookup.StaticHashTable(
+            tf.lookup.KeyValueTensorInitializer(
+                keys, tf.ones_like(keys, dtype=tf.int64) if len(allowed) else tf.zeros([0], tf.int64)),
+            default_value=tf.constant(0, tf.int64))
+
+        def _keep(serialised):
+            return table.lookup(_key(tf.io.parse_single_example(serialised, small))) > 0
+        ds = ds.filter(_keep)
+
+    def _parse(serialised):
+        p = tf.io.parse_single_example(serialised, full)
+        inputs = {}
+        for key, shape in input_shapes.items():
+            t = tf.io.parse_tensor(p[key], out_type=tf.float32)
+            t.set_shape(shape)
+            inputs[key] = t
+        label = tf.io.parse_tensor(p["label"], out_type=tf.float32)
+        label.set_shape(label_shape)
+        return inputs, label, p["date"], p["reference_utc"], p["patch_number"]
+
+    return (ds.map(_parse, num_parallel_calls=tf.data.AUTOTUNE)
+              .batch(batch_size).prefetch(tf.data.AUTOTUNE))
+
+
+def _iter_references(split_dir: Path, allowed: set | None, batch_size: int,
+                     predict_batch):
+    """Yield (date, reference_utc, patch_numbers, outputs, labels) per
+    reference of a split: the records are predicted batch by batch with
+    `predict_batch(inputs) -> (B, ...)` and regrouped by reference, which
+    the file order keeps contiguous. `outputs` and `labels` are stacked
+    over the reference's patches, in patch order of the records."""
+    cur = None
+    outs: list = []
+    labs: list = []
+    nums: list = []
+    for inputs, labels, dates, refs, patches in _tfrecord_batches(split_dir, allowed, batch_size):
+        out = np.asarray(predict_batch(inputs))
+        labels = labels.numpy()
+        dates = [d.decode() for d in dates.numpy()]
+        refs = [r.decode() for r in refs.numpy()]
+        patches = patches.numpy()
+        for i in range(len(dates)):
+            key = (dates[i], refs[i])
+            if cur is not None and key != cur:
+                yield cur[0], cur[1], nums, np.stack(outs), np.stack(labs)
+                outs, labs, nums = [], [], []
+            cur = key
+            outs.append(out[i])
+            labs.append(labels[i])
+            nums.append(int(patches[i]))
+    if cur is not None:
+        yield cur[0], cur[1], nums, np.stack(outs), np.stack(labs)
+
+
+def _paste_label_canvases(labels: np.ndarray, patches: list[int],
+                          label_type: str) -> list[np.ndarray]:
+    """The ground truth of one reference from its records' labels
+    (N, L, 256, 256, C): one int32 canvas per lead with the class index
+    (radar: argmax of the one-hot) or 0/1 (lightning) at the records'
+    patch slots and -1 elsewhere, the marker every scorer treats as
+    'no model output here'."""
+    canvases = []
+    for i in range(labels.shape[1]):
+        canvas = np.full((H_FULL, W_FULL), -1, dtype=np.int32)
+        for p_pos, patch_num in enumerate(patches):
+            r0, r1, c0, c1 = get_patch_bounds(patch_num)
+            lab = labels[p_pos, i]
+            canvas[r0:r1, c0:c1] = (np.argmax(lab, axis=-1) if label_type == "radar"
+                                    else (lab[..., 0] > 0.5)).astype(np.int32)
+        canvases.append(canvas)
+    return canvases
+
+
 def _paste_class_canvases(classes_by_step: dict, valid_patches: list[int],
                           n_lead: int) -> list[np.ndarray]:
     """SepConv class maps (step -> (N, 256, 256)) onto full canvases,
@@ -1587,7 +1699,9 @@ def run_extraction(track: str, year: int, month: int,
                    tune_leads: str = "each",
                    cache_gb: float | None = None,
                    period=None,
-                   baseline: bool = False):
+                   baseline: bool = False,
+                   datasets_root: Path | None = None,
+                   batch_size: int = 32):
     """Extraction mode for the rainfall track, in three phases.
 
     1. LOW per lead, tuned on samples drawn from the VALIDATION split:
@@ -1619,7 +1733,11 @@ def run_extraction(track: str, year: int, month: int,
             raise SystemExit("--baseline needs --period (the window the "
                              "baseline was trained on, e.g. w44)")
     tag = artifact_tag(mode, source, period, finetuned, baseline=baseline)
+    from pipeline_config import resolve_datasets_root
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
     print(f"  Data root: {data_root}")
+    print(f"  Datasets:  {datasets_root}  (the split records are predicted, "
+          f"as in the evaluation)")
     print(f"  Model:     {mode} ({source}"
           f"{' finetuned' if finetuned else ''}"
           f"{' - SepConv-ens baseline' if baseline else ''})  -> {tag}")
@@ -1675,72 +1793,60 @@ def run_extraction(track: str, year: int, month: int,
         print(f"  Loaded: {model.count_params():,} parameters")
     from visualize_gt_vs_pred import build_full_soft_pred
 
-    def _load_sample(sel):
-        """Inputs and the ground-truth field of every lead for one
-        reference timestep; runs in the loader thread."""
-        date_str, hhmm = sel
-        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-        inputs, valid_patches = build_inputs_for_reference(
-            data_root, mode_config, date_str, ref_utc, step_minutes,
-        )
-        gt_fields = []
-        if valid_patches:
-            for offset in LEAD_STEP_OFFSETS:
-                gt_hhmm, gt_day = _resolve_gt(
-                    ref_utc, offset * step_minutes, date_str,
-                )
-                gt_fields.append(
-                    _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm))
-        return inputs, valid_patches, gt_fields
+    scope_splits = [SPLIT] if SPLIT else ["train", "validation", "test"]
 
-    def _predict(inputs, valid_patches):
-        """(argmax canvases, score canvases or None, eligible masks or
-        None) for one sample. Score = p(argmax) on rainy-argmax pixels,
-        the quantity the hysteresis thresholds act on."""
+    def _predict_batch(inputs):
+        """Per-patch outputs of one batch of records: the softmax maps
+        (B, L, 256, 256, C) of the model, or the class maps
+        (B, L, 256, 256) of the baseline."""
         if baseline:
-            past = np.asarray(inputs["past_hr"])
+            past = inputs["past_hr"].numpy()
             frames = [past[:, t, :, :, 0] for t in range(past.shape[1])]
             classes, _mmh = predict_classes(
                 base_models, frames, period, max_step=L,
                 data_root=str(data_root), source=source,
                 batch_size=18, batched=True)
-            return _paste_class_canvases(classes, valid_patches, L), None, None
-        preds = _predict_batches(model, inputs, batch_size=18)
-        pred_canvases = paste_predictions_to_canvas(
-            preds, valid_patches, label_type="radar")
-        soft = build_full_soft_pred(preds, valid_patches,
-                                    n_classes=preds.shape[-1])
-        scores, eligible = [], []
-        for i in range(L):
-            argmax = np.argmax(soft[i], axis=-1)
-            p_arg = np.take_along_axis(soft[i], argmax[..., None],
-                                       axis=-1).squeeze(-1)
-            scores.append(np.where(argmax > 0, p_arg, 0.0).astype(np.float32))
-            eligible.append(argmax > 0)
-        return pred_canvases, scores, eligible
+            return np.stack([classes[i + 1] for i in range(L)], axis=1)
+        return model(inputs, training=False).numpy()
 
-    def _run(samples, label, per_sample):
-        """Loop `samples` through the model, calling per_sample(k, date,
-        ref, pred_canvases, scores, eligible, gt_canvases). Returns the
-        (date, ref) of every sample that produced predictions."""
+    def _run(splits, allowed, label, per_sample):
+        """Every selected reference of `splits`, predicted from its
+        records and pasted onto the canvas; per_sample(k, date, ref,
+        pred_canvases, scores, eligible, gt_canvases) for each. Returns
+        the (date, ref) of every reference scored."""
         done = []
-        n_skipped = 0
-        print(f"\n{label}: {len(samples)} samples ...")
-        for k, ((date_str, hhmm), (inputs, valid_patches, gt_fields)) in enumerate(
-                _prefetch(samples, _load_sample), 1):
-            ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-            if k == 1 or k % 20 == 0 or k == len(samples):
-                print(f"  [{k}/{len(samples)}] {date_str} {ref_utc}")
-            if not valid_patches:
-                n_skipped += 1
-                continue
-            pred_canvases, scores, eligible = _predict(inputs, valid_patches)
-            gt_canvases = [_paste_gt_class_canvas(gt_fields[i], valid_patches)
-                           for i in range(L)]
-            per_sample(len(done), date_str, ref_utc, pred_canvases, scores,
-                       eligible, gt_canvases)
-            done.append((date_str, ref_utc))
-        print(f"  done: {len(done)} scored, {n_skipped} skipped (missing inputs)")
+        allowed = set(allowed)
+        print(f"\n{label}: {len(allowed)} samples from the "
+              f"{' + '.join(splits)} split records ...")
+        for split in splits:
+            split_dir = _split_dataset_dir(datasets_root, mode, source, period, split)
+            for date_str, ref_utc, patches, out, labels in _iter_references(
+                    split_dir, allowed, batch_size, _predict_batch):
+                k = len(done) + 1
+                if k == 1 or k % 100 == 0:
+                    print(f"  [{k}/{len(allowed)}] {date_str} {ref_utc}")
+                gt_canvases = _paste_label_canvases(labels, patches, "radar")
+                if baseline:
+                    pred_canvases = _paste_class_canvases(
+                        {i + 1: out[:, i] for i in range(L)}, patches, L)
+                    scores, eligible = None, None
+                else:
+                    pred_canvases = paste_predictions_to_canvas(
+                        out, patches, label_type="radar")
+                    soft = build_full_soft_pred(out, patches, n_classes=out.shape[-1])
+                    scores, eligible = [], []
+                    for i in range(L):
+                        argmax = np.argmax(soft[i], axis=-1)
+                        p_arg = np.take_along_axis(soft[i], argmax[..., None],
+                                                   axis=-1).squeeze(-1)
+                        scores.append(np.where(argmax > 0, p_arg, 0.0).astype(np.float32))
+                        eligible.append(argmax > 0)
+                per_sample(len(done), date_str, ref_utc, pred_canvases, scores,
+                           eligible, gt_canvases)
+                done.append((date_str, ref_utc))
+        missing = len(allowed) - len(done)
+        print(f"  done: {len(done)} scored"
+              + (f", {missing} selected reference(s) without records" if missing else ""))
         return done
 
     low_grid = np.round(np.arange(0.01, 1.00, 0.01), 2)
@@ -1794,8 +1900,8 @@ def run_extraction(track: str, year: int, month: int,
                     replay.append((date_str, ref_utc, item))
                     replay_bytes += size
 
-        tune_dates = _run(tuning_selected, "Phase 1 - LOW sweep on the "
-                          "validation split", _phase1)
+        tune_dates = _run(["validation"], tuning_selected,
+                          "Phase 1 - LOW sweep on the validation split", _phase1)
         if not tune_dates:
             raise SystemExit("no tuning sample produced predictions")
         if rainfall_low is not None:
@@ -1845,8 +1951,8 @@ def run_extraction(track: str, year: int, month: int,
                 _phase2(n, date_str, ref_utc, None, scores, eligible, gts)
             replay = None
         else:
-            _run(tuning_selected, "Phase 2 - window sweep on the validation "
-                 "split", _phase2)
+            _run(["validation"], tuning_selected,
+                 "Phase 2 - window sweep on the validation split", _phase2)
         print("\nPhase 2 result (hysteresis (LOW, HIGH), pooled CSI):")
         for i in tuned:
             offset = LEAD_STEP_OFFSETS[i]
@@ -1915,7 +2021,7 @@ def run_extraction(track: str, year: int, month: int,
             _merge_patch_counts(patch_acc, i, per_patch)
         rows.append(row)
 
-    _run(selected, "Phase 3 - scoring the scope", _phase3)
+    _run(scope_splits, selected, "Phase 3 - scoring the scope", _phase3)
     if not rows:
         print("No sample produced predictions. Nothing to write.")
         return
@@ -2952,8 +3058,8 @@ def run_extraction_lightning(
     year: int, month: int, mode: str, source: str, finetuned: bool,
     data_root: Path, model_dir: Path, output_dir: Path,
     *,
-    stride: int = DEFAULT_STRIDE,
     low_threshold: float | None = None,
+    datasets_root: Path | None = None,
     batch_size: int = 32,
     rainfall_threshold_mmh: float = RAINFALL_THRESHOLD_MMH,
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
@@ -2989,8 +3095,13 @@ def run_extraction_lightning(
                  for k in range(1, int(round((0.99 - low_threshold) / 0.01)) + 1)]
     if not high_grid:
         raise SystemExit(f"LOW {low_threshold:.2f} leaves no room for a HIGH sweep")
-    print(f"  Post-proc: stride={stride}  low={low_threshold:.2f}  "
+    print(f"  Post-proc: low={low_threshold:.2f}  "
           f"high {high_grid[0]:.2f}..{high_grid[-1]:.2f} ({len(high_grid)} candidates)")
+    from pipeline_config import resolve_datasets_root
+    datasets_root = resolve_datasets_root(data_root, datasets_root)
+    dataset_mode = KD_TEACHER_MODE if kd else mode
+    print(f"  Datasets:  {datasets_root} / {dataset_mode} records"
+          f"{' (HR channels sliced for the student)' if kd else ''}")
     print(f"  Thresholds: rainfall_threshold_mmh={rainfall_threshold_mmh:g}  "
           f"high_coverage_pct={high_coverage_pct:g}")
 
@@ -3029,41 +3140,38 @@ def run_extraction_lightning(
                                 kd=kd, period=period, weights=WEIGHTS)
     print(f"  Loaded: {model.count_params():,} parameters")
 
-    def _load_sample(sel):
-        date_str, hhmm = sel
-        ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-        inputs, positions = build_inputs_for_reference_overlapped(
-            data_root, mode_config, date_str, ref_utc, step_minutes,
-            stride=stride,
-        )
-        gt_bins = []
-        if positions:
-            for offset in LEAD_STEP_OFFSETS:
-                gt_hhmm, gt_day = _resolve_gt(
-                    ref_utc, offset * step_minutes, date_str,
-                )
-                gt_bins.append(
-                    _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm))
-        return inputs, positions, gt_bins
+    scope_splits = [SPLIT] if SPLIT else ["train", "validation", "test"]
 
-    def _run(samples, label, per_sample):
+    def _predict_batch(inputs):
+        if kd:
+            inputs = _kd_slice_student_inputs(inputs)
+        return model(inputs, training=False).numpy()
+
+    def _run(splits, allowed, label, per_sample):
+        """Every selected reference of `splits`, predicted from its
+        records and pasted onto the canvas (its own probability in each
+        patch slot, 0 elsewhere); per_sample(k, date, ref,
+        prob_canvases, gt_canvases) for each."""
         done = []
-        n_skipped = 0
-        print(f"\n{label}: {len(samples)} samples (Hann overlap, stride={stride}) ...")
-        for k, ((date_str, hhmm), (inputs, positions, gt_bins)) in enumerate(
-                _prefetch(samples, _load_sample), 1):
-            ref_utc = f"{hhmm[:2]}:{hhmm[2:]}"
-            if k == 1 or k % 20 == 0 or k == len(samples):
-                print(f"  [{k}/{len(samples)}] {date_str} {ref_utc}")
-            if not positions:
-                n_skipped += 1
-                continue
-            preds = _predict_batches(model, inputs, batch_size=batch_size)
-            prob_canvases = paste_predictions_hann_blended(preds, positions)
-            gts = [None if g is None else g.astype(np.int32) for g in gt_bins]
-            per_sample(len(done), date_str, ref_utc, prob_canvases, gts)
-            done.append((date_str, ref_utc))
-        print(f"  done: {len(done)} scored, {n_skipped} skipped (missing inputs)")
+        allowed = set(allowed)
+        print(f"\n{label}: {len(allowed)} samples from the "
+              f"{' + '.join(splits)} split records ...")
+        for split in splits:
+            split_dir = _split_dataset_dir(datasets_root, dataset_mode, source,
+                                           period, split)
+            for date_str, ref_utc, patches, preds, labels in _iter_references(
+                    split_dir, allowed, batch_size, _predict_batch):
+                k = len(done) + 1
+                if k == 1 or k % 100 == 0:
+                    print(f"  [{k}/{len(allowed)}] {date_str} {ref_utc}")
+                prob_canvases = paste_predictions_to_canvas(
+                    preds, patches, label_type="lightning")
+                gts = _paste_label_canvases(labels, patches, "lightning")
+                per_sample(len(done), date_str, ref_utc, prob_canvases, gts)
+                done.append((date_str, ref_utc))
+        missing = len(allowed) - len(done)
+        print(f"  done: {len(done)} scored"
+              + (f", {missing} selected reference(s) without records" if missing else ""))
         return done
 
     # ---- Phase A: HIGH per lead on the validation-split samples --------
@@ -3079,8 +3187,8 @@ def run_extraction_lightning(
             return [conf[h] for h in high_grid]
         tune_conf.append(_map_leads(one, L))
 
-    tune_dates = _run(tuning_selected, "Phase A - HIGH sweep on the validation split",
-                      _phase_a)
+    tune_dates = _run(["validation"], tuning_selected,
+                      "Phase A - HIGH sweep on the validation split", _phase_a)
     if not tune_dates:
         raise SystemExit("no tuning sample produced predictions")
     tuning_scores: dict[int, dict[float, dict]] = {i: {} for i in range(L)}
@@ -3150,7 +3258,7 @@ def run_extraction_lightning(
             _merge_patch_counts(patch_acc, i, per_patch)
         rows.append(row)
 
-    _run(selected, "Phase B - scoring the scope", _phase_b)
+    _run(scope_splits, selected, "Phase B - scoring the scope", _phase_b)
     if not rows:
         print("No sample produced predictions. Nothing to write.")
         return
@@ -4042,6 +4150,10 @@ def main() -> int:
                              "weights, the normalization statistics and the "
                              "sequence metadata together.")
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()))
+    parser.add_argument("--datasets_root", type=str, default=None, metavar="PATH",
+                        help="Root of the TFRecord datasets whose split "
+                             "records the extraction predicts (default "
+                             "<data_root>/datasets or COALITION4_DATASETS_ROOT).")
     parser.add_argument("--weights", type=str, default="best",
                         choices=["best", "latest"],
                         help="Which saved state to load: `best`, the final save (best epoch, restored by early stopping), or `latest`, the per-epoch checkpoint under models/checkpoints/ (the last epoch run). Outputs of a `latest` run carry a _latest suffix.")
@@ -4051,8 +4163,11 @@ def main() -> int:
                              "<output_dir>/<stem>/.")
     # --- Lightning-only knobs (ignored when --track rainfall) ---
     parser.add_argument("--stride", type=int, default=DEFAULT_STRIDE,
-                        help="Overlap stride for Hann inference (lightning). "
-                             f"Default {DEFAULT_STRIDE} = 50%% overlap.")
+                        help="Overlap stride of the Hann-blended lightning "
+                             "inference in the per-date visualisation (--date) "
+                             f"and the kd track. Default {DEFAULT_STRIDE} = 50%% "
+                             "overlap. The extraction predicts the split "
+                             "records and does not use it.")
     parser.add_argument("--lightning_low_threshold", type=float, default=None,
                         help="Hysteresis LOW threshold (lightning). Default: "
                              "the threshold the evaluation tuned for this "
@@ -4128,9 +4243,9 @@ def main() -> int:
                         help=f"CPU threads for the per-lead sweeps "
                              f"(default {WORKERS}).")
     parser.add_argument("--batch_size", type=int, default=32,
-                        help="model.predict batch size. For lightning the "
-                             "Hann overlap produces ~55 patches per reference "
-                             "so 32-64 is a good range.")
+                        help="Records per batch through the model in the "
+                             "extraction (default 32), and the predict batch "
+                             "size of the per-date visualisation.")
     # ---- KD-track-only knobs (ignored when --track != kd) ----
     parser.add_argument("--teacher_mode", type=str, default=KD_TEACHER_MODE,
                         help=f"KD teacher mode. Default {KD_TEACHER_MODE}.")
@@ -4237,6 +4352,8 @@ def main() -> int:
                     cache_gb=args.cache_gb,
                     period=period,
                     baseline=baseline,
+                    datasets_root=args.datasets_root,
+                    batch_size=args.batch_size,
                 )
                 _release()
         else:
@@ -4263,8 +4380,8 @@ def main() -> int:
                     args.year, args.month,
                     mode, SOURCE, finetuned,
                     data_root, model_dir, output_dir,
-                    stride=args.stride,
                     low_threshold=args.lightning_low_threshold,
+                    datasets_root=args.datasets_root,
                     batch_size=args.batch_size,
                     rainfall_threshold_mmh=args.rainfall_threshold_mmh,
                     high_coverage_pct=args.high_coverage_pct,
