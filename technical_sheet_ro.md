@@ -371,12 +371,12 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ### A4. Inferență pe întregul domeniu
 ```bash
 python predict_full_domain.py --mode ... --date YYYY-MM-DD
-python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
+python predict_full_domain.py --mode ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 ```
 - **Descriere** — asamblează patch-uri suprapuse, ponderate Hann, într-o suprafață completă la `--stride 128` (suprapunere 50 %), eliminând discontinuitățile plăcilor de 256 px.
 - **Scrie** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — salvate ca matrice, astfel încât o explorare a pragurilor să nu impună repetarea inferenței.
 - **Grafic** — `*_hits.png`, `*_perclass_hits.png`
-- **Separat** — `--pick csi` rulează primele `--top_n` eșantioane (implicit 5) după CSI-ul mediu pe orizonturi ale unei execuții de validare; nu este necesar adevărul de teren. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
+- **Separat** — `--pick csi` rulează primele `--top_n` eșantioane (implicit 5) după CSI-ul mediu pe orizonturi ale unei execuții de validare, `--pick active` primele `--top_n` după numărul de pixeli activi în adevărul de teren, însumat pe orizonturi; ieșirile poartă prefixul `csi_top<NN>_` sau `active_top<NN>_`, astfel încât cele două seturi coexistă. Adevărul de teren nu este necesar la rulare. `--validation_summary` aplică pragurile calibrate per orizont pentru ambele categorii (LOW și HIGH pentru precipitații); fără el, valorile implicite sunt 0,20 / 0,25.
 
 ### A5. Validarea și calibrarea pragurilor
 ```bash
@@ -392,14 +392,15 @@ python validate_predictions.py --track rainfall --split test --mode mtg_lightnin
 - **Scrie** — `…_samples.csv`, cu `csi_t+<k>` și procentele de detecții / ratări / alarme false per orizont la pragul HIGH calibrat.
 - **Separat** — `--baseline` validează SepConv-ens post-procesat în aceleași clase (fără histerezis); `--max_samples N` limitează o execuție de probă; `--weights latest` evaluează checkpoint-ul per epocă în locul salvării finale (eticheta primește sufixul `_latest`). Același indicator există la A4 și A6.
 - **Calibrare** — pe eșantioane extrase din partiția de validare, niciodată pe cele evaluate. Precipitații: faza 1 alege LOW per orizont printr-un baleiaj cu prag simplu pe p(argmax) (`--rainfall_low_threshold` îl fixează în loc); faza 2 alege perechea (LOW, HIGH) per orizont dintre ferestre de lățime `--rainfall_window` așezate una lângă alta de ambele părți ale acelui LOW până la `--rainfall_reach`; domeniul este evaluat la perechea aleasă. `--tune_leads first` calibrează doar pe t+1 și refolosește rezultatul pentru toate orizonturile (ambele categorii). Fulgere: LOW este pragul calibrat de evaluare (citit din `evaluation/eval_<tag>/`, `--lightning_low_threshold` îl suprascrie), iar HIGH este baleiat deasupra lui per orizont. `--max_samples` extrage ambele seturi reproductibil per lună (`--month_batch`, `--seed`).
+- **Cost** — fiecare câmp este citit, agregat și transformat o singură dată per pas de timp și decupat abia apoi; maximele OPERA de care are nevoie selecția eșantioanelor sunt reținute în `our_data/data_statistics/opera_rainfall_max_cache.json`; faza 2 a pistei de precipitații reia din memorie predicțiile fazei 1 (`--cache_gb`, implicit o treime din memoria fizică) în loc să treacă din nou eșantioanele prin model. Niciuna dintre acestea nu schimbă vreun număr.
 - **Cost** — o singură etichetare a componentelor conexe per eșantion și orizont deservește toți candidații HIGH (rezultate identice cu pragul aplicat fiecăruia); un fir de încărcare pregătește eșantionul următor cât timp GPU-ul îl procesează pe cel curent. Aproximativ 4–5 s per eșantion pe întreaga suprafață.
-- **Grafic** — `…_metrics.png` (barele FAR/POD/CSI), `…_coverage.png` (IoU în raport cu suprapunerea ponderată pe clase, precipitații), `…_hmf.png` (detecții / ratări / alarme false per eșantion, marcator per orizont, linie roșie la 50 %, primul / medianul / ultimul eșantion datate pe axa x), `…_hmf_percentiles.png` (per orizont p10–p90 / p25–p75 / mediana acestor rate și proporția eșantioanelor peste și sub 50 %), `…_tuning_low.png` și `…_tuning_high.png` (precipitații: baleiajul din faza 1 și ferestrele din faza 2 per orizont) sau `…_tuning.png` (fulgere: baleiajul HIGH per orizont). Toate sunt generate din rezumatul și CSV-ul salvate; `python validate_predictions.py --plots <summary.json>` le regenerează pentru oricare categorie. Suprapuneri pe zile cu `--date`
+- **Grafic** — `…_metrics.png` (barele FAR/POD/CSI), `…_coverage.png` (IoU în raport cu suprapunerea ponderată pe clase, precipitații), `…_hmf.png` (detecții / ratări / alarme false per eșantion, marcator per orizont, linie roșie la 50 %, primul / medianul / ultimul eșantion datate pe axa x), `…_hmf_percentiles.png` (per orizont p10–p90 / p25–p75 / mediana acestor rate și proporția eșantioanelor peste și sub 50 %), `…_hysteresis.png` (per orizont, variația numărului cumulat de detecții / ratări / alarme false de la decizia brută, argmax pentru precipitații și p ≥ LOW pentru fulgere, la cea post-procesată, și ratele ambelor), `…_tuning_low.png` și `…_tuning_high.png` (precipitații: baleiajul din faza 1 și ferestrele din faza 2 per orizont) sau `…_tuning.png` (fulgere: baleiajul HIGH per orizont). Toate sunt generate din rezumatul și CSV-ul salvate; `python validate_predictions.py --plots <summary.json>` le regenerează pentru oricare categorie. Suprapuneri pe zile cu `--date`
 - **Citit de** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figuri și raport
 ```bash
 python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
-python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
+python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
 ```
 - **Notă** — vizualizatorul construiește adevărul de teren din fișierele de patch ale rândurilor din `--csv`, astfel încât un moment selectat trebuie să fie un rând al acelui CSV (validați pe `--split test` și indicați CSV-ul de test).
