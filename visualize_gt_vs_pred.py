@@ -2211,14 +2211,17 @@ def main() -> int:
                              "(train/validation/test_data_<source>.csv). "
                              "Required: the ground truth is built from the "
                              "patch files its rows name.")
-    parser.add_argument("--pick", type=str, default=None, choices=["csi"],
+    parser.add_argument("--pick", type=str, default=None,
+                        choices=["csi", "active"],
                         help="Choose the timesteps by the validation run in "
                              "--validation_summary instead of by patch "
                              "count: `csi` draws the --top_n best samples "
-                             "(default 5) by mean CSI over leads. Each must "
-                             "be a row of --csv, where its ground truth "
-                             "comes from. Outputs are named "
-                             "csi_top<NN>_<date>_<time>.png.")
+                             "(default 5) by mean CSI over leads, `active` "
+                             "the --top_n with the most ground-truth-active "
+                             "pixels over the leads. Each must be a row of "
+                             "--csv, where its ground truth comes from. "
+                             "Outputs are named csi_top<NN>_... or "
+                             "active_top<NN>_..., so the two sets coexist.")
     parser.add_argument("--mode", required=True, type=str,
                         choices=_mode_choices(),
                         help="Model variant. The name states its own track: "
@@ -2402,7 +2405,8 @@ def main() -> int:
     if args.pick:
         from validate_predictions import picks_from_summary
         picks = picks_from_summary(args.validation_summary, args.pick,
-                                   top_n=args.top_n)
+                                   top_n=args.top_n,
+                                   data_root=Path(args.data_root))
         print(f"\nPicked timesteps from {args.validation_summary}:")
         df_all = pd.read_csv(csv_path)
         df_all["reference_utc"] = df_all["reference_utc"].str.strip()

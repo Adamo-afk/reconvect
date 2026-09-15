@@ -354,12 +354,12 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ### A4. Full-domain inference
 ```bash
 python predict_full_domain.py --mode ... --date YYYY-MM-DD
-python predict_full_domain.py --mode ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
+python predict_full_domain.py --mode ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 ```
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
-- **Alone** — `--pick csi` runs the `--top_n` best samples (default 5) by mean CSI over leads of a validation run; no ground truth is needed. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
+- **Alone** — `--pick csi` runs the `--top_n` best samples (default 5) by mean CSI over leads of a validation run, `--pick active` the `--top_n` with the most ground-truth-active pixels over the leads; the outputs are prefixed `csi_top<NN>_` or `active_top<NN>_` so the two sets coexist. No ground truth is needed at run time. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
 
 ### A5. Validation and threshold tuning
 ```bash
@@ -375,14 +375,15 @@ python validate_predictions.py --track rainfall --split test --mode mtg_lightnin
 - **Writes** — `…_samples.csv`, with `csi_t+<k>` and the hits / misses / false-alarm percentages per lead at the tuned HIGH.
 - **Alone** — `--baseline` validates SepConv-ens post-processed into the same classes (no hysteresis); `--max_samples N` caps a trial run; `--weights latest` scores the per-epoch checkpoint instead of the final save (tag suffixed `_latest`). The same flag exists on A4 and A6.
 - **Tuning** — on samples drawn from the validation split, never on the scored ones. Rainfall: phase 1 picks LOW per lead with a plain-threshold sweep on p(argmax) (`--rainfall_low_threshold` fixes it instead); phase 2 picks the (LOW, HIGH) pair per lead among windows of `--rainfall_window` tiled on both sides of that LOW out to `--rainfall_reach`; the scope is scored at the pair. `--tune_leads first` tunes on t+1 alone and reuses the result for every lead (both tracks). Lightning: LOW is the evaluation's tuned threshold (read from `evaluation/eval_<tag>/`, `--lightning_low_threshold` overrides), HIGH is swept above it per lead. `--max_samples` draws both sets reproducibly per month (`--month_batch`, `--seed`).
+- **Cost** — each field is read, pooled and transformed once per timestep and sliced afterwards; the OPERA maxima the sample selection needs are cached in `our_data/data_statistics/opera_rainfall_max_cache.json`; the rainfall phase 2 replays the phase-1 predictions from memory (`--cache_gb`, default a third of the physical memory) instead of predicting the tuning samples again. The numbers are unchanged by any of this.
 - **Cost** — one component labelling per sample and lead serves every HIGH candidate (identical results to thresholding each one); a loader thread assembles the next sample while the GPU runs the current one. About 4–5 s per sample on the full canvas.
-- **Graph** — `…_metrics.png` (FAR/POD/CSI bars), `…_coverage.png` (IoU against class-weighted overlap, rainfall), `…_hmf.png` (per-sample hits / misses / false alarms, marker per lead, red line at 50 %, first / median / last sample dated on the x axis), `…_hmf_percentiles.png` (per lead the p10–p90 / p25–p75 / median of those rates and the share of samples above and below 50 %), `…_tuning_low.png` and `…_tuning_high.png` (rainfall: the phase-1 sweep and the phase-2 windows per lead) or `…_tuning.png` (lightning: the HIGH sweep per lead). All drawn from the saved summary and CSV; `python validate_predictions.py --plots <summary.json>` redraws them for either track. Per-date overlays with `--date`
+- **Graph** — `…_metrics.png` (FAR/POD/CSI bars), `…_coverage.png` (IoU against class-weighted overlap, rainfall), `…_hmf.png` (per-sample hits / misses / false alarms, marker per lead, red line at 50 %, first / median / last sample dated on the x axis), `…_hmf_percentiles.png` (per lead the p10–p90 / p25–p75 / median of those rates and the share of samples above and below 50 %), `…_hysteresis.png` (per lead, the change of the pooled hit / miss / false-alarm counts from the raw decision, argmax for rainfall and p ≥ LOW for lightning, to the post-processed one, and the rates of both), `…_tuning_low.png` and `…_tuning_high.png` (rainfall: the phase-1 sweep and the phase-2 windows per lead) or `…_tuning.png` (lightning: the HIGH sweep per lead). All drawn from the saved summary and CSV; `python validate_predictions.py --plots <summary.json>` redraws them for either track. Per-date overlays with `--date`
 - **Read by** — `generate_report`, `build_patch_ensemble`, `bundle_eval_scores`
 
 ### A6. Figures and report
 ```bash
 python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
-python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi [--top_n N] --validation_summary validation/<summary>.json
+python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
 ```
 - **Note** — the visualiser builds its ground truth from the patch files of the `--csv` rows, so a picked timestep must be a row of that CSV (validate on `--split test` and pass the test CSV).

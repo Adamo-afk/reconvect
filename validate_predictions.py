@@ -420,6 +420,34 @@ def window_pairs(low: float, width: float, reach: float) -> list[tuple[float, fl
     return kept
 
 
+def _default_cache_gb() -> float:
+    """A third of the physical memory, the default budget of the
+    phase-1 replay cache; 16 GB when the size cannot be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            total = ms.ullTotalPhys
+        else:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        return max(1.0, total / 3 / 1e9)
+    except Exception:
+        return 16.0
+
+
 def _map_leads(fn, n: int):
     """fn(i) for i in range(n), in WORKERS threads; returns the list of
     results in lead order. The per-lead sweeps are numpy / scipy heavy
@@ -562,6 +590,56 @@ def _iter_opera_files(data_root: Path, year: int, month: int):
             yield m.group(1), m.group(2), day_folder / name
 
 
+class _OperaMaxCache:
+    """The maximum rain rate of every OPERA field the sample selection
+    has looked at, kept in <data_root>/data_statistics/ so the next run
+    does not reopen thousands of files to ask the same question. An
+    entry is trusted only while the file's size and modification time
+    are the ones recorded with it."""
+
+    NAME = "opera_rainfall_max_cache.json"
+
+    def __init__(self, data_root: Path):
+        self.path = Path(data_root) / "data_statistics" / self.NAME
+        self.entries: dict = {}
+        self.dirty = 0
+        try:
+            with open(self.path) as f:
+                self.entries = json.load(f)
+        except (OSError, ValueError):
+            self.entries = {}
+
+    def field_max(self, date_str: str, hhmm: str, path: Path):
+        from compress_datasets import array_path
+        real = array_path(path)
+        st = real.stat()
+        key = f"{date_str}_{hhmm}"
+        ent = self.entries.get(key)
+        if ent and ent[0] == st.st_mtime_ns and ent[1] == st.st_size:
+            return np.float32(ent[2])
+        data = load_array(path)
+        if data.ndim == 3:
+            data = np.squeeze(data, axis=0)
+        # NaN -> 0 to mirror the label transform in create_datasets.
+        finite_max = np.nanmax(data) if data.size else np.float32(0.0)
+        self.entries[key] = [st.st_mtime_ns, st.st_size, float(finite_max)]
+        self.dirty += 1
+        return np.float32(finite_max)
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(self.entries, f)
+            tmp.replace(self.path)
+            print(f"  OPERA maxima: {self.dirty} new, cached in {self.path.name}")
+        except OSError as e:
+            print(f"  WARNING: could not write {self.path}: {e}")
+
+
 def _opera_file_for(data_root: Path, date_str: str, hhmm: str) -> Path:
     """The reprojected OPERA rain-rate file of one reference timestep."""
     return (data_root / "reprojected_data" / "opera_data" / "rainfall_rate"
@@ -666,15 +744,13 @@ def select_samples(data_root: Path, year: int | None, month: int | None,
         candidates = _iter_opera_files(data_root, year, month)
     kept: list[tuple[str, str]] = []
     scanned = 0
+    cache = _OperaMaxCache(data_root)
     for date_str, hhmm, path in candidates:
         scanned += 1
-        data = load_array(path)
-        if data.ndim == 3:
-            data = np.squeeze(data, axis=0)
-        # NaN -> 0 to mirror the label transform in create_datasets.
-        finite_max = np.nanmax(data) if data.size else 0.0
+        finite_max = cache.field_max(date_str, hhmm, path)
         if finite_max >= threshold_mmh:
             kept.append((date_str, hhmm))
+    cache.save()
     print(f"  Scanned {scanned} OPERA files; "
           f"kept {len(kept)} with >= {threshold_mmh:g} mm/h")
     return subsample_by_month(kept, limit, MONTH_BATCH, SEED)
@@ -800,6 +876,8 @@ def _write_csv(rows: list[dict], path: Path):
         fieldnames.append(f"csi_t+{offset}")
         for name in HMF_NAMES:
             fieldnames.append(f"{name}_pct_t+{offset}")
+        fieldnames.append(f"gt_active_px_t+{offset}")
+        fieldnames.append(f"pred_active_px_t+{offset}")
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -894,17 +972,46 @@ def _write_json(track: str, year: int, month: int,
 # Metrics figure (extraction mode side-effect)
 # ============================================================================
 HMF_NAMES = ("hits", "misses", "false_alarms")
-PICK_MODES = ("csi",)
+PICK_MODES = ("csi", "active")
 
 
-def picks_from_summary(summary_path, mode: str = "csi", top_n: int | None = None
+def _gt_active_from_files(track: str, data_root: Path, date_str: str,
+                          ref_utc: str, offsets: list[int], step: int) -> int | None:
+    """Ground-truth-active pixels of one sample summed over its leads,
+    read from the reprojected files: rain >= 10 mm/h on the rainfall
+    track, lightning occurrence on the lightning track, over the whole
+    canvas. None when a lead's file is missing."""
+    total = 0
+    for o in offsets:
+        gt_hhmm, gt_day = _resolve_gt(ref_utc, o * step, date_str)
+        if track == "rainfall":
+            field = _load_gt_rainfall_canvas(data_root, gt_day, gt_hhmm)
+            if field is None:
+                return None
+            total += int((_mmh_to_class(field) > 0).sum())
+        else:
+            canvas = _load_gt_lightning_canvas(data_root, gt_day, gt_hhmm)
+            if canvas is None:
+                return None
+            total += int((canvas > 0).sum())
+    return total
+
+
+def picks_from_summary(summary_path, mode: str = "csi", top_n: int | None = None,
+                       data_root: Path | None = None,
                        ) -> list[tuple[str, str, str]]:
-    """(label, date, reference_utc) of the top N samples of a run.
+    """(label, date, reference_utc) of the top N samples of a run, from
+    the samples CSV next to the summary; N defaults to 5.
 
     mode "csi": ranked by the mean of the per-sample CSI over leads,
-    descending, from the samples CSV next to the summary; N defaults to
-    5. Labels csi_top01, csi_top02, ... Used by --pick in
-    visualize_gt_vs_pred and predict_full_domain.
+    descending. Labels csi_top01, csi_top02, ...
+    mode "active": ranked by the ground-truth-active pixels summed over
+    the leads (rain >= 10 mm/h, or lightning occurrence), descending,
+    from the `gt_active_px_t+*` columns the validation writes; a CSV
+    from before those columns is ranked from the ground-truth files
+    under `data_root`. Labels active_top01, active_top02, ...
+    Used by --pick in visualize_gt_vs_pred and predict_full_domain; the
+    two prefixes keep the two sets of figures apart.
     """
     if mode not in PICK_MODES:
         raise SystemExit(f"unknown pick mode {mode!r}; choose from {PICK_MODES}")
@@ -916,17 +1023,44 @@ def picks_from_summary(summary_path, mode: str = "csi", top_n: int | None = None
     if not rows:
         raise SystemExit(f"no samples CSV next to {summary_path}")
     track = summary.get("track", "rainfall")
-    cols = ([f"csi_t+{o}" for o in offsets] if track == "rainfall"
-            else [f"csi_t+{o * step}" for o in offsets])
+
+    def _cols(prefix):
+        return ([f"{prefix}_t+{o}" for o in offsets] if track == "rainfall"
+                else [f"{prefix}_t+{o * step}" for o in offsets])
+
     scored = []
-    for r in rows:
-        vals = [r[c] for c in cols if r.get(c) is not None]
-        if vals:
-            scored.append((sum(vals) / len(vals), r["date"], r["reference_utc"]))
-    if not scored:
-        raise SystemExit(f"{summary_path}: the samples CSV has no per-sample CSI")
+    if mode == "csi":
+        cols = _cols("csi")
+        for r in rows:
+            vals = [r[c] for c in cols if r.get(c) is not None]
+            if vals:
+                scored.append((sum(vals) / len(vals), r["date"], r["reference_utc"]))
+        if not scored:
+            raise SystemExit(f"{summary_path}: the samples CSV has no per-sample CSI")
+    else:
+        cols = _cols("gt_active_px")
+        if all(c in rows[0] for c in cols):
+            for r in rows:
+                vals = [r[c] for c in cols if r.get(c) is not None]
+                if vals:
+                    scored.append((sum(vals), r["date"], r["reference_utc"]))
+        else:
+            if data_root is None:
+                raise SystemExit(
+                    f"{summary_path}: the samples CSV predates the gt_active_px "
+                    f"columns and no data_root was given to read the ground "
+                    f"truth; re-run the validation or pass --data_root")
+            print(f"  {summary_path.name}: no gt_active_px columns; counting the "
+                  f"ground-truth-active pixels of {len(rows)} samples from the files ...")
+            for r in rows:
+                n = _gt_active_from_files(track, Path(data_root), r["date"],
+                                          r["reference_utc"], offsets, step)
+                if n is not None:
+                    scored.append((n, r["date"], r["reference_utc"]))
+        if not scored:
+            raise SystemExit(f"{summary_path}: no sample with a ground-truth count")
     scored.sort(key=lambda t: (-t[0], t[1], t[2]))
-    return [(f"csi_top{i:02d}", d, ref)
+    return [(f"{mode}_top{i:02d}", d, ref)
             for i, (_, d, ref) in enumerate(scored[:top_n], 1)]
 
 def _hmf_percentages(tp: int, fp: int, fn: int) -> dict[str, float | None]:
@@ -1060,6 +1194,127 @@ def _plot_metrics_bars(summary: dict, offsets: list[int], step: int,
     fig.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"  Wrote {path.name}")
+
+
+HYSTERESIS_COLORS = {"hits": "tab:orange", "misses": "tab:blue",
+                     "false_alarms": "tab:red"}
+
+
+def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
+                          path: Path) -> bool:
+    """What the hysteresis post-processing buys on the scope samples,
+    per lead: the change in the pooled hit, miss and false-alarm pixel
+    counts from the raw decision to the post-processed one (top), and
+    the pooled rates of both (bottom: hits and misses over the
+    GT-active pixels, false alarms over the predicted-active pixels,
+    the denominators of the other hits / misses / false alarms
+    figures). Raw is the argmax class map on the rainfall track and
+    the plain p >= LOW decision on the lightning track. Needs
+    `metrics_per_lead_raw` in the summary; returns False without it."""
+    raw_per_lead = summary.get("metrics_per_lead_raw")
+    post_per_lead = summary.get("metrics_per_lead") or {}
+    pp = summary.get("post_processing") or {}
+    if not raw_per_lead or str(pp.get("method", "")).startswith("none"):
+        print("  No raw-versus-post counts in this summary; hysteresis figure skipped")
+        return False
+    lead_titles = [f"t+{o * step}" for o in offsets]
+    # The rainfall summary keys its thresholds by step index (t+1), the
+    # lightning one by minutes (t+15); accept both.
+    def _per_lead(block):
+        block = block or {}
+        return {f"t+{o * step}": block.get(f"t+{o * step}", block.get(f"t+{o}"))
+                for o in offsets}
+    lows = _per_lead(pp.get("low_threshold_per_lead"))
+    highs = _per_lead(pp.get("high_threshold_per_lead"))
+    counts = {}
+    for lt in lead_titles:
+        r, p = raw_per_lead.get(lt) or {}, post_per_lead.get(lt) or {}
+        counts[lt] = {"raw": (int(r.get("TP", 0)), int(r.get("FP", 0)), int(r.get("FN", 0))),
+                      "post": (int(p.get("TP", 0)), int(p.get("FP", 0)), int(p.get("FN", 0)))}
+
+    def _count(trip, name):
+        tp, fp, fn = trip
+        return {"hits": tp, "misses": fn, "false_alarms": fp}[name]
+
+    labels = {"hits": "hits", "misses": "misses", "false_alarms": "false alarms"}
+    n_lead = len(lead_titles)
+    x = np.arange(n_lead)
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, 2.6 * n_lead + 3), 9),
+                                         constrained_layout=True)
+
+    # Top: change of the pixel counts, raw -> post, per lead
+    width = 0.8 / 3
+    for j, name in enumerate(HMF_NAMES):
+        xs = x + (j - 1) * width
+        vals = []
+        for lt in lead_titles:
+            a, b = _count(counts[lt]["raw"], name), _count(counts[lt]["post"], name)
+            vals.append(100.0 * (b - a) / a if a else np.nan)
+        bars = ax_top.bar(xs, [0.0 if np.isnan(v) else v for v in vals], width,
+                          color=HYSTERESIS_COLORS[name], edgecolor="white",
+                          linewidth=0.5, label=labels[name])
+        for bar, v in zip(bars, vals):
+            y = bar.get_height()
+            ax_top.annotate("n/a" if np.isnan(v) else f"{v:+.1f} %",
+                            (bar.get_x() + bar.get_width() / 2, y),
+                            xytext=(0, 3 if y >= 0 else -3), textcoords="offset points",
+                            ha="center", va="bottom" if y >= 0 else "top", fontsize=8)
+    ax_top.axhline(0.0, color="black", linewidth=0.8)
+    ax_top.set_xticks(x)
+    # The counts behind the bars, under each lead: raw -> post.
+    ax_top.set_xticklabels([
+        lt + "".join(f"\n{labels[name]} {_count(counts[lt]['raw'], name):,} -> "
+                     f"{_count(counts[lt]['post'], name):,}" for name in HMF_NAMES)
+        for lt in lead_titles], fontsize=8)
+    ax_top.set_ylabel("Change of the pixel count (%)")
+    ax_top.set_title("Raw -> post-processed: change of the pooled hit / miss / false-alarm "
+                     "pixel counts per lead (fewer misses and false alarms is the gain)")
+    ax_top.grid(axis="y", alpha=0.3)
+    ax_top.margins(y=0.25)
+    ax_top.legend(loc="best", fontsize=9)
+
+    # Bottom: the pooled rates, raw (hatched) and post (solid)
+    width = 0.8 / 6
+    for j, name in enumerate(HMF_NAMES):
+        for k, which in enumerate(("raw", "post")):
+            xs = x + (2 * j + k - 2.5) * width
+            vals = []
+            for lt in lead_titles:
+                tp, fp, fn = counts[lt][which]
+                vals.append(_hmf_percentages(tp, fp, fn)[name])
+            bars = ax_bot.bar(xs, [0.0 if v is None else v for v in vals], width,
+                              color=HYSTERESIS_COLORS[name],
+                              alpha=0.45 if which == "raw" else 1.0,
+                              hatch="//" if which == "raw" else None,
+                              edgecolor="white", linewidth=0.5,
+                              label=f"{labels[name]} {which}")
+            for bar, v in zip(bars, vals):
+                ax_bot.annotate("n/a" if v is None else f"{v:.1f}",
+                                (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                                xytext=(0, 2), textcoords="offset points",
+                                ha="center", va="bottom", fontsize=7)
+    ax_bot.set_xticks(x)
+    ax_bot.set_xticklabels([
+        f"{lt}\nLOW {lows[lt]:.2f}  HIGH {highs[lt]:.2f}"
+        if lows.get(lt) is not None and highs.get(lt) is not None else lt
+        for lt in lead_titles])
+    ax_bot.set_ylabel("%")
+    ax_bot.set_ylim(0, 105)
+    ax_bot.set_title("Pooled rates: hits and misses over the GT-active pixels, false alarms "
+                     "over the predicted-active pixels (hatched = raw, solid = post-processed)")
+    ax_bot.grid(axis="y", alpha=0.3)
+    ax_bot.legend(loc="upper right", fontsize=8, ncol=3)
+
+    raw_def = summary.get("raw_definition") or (
+        "argmax class map, no hysteresis" if summary.get("track") == "rainfall"
+        else "p >= LOW, no hysteresis")
+    fig.suptitle(f"{_run_title(summary)}  |  hysteresis vs raw ({raw_def}), "
+                 f"{summary.get('total_selected_samples', len(summary.get('initial_selection', [])))} scope samples",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {path.name}")
+    return True
 
 
 def _plot_coverage_scatter(summary: dict, rows: list[dict], offsets: list[int],
@@ -1279,7 +1534,8 @@ def plot_tuning_from_summary(summary_path: Path, out_path: Path) -> None:
 def make_plots(summary_path: Path) -> list[Path]:
     """Every figure the saved run allows, next to the summary: metrics
     bars, coverage scatter (rainfall), hits / misses / false alarms,
-    their percentiles, and the tuning curves (runs with a sweep).
+    their percentiles, what the hysteresis buys over the raw decision,
+    and the tuning curves (runs with a sweep).
     Called at the end of an extraction and by --plots."""
     summary_path = Path(summary_path)
     summary, rows, offsets, step, stem = _load_run(summary_path)
@@ -1299,6 +1555,8 @@ def make_plots(summary_path: Path) -> list[Path]:
     if rows:
         _plot_hmf_figure(summary, rows, offsets, step, out("hmf"))
         _plot_hmf_percentiles(summary, rows, offsets, step, out("hmf_percentiles"))
+    if not _plot_hysteresis_gain(summary, offsets, step, out("hysteresis")):
+        made.pop()
     pp = summary.get("post_processing") or {}
     if pp.get("low_sweep"):
         plot_rainfall_tuning(summary, out("tuning_low"), out("tuning_high"))
@@ -1320,6 +1578,7 @@ def run_extraction(track: str, year: int, month: int,
                    rainfall_window: float = 0.02,
                    rainfall_reach: float = 0.10,
                    tune_leads: str = "each",
+                   cache_gb: float | None = None,
                    period=None,
                    baseline: bool = False):
     """Extraction mode for the rainfall track, in three phases.
@@ -1493,7 +1752,20 @@ def run_extraction(track: str, year: int, month: int,
 
     if not baseline:
         # ---- Phase 1: LOW per lead from a plain threshold sweep --------
+        # Phase 2 needs the same predictions phase 1 just made. They are
+        # kept in memory (scores as they are, class canvases as int8,
+        # which holds -1..4 exactly) up to --cache_gb, and replayed; past
+        # the budget the tuning samples go through the model again.
+        cache_limit = int((cache_gb if cache_gb is not None
+                           else _default_cache_gb()) * 1e9)
+        replay: list | None = [] if cache_limit > 0 else None
+        replay_bytes = 0
+        print(f"  Replay cache: up to {cache_limit / 1e9:.0f} GB of phase-1 "
+              f"predictions (--cache_gb)")
+
         def _phase1(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
+            nonlocal replay, replay_bytes
+
             def one(i):
                 if i not in tuned:
                     return None
@@ -1501,6 +1773,19 @@ def run_extraction(track: str, year: int, month: int,
                 gt_pos_total = int(((gts[i] > 0) & (gts[i] >= 0)).sum())
                 return pos, neg, gt_pos_total
             tune_hist.append(_map_leads(one, L))
+            if replay is not None:
+                item = ([scores[i] if i in tuned else None for i in range(L)],
+                        [eligible[i] if i in tuned else None for i in range(L)],
+                        [gts[i].astype(np.int8) if i in tuned else None
+                         for i in range(L)])
+                size = sum(a.nbytes for part in item for a in part if a is not None)
+                if replay_bytes + size > cache_limit:
+                    print(f"  Replay cache full after {len(replay)} samples; "
+                          f"phase 2 will predict the tuning samples again")
+                    replay = None
+                else:
+                    replay.append((date_str, ref_utc, item))
+                    replay_bytes += size
 
         tune_dates = _run(tuning_selected, "Phase 1 - LOW sweep on the "
                           "validation split", _phase1)
@@ -1544,8 +1829,17 @@ def run_extraction(track: str, year: int, month: int,
                 return out
             tune_window.append(_map_leads(one, L))
 
-        _run(tuning_selected, "Phase 2 - window sweep on the validation "
-             "split", _phase2)
+        if replay is not None and len(replay) == len(tune_dates):
+            print(f"\nPhase 2 - replaying the phase-1 predictions of "
+                  f"{len(replay)} samples from memory "
+                  f"({replay_bytes / 1e9:.1f} GB)")
+            for n, (date_str, ref_utc, (scores, eligible, gts8)) in enumerate(replay):
+                gts = [None if g is None else g.astype(np.int32) for g in gts8]
+                _phase2(n, date_str, ref_utc, None, scores, eligible, gts)
+            replay = None
+        else:
+            _run(tuning_selected, "Phase 2 - window sweep on the validation "
+                 "split", _phase2)
         print("\nPhase 2 result (hysteresis (LOW, HIGH), pooled CSI):")
         for i in tuned:
             offset = LEAD_STEP_OFFSETS[i]
@@ -1609,6 +1903,8 @@ def run_extraction(track: str, year: int, month: int,
             for name in HMF_NAMES:
                 row[f"{name}_pct_t+{offset}"] = pct[name]
             row[f"csi_t+{offset}"] = (tp / (tp + fp + fn) if (tp + fp + fn) else None)
+            row[f"gt_active_px_t+{offset}"] = int(tp + fn)
+            row[f"pred_active_px_t+{offset}"] = int(tp + fp)
             _merge_patch_counts(patch_acc, i, per_patch)
         rows.append(row)
 
@@ -1660,6 +1956,7 @@ def run_extraction(track: str, year: int, month: int,
         "metrics_per_lead_raw": {
             f"t+{off * step_minutes}": _summarise_confusion(confusion_raw[i])
             for i, off in enumerate(LEAD_STEP_OFFSETS)},
+        "raw_definition": "argmax class map, no hysteresis",
     }
 
     stem = f"{track}_{scope_stem(year, month)}_{tag}"
@@ -2521,6 +2818,7 @@ def _write_csv_lightning(rows: list[dict], path: Path, step_minutes: int):
         m = offset * step_minutes
         fieldnames += [
             f"iou_t+{m}", f"far_t+{m}", f"pod_t+{m}", f"csi_t+{m}",
+            f"gt_active_px_t+{m}", f"pred_active_px_t+{m}",
         ]
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -2801,6 +3099,10 @@ def run_extraction_lightning(
     rows: list[dict] = []
     aggregate_confusion_per_lead = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
                                     for i in range(L)}
+    # The raw decision, p >= LOW with no hysteresis, on the same pixels:
+    # what the post-processing is measured against.
+    raw_confusion_per_lead = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0}
+                              for i in range(L)}
     patch_acc: dict = {}
 
     def _phase_b(n, date_str, ref_utc, probs, gts):
@@ -2811,18 +3113,28 @@ def run_extraction_lightning(
                 return None
             h = best_high_per_lead[LEAD_STEP_OFFSETS[i]]
             conf, patches = sweep_hysteresis(probs[i], low_threshold, [h], gts[i])
-            return conf[h], patches[h]
+            gt = gts[i]
+            pred = probs[i] >= low_threshold
+            gt_pos = gt > 0
+            gt_neg = gt == 0
+            raw = (int((pred & gt_pos).sum()), int((pred & gt_neg).sum()),
+                   int((~pred & gt_pos).sum()), int((~pred & gt_neg).sum()))
+            return conf[h], patches[h], raw
 
         results = _map_leads(one, L)
         for i, offset in enumerate(LEAD_STEP_OFFSETS):
             m = offset * step_minutes
             if results[i] is None:
-                for name in ("iou", "far", "pod", "csi"):
+                for name in ("iou", "far", "pod", "csi", "gt_active_px", "pred_active_px"):
                     row[f"{name}_t+{m}"] = None
                 continue
-            (tp, fp, fn, tn), per_patch = results[i]
+            (tp, fp, fn, tn), per_patch, raw = results[i]
+            row[f"gt_active_px_t+{m}"] = int(tp + fn)
+            row[f"pred_active_px_t+{m}"] = int(tp + fp)
             for key, val in zip(("TP", "FP", "FN", "TN"), (tp, fp, fn, tn)):
                 aggregate_confusion_per_lead[i][key] += val
+            for key, val in zip(("TP", "FP", "FN", "TN"), raw):
+                raw_confusion_per_lead[i][key] += val
             per = _summarise_confusion({"TP": tp, "FP": fp, "FN": fn, "TN": tn})
             row[f"iou_t+{m}"] = _iou_lightning(tp, fp, fn)
             row[f"far_t+{m}"] = per["FAR"]
@@ -2838,8 +3150,9 @@ def run_extraction_lightning(
     print("\nScope results at the chosen thresholds:")
     for i, offset in enumerate(LEAD_STEP_OFFSETS):
         m = _summarise_confusion(aggregate_confusion_per_lead[i])
+        r = _summarise_confusion(raw_confusion_per_lead[i])
         print(f"  t+{offset * step_minutes}: CSI={m['CSI']:.4f} POD={m['POD']:.4f} "
-              f"FAR={m['FAR']:.4f}")
+              f"FAR={m['FAR']:.4f}  (raw p >= LOW CSI={r['CSI']:.4f})")
 
     stem = f"lightning_{scope_stem(year, month)}_{tag}"
     _write_csv_lightning(rows, output_dir / f"{stem}_samples.csv", step_minutes)
@@ -2852,6 +3165,10 @@ def run_extraction_lightning(
         high_coverage_pct=high_coverage_pct,
         per_patch=per_patch_scores(patch_acc),
         extra={
+            "metrics_per_lead_raw": {
+                f"t+{off * step_minutes}": _summarise_confusion(raw_confusion_per_lead[i])
+                for i, off in enumerate(LEAD_STEP_OFFSETS)},
+            "raw_definition": f"p >= LOW {low_threshold:.2f}, no hysteresis",
             "sampling": {"max_samples": MAX_SAMPLES, "month_batch": MONTH_BATCH,
                          "seed": SEED},
             "tuning": {"split": "validation", "n_samples": len(tune_dates),
@@ -3794,6 +4111,12 @@ def main() -> int:
                              f"the draw (default {MONTH_BATCH}).")
     parser.add_argument("--seed", type=int, default=SEED,
                         help=f"Seed of the draw (default {SEED}).")
+    parser.add_argument("--cache_gb", type=float, default=None,
+                        help="Rainfall track: memory budget for keeping the "
+                             "phase-1 predictions of the tuning samples so "
+                             "phase 2 replays them instead of predicting "
+                             "again (default: a third of the physical "
+                             "memory; 0 disables).")
     parser.add_argument("--workers", type=int, default=WORKERS,
                         help=f"CPU threads for the per-lead sweeps "
                              f"(default {WORKERS}).")
@@ -3904,6 +4227,7 @@ def main() -> int:
                     rainfall_window=args.rainfall_window,
                     rainfall_reach=args.rainfall_reach,
                     tune_leads=args.tune_leads,
+                    cache_gb=args.cache_gb,
                     period=period,
                     baseline=baseline,
                 )
