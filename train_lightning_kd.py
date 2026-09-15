@@ -75,6 +75,8 @@ from train_models import (
     load_dataset,
     configure_tf_runtime,
     WallTimeCallback,
+    load_training_config,
+    cosine_warmup_schedule,
 )
 
 from pipeline_config import (
@@ -349,7 +351,7 @@ def train_kd(
     alpha: float, temperature: float,
     source: str = "dbscan",
     teacher_finetuned: bool = False,
-    learning_rate: float = 1e-4,
+    lr_schedule: dict | None = None,
     patience: int = 10,
     seed: int = 42,
     shuffle_buffer: int = 256,
@@ -411,7 +413,13 @@ def train_kd(
     print(f"  Student mode:  {student_mode}")
     print(f"  Source:        {source}")
     print(f"  Dataset:       {dataset_dir}")
-    print(f"  Batch size:    {batch_size}   Epochs: {epochs}   LR: {learning_rate}")
+    # The same cosine-with-warmup schedule the other models train on,
+    # from [lr_schedule] in training.config (or its defaults).
+    if lr_schedule is None:
+        lr_schedule = {"initial_lr": 1e-3, "warmup_epochs": 3, "min_lr": 1e-6}
+    print(f"  Batch size:    {batch_size}   Epochs: {epochs}")
+    print(f"  LR schedule:   cosine_warmup (initial={lr_schedule['initial_lr']:g}, "
+          f"warmup={lr_schedule['warmup_epochs']} ep, min={lr_schedule['min_lr']:g})")
     print(f"  KD alpha:      {alpha}")
     print(f"  KD temperature:{temperature}")
     print(f"  Teacher past_hr channels: {teacher_input_shapes['past_hr'][-1]}"
@@ -455,7 +463,8 @@ def train_kd(
     )
     print(f"  Soft loss: KL x T^2, T={temperature:g}, "
           f"{'teacher-weighted, floor ' + format(weight_floor, 'g') if soft_weight == 'teacher' else 'unweighted'}")
-    kd_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate))
+    kd_model.compile(optimizer=tf.keras.optimizers.Adam(
+        learning_rate=lr_schedule["initial_lr"]))
 
     # Per-epoch checkpoint of the STUDENT (the teacher is frozen), the
     # same layout the base training uses: checkpoints/<tag>_kd_latest.keras
@@ -498,9 +507,17 @@ def train_kd(
         monitor='val_loss', patience=patience,
         restore_best_weights=True, verbose=1,
     )
-    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss', factor=0.5, patience=max(3, patience // 2),
-        min_lr=1e-8, min_delta=1e-4, verbose=1,
+    # Cosine with warmup, a pure function of the epoch index, so a resumed
+    # run (initial_epoch > 0) lands on the same rate it stopped at. No
+    # ReduceLROnPlateau on top: the decay is already explicit.
+    lr_sched = tf.keras.callbacks.LearningRateScheduler(
+        cosine_warmup_schedule(
+            initial_lr=lr_schedule["initial_lr"],
+            warmup_epochs=lr_schedule["warmup_epochs"],
+            total_epochs=epochs,
+            min_lr=lr_schedule["min_lr"],
+        ),
+        verbose=1,
     )
     wall_timer = WallTimeCallback()
 
@@ -511,7 +528,7 @@ def train_kd(
     history = kd_model.fit(
         train_ds, validation_data=val_ds, epochs=epochs,
         initial_epoch=initial_epoch,
-        callbacks=[early_stop, reduce_lr, wall_timer, _StudentCheckpoint()],
+        callbacks=[lr_sched, early_stop, wall_timer, _StudentCheckpoint()],
         verbose=1,
     )
     total_time = time.time() - t0
@@ -535,7 +552,7 @@ def train_kd(
         "epochs_configured": epochs,
         "epochs_completed": len(history.history.get("loss", [])),
         "batch_size": batch_size,
-        "learning_rate": learning_rate,
+        "lr_schedule": {"type": "cosine_warmup", **lr_schedule},
         "patience": patience,
         "seed": seed,
         "student_params": int(student.count_params()),
@@ -624,7 +641,13 @@ def main() -> int:
                    help="Where the training curves are drawn after the run "
                         "(<eval_root>/eval_<student_tag>_kd/, the folder the "
                         "student's evaluation uses).")
-    p.add_argument("--learning_rate", type=float, default=1e-4)
+    p.add_argument("--config", type=str, default="training.config",
+                   help="training.config whose [lr_schedule] section gives "
+                        "the cosine-with-warmup schedule, the one the other "
+                        "models train on (default training.config).")
+    p.add_argument("--learning_rate", type=float, default=None,
+                   help="Override [lr_schedule].initial_lr, the peak rate "
+                        "the warmup climbs to and the cosine decays from.")
     p.add_argument("--patience", type=int, default=10,
                    help="EarlyStopping patience on val_loss.")
     p.add_argument("--seed", type=int, default=42)
@@ -647,12 +670,23 @@ def main() -> int:
             f"--kd_temperature must be > 0; got {args.kd_temperature}"
         )
 
+    cfg_path = Path(args.config)
+    if cfg_path.is_file():
+        lr_schedule = dict(load_training_config(cfg_path)["lr_schedule"])
+    else:
+        print(f"WARNING: {cfg_path} not found; using the default schedule")
+        lr_schedule = {"type": "cosine_warmup", "initial_lr": 1e-3,
+                       "warmup_epochs": 3, "min_lr": 1e-6}
+    lr_schedule.pop("type", None)
+    if args.learning_rate is not None:
+        lr_schedule["initial_lr"] = float(args.learning_rate)
+
     train_kd(
         data_root=Path(args.data_root), model_dir=Path(args.model_dir),
         epochs=args.epochs, batch_size=args.batch_size,
         alpha=args.kd_alpha, temperature=args.kd_temperature,
         source=SOURCE, teacher_finetuned=args.teacher_finetuned,
-        learning_rate=args.learning_rate, patience=args.patience,
+        lr_schedule=lr_schedule, patience=args.patience,
         seed=args.seed, shuffle_buffer=args.shuffle_buffer,
         mixed_precision=not args.no_mixed_precision,
         period=args.period, datasets_root=Path(args.datasets_root),
