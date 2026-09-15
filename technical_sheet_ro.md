@@ -570,6 +570,8 @@ python train_models.py --config training.config --mode mtg_lightning_opera_occur
 python train_lightning_kd.py --period f34 --epochs 30 --batch_size 32 --datasets_root E:/nowcasting/datasets --model_dir E:/nowcasting/models
 ```
 - **Descriere** — antrenează pe setul de date al **modelului-profesor**, cu `past_hr` restrâns la ultimele `STUDENT_HR_CHANNELS` (= `vis_06`), astfel încât modelul-student nu vede niciodată date de fulgere. Funcția de pierdere combină țintele atenuate ale modelului-profesor la `--kd_alpha 0.7`, temperatura 4.0, cu valorile de referință.
+- **Funcția de cost** — termenul soft: divergența KL per pixel între profesor și student, ambii înmuiați cu temperatura (T = 2 implicit), ponderată cu probabilitatea brută a profesorului plus un prag de 0,01, astfel încât gradientul să se concentreze unde profesorul are o opinie, înmulțită cu T²; termenul hard: funcția focală a profesorului față de LINET; total = 0,7·soft + 0,3·hard. Valoarea soft afișată este numai nepotrivirea, nu entropia profesorului. `--kd_temperature`, `--kd_soft_weight`, `--kd_weight_floor`, `--kd_alpha` le modifică.
+- **Grafic** — după execuție, `evaluation/eval_<student_tag>_kd/training_{loss,l_soft,l_hard}.png`, cu valorile exacte de la cea mai bună și de la ultima epocă în legendă.
 - **Notă** — `mtg_opera_occurrence` **nu** poate fi construit cu `create_datasets`: există exclusiv ca model-student pe datele modelului-profesor.
 - **Scrie** — `models/coalition_<student_run_tag>_kd.keras`, `history_…_kd.json` **CRITIC**
 

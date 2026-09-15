@@ -1567,12 +1567,23 @@ def plot_training_history(history_path, output_dir, sidecar_path=None):
     for train_k, val_k, ylabel in curves:
         if train_k not in history:
             continue
-        fig, ax = plt.subplots(figsize=(7, 4.6))
+        def _label(prefix, key):
+            """`train loss  best 0.0932 (ep 16)  last 0.0928 (ep 30)`: the
+            exact values at the best epoch and at the last epoch run."""
+            vals = history[key][:n]
+            parts = [f"{prefix} {train_k}"]
+            if best and 1 <= best <= len(vals):
+                parts.append(f"best {vals[best - 1]:.4f} (ep {best})")
+            if vals:
+                parts.append(f"last {vals[-1]:.4f} (ep {len(vals)})")
+            return "  ".join(parts)
+
+        fig, ax = plt.subplots(figsize=(7.5, 4.8))
         ax.plot(epochs, history[train_k][:n], 'b-', linewidth=2,
-                label=f"train {train_k}")
+                label=_label("train", train_k))
         if val_k and val_k in history:
             ax.plot(epochs, history[val_k][:n], 'r-', linewidth=2,
-                    label=f"val {train_k}")
+                    label=_label("val", val_k))
         draw_cutoffs(ax, best, last)
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
