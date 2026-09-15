@@ -212,11 +212,14 @@ def _ref_to_hhmm(ref_utc: str, offset_min: int,
 # ============================================================================
 # Full-domain patch assembly (no on-disk .npy patches required)
 # ============================================================================
-def _load_and_slice_patches(data_root: Path, variable: str, date_str: str,
-                            hhmm: str, target_res: int) -> list[np.ndarray] | None:
-    """Load the reprojected full-domain field, slice all 18 patches, pool
-    down to target_res. Returns list of 18 arrays each shape (target_res,
-    target_res) as float32, or None if the field file is missing."""
+def _load_transformed_field(data_root: Path, variable: str, date_str: str,
+                            hhmm: str, transform_fn, target_res: int,
+                            ) -> np.ndarray | None:
+    """The reprojected full-domain field of one variable, pooled to
+    target_res and transformed once, as (h, w, C_var) float32; None if
+    the file is missing. Slicing it at a patch gives exactly what
+    pooling and transforming that patch's tile gave."""
+    from lightning_postproc import transform_full_field
     group = _VARIABLE_TO_GROUP.get(variable)
     if group is None:
         return None
@@ -227,17 +230,8 @@ def _load_and_slice_patches(data_root: Path, variable: str, date_str: str,
     )
     if path is None:
         return None
-    field = load_reprojected(path)          # (768, 1536), float32
-    pool_factor = PATCH_SIZE // target_res
-
-    patches = []
-    for p in range(1, N_PATCHES + 1):
-        r0, r1, c0, c1 = get_patch_bounds(p)
-        tile = field[r0:r1, c0:c1]
-        if pool_factor > 1:
-            tile = average_pool(tile, pool_factor)
-        patches.append(tile.astype(np.float32))
-    return patches
+    field = load_reprojected(path)          # (768, 1536)
+    return transform_full_field(field, transform_fn, PATCH_SIZE // target_res)
 
 
 def _build_group_batch(data_root: Path, mode_config: dict, group_key: str,
@@ -262,69 +256,59 @@ def _build_group_batch(data_root: Path, mode_config: dict, group_key: str,
     if group is None:
         return np.empty((0,), dtype=np.float32), []
     var_config, resolution, _suffix = group
+    pool = PATCH_SIZE // resolution
+    T = len(INPUT_STEP_OFFSETS)
+    var_names = list(var_config)
 
-    # For each input timestep, load one (patches x H x W) plate per variable.
-    # Structure per timestep: dict[var_name -> list of 18 (H, W) arrays].
-    per_step_channels: list[list[np.ndarray | None]] = []
-    for offset in INPUT_STEP_OFFSETS:
+    # fields[t][var] -> transformed (h, w, C_var) field, or None when
+    # the file is missing at that timestep. The T x V files are read in
+    # threads and assembled by index.
+    from lightning_postproc import read_fields_parallel
+
+    def _one(job):
+        t, var_name, day, hhmm, transform_fn = job
+        return _load_transformed_field(
+            data_root, var_name, day, hhmm, transform_fn, resolution)
+
+    jobs = []
+    for t, offset in enumerate(INPUT_STEP_OFFSETS):
         hhmm, day = _ref_to_hhmm(
             ref_utc, offset * step_minutes, date_str,
         )
-        step_channels: list[np.ndarray | None] = []
         for var_name, (transform_fn, _extra) in var_config.items():
-            patches = _load_and_slice_patches(
-                data_root, var_name, day, hhmm, resolution,
-            )
-            if patches is None:
-                step_channels.append(None)
-                continue
-            # Apply per-variable transform pixel-wise on each patch.
-            transformed = []
-            for tile in patches:
-                out = transform_fn(tile)
-                if out.ndim == 2:
-                    out = out[:, :, np.newaxis]
-                transformed.append(out.astype(np.float32))
-            step_channels.append(np.stack(transformed, axis=0))   # (18, H, W, C_var)
-        per_step_channels.append(step_channels)
+            jobs.append((t, var_name, day, hhmm, transform_fn))
+    fields: list[dict[str, np.ndarray | None]] = [{} for _ in INPUT_STEP_OFFSETS]
+    for job, out in zip(jobs, read_fields_parallel(_one, jobs)):
+        fields[job[0]][job[1]] = out
 
-    # Concatenate variables along channel dim per timestep, zero-filling
-    # any that were missing (so the channel count stays constant).
-    zero_shape_lookup: dict[int, tuple[int, int, int]] = {}
-    for vi, plates in enumerate(zip(*per_step_channels)):
-        for plate in plates:
-            if plate is not None:
-                zero_shape_lookup[vi] = plate.shape[1:]  # (H, W, C_var)
+    per_var_c: dict[str, int] = {}
+    for vn in var_names:
+        for t in range(T):
+            arr = fields[t][vn]
+            if arr is not None:
+                per_var_c[vn] = arr.shape[-1]
                 break
-
-    if not zero_shape_lookup:
+    if not per_var_c:
         # No data anywhere for this group at this reference -> zero batch
         return np.empty((0,), dtype=np.float32), []
 
-    # Reshape per_step_channels into (T, 18, H, W, C_group) with zero-fills
-    T = len(per_step_channels)
-    plates_per_var = list(zip(*per_step_channels))  # var -> tuple of T (18,H,W,C_var) or None
-
-    # Pick sample var shape for the (H, W) size (all vars in a group share the same resolution)
-    first_shape = next(iter(zero_shape_lookup.values()))
-    H, W = first_shape[0], first_shape[1]
-
-    n_valid_vars = len(plates_per_var)
-    filled_per_var = []
-    for vi, plates in enumerate(plates_per_var):
-        c_var = zero_shape_lookup.get(vi, (H, W, 1))[2]
-        filled_ts = []
+    # (18, T, H, W, C_group), written contiguously; a missing
+    # (variable, timestep) stays zero so the channel count is constant.
+    c_of = {vn: per_var_c.get(vn, 1) for vn in var_names}
+    batch = np.zeros((N_PATCHES, T, resolution, resolution, sum(c_of.values())),
+                     dtype=np.float32)
+    ch0 = 0
+    for vn in var_names:
+        ch1 = ch0 + c_of[vn]
         for t in range(T):
-            if plates[t] is None:
-                filled_ts.append(np.zeros((N_PATCHES, H, W, c_var),
-                                          dtype=np.float32))
-            else:
-                filled_ts.append(plates[t])
-        filled_per_var.append(np.stack(filled_ts, axis=0))  # (T, 18, H, W, C_var)
-
-    stacked = np.concatenate(filled_per_var, axis=-1)  # (T, 18, H, W, C_group)
-    # Reorder to (18, T, H, W, C_group) so we batch over patches
-    batch = np.transpose(stacked, (1, 0, 2, 3, 4))
+            arr = fields[t][vn]
+            if arr is None:
+                continue
+            for p in range(1, N_PATCHES + 1):
+                r0, r1, c0, c1 = get_patch_bounds(p)
+                batch[p - 1, t, :, :, ch0:ch1] = arr[r0 // pool:r1 // pool,
+                                                     c0 // pool:c1 // pool]
+        ch0 = ch1
 
     all_patches = list(range(1, N_PATCHES + 1))
     if restrict_to_patches is not None:
@@ -1068,12 +1052,16 @@ def main() -> int:
     parser.add_argument("--date", type=str, default=None,
                         help="Reference date (YYYY-MM-DD). Required unless "
                              "--pick names the timesteps.")
-    parser.add_argument("--pick", type=str, default=None, choices=["csi"],
-                        help="Run the --top_n best samples (default 5) by "
-                             "mean CSI over leads of the validation run in "
-                             "--validation_summary. No ground truth is "
-                             "needed; --date and the time flags are then "
-                             "ignored.")
+    parser.add_argument("--pick", type=str, default=None,
+                        choices=["csi", "active"],
+                        help="Run the --top_n samples (default 5) of the "
+                             "validation run in --validation_summary: "
+                             "`csi` the best by mean CSI over leads, "
+                             "`active` the ones with the most ground-truth-"
+                             "active pixels over the leads. Outputs are "
+                             "named csi_top<NN>_... or active_top<NN>_..., "
+                             "so the two sets coexist. --date and the time "
+                             "flags are then ignored.")
     parser.add_argument("--top_n", type=int, default=None,
                         help="With --pick csi: how many samples (default 5).")
     time_group = parser.add_mutually_exclusive_group()
@@ -1214,7 +1202,8 @@ def main() -> int:
     if args.pick:
         from validate_predictions import picks_from_summary
         picks = picks_from_summary(args.validation_summary, args.pick,
-                                   top_n=args.top_n)
+                                   top_n=args.top_n,
+                                   data_root=Path(args.data_root))
         jobs = [(d, r) for _, d, r in picks]
         pick_names = [n for n, _, _ in picks]
     else:

@@ -129,24 +129,32 @@ def _load_full_field(data_root: Path, variable: str,
     return field.astype(np.float32)
 
 
-def _slice_at_positions(
-    full_field: np.ndarray,
-    positions: list[tuple[int, int]],
-    target_res: int,
-    patch_size: int = DEFAULT_PATCH_SIZE,
-) -> np.ndarray:
-    """For each (r0, c0) in `positions`, slice the corresponding
-    (patch_size, patch_size) tile out of `full_field` and, if the target
-    resolution is smaller than patch_size, average-pool it down. Returns
-    stacked (N_positions, target_res, target_res) float32."""
-    pool_factor = patch_size // target_res
-    tiles = []
-    for r0, c0 in positions:
-        tile = full_field[r0:r0 + patch_size, c0:c0 + patch_size]
-        if pool_factor > 1:
-            tile = average_pool(tile, pool_factor)
-        tiles.append(tile.astype(np.float32))
-    return np.stack(tiles, axis=0)
+FIELD_READERS = 8      # threads reading one reference's input files
+
+
+def read_fields_parallel(fn, jobs: list) -> list:
+    """fn(job) for every job, in FIELD_READERS threads, results in job
+    order. Used for the file reads of one reference."""
+    if len(jobs) <= 1 or FIELD_READERS <= 1:
+        return [fn(j) for j in jobs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(FIELD_READERS, len(jobs))) as ex:
+        return list(ex.map(fn, jobs))
+
+
+def transform_full_field(field: np.ndarray, transform_fn, pool_factor: int
+                         ) -> np.ndarray:
+    """One variable's field, pooled to the group's resolution and
+    transformed ONCE, as (h, w, C_var) float32. Every input transform is
+    pixelwise with global statistics and the pooling averages fixed
+    blocks, so slicing this field at a patch gives exactly what pooling
+    and transforming the raw tile gave; the work is done once instead of
+    once per position."""
+    x = average_pool(field, pool_factor) if pool_factor > 1 else field
+    out = transform_fn(x.astype(np.float32))
+    if out.ndim == 2:
+        out = out[:, :, np.newaxis]
+    return out.astype(np.float32)
 
 
 def _build_group_batch_overlapped(
@@ -173,63 +181,61 @@ def _build_group_batch_overlapped(
     var_config, resolution, _suffix = group
 
     N = len(positions)
-    # per-timestep list of dicts {var_name -> (N, res, res) or None}
-    per_step: list[list[tuple[str, np.ndarray | None]]] = []
-    for offset in INPUT_STEP_OFFSETS:
+    T = len(INPUT_STEP_OFFSETS)
+    pool = patch_size // resolution
+    var_names = list(var_config)
+
+    # fields[t][var] -> the transformed (h, w, C_var) field, or None
+    # when the file is missing at that timestep. The T x V files are
+    # read in threads: reading and decompressing release the
+    # interpreter lock, and the result is assembled by index, so the
+    # order of completion does not matter.
+    def _one(job):
+        t, var_name, day, hhmm, transform_fn = job
+        full_field = _load_full_field(data_root, var_name, day, hhmm)
+        return (None if full_field is None
+                else transform_full_field(full_field, transform_fn, pool))
+
+    jobs = []
+    for t, offset in enumerate(INPUT_STEP_OFFSETS):
         hhmm, day = _ref_to_hhmm(
             ref_utc, offset * step_minutes, date_str,
         )
-        step_channels: list[tuple[str, np.ndarray | None]] = []
         for var_name, (transform_fn, _extra) in var_config.items():
-            full_field = _load_full_field(data_root, var_name, day, hhmm)
-            if full_field is None:
-                step_channels.append((var_name, None))
-                continue
-            tiles = _slice_at_positions(
-                full_field, positions, resolution, patch_size,
-            )
-            # Apply per-variable transform to each tile.
-            transformed = []
-            for t in tiles:
-                out = transform_fn(t)
-                if out.ndim == 2:
-                    out = out[:, :, np.newaxis]
-                transformed.append(out.astype(np.float32))
-            step_channels.append((var_name, np.stack(transformed, axis=0)))
-        per_step.append(step_channels)
+            jobs.append((t, var_name, day, hhmm, transform_fn))
+    fields: list[dict[str, np.ndarray | None]] = [{} for _ in INPUT_STEP_OFFSETS]
+    for job, out in zip(jobs, read_fields_parallel(_one, jobs)):
+        fields[job[0]][job[1]] = out
 
-    # Figure out the channel shape for each variable (needed for zero-fill).
-    T = len(INPUT_STEP_OFFSETS)
-    var_names = [vn for vn, _ in per_step[0]]
-    per_var_shapes: dict[str, tuple[int, int, int]] = {}
+    # Channel count per variable from its first available timestep
+    # (one channel when it was never on disk, the zero-fill width).
+    per_var_c: dict[str, int] = {}
     for vn in var_names:
         for t in range(T):
-            arr = dict(per_step[t]).get(vn)
+            arr = fields[t][vn]
             if arr is not None:
-                per_var_shapes[vn] = arr.shape[1:]  # (res, res, C_var)
+                per_var_c[vn] = arr.shape[-1]
                 break
-
-    if not per_var_shapes:
+    if not per_var_c:
         # No data anywhere - caller decides what to do (usually skip).
         return np.empty((0,), dtype=np.float32)
 
-    first_shape = next(iter(per_var_shapes.values()))
-    res_h, res_w = first_shape[0], first_shape[1]
-
-    # Assemble (N, T, res, res, C_group).
-    per_var_stacks = []
+    # Assemble (N, T, res, res, C_group) contiguously; a missing
+    # (variable, timestep) stays zero.
+    c_of = {vn: per_var_c.get(vn, 1) for vn in var_names}
+    batch = np.zeros((N, T, resolution, resolution, sum(c_of.values())),
+                     dtype=np.float32)
+    ch0 = 0
     for vn in var_names:
-        c_var = per_var_shapes.get(vn, (res_h, res_w, 1))[2]
-        t_stack = []
+        ch1 = ch0 + c_of[vn]
         for t in range(T):
-            arr = dict(per_step[t]).get(vn)
+            arr = fields[t][vn]
             if arr is None:
-                arr = np.zeros((N, res_h, res_w, c_var), dtype=np.float32)
-            t_stack.append(arr)
-        per_var_stacks.append(np.stack(t_stack, axis=0))  # (T, N, res, res, C_var)
-
-    stacked = np.concatenate(per_var_stacks, axis=-1)     # (T, N, res, res, C_group)
-    batch = np.transpose(stacked, (1, 0, 2, 3, 4))        # (N, T, res, res, C_group)
+                continue
+            for p, (r0, c0) in enumerate(positions):
+                r, c = r0 // pool, c0 // pool
+                batch[p, t, :, :, ch0:ch1] = arr[r:r + resolution, c:c + resolution]
+        ch0 = ch1
     return batch
 
 
