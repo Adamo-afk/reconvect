@@ -2056,18 +2056,17 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
         print(f"  Weights: latest (last epoch run, not the best)")
 
     if kd:
-        if weights == "latest":
-            raise FileNotFoundError(
-                "the KD student has no per-epoch checkpoint; drop "
-                "--weights latest for --kd")
         # KD student is saved via .save() so a straight load_model works;
         # the custom_objects list handles ResBlock / ResGRU / ConvBlock /
         # WeightedFocalLoss registration same as the base path.
-        kd_path = _resolve("_kd")
+        kd_path = (ckpt_dir / f"{run_tag}_kd_latest.keras" if weights == "latest"
+                   else _resolve("_kd"))
         if not kd_path.is_file():
             raise FileNotFoundError(
                 f"KD-student checkpoint not found: {kd_path}. "
                 f"Train it via `train_lightning_kd.py`."
+                + (" No per-epoch checkpoint for --weights latest."
+                   if weights == "latest" else "")
             )
         return tf.keras.models.load_model(
             str(kd_path), custom_objects=_custom_objects(),

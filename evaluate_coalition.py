@@ -1749,6 +1749,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     # name, so the variant has to pick the matching one.
     if weights == "latest":
         ckpt_stem = (f"{run_tag}_finetune_latest" if finetuned
+                     else f"{run_tag}_kd_latest" if kd
                      else f"{run_tag}_latest")
         model_path = model_dir / "checkpoints" / f"{ckpt_stem}.keras"
     else:
