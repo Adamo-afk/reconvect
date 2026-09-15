@@ -332,6 +332,7 @@ def train_kd(
     datasets_root: Path | None = None,
     teacher_mode: str = TEACHER_MODE,
     student_mode: str = STUDENT_MODE,
+    resume: bool = True,
 ):
     """Full KD training run. Loads the teacher's dataset, wraps
     (student, teacher) in KDModel, fits, saves the student only."""
@@ -424,6 +425,43 @@ def train_kd(
     )
     kd_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate))
 
+    # Per-epoch checkpoint of the STUDENT (the teacher is frozen), the
+    # same layout the base training uses: checkpoints/<tag>_kd_latest.keras
+    # plus a sidecar with the epoch counter, so an interrupted run
+    # resumes where it stopped (student weights and epoch; the Adam
+    # state starts afresh) and --weights latest can score the last
+    # epoch. EarlyStopping(restore_best_weights) still decides what the
+    # final coalition_<tag>_kd.keras holds.
+    student_run_tag = build_run_tag(student_mode, source, period)
+    ckpt_dir = model_dir / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"{student_run_tag}_kd_latest.keras"
+    ckpt_meta = ckpt_dir / f"{student_run_tag}_kd_latest.json"
+    initial_epoch = 0
+    if resume and ckpt_path.is_file():
+        try:
+            print(f"Resuming the student from {ckpt_path}")
+            student.load_weights(str(ckpt_path))
+            if ckpt_meta.is_file():
+                with open(ckpt_meta) as f:
+                    initial_epoch = int(json.load(f).get("next_epoch", 0))
+                print(f"  Resumed at epoch {initial_epoch}")
+        except Exception as e:
+            print(f"  WARNING: could not load {ckpt_path}: {e}; starting fresh")
+            initial_epoch = 0
+
+    class _StudentCheckpoint(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            try:
+                student.save(str(ckpt_path))
+                with open(ckpt_meta, "w") as f:
+                    json.dump({"next_epoch": epoch + 1,
+                               "completed_epoch": epoch}, f, indent=2)
+                print(f"  [ckpt] saved epoch {epoch + 1} -> {ckpt_path}")
+            except Exception as e:
+                print(f"  [ckpt] WARNING: failed to save checkpoint: {e}")
+
+    print(f"  Checkpoint:   per-epoch -> {ckpt_path}")
     early_stop = tf.keras.callbacks.EarlyStopping(
         monitor='val_loss', patience=patience,
         restore_best_weights=True, verbose=1,
@@ -440,12 +478,12 @@ def train_kd(
     t0 = time.time()
     history = kd_model.fit(
         train_ds, validation_data=val_ds, epochs=epochs,
-        callbacks=[early_stop, reduce_lr, wall_timer],
+        initial_epoch=initial_epoch,
+        callbacks=[early_stop, reduce_lr, wall_timer, _StudentCheckpoint()],
         verbose=1,
     )
     total_time = time.time() - t0
 
-    student_run_tag = build_run_tag(student_mode, source, period)
     student_path = model_dir / f"coalition_{student_run_tag}_kd.keras"
     student.save(str(student_path))
     print(f"\nSaved student: {student_path}")
@@ -512,6 +550,9 @@ def main() -> int:
                    help=f"Teacher mode (default {TEACHER_MODE}).")
     p.add_argument("--student_mode", type=str, default=STUDENT_MODE,
                    help=f"Student mode (default {STUDENT_MODE}).")
+    p.add_argument("--fresh", action="store_true",
+                   help="Ignore checkpoints/<student>_kd_latest.keras and "
+                        "start the student from scratch.")
     p.add_argument("--teacher_finetuned", action="store_true",
                    help="Distil from coalition_..._finetuned.keras instead "
                         "of the base teacher.")
@@ -562,6 +603,7 @@ def main() -> int:
         mixed_precision=not args.no_mixed_precision,
         period=args.period, datasets_root=Path(args.datasets_root),
         teacher_mode=args.teacher_mode, student_mode=args.student_mode,
+        resume=not args.fresh,
     )
     return 0
 
