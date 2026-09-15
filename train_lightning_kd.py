@@ -89,7 +89,14 @@ from pipeline_config import (
 # Constants (Hinton et al. defaults; overridable via CLI)
 # ============================================================================
 DEFAULT_KD_ALPHA = 0.7            # weight on the soft-teacher loss
-DEFAULT_KD_TEMPERATURE = 4.0      # temperature for both teacher and student
+DEFAULT_KD_TEMPERATURE = 2.0      # temperature for both teacher and student
+# The soft loss is weighted per pixel by the raw teacher probability plus
+# this floor ("teacher"), or unweighted ("none"). On a field that is
+# 99.8 % dry the unweighted mean is owned by the dry pixels; the weight
+# puts the gradient where the teacher has an opinion, the floor keeps a
+# faint "stay quiet here" signal on the rest.
+DEFAULT_KD_SOFT_WEIGHT = "teacher"
+DEFAULT_KD_WEIGHT_FLOOR = 0.01
 
 # The LAST channel of the teacher's past_hr is MTG vis_06 (the student's
 # only HR input); the first three are LINET density/current/occurrence.
@@ -116,16 +123,17 @@ def _inverse_sigmoid(p: tf.Tensor) -> tf.Tensor:
     return tf.math.log(p) - tf.math.log1p(-p)
 
 
-def _soft_bce(soft_teacher: tf.Tensor, soft_student: tf.Tensor) -> tf.Tensor:
-    """Element-wise BCE with the temperature-softened teacher as target and
-    softened student as prediction. Averages across the whole batch tensor.
-    Matches WeightedFocalLoss's `tf.reduce_mean` reduction so the two loss
-    terms are on the same scale before alpha weighting."""
-    soft_teacher = tf.clip_by_value(soft_teacher, _EPS, 1.0 - _EPS)
-    soft_student = tf.clip_by_value(soft_student, _EPS, 1.0 - _EPS)
-    bce = -soft_teacher * tf.math.log(soft_student) \
-          - (1.0 - soft_teacher) * tf.math.log(1.0 - soft_student)
-    return tf.reduce_mean(bce)
+def _soft_kl_map(soft_teacher: tf.Tensor, soft_student: tf.Tensor) -> tf.Tensor:
+    """Element-wise KL(teacher || student) of the temperature-softened
+    binary distributions, i.e. the cross-entropy minus the teacher's own
+    entropy. Same gradient as the cross-entropy (the entropy does not
+    depend on the student), but the value is the mismatch alone, so it
+    reads zero for a perfect student instead of sitting on a constant
+    floor of about T^2 * ln 2."""
+    t = tf.clip_by_value(soft_teacher, _EPS, 1.0 - _EPS)
+    s = tf.clip_by_value(soft_student, _EPS, 1.0 - _EPS)
+    return (t * (tf.math.log(t) - tf.math.log(s))
+            + (1.0 - t) * (tf.math.log(1.0 - t) - tf.math.log(1.0 - s)))
 
 
 def kd_loss(
@@ -133,9 +141,16 @@ def kd_loss(
     y_true: tf.Tensor,
     alpha: float, temperature: float,
     hard_loss_fn: tf.keras.losses.Loss,
+    soft_weight: str = DEFAULT_KD_SOFT_WEIGHT,
+    weight_floor: float = DEFAULT_KD_WEIGHT_FLOOR,
 ) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
     """Compute (total_loss, soft_component, hard_component). All three
-    reduced to a scalar so the training loop can log each independently."""
+    reduced to a scalar so the training loop can log each independently.
+
+    The soft component is the per-pixel KL of the softened teacher and
+    student, weighted per pixel by the raw teacher probability plus
+    `weight_floor` when `soft_weight` is "teacher" (unweighted for
+    "none"), averaged by the weights, times T^2."""
     teacher_probs = tf.cast(teacher_probs, tf.float32)
     student_probs = tf.cast(student_probs, tf.float32)
     y_true = tf.cast(y_true, tf.float32)
@@ -145,7 +160,12 @@ def kd_loss(
     soft_teacher = tf.sigmoid(_inverse_sigmoid(teacher_probs) / T)
     soft_student = tf.sigmoid(_inverse_sigmoid(student_probs) / T)
 
-    L_soft = _soft_bce(soft_teacher, soft_student) * (T * T)
+    kl = _soft_kl_map(soft_teacher, soft_student)
+    if soft_weight == "teacher":
+        w = teacher_probs + tf.constant(float(weight_floor), dtype=tf.float32)
+        L_soft = tf.reduce_sum(w * kl) / (tf.reduce_sum(w) + _EPS) * (T * T)
+    else:
+        L_soft = tf.reduce_mean(kl) * (T * T)
     L_hard = hard_loss_fn(y_true, student_probs)
 
     L_total = alpha * L_soft + (1.0 - alpha) * L_hard
@@ -166,9 +186,13 @@ class KDModel(tf.keras.Model):
         alpha: float, temperature: float,
         hard_loss_fn: tf.keras.losses.Loss,
         student_hr_channels: int = STUDENT_HR_CHANNELS,
+        soft_weight: str = DEFAULT_KD_SOFT_WEIGHT,
+        weight_floor: float = DEFAULT_KD_WEIGHT_FLOOR,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.soft_weight = soft_weight
+        self.weight_floor = float(weight_floor)
         self.student = student
         # Underscore prefix + object.__setattr__ so tf.keras.Model doesn't
         # auto-register teacher as a sub-layer (which would save its
@@ -222,6 +246,7 @@ class KDModel(tf.keras.Model):
             total, soft, hard = kd_loss(
                 teacher_probs, student_probs, y_true,
                 self.alpha, self.temperature, self.hard_loss_fn,
+                self.soft_weight, self.weight_floor,
             )
             loss_for_grad = (self.optimizer.get_scaled_loss(total)
                              if is_lso else total)
@@ -246,6 +271,7 @@ class KDModel(tf.keras.Model):
         total, soft, hard = kd_loss(
             teacher_probs, student_probs, y_true,
             self.alpha, self.temperature, self.hard_loss_fn,
+            self.soft_weight, self.weight_floor,
         )
         self.loss_tracker.update_state(total)
         self.soft_tracker.update_state(soft)
@@ -333,6 +359,9 @@ def train_kd(
     teacher_mode: str = TEACHER_MODE,
     student_mode: str = STUDENT_MODE,
     resume: bool = True,
+    soft_weight: str = DEFAULT_KD_SOFT_WEIGHT,
+    weight_floor: float = DEFAULT_KD_WEIGHT_FLOOR,
+    eval_root: Path = Path("./evaluation"),
 ):
     """Full KD training run. Loads the teacher's dataset, wraps
     (student, teacher) in KDModel, fits, saves the student only."""
@@ -422,7 +451,10 @@ def train_kd(
         alpha=alpha, temperature=temperature,
         hard_loss_fn=hard_loss_fn,
         student_hr_channels=STUDENT_HR_CHANNELS,
+        soft_weight=soft_weight, weight_floor=weight_floor,
     )
+    print(f"  Soft loss: KL x T^2, T={temperature:g}, "
+          f"{'teacher-weighted, floor ' + format(weight_floor, 'g') if soft_weight == 'teacher' else 'unweighted'}")
     kd_model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate))
 
     # Per-epoch checkpoint of the STUDENT (the teacher is frozen), the
@@ -497,6 +529,9 @@ def train_kd(
         "teacher_finetuned": teacher_finetuned,
         "kd_alpha": alpha,
         "kd_temperature": temperature,
+        "kd_soft_weight": soft_weight,
+        "kd_weight_floor": weight_floor,
+        "soft_loss_form": "KL(teacher || student) x T^2",
         "epochs_configured": epochs,
         "epochs_completed": len(history.history.get("loss", [])),
         "batch_size": batch_size,
@@ -517,6 +552,13 @@ def train_kd(
     with open(hist_path, "w") as f:
         json.dump(hist_data, f, indent=2)
     print(f"Saved history: {hist_path}")
+
+    # The training curves, with the exact values at the best and the
+    # last epoch, where the student's evaluation will land too.
+    from evaluate_coalition import plot_training_history
+    curves_dir = Path(eval_root) / f"eval_{student_run_tag}_kd"
+    curves_dir.mkdir(parents=True, exist_ok=True)
+    plot_training_history(hist_path, curves_dir, sidecar_path=ckpt_meta)
     print(f"\nTotal wall time: {total_time:.1f}s "
           f"({total_time / 60.0:.1f} min)")
 
@@ -570,6 +612,18 @@ def main() -> int:
                         f"Default {DEFAULT_KD_TEMPERATURE} (Hinton canonical). "
                         f"Higher -> softer distribution, more subtle knowledge "
                         f"transfer.")
+    p.add_argument("--kd_soft_weight", type=str, default=DEFAULT_KD_SOFT_WEIGHT,
+                   choices=["teacher", "none"],
+                   help="Per-pixel weight of the soft loss: the raw teacher "
+                        "probability plus --kd_weight_floor (teacher, "
+                        "default), or none.")
+    p.add_argument("--kd_weight_floor", type=float, default=DEFAULT_KD_WEIGHT_FLOOR,
+                   help=f"Floor added to the teacher weight so dry pixels "
+                        f"keep a faint signal (default {DEFAULT_KD_WEIGHT_FLOOR}).")
+    p.add_argument("--eval_root", type=str, default="./evaluation",
+                   help="Where the training curves are drawn after the run "
+                        "(<eval_root>/eval_<student_tag>_kd/, the folder the "
+                        "student's evaluation uses).")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--patience", type=int, default=10,
                    help="EarlyStopping patience on val_loss.")
@@ -604,6 +658,8 @@ def main() -> int:
         period=args.period, datasets_root=Path(args.datasets_root),
         teacher_mode=args.teacher_mode, student_mode=args.student_mode,
         resume=not args.fresh,
+        soft_weight=args.kd_soft_weight, weight_floor=args.kd_weight_floor,
+        eval_root=Path(args.eval_root),
     )
     return 0
 
