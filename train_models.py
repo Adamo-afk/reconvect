@@ -397,6 +397,38 @@ def load_training_config(path: Path) -> dict:
         "c_shared":       _coerce(f.get("c_shared", "64"), int),
         "head_dropout":   _coerce(f.get("head_dropout", "0.1"), float),
     }
+    # v2 head (two-level Swin-UNet correction, optional cVAE); the
+    # defaults are the values chosen inside the recommended ranges.
+    v2 = finetune_head_defaults()
+
+    def _ints(key):
+        raw = f.get(key, None)
+        return ([int(x) for x in str(raw).split(",")] if raw is not None
+                else v2[key])
+    finetune.update({
+        "head":                  f.get("head", v2["head"]).strip().lower(),
+        "stage_dims":            _ints("stage_dims"),
+        "blocks_per_stage":      _coerce(f.get("blocks_per_stage", str(v2["blocks_per_stage"])), int),
+        "stage_heads":           _ints("stage_heads"),
+        "mlp_ratio":             _coerce(f.get("mlp_ratio", str(v2["mlp_ratio"])), float),
+        "stem_width":            _coerce(f.get("stem_width", str(v2["stem_width"])), int),
+        "expand_dim":            _coerce(f.get("expand_dim", str(v2["expand_dim"])), int),
+        "drop_path":             _coerce(f.get("drop_path", str(v2["drop_path"])), float),
+        "latent_res":            _coerce(f.get("latent_res", str(v2["latent_res"])), int),
+        "latent_channels":       _coerce(f.get("latent_channels", str(v2["latent_channels"])), int),
+        "beta":                  _coerce(f.get("beta", str(v2["beta"])), float),
+        "beta_warmup_epochs":    _coerce(f.get("beta_warmup_epochs", str(v2["beta_warmup_epochs"])), int),
+        "free_bits":             _coerce(f.get("free_bits", str(v2["free_bits"])), float),
+        "pos_weight_cap":        _coerce(f.get("pos_weight_cap", str(v2["pos_weight_cap"])), float),
+        "lightning_gamma":       _coerce(f.get("lightning_gamma", str(v2["lightning_gamma"])), float),
+        "expected_class_weight": _coerce(f.get("expected_class_weight", str(v2["expected_class_weight"])), float),
+        "n_members":             _coerce(f.get("n_members", str(v2["n_members"])), int),
+        "es_patience":           _coerce(f.get("es_patience", "4"), int),
+    })
+    if finetune["head"] not in FINETUNE_HEADS:
+        raise ValueError(
+            f"[finetune].head = {finetune['head']!r} is not supported. "
+            f"Use one of {FINETUNE_HEADS}.")
     if finetune["optimizer"] not in ("adam", "adamw"):
         raise ValueError(
             f"[finetune].optimizer = {finetune['optimizer']!r} is not "
@@ -1322,6 +1354,947 @@ def build_swin_head(backbone_features, future_timesteps, num_outputs,
     return seq_out
 
 
+# ============================================================================
+# Fine-tune head v2: two-level Swin-UNet correction on the frozen backbone,
+# with an optional conditional VAE (rain track)
+# ============================================================================
+#
+# The head reads the frozen backbone's decoder features F (B, L, 256, 256,
+# 32) and its logits L_b, and writes
+#
+#     logits_l = s_l * L_b[l] + head_l(x)          for every lead l
+#
+# with the four per-lead 1x1 heads initialised at zero and s_l at one, so
+# at step 0 the model reproduces the frozen backbone exactly and training
+# can only move away from it where the loss improves. The head learns a
+# correction field, not the readout.
+#
+# Path (the shapes are for one batch element):
+#   F collapsed over time     (256, 256, 128)
+#   patch embed  k=2 s=2 + LN (128, 128, 64)   + MR stem (last 2 MR frames)
+#   Swin stage 1, 2 blocks     (128, 128, 64)   8x8 windows, 4 heads
+#   patch merge 2x2 -> LN -> linear  (64, 64, 128) = c
+#   [cVAE] gated FiLM of c with a latent z (16, 16, 32)
+#   Swin stage 2, 2 blocks     (64, 64, 128)    8x8 windows, 8 heads
+#   linear 128->64, bilinear x2, + stage-1 skip, conv block   (128, 128, 64)
+#   linear 64->128, pixel shuffle x2   (256, 256, 32)   + target stem
+#   4 per-lead 1x1 heads, zero-init
+#
+# Two raw stems bypass the backbone: the last two frames of the target
+# field at 1 km (lightning: the HR lightning channels; rain: OPERA rain
+# rate and reflectivity upsampled 2 -> 1 km) join at the output
+# resolution, so persistence is one linear step away, and the last two MR
+# frames join at 2 km.
+#
+# The Swin blocks here carry the relative position bias and the shifted-
+# window attention mask of the paper; the legacy `build_swin_head` keeps
+# its lite variant so the models saved with it still load.
+#
+# The conditional VAE (rain track): a prior network p(z | c) and a
+# posterior network q(z | c, y) both output a Gaussian over a (16, 16, 32)
+# latent. Training samples z from q, inference from p (its mean by
+# default; `set_member(k)` draws member k from a fixed seed). z is
+# upsampled to c's grid and modulates it through a gated FiLM,
+# c <- c + sigmoid(g(c)) * (gamma(z) * c + beta(z)), with gamma and beta
+# zero-initialised so the latent starts inert. The loss adds
+# beta_t * mean_i max(KL_i, free_bits) with KL_i the per-dimension
+# KL(q || p) averaged over the batch, beta_t warmed up linearly.
+
+
+class DropPath(tf.keras.layers.Layer):
+    """Stochastic depth: drops a residual branch for a whole sample with
+    probability `rate` in training, rescaling the kept ones."""
+
+    def __init__(self, rate=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.rate = float(rate)
+
+    def call(self, x, training=None):
+        if not training or self.rate <= 0.0:
+            return x
+        keep = 1.0 - self.rate
+        shape = tf.concat([tf.shape(x)[:1],
+                           tf.ones([tf.rank(x) - 1], dtype=tf.int32)], axis=0)
+        mask = tf.floor(keep + tf.random.uniform(shape, dtype=x.dtype))
+        return x / tf.cast(keep, x.dtype) * mask
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"rate": self.rate})
+        return cfg
+
+
+class WindowAttention(tf.keras.layers.Layer):
+    """Multi-head self-attention inside (window_size x window_size)
+    windows with the learned relative position bias of Swin and, for
+    the shifted blocks, the additive mask that keeps tokens from
+    attending across the cyclic wrap-around seam."""
+
+    def __init__(self, dim, num_heads, window_size, dropout=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.window_size = int(window_size)
+        self.dropout = float(dropout)
+        self.head_dim = max(1, self.dim // self.num_heads)
+        self.scale = self.head_dim ** -0.5
+
+    def build(self, input_shape):
+        ws = self.window_size
+        self.qkv = tf.keras.layers.Dense(3 * self.num_heads * self.head_dim,
+                                         name="qkv")
+        self.proj = tf.keras.layers.Dense(self.dim, name="proj")
+        self.attn_drop = tf.keras.layers.Dropout(self.dropout)
+        # (2ws-1)^2 x heads table, indexed by the relative offset of every
+        # (query, key) pair of the window.
+        self.rel_pos_bias = self.add_weight(
+            name="rel_pos_bias",
+            shape=((2 * ws - 1) ** 2, self.num_heads),
+            initializer=tf.keras.initializers.TruncatedNormal(stddev=0.02),
+            trainable=True, dtype="float32")
+        coords = np.stack(np.meshgrid(np.arange(ws), np.arange(ws),
+                                      indexing="ij")).reshape(2, -1)     # (2, N)
+        rel = coords[:, :, None] - coords[:, None, :]                     # (2, N, N)
+        rel = rel.transpose(1, 2, 0) + (ws - 1)
+        index = rel[:, :, 0] * (2 * ws - 1) + rel[:, :, 1]               # (N, N)
+        self.rel_index = tf.constant(index.reshape(-1), dtype=tf.int32)
+        super().build(input_shape)
+
+    def call(self, x_windows, mask=None, training=None):
+        # x_windows: (nW*B, N, C); mask: (nW, N, N) additive or None
+        shape = tf.shape(x_windows)
+        b_, n = shape[0], shape[1]
+        qkv = self.qkv(x_windows)
+        qkv = tf.reshape(qkv, [b_, n, 3, self.num_heads, self.head_dim])
+        qkv = tf.transpose(qkv, [2, 0, 3, 1, 4])           # (3, nW*B, h, N, d)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = tf.matmul(q * tf.cast(self.scale, q.dtype), k, transpose_b=True)
+        n_static = self.window_size * self.window_size
+        bias = tf.gather(self.rel_pos_bias, self.rel_index)
+        bias = tf.transpose(tf.reshape(bias, [n_static, n_static, self.num_heads]),
+                            [2, 0, 1])                       # (h, N, N)
+        attn = attn + tf.cast(bias, attn.dtype)[None]
+        if mask is not None:
+            n_w = tf.shape(mask)[0]
+            attn = tf.reshape(attn, [b_ // n_w, n_w, self.num_heads, n, n])
+            attn = attn + tf.cast(mask, attn.dtype)[None, :, None]
+            attn = tf.reshape(attn, [b_, self.num_heads, n, n])
+        attn = tf.nn.softmax(tf.cast(attn, tf.float32), axis=-1)
+        attn = tf.cast(attn, v.dtype)
+        attn = self.attn_drop(attn, training=training)
+        out = tf.matmul(attn, v)                            # (nW*B, h, N, d)
+        out = tf.reshape(tf.transpose(out, [0, 2, 1, 3]),
+                         [b_, n, self.num_heads * self.head_dim])
+        return self.proj(out)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"dim": self.dim, "num_heads": self.num_heads,
+                    "window_size": self.window_size, "dropout": self.dropout})
+        return cfg
+
+
+def _shift_attention_mask(H, W, window_size, shift_size):
+    """The (nW, N, N) additive mask of a shifted Swin block: -100 between
+    tokens that come from different regions of the cyclic shift, 0
+    otherwise, so a window never mixes the two sides of the seam."""
+    ws, s = window_size, shift_size
+    img = np.zeros((1, H, W, 1), dtype=np.float32)
+    cnt = 0
+    for hs in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
+        for wsl in (slice(0, -ws), slice(-ws, -s), slice(-s, None)):
+            img[:, hs, wsl, :] = cnt
+            cnt += 1
+    win = img.reshape(1, H // ws, ws, W // ws, ws, 1).transpose(0, 1, 3, 2, 4, 5)
+    win = win.reshape(-1, ws * ws)
+    mask = win[:, None, :] - win[:, :, None]
+    return np.where(mask != 0, -100.0, 0.0).astype(np.float32)
+
+
+class SwinBlockV2(tf.keras.layers.Layer):
+    """Swin block with the relative position bias, the shift mask and
+    stochastic depth: pre-norm windowed attention + pre-norm MLP, both
+    residual."""
+
+    def __init__(self, dim, num_heads, window_size, shift_size,
+                 mlp_ratio=2.0, dropout=0.0, drop_path=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
+        self.window_size = int(window_size)
+        self.shift_size = int(shift_size)
+        self.mlp_ratio = float(mlp_ratio)
+        self.dropout = float(dropout)
+        self.drop_path_rate = float(drop_path)
+
+    def build(self, input_shape):
+        H, W = int(input_shape[1]), int(input_shape[2])
+        self.norm1 = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="norm1")
+        self.attn = WindowAttention(self.dim, self.num_heads, self.window_size,
+                                    dropout=self.dropout, name="attn")
+        self.norm2 = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="norm2")
+        hidden = int(self.dim * self.mlp_ratio)
+        self.mlp_dense1 = tf.keras.layers.Dense(hidden, activation="gelu", name="mlp1")
+        self.mlp_dense2 = tf.keras.layers.Dense(self.dim, name="mlp2")
+        self.drop_path = DropPath(self.drop_path_rate)
+        self.mask = (tf.constant(_shift_attention_mask(H, W, self.window_size,
+                                                       self.shift_size))
+                     if self.shift_size > 0 else None)
+        super().build(input_shape)
+
+    def call(self, x, training=None):
+        B = tf.shape(x)[0]
+        H = tf.shape(x)[1]
+        W = tf.shape(x)[2]
+        shortcut = x
+        x = self.norm1(x)
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(-self.shift_size, -self.shift_size), axis=(1, 2))
+        x_windows = _window_partition(x, self.window_size)
+        x_windows = self.attn(x_windows, mask=self.mask, training=training)
+        x = _window_reverse(x_windows, H, W, self.window_size, B)
+        if self.shift_size > 0:
+            x = tf.roll(x, shift=(self.shift_size, self.shift_size), axis=(1, 2))
+        x = shortcut + self.drop_path(x, training=training)
+        h = self.mlp_dense2(self.mlp_dense1(self.norm2(x)))
+        return x + self.drop_path(h, training=training)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"dim": self.dim, "num_heads": self.num_heads,
+                    "window_size": self.window_size, "shift_size": self.shift_size,
+                    "mlp_ratio": self.mlp_ratio, "dropout": self.dropout,
+                    "drop_path": self.drop_path_rate})
+        return cfg
+
+
+def _conv_block(filters, name):
+    """3x3 conv + LayerNorm + GELU, the small conv block of the stems and
+    the decoder."""
+    return tf.keras.Sequential([
+        tf.keras.layers.Conv2D(filters, 3, padding="same", name=f"{name}_conv"),
+        tf.keras.layers.LayerNormalization(epsilon=1e-5, name=f"{name}_ln"),
+        tf.keras.layers.Activation("gelu", name=f"{name}_act"),
+    ], name=name)
+
+
+class PosWeightedBCE(tf.keras.losses.Loss):
+    """Binary cross-entropy with a positive-class weight, and an optional
+    focal factor (gamma > 0) as the fallback when false alarms dominate.
+    pos_weight = min(N_neg / N_pos, cap) from the training-set frequency."""
+
+    def __init__(self, ones_fraction, cap=30.0, gamma=0.0,
+                 name="pos_weighted_bce", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ones_fraction = float(ones_fraction)
+        self.cap = float(cap)
+        self.gamma = float(gamma)
+        self.pos_weight = float(min((1.0 - self.ones_fraction)
+                                    / max(self.ones_fraction, 1e-6), self.cap))
+
+    def call(self, y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(tf.cast(y_pred, tf.float32), 1e-7, 1.0 - 1e-7)
+        bce = -(self.pos_weight * y_true * tf.math.log(y_pred)
+                + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+        if self.gamma > 0:
+            pt = tf.where(y_true > 0.5, y_pred, 1.0 - y_pred)
+            bce = tf.pow(1.0 - pt, self.gamma) * bce
+        return tf.reduce_mean(bce)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"ones_fraction": self.ones_fraction, "cap": self.cap,
+                    "gamma": self.gamma})
+        return cfg
+
+
+FINETUNE_HEADS = ("swin_legacy", "swin_unet", "swin_unet_cvae")
+
+
+def finetune_head_defaults() -> dict:
+    """Hyperparameters of the v2 head, the values chosen inside the
+    recommended ranges; [finetune] in training.config overrides them."""
+    return {
+        "head":                 "swin_unet",
+        "stage_dims":           [64, 128],
+        "blocks_per_stage":     2,
+        "stage_heads":          [4, 8],
+        "window_size":          8,
+        "mlp_ratio":            2.0,
+        "stem_width":           16,
+        "expand_dim":           32,
+        "drop_path":            0.1,
+        "latent_res":           16,
+        "latent_channels":      32,
+        "beta":                 0.02,
+        "beta_warmup_epochs":   2,
+        "free_bits":            0.2,
+        "pos_weight_cap":       30.0,
+        "lightning_gamma":      0.0,
+        "expected_class_weight": 0.2,
+        "lead_weights":         None,
+        "n_members":            3,
+    }
+
+
+class FinetuneHeadV2(tf.keras.layers.Layer):
+    """The correction head. call(features, logits_b, inputs, y=None,
+    training=None) -> probabilities (B, L, H, W, n_out). `y` is the
+    future target, read by the posterior network of the cVAE variant
+    in training only."""
+
+    def __init__(self, hp: dict, label_type: str, num_outputs: int,
+                 future_timesteps: int, hr_channels: int, mr_channels: int,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.hp = dict(hp)
+        self.label_type = label_type
+        self.num_outputs = int(num_outputs)
+        self.L = int(future_timesteps)
+        self.hr_channels = int(hr_channels)
+        self.mr_channels = int(mr_channels)
+        self.cvae = self.hp["head"] == "swin_unet_cvae"
+        d1, d2 = [int(v) for v in self.hp["stage_dims"]]
+        h1, h2 = [int(v) for v in self.hp["stage_heads"]]
+        ws = int(self.hp["window_size"])
+        nb = int(self.hp["blocks_per_stage"])
+        stem = int(self.hp["stem_width"])
+        ex = int(self.hp["expand_dim"])
+        dp = float(self.hp["drop_path"])
+        mlp = float(self.hp["mlp_ratio"])
+        # --- level 1
+        self.embed = tf.keras.layers.Conv2D(d1, 2, strides=2, name="patch_embed")
+        self.embed_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="patch_embed_ln")
+        self.mr_stem = _conv_block(stem, "mr_stem")
+        self.level1_fuse = tf.keras.layers.Dense(d1, name="level1_fuse")
+        self.stage1 = [SwinBlockV2(d1, h1, ws, ws // 2 if i % 2 else 0,
+                                   mlp_ratio=mlp, drop_path=dp, name=f"stage1_block{i}")
+                       for i in range(nb)]
+        # --- merge to level 2
+        self.merge_norm = tf.keras.layers.LayerNormalization(epsilon=1e-5, name="merge_ln")
+        self.merge = tf.keras.layers.Dense(d2, name="merge_linear")
+        # --- cVAE
+        if self.cvae:
+            lc = int(self.hp["latent_channels"])
+            self.prior_net = tf.keras.Sequential([
+                tf.keras.layers.Conv2D(d2, 3, strides=2, padding="same", activation="gelu"),
+                tf.keras.layers.Conv2D(d2, 3, strides=2, padding="same", activation="gelu"),
+                tf.keras.layers.Conv2D(2 * lc, 1, dtype="float32"),
+            ], name="prior_net")
+            self.post_y_stem = tf.keras.Sequential([
+                tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", activation="gelu"),
+                tf.keras.layers.Conv2D(64, 3, strides=2, padding="same", activation="gelu"),
+            ], name="posterior_y_stem")
+            self.post_net = tf.keras.Sequential([
+                tf.keras.layers.Conv2D(d2, 3, strides=2, padding="same", activation="gelu"),
+                tf.keras.layers.Conv2D(d2, 3, strides=2, padding="same", activation="gelu"),
+                tf.keras.layers.Conv2D(2 * lc, 1, dtype="float32"),
+            ], name="posterior_net")
+            self.film_gamma = tf.keras.layers.Conv2D(
+                d2, 1, kernel_initializer="zeros", bias_initializer="zeros", name="film_gamma")
+            self.film_beta = tf.keras.layers.Conv2D(
+                d2, 1, kernel_initializer="zeros", bias_initializer="zeros", name="film_beta")
+            # the gate starts mostly closed (sigmoid(-2) = 0.12) and opens
+            # where the latent turns out to help
+            self.film_gate = tf.keras.layers.Conv2D(
+                1, 1, kernel_initializer="zeros",
+                bias_initializer=tf.keras.initializers.Constant(-2.0), name="film_gate")
+        # --- level 2
+        self.stage2 = [SwinBlockV2(d2, h2, ws, ws // 2 if i % 2 else 0,
+                                   mlp_ratio=mlp, drop_path=dp, name=f"stage2_block{i}")
+                       for i in range(nb)]
+        # --- decoder
+        self.dec_proj = tf.keras.layers.Dense(d1, name="dec_proj")
+        self.dec_up = tf.keras.layers.UpSampling2D(interpolation="bilinear", name="dec_up")
+        self.dec_block = _conv_block(d1, "dec_block")
+        self.expand = tf.keras.layers.Dense(ex * 4, name="patch_expand")
+        self.target_stem = _conv_block(stem, "target_stem")
+        self.out_block = _conv_block(ex, "out_block")
+        self.heads = [tf.keras.layers.Conv2D(
+            self.num_outputs, 1, kernel_initializer="zeros",
+            bias_initializer="zeros", dtype="float32", name=f"head_t{t}")
+            for t in range(self.L)]
+        self.lb_scale = self.add_weight(
+            name="lb_scale", shape=(self.L,), initializer="ones",
+            trainable=True, dtype="float32")
+        self.last_stats: dict = {}
+
+    # -- pieces -----------------------------------------------------------
+    def _target_frames(self, inputs):
+        """The last two raw frames of the target field at 1 km: the HR
+        lightning channels (lightning), or OPERA rain rate and
+        reflectivity from the MR group upsampled x2 (rain)."""
+        if self.label_type == "lightning":
+            x = inputs["past_hr"][:, -2:, :, :, :min(3, self.hr_channels)]
+        else:
+            x = inputs["past_mr"][:, -2:, :, :, :min(2, self.mr_channels)]
+        shape = tf.shape(x)
+        x = tf.transpose(x, [0, 2, 3, 1, 4])
+        x = tf.reshape(x, [shape[0], shape[2], shape[3], -1])
+        if self.label_type != "lightning":
+            x = tf.image.resize(x, [shape[2] * 2, shape[3] * 2], method="bilinear")
+        return x
+
+    def _mr_frames(self, inputs):
+        x = inputs["past_mr"][:, -2:]
+        shape = tf.shape(x)
+        x = tf.transpose(x, [0, 2, 3, 1, 4])
+        return tf.reshape(x, [shape[0], shape[2], shape[3], -1])
+
+    @staticmethod
+    def _gaussian(params):
+        mu, log_sigma = tf.split(tf.cast(params, tf.float32), 2, axis=-1)
+        log_sigma = tf.clip_by_value(log_sigma, -7.0, 4.0)
+        return mu, log_sigma
+
+    def latent(self, c, y=None, member=None):
+        """(z, stats): the prior and, when `y` is given, the posterior
+        over the latent; z sampled from q when y is given (training),
+        else the prior mean, or the prior's member `member` (>= 0) drawn
+        from a fixed seed."""
+        mu_p, ls_p = self._gaussian(self.prior_net(c))
+        stats = {"mu_p": mu_p, "log_sigma_p": ls_p}
+        if y is not None:
+            shape = tf.shape(y)
+            yy = tf.transpose(y, [0, 2, 3, 1, 4])
+            yy = tf.reshape(yy, [shape[0], shape[2], shape[3], -1])
+            yy = self.post_y_stem(tf.cast(yy, c.dtype))
+            mu_q, ls_q = self._gaussian(self.post_net(tf.concat([c, yy], axis=-1)))
+            eps = tf.random.normal(tf.shape(mu_q))
+            z = mu_q + tf.exp(ls_q) * eps
+            stats.update({"mu_q": mu_q, "log_sigma_q": ls_q})
+        elif member is not None:
+            def _draw():
+                seed = tf.stack([tf.cast(member, tf.int32), tf.constant(7, tf.int32)])
+                return mu_p + tf.exp(ls_p) * tf.random.stateless_normal(tf.shape(mu_p), seed=seed)
+            z = tf.cond(tf.cast(member, tf.int32) >= 0, _draw, lambda: mu_p)
+        else:
+            z = mu_p
+        return z, stats
+
+    def film(self, c, z):
+        target = tf.shape(c)[1:3]
+        zz = tf.image.resize(z, target, method="bilinear")
+        zz = tf.cast(zz, c.dtype)
+        gate = tf.sigmoid(self.film_gate(c))
+        mod = self.film_gamma(zz) * c + self.film_beta(zz)
+        self.last_stats["gate_mean"] = tf.reduce_mean(tf.cast(gate, tf.float32))
+        self.last_stats["gate_std"] = tf.math.reduce_std(tf.cast(gate, tf.float32))
+        return c + gate * mod
+
+    # -- forward ----------------------------------------------------------
+    def call(self, features, logits_b, inputs, y=None, training=None, member=None):
+        shape = tf.shape(features)
+        x = tf.transpose(features, [0, 2, 3, 1, 4])
+        x = tf.reshape(x, [shape[0], shape[2], shape[3], -1])
+        x = self.embed_norm(self.embed(x))                            # (B,128,128,d1)
+        mr = self.mr_stem(tf.cast(self._mr_frames(inputs), x.dtype))
+        x = self.level1_fuse(tf.concat([x, mr], axis=-1))
+        for blk in self.stage1:
+            x = blk(x, training=training)
+        s1 = x
+        c = tf.nn.space_to_depth(x, 2)                                 # (B,64,64,4*d1)
+        c = self.merge(self.merge_norm(c))
+        self.last_stats = {}
+        stats = {}
+        if self.cvae:
+            z, stats = self.latent(c, y=y, member=member)
+            c = self.film(c, z)
+        for blk in self.stage2:
+            c = blk(c, training=training)
+        d = tf.cast(self.dec_up(self.dec_proj(c)), s1.dtype)   # bilinear resize returns float32
+        d = self.dec_block(d + s1)
+        e = tf.nn.depth_to_space(self.expand(d), 2)                    # (B,256,256,ex)
+        t = self.target_stem(tf.cast(self._target_frames(inputs), e.dtype))
+        e = self.out_block(tf.concat([e, t], axis=-1))
+        logits_b = tf.cast(logits_b, tf.float32)
+        outs, ratios = [], []
+        for l in range(self.L):
+            corr = self.heads[l](e)
+            lb = tf.cast(self.lb_scale[l], tf.float32) * logits_b[:, l]
+            outs.append(lb + corr)
+            ratios.append(tf.norm(corr) / (tf.norm(logits_b[:, l]) + 1e-6))
+        logits = tf.stack(outs, axis=1)
+        self.last_stats["correction_ratio"] = tf.stack(ratios)
+        self.last_stats.update(stats)
+        if self.label_type == "lightning":
+            return tf.sigmoid(logits)
+        return tf.nn.softmax(logits, axis=-1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"hp": self.hp, "label_type": self.label_type,
+                    "num_outputs": self.num_outputs, "future_timesteps": self.L,
+                    "hr_channels": self.hr_channels, "mr_channels": self.mr_channels})
+        return cfg
+
+
+class _Confusion(tf.keras.metrics.Metric):
+    """Pooled TP / FP / FN of a binary event; result() is the CSI."""
+
+    def __init__(self, name, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.tp = self.add_weight(name="tp", initializer="zeros", dtype=tf.float32)
+        self.fp = self.add_weight(name="fp", initializer="zeros", dtype=tf.float32)
+        self.fn = self.add_weight(name="fn", initializer="zeros", dtype=tf.float32)
+
+    def update_state(self, gt, pred, sample_weight=None):
+        gt = tf.cast(gt, tf.bool)
+        pred = tf.cast(pred, tf.bool)
+        self.tp.assign_add(tf.reduce_sum(tf.cast(gt & pred, tf.float32)))
+        self.fp.assign_add(tf.reduce_sum(tf.cast(~gt & pred, tf.float32)))
+        self.fn.assign_add(tf.reduce_sum(tf.cast(gt & ~pred, tf.float32)))
+
+    def result(self):
+        return self.tp / (self.tp + self.fp + self.fn + 1e-7)
+
+    def reset_state(self):
+        for v in (self.tp, self.fp, self.fn):
+            v.assign(0.0)
+
+
+class _Fss(tf.keras.metrics.Metric):
+    """Fractions skill score at one neighbourhood: 1 - sum((Pf-Po)^2) /
+    (sum(Pf^2) + sum(Po^2)) over the neighbourhood fractions."""
+
+    def __init__(self, name, window, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.window = int(window)
+        self.num = self.add_weight(name="num", initializer="zeros", dtype=tf.float32)
+        self.den = self.add_weight(name="den", initializer="zeros", dtype=tf.float32)
+
+    def update_state(self, gt, pred, sample_weight=None):
+        g = tf.cast(gt, tf.float32)[..., None]
+        p = tf.cast(pred, tf.float32)[..., None]
+        fg = tf.nn.avg_pool2d(g, self.window, 1, "SAME")
+        fp = tf.nn.avg_pool2d(p, self.window, 1, "SAME")
+        self.num.assign_add(tf.reduce_sum(tf.square(fp - fg)))
+        self.den.assign_add(tf.reduce_sum(tf.square(fp)) + tf.reduce_sum(tf.square(fg)))
+
+    def result(self):
+        return 1.0 - self.num / (self.den + 1e-7)
+
+    def reset_state(self):
+        self.num.assign(0.0)
+        self.den.assign(0.0)
+
+
+class _MeanOf(tf.keras.metrics.Metric):
+    """The mean of other metrics' results (the early-stopping monitor)."""
+
+    def __init__(self, name, parts, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.parts = list(parts)
+
+    def update_state(self, *args, **kwargs):
+        pass
+
+    def result(self):
+        return tf.add_n([p.result() for p in self.parts]) / float(len(self.parts))
+
+    def reset_state(self):
+        pass
+
+
+class FinetuneModelV2(tf.keras.Model):
+    """Frozen backbone + FinetuneHeadV2, with the losses, the beta
+    schedule and the monitoring of the fine-tune stage.
+
+    Logged per epoch (train and val): loss, l_forecast, l_kl,
+    csi_t<k> per lead (lightning: p >= 0.5; rain: class >= 1),
+    csi_mid (mean of the two middle leads, the early-stopping monitor),
+    brier (lightning), fss3 / fss9 per lead, adjacent_frac (rain: the
+    share of wrong pixels that are off by one class), persistence_csi
+    per lead (lightning, the last occurrence frame as the forecast),
+    corr_ratio_t<k> (|correction| / |L_b|), lb_scale_t<k>, grad_norm_stage2,
+    and for the cVAE kl, active_units, gate_mean, gate_std and, on
+    validation, l_forecast_q (z from the posterior, the ceiling)."""
+
+    def __init__(self, feature_model, head, label_type, forecast_loss,
+                 hp, **kwargs):
+        super().__init__(**kwargs)
+        self.feature_model = feature_model
+        self.head = head
+        self.label_type = label_type
+        self.forecast_loss = forecast_loss
+        self.hp = dict(hp)
+        self.cvae = head.cvae
+        L = head.L
+        self.beta = tf.Variable(0.0, trainable=False, dtype=tf.float32, name="beta")
+        self.member = tf.Variable(-1, trainable=False, dtype=tf.int32, name="member")
+        w = self.hp.get("lead_weights") or [1.0] * L
+        self.lead_weights = tf.constant([float(v) for v in w], dtype=tf.float32)
+        self.expected_class_weight = float(self.hp.get("expected_class_weight", 0.0)
+                                           if label_type != "lightning" else 0.0)
+        self.free_bits = float(self.hp.get("free_bits", 0.0))
+        mid = [min(1, L - 1), min(2, L - 1)]
+        self.mid_leads = sorted(set(mid))
+        # trackers
+        self.t_loss = tf.keras.metrics.Mean(name="loss")
+        self.t_forecast = tf.keras.metrics.Mean(name="l_forecast")
+        self.t_kl = tf.keras.metrics.Mean(name="l_kl")
+        self.t_forecast_q = tf.keras.metrics.Mean(name="l_forecast_q")
+        self.t_active = tf.keras.metrics.Mean(name="active_units")
+        self.t_gate_mean = tf.keras.metrics.Mean(name="gate_mean")
+        self.t_gate_std = tf.keras.metrics.Mean(name="gate_std")
+        self.t_grad2 = tf.keras.metrics.Mean(name="grad_norm_stage2")
+        self.t_brier = tf.keras.metrics.Mean(name="brier")
+        self.t_adjacent = tf.keras.metrics.Mean(name="adjacent_frac")
+        self.t_corr = [tf.keras.metrics.Mean(name=f"corr_ratio_t{l}") for l in range(L)]
+        self.t_scale = [tf.keras.metrics.Mean(name=f"lb_scale_t{l}") for l in range(L)]
+        self.m_csi = [_Confusion(f"csi_t{l}") for l in range(L)]
+        self.m_fss3 = [_Fss(f"fss3_t{l}", 3) for l in range(L)]
+        self.m_fss9 = [_Fss(f"fss9_t{l}", 9) for l in range(L)]
+        self.m_persist = ([_Confusion(f"persistence_csi_t{l}") for l in range(L)]
+                          if label_type == "lightning" else [])
+        self.m_csi_mid = _MeanOf("csi_mid", [self.m_csi[i] for i in self.mid_leads])
+
+    # -- API ----------------------------------------------------------------
+    def set_member(self, k: int):
+        """Member k >= 0 draws the latent from the prior with a fixed seed;
+        -1 uses the prior mean (the deterministic forecast)."""
+        self.member.assign(int(k))
+
+    @property
+    def metrics(self):
+        base = [self.t_loss, self.t_forecast]
+        if self.cvae:
+            base += [self.t_kl, self.t_forecast_q, self.t_active,
+                     self.t_gate_mean, self.t_gate_std]
+        base += self.m_csi + [self.m_csi_mid] + self.m_fss3 + self.m_fss9
+        if self.label_type == "lightning":
+            base += [self.t_brier] + self.m_persist
+        else:
+            base += [self.t_adjacent]
+        base += self.t_corr + self.t_scale + [self.t_grad2]
+        return base
+
+    def call(self, inputs, training=None, y=None):
+        feats, logits_b = self.feature_model(inputs, training=False)
+        return self.head(feats, logits_b, inputs, y=y, training=training,
+                         member=self.member)
+
+    # -- losses -------------------------------------------------------------
+    def _forecast(self, y, probs):
+        y = tf.cast(y, tf.float32)
+        probs = tf.cast(probs, tf.float32)
+        total = 0.0
+        for l in range(self.head.L):
+            term = self.forecast_loss(y[:, l], probs[:, l])
+            if self.expected_class_weight > 0:
+                classes = tf.range(self.head.num_outputs, dtype=tf.float32)
+                exp_c = tf.reduce_sum(probs[:, l] * classes, axis=-1)
+                true_c = tf.reduce_sum(y[:, l] * classes, axis=-1)
+                term += self.expected_class_weight * tf.reduce_mean(tf.abs(exp_c - true_c))
+            total += self.lead_weights[l] * term
+        return total
+
+    def _kl(self, stats):
+        mu_q, ls_q = stats["mu_q"], stats["log_sigma_q"]
+        mu_p, ls_p = stats["mu_p"], stats["log_sigma_p"]
+        var_q, var_p = tf.exp(2.0 * ls_q), tf.exp(2.0 * ls_p)
+        kl = 0.5 * (var_q / var_p + tf.square(mu_q - mu_p) / var_p
+                    - 1.0 - 2.0 * (ls_q - ls_p))              # (B, h, w, c)
+        kl_dim = tf.reduce_mean(kl, axis=0)                     # per latent dimension
+        active = tf.reduce_sum(tf.cast(kl_dim > 0.02, tf.float32))
+        kl_fb = tf.reduce_mean(tf.maximum(kl_dim, self.free_bits))
+        return kl_fb, active
+
+    # -- monitoring ---------------------------------------------------------
+    def _event(self, t):
+        t = tf.cast(t, tf.float32)
+        if self.label_type == "lightning":
+            return t[..., 0] > 0.5
+        return tf.argmax(t, axis=-1) > 0
+
+    def _update_skill(self, inputs, y, probs):
+        y = tf.cast(y, tf.float32)
+        probs = tf.cast(probs, tf.float32)
+        for l in range(self.head.L):
+            g = self._event(y[:, l])
+            p = self._event(probs[:, l])
+            self.m_csi[l].update_state(g, p)
+            self.m_fss3[l].update_state(g, p)
+            self.m_fss9[l].update_state(g, p)
+            if self.label_type == "lightning" and self.head.hr_channels >= 3:
+                last = tf.cast(inputs["past_hr"][:, -1, :, :, 2], tf.float32) > 0.5
+                self.m_persist[l].update_state(g, last)
+        if self.label_type == "lightning":
+            self.t_brier.update_state(tf.reduce_mean(tf.square(probs[..., 0] - y[..., 0])))
+        else:
+            yc = tf.argmax(y, axis=-1)
+            pc = tf.argmax(probs, axis=-1)
+            wrong = tf.not_equal(yc, pc)
+            adjacent = tf.abs(yc - pc) == 1
+            self.t_adjacent.update_state(
+                tf.reduce_sum(tf.cast(wrong & adjacent, tf.float32))
+                / (tf.reduce_sum(tf.cast(wrong, tf.float32)) + 1e-7))
+        st = self.head.last_stats
+        for l in range(self.head.L):
+            self.t_corr[l].update_state(st["correction_ratio"][l])
+            self.t_scale[l].update_state(self.head.lb_scale[l])
+        if self.cvae:
+            self.t_gate_mean.update_state(st["gate_mean"])
+            self.t_gate_std.update_state(st["gate_std"])
+
+    # -- steps --------------------------------------------------------------
+    def train_step(self, data):
+        inputs, y = data
+        with tf.GradientTape() as tape:
+            probs = self(inputs, training=True, y=y if self.cvae else None)
+            l_forecast = self._forecast(y, probs)
+            if self.cvae:
+                kl, active = self._kl(self.head.last_stats)
+                loss = l_forecast + self.beta * kl
+            else:
+                kl, active = 0.0, 0.0
+                loss = l_forecast
+            scaled = (self.optimizer.get_scaled_loss(loss)
+                      if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer)
+                      else loss)
+        variables = self.head.trainable_variables
+        grads = tape.gradient(scaled, variables)
+        if isinstance(self.optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+            grads = self.optimizer.get_unscaled_gradients(grads)
+        stage2 = {id(v) for blk in self.head.stage2 for v in blk.trainable_variables}
+        g2 = [g for g, v in zip(grads, variables) if id(v) in stage2 and g is not None]
+        if g2:
+            self.t_grad2.update_state(tf.linalg.global_norm(g2))
+        self.optimizer.apply_gradients(
+            [(g, v) for g, v in zip(grads, variables) if g is not None])
+        self.t_loss.update_state(loss)
+        self.t_forecast.update_state(l_forecast)
+        if self.cvae:
+            self.t_kl.update_state(kl)
+            self.t_active.update_state(active)
+        self._update_skill(inputs, y, probs)
+        return {m.name: m.result() for m in self.metrics}
+
+    def test_step(self, data):
+        inputs, y = data
+        # what you actually get: the prior mean (or the set member)
+        probs = self(inputs, training=False)
+        l_forecast = self._forecast(y, probs)
+        loss = l_forecast
+        if self.cvae:
+            # the ceiling: z from the posterior, and the KL of the pair
+            probs_q = self(inputs, training=False, y=y)
+            l_q = self._forecast(y, probs_q)
+            kl, active = self._kl(self.head.last_stats)
+            self.t_forecast_q.update_state(l_q)
+            self.t_kl.update_state(kl)
+            self.t_active.update_state(active)
+            loss = l_forecast + self.beta * kl
+            probs = self(inputs, training=False)   # restore last_stats of the prior pass
+        self.t_loss.update_state(loss)
+        self.t_forecast.update_state(l_forecast)
+        self._update_skill(inputs, y, probs)
+        return {m.name: m.result() for m in self.metrics}
+
+
+class _BetaWarmup(tf.keras.callbacks.Callback):
+    """beta_t: linear from 0 to beta over `warmup_epochs`, then constant."""
+
+    def __init__(self, beta, warmup_epochs):
+        super().__init__()
+        self.beta_final = float(beta)
+        self.warmup = max(0, int(warmup_epochs))
+
+    def on_epoch_begin(self, epoch, logs=None):
+        frac = 1.0 if self.warmup == 0 else min(1.0, (epoch + 1) / self.warmup)
+        self.model.beta.assign(self.beta_final * frac)
+        print(f"  beta = {self.beta_final * frac:.4f}")
+
+
+class _WeightsCheckpoint(tf.keras.callbacks.Callback):
+    """Per-epoch weights of a subclassed model (HDF5 through the .keras
+    name), plus the epoch sidecar; the optimizer state is not kept."""
+
+    def __init__(self, filepath, epoch_meta_path):
+        super().__init__()
+        self.filepath = str(filepath)
+        self.epoch_meta_path = str(epoch_meta_path)
+
+    def on_epoch_end(self, epoch, logs=None):
+        try:
+            self.model.save_weights(self.filepath)
+            with open(self.epoch_meta_path, "w") as f:
+                json.dump({"next_epoch": epoch + 1, "completed_epoch": epoch}, f, indent=2)
+            print(f"  [ckpt] saved epoch {epoch + 1} -> {self.filepath}")
+        except Exception as e:
+            print(f"  [ckpt] WARNING: failed to save checkpoint: {e}")
+
+
+def _ensemble_metrics(model, dataset, n_members: int, max_batches: int = 20) -> dict:
+    """Ensemble quality of a cVAE model on a few validation batches:
+    n_members draws from the prior. RPS (ordinal classes) or the Brier
+    score of the ensemble mean (lightning), the ensemble-mean CSI of the
+    event and of the top two classes, the mean pairwise member
+    disagreement, the spread-skill ratio of the expected class, and a
+    rank histogram of the truth among the members."""
+    L = model.head.L
+    n_out = model.head.num_outputs
+    rps_num = 0.0
+    n_pix = 0.0
+    csi = {"event": [0.0, 0.0, 0.0], "top2": [0.0, 0.0, 0.0]}
+    disagree = 0.0
+    spread_sq = 0.0
+    err_sq = 0.0
+    ranks = np.zeros(n_members + 1, dtype=np.int64)
+    classes = np.arange(n_out, dtype=np.float32)
+    for b, (inputs, y) in enumerate(dataset):
+        if b >= max_batches:
+            break
+        members = []
+        for k in range(n_members):
+            model.set_member(k)
+            members.append(np.asarray(model(inputs, training=False), dtype=np.float32))
+        model.set_member(-1)
+        y = np.asarray(y, dtype=np.float32)
+        stack = np.stack(members, axis=0)                     # (K, B, L, H, W, C)
+        mean = stack.mean(axis=0)
+        if n_out > 1:
+            cum_f = np.cumsum(mean, axis=-1)
+            cum_o = np.cumsum(y, axis=-1)
+            rps_num += float(np.sum(np.square(cum_f - cum_o)[..., :-1]))
+            n_pix += float(np.prod(y.shape[:-1]))
+            yc = np.argmax(y, axis=-1)
+            mc = np.argmax(mean, axis=-1)
+            for name, thr in (("event", 1), ("top2", n_out - 2)):
+                g, p = yc >= thr, mc >= thr
+                csi[name][0] += float(np.sum(g & p))
+                csi[name][1] += float(np.sum(~g & p))
+                csi[name][2] += float(np.sum(g & ~p))
+            exp_m = np.sum(stack * classes, axis=-1)          # (K, ...)
+            exp_o = np.sum(y * classes, axis=-1)
+            arg_m = np.argmax(stack, axis=-1)
+            for i in range(n_members):
+                for j in range(i + 1, n_members):
+                    disagree += float(np.mean(arg_m[i] != arg_m[j]))
+            spread_sq += float(np.mean(np.var(exp_m, axis=0)))
+            err_sq += float(np.mean(np.square(exp_m.mean(axis=0) - exp_o)))
+            rank = np.sum(exp_m < exp_o[None], axis=0)
+            ranks += np.bincount(rank.ravel(), minlength=n_members + 1)[:n_members + 1]
+        else:
+            rps_num += float(np.sum(np.square(mean[..., 0] - y[..., 0])))
+            n_pix += float(np.prod(y.shape[:-1]))
+            g, p = y[..., 0] > 0.5, mean[..., 0] >= 0.5
+            csi["event"][0] += float(np.sum(g & p))
+            csi["event"][1] += float(np.sum(~g & p))
+            csi["event"][2] += float(np.sum(g & ~p))
+            bm = stack[..., 0] >= 0.5
+            for i in range(n_members):
+                for j in range(i + 1, n_members):
+                    disagree += float(np.mean(bm[i] != bm[j]))
+            spread_sq += float(np.mean(np.var(stack[..., 0], axis=0)))
+            err_sq += float(np.mean(np.square(mean[..., 0] - y[..., 0])))
+            rank = np.sum(stack[..., 0] < y[None, ..., 0], axis=0)
+            ranks += np.bincount(rank.ravel(), minlength=n_members + 1)[:n_members + 1]
+    n_b = min(max_batches, b + 1) if n_pix else 1
+    n_pairs = max(1, n_members * (n_members - 1) // 2)
+    out = {
+        "n_members": n_members,
+        "n_batches": n_b,
+        ("rps" if n_out > 1 else "brier_ensemble_mean"): rps_num / max(n_pix, 1.0),
+        "ensemble_mean_csi_event": csi["event"][0] / (sum(csi["event"]) + 1e-7),
+        "member_disagreement": disagree / (n_b * n_pairs),
+        "spread_skill_ratio": float(np.sqrt(spread_sq / n_b) / (np.sqrt(err_sq / n_b) + 1e-7)),
+        "rank_histogram": (ranks / max(ranks.sum(), 1)).tolist(),
+    }
+    if n_out > 1:
+        out["ensemble_mean_csi_top2"] = csi["top2"][0] / (sum(csi["top2"]) + 1e-7)
+    return out
+
+
+class _EnsembleMonitor(tf.keras.callbacks.Callback):
+    """The ensemble metrics of a cVAE model at the end of every epoch, on
+    a few validation batches, written into the logs (history)."""
+
+    def __init__(self, val_ds, n_members, max_batches=20):
+        super().__init__()
+        self.val_ds = val_ds
+        self.n_members = int(n_members)
+        self.max_batches = int(max_batches)
+
+    def on_epoch_end(self, epoch, logs=None):
+        m = _ensemble_metrics(self.model, self.val_ds, self.n_members, self.max_batches)
+        if logs is not None:
+            for k, v in m.items():
+                if k != "rank_histogram":
+                    logs[f"val_ens_{k}"] = float(v)
+            for i, v in enumerate(m["rank_histogram"]):
+                logs[f"val_ens_rank_{i}"] = float(v)
+        print(f"  ensemble ({self.n_members} members): "
+              + "  ".join(f"{k}={v:.4f}" for k, v in m.items()
+                          if isinstance(v, float)))
+
+
+def build_finetune_model_v2(base_model_path, hp: dict, label_type_hint=None,
+                            ones_fraction=None, class_fractions=None,
+                            radar_loss_cfg=None):
+    """Frozen backbone + FinetuneHeadV2 as a FinetuneModelV2 (built, not
+    compiled). The backbone's final 1x1 conv is copied without its
+    activation so the head sees the logits L_b."""
+    base = tf.keras.models.load_model(
+        str(base_model_path),
+        custom_objects={
+            "ConvBlock": ConvBlock, "ResBlock": ResBlock,
+            "GRUResBlock": GRUResBlock, "ResGRU": ResGRU,
+            "WeightedFocalLoss": WeightedFocalLoss,
+            "WeightedFocalCategoricalCrossentropy": WeightedFocalCategoricalCrossentropy,
+            "iou_metric": iou_metric, "true_pos": true_pos,
+            "false_pos": false_pos, "false_neg": false_neg,
+        },
+        compile=False,
+    )
+    base.trainable = False
+    out_shape = base.output_shape
+    L = int(out_shape[1])
+    num_outputs = int(out_shape[-1])
+    label_type = "lightning" if num_outputs == 1 else "radar"
+    features = base.get_layer("backbone_output").output
+    final_td = base.layers[-1]
+    final_conv = final_td.layer if hasattr(final_td, "layer") else final_td
+    logit_conv = tf.keras.layers.Conv2D(num_outputs, 1, activation=None,
+                                        dtype="float32", name="backbone_logits")
+    logits = tf.keras.layers.TimeDistributed(logit_conv, name="backbone_logits_td")(features)
+    feature_model = tf.keras.Model(inputs=base.inputs, outputs=[features, logits],
+                                   name="frozen_backbone")
+    logit_conv.set_weights(final_conv.get_weights())
+    feature_model.trainable = False
+
+    shapes = {inp.name.split(":")[0]: inp.shape for inp in base.inputs}
+    hr_channels = int(shapes.get("past_hr", [None, 0, 0, 0, 0])[-1] or 0)
+    mr_channels = int(shapes.get("past_mr", [None, 0, 0, 0, 0])[-1] or 0)
+
+    head = FinetuneHeadV2(hp, label_type, num_outputs, L, hr_channels, mr_channels,
+                          name="finetune_head_v2")
+    if label_type == "lightning":
+        forecast_loss = PosWeightedBCE(ones_fraction if ones_fraction else 0.0106,
+                                       cap=float(hp.get("pos_weight_cap", 30.0)),
+                                       gamma=float(hp.get("lightning_gamma", 0.0)))
+    else:
+        cfg = dict(radar_loss_cfg or {})
+        if hp["head"] == "swin_unet_cvae":
+            # the reconstruction term of the ELBO: class-weighted CE, no
+            # focal modulation
+            cfg["gamma"] = 0.0
+        forecast_loss = _build_radar_loss(class_fractions, cfg)
+    model = FinetuneModelV2(feature_model, head, label_type, forecast_loss, hp,
+                            name="finetuned_v2")
+    # build the variables with one symbolic pass
+    dummy = {k: tf.zeros([1] + [int(d) for d in shape[1:]], dtype=tf.float32)
+             for k, shape in shapes.items()}
+    model(dummy, training=False)
+    if head.cvae:
+        # the posterior path exists only with a target; build it too, so
+        # every weight exists before load_weights / the optimizer
+        y0 = tf.zeros([1] + [int(d) for d in out_shape[1:]], dtype=tf.float32)
+        model(dummy, training=False, y=y0)
+    return model, label_type
+
+
 def build_finetune_model(base_model_path, finetune_cfg, ones_fraction,
                          class_fractions=None, radar_loss_cfg=None):
     """Load a base model, freeze it, and graft on a Swin head.
@@ -1338,7 +2311,16 @@ def build_finetune_model(base_model_path, finetune_cfg, ones_fraction,
     Returns: (model, loss, metrics) - the compiled finetune model, plus
     the loss/metrics it should be compiled with (the caller wires those
     into model.compile alongside the AdamW optimizer).
+
+    With `finetune_cfg["head"]` other than "swin_legacy" the v2 head is
+    built instead (see FinetuneModelV2); the loss lives inside the model
+    and (None, None) comes back for loss and metrics.
     """
+    if finetune_cfg.get("head", "swin_legacy") != "swin_legacy":
+        model, _label_type = build_finetune_model_v2(
+            base_model_path, finetune_cfg, ones_fraction=ones_fraction,
+            class_fractions=class_fractions, radar_loss_cfg=radar_loss_cfg)
+        return model, None, None
     # Custom layers + loss + metrics defined in this module need to be
     # registered when reloading a saved base model. Without this Keras
     # can't reconstruct ResBlock/ResGRU/ConvBlock instances and bails
@@ -2079,7 +3061,18 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     train_ds = load_dataset(train_dir, batch_size,
                              shuffle=True, shuffle_buffer=shuffle_buffer)
     val_ds = load_dataset(val_dir, batch_size, shuffle=False)
+    if finetune_cfg.get("max_batches"):
+        n = int(finetune_cfg["max_batches"])
+        train_ds, val_ds = train_ds.take(n), val_ds.take(n)
+        print(f"  DRY RUN: {n} batch(es) per split, one epoch")
     print("  Datasets loaded")
+
+    if finetune_cfg.get("head", "swin_legacy") != "swin_legacy":
+        return _train_finetune_v2(
+            mode, source, period, run_tag, base_model_path, output_dir,
+            train_ds, val_ds, finetune_cfg, label_type, ones_fraction,
+            class_fractions, radar_loss_cfg, checkpoint_cfg, resume,
+            batch_size, ds_period, fe_period, allow_period_overlap, dataset_dir)
 
     # Build the fine-tune model: frozen backbone + Swin head + per-step heads.
     print("\nBuilding fine-tune model (frozen backbone + Swin head)...")
@@ -2287,6 +3280,167 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     return model_path, history_path
 
 
+def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_dir,
+                       train_ds, val_ds, finetune_cfg, label_type, ones_fraction,
+                       class_fractions, radar_loss_cfg, checkpoint_cfg, resume,
+                       batch_size, ds_period, fe_period, allow_period_overlap,
+                       dataset_dir):
+    """The fine-tune stage with the v2 head: AdamW (decay off the norms,
+    biases, position tables and L_b scalars), cosine warm-up, beta
+    warm-up for the cVAE, early stopping on val_csi_mid, per-epoch
+    weights, the step-0 check against the frozen backbone, and the
+    ensemble monitor for the cVAE."""
+    hp = dict(finetune_cfg)
+    head = hp["head"]
+    epochs = int(hp["epochs"])
+    print("=" * 70)
+    print(f"COALITION-4 Training (finetune v2: {head}) - Mode: {mode}  Source: {source}")
+    print("=" * 70)
+    print(f"  Base model:     {base_model_path}")
+    print(f"  Label type:     {label_type}")
+    print(f"  Epochs:         {epochs}   batch {batch_size}")
+    print(f"  Optimizer:      adamw lr={hp['initial_lr']:g} wd={hp['weight_decay']:g} "
+          f"warmup={hp['warmup_epochs']} ep, clipnorm 1.0")
+    print(f"  Head:           dims {hp['stage_dims']}, {hp['blocks_per_stage']} blocks/stage, "
+          f"heads {hp['stage_heads']}, window {hp['window_size']}, stems {hp['stem_width']}, "
+          f"expand {hp['expand_dim']}, drop_path {hp['drop_path']}")
+    if head == "swin_unet_cvae":
+        print(f"  cVAE:           latent {hp['latent_res']}^2 x {hp['latent_channels']}, "
+              f"beta {hp['beta']} (warm-up {hp['beta_warmup_epochs']} ep), "
+              f"free bits {hp['free_bits']}, {hp['n_members']} members monitored")
+    if label_type == "lightning":
+        print(f"  Loss:           BCE, pos_weight = min(N_neg/N_pos, {hp['pos_weight_cap']:g})"
+              + (f", focal gamma {hp['lightning_gamma']:g}" if hp['lightning_gamma'] > 0 else ""))
+    else:
+        print(f"  Loss:           " + ("class-weighted CE (no focal) + beta * KL"
+                                       if head == "swin_unet_cvae" else
+                                       f"weighted focal CE + {hp['expected_class_weight']:g} * expected-class L1"))
+
+    model, _lt = build_finetune_model_v2(
+        base_model_path, hp, ones_fraction=ones_fraction,
+        class_fractions=class_fractions, radar_loss_cfg=radar_loss_cfg)
+    n_train = sum(int(np.prod(v.shape)) for v in model.head.trainable_variables)
+    print(f"  Head parameters: {n_train:,} trainable")
+
+    # ---- step-0 check: the head must reproduce the frozen backbone
+    base = tf.keras.models.load_model(
+        str(base_model_path), compile=False,
+        custom_objects={"ConvBlock": ConvBlock, "ResBlock": ResBlock,
+                        "GRUResBlock": GRUResBlock, "ResGRU": ResGRU})
+    for inputs, _y in val_ds.take(1):
+        ref = np.asarray(base(inputs, training=False), dtype=np.float32)
+        got = np.asarray(model(inputs, training=False), dtype=np.float32)
+        diff = float(np.max(np.abs(ref - got)))
+        print(f"  Step-0 check:   max |head - backbone| = {diff:.2e} on one batch"
+              + ("" if diff < 1e-3 else "  WARNING: the residual is miswired"))
+    del base
+
+    # ---- optimizer: AdamW, no decay on norms, biases, position tables, scalars
+    lr, wd = float(hp["initial_lr"]), float(hp["weight_decay"])
+    optimizer = None
+    if hasattr(tf.keras.optimizers, "AdamW"):
+        try:
+            optimizer = tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=wd,
+                                                  global_clipnorm=1.0)
+        except (TypeError, ValueError):
+            optimizer = None
+    if optimizer is None and hasattr(tf.keras.optimizers, "experimental"):
+        optimizer = tf.keras.optimizers.experimental.AdamW(
+            learning_rate=lr, weight_decay=wd, jit_compile=False, global_clipnorm=1.0)
+    if optimizer is None:
+        print("  WARNING: AdamW unavailable; Adam without weight decay")
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr, global_clipnorm=1.0)
+    if hasattr(optimizer, "exclude_from_weight_decay"):
+        optimizer.exclude_from_weight_decay(
+            var_names=["layer_normalization", "_ln", "norm1", "norm2", "bias",
+                       "rel_pos_bias", "lb_scale", "merge_ln", "patch_embed_ln"])
+    model.compile(optimizer=optimizer)
+
+    # ---- resume
+    ckpt_cfg = checkpoint_cfg or {}
+    ckpt_enabled = ckpt_cfg.get("enabled", True)
+    ckpt_dir = output_dir / "checkpoints"
+    ckpt_path = ckpt_dir / f"{run_tag}_finetune_latest.keras"
+    ckpt_meta = ckpt_dir / f"{run_tag}_finetune_latest.json"
+    initial_epoch = 0
+    if ckpt_enabled and resume and ckpt_path.is_file():
+        try:
+            print(f"Resuming fine-tune from checkpoint: {ckpt_path}")
+            model.load_weights(str(ckpt_path))
+            if ckpt_meta.is_file():
+                with open(ckpt_meta) as f:
+                    initial_epoch = int(json.load(f).get("next_epoch", 0))
+                print(f"  Resumed at epoch {initial_epoch}")
+        except Exception as e:
+            print(f"  WARNING: could not load {ckpt_path}: {e}; starting fresh")
+            initial_epoch = 0
+
+    wall_time = WallTimeCallback()
+    callbacks: list = [wall_time]
+    callbacks.append(tf.keras.callbacks.LearningRateScheduler(
+        cosine_warmup_schedule(initial_lr=lr, warmup_epochs=int(hp["warmup_epochs"]),
+                               total_epochs=epochs, min_lr=float(hp["min_lr"])),
+        verbose=1))
+    if head == "swin_unet_cvae":
+        callbacks.append(_BetaWarmup(hp["beta"], hp["beta_warmup_epochs"]))
+        callbacks.append(_EnsembleMonitor(val_ds, hp["n_members"]))
+    callbacks.append(tf.keras.callbacks.EarlyStopping(
+        monitor="val_csi_mid", mode="max", patience=int(hp["es_patience"]),
+        restore_best_weights=True, verbose=1))
+    if ckpt_enabled:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        callbacks.append(_WeightsCheckpoint(ckpt_path, ckpt_meta))
+        print(f"  Checkpoint:     per-epoch weights -> {ckpt_path}")
+
+    print("\nStarting fine-tune training (v2)...")
+    history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
+                        initial_epoch=initial_epoch, callbacks=callbacks)
+
+    model_path = output_dir / f"coalition_{run_tag}_finetuned.keras"
+    model.save_weights(str(model_path))
+    print(f"\nFine-tuned weights saved to: {model_path}")
+    sidecar = save_model_period(model_path, ds_period, mode=mode, source=source,
+                               stage="finetune", dataset_dir=dataset_dir)
+    with open(sidecar, encoding="utf-8") as fh:
+        blob = json.load(fh)
+    blob["feature_extractor"] = {
+        "model": str(base_model_path),
+        "period": fe_period.to_dict() if fe_period else None,
+        "overlap_allowed": bool(allow_period_overlap),
+    }
+    blob["head_variant"] = head
+    with open(sidecar, "w", encoding="utf-8") as fh:
+        json.dump(blob, fh, indent=2)
+
+    head_keys = [k for k in finetune_head_defaults() if k in hp]
+    history_data = {
+        "mode": mode, "source": source, "stage": "finetune",
+        "label_type": label_type, "base_model": str(base_model_path),
+        "epochs_completed": len(history.history.get("loss", [])),
+        "batch_size": batch_size,
+        "optimizer": "adamw", "weight_decay": wd, "initial_lr": lr,
+        "warmup_epochs": int(hp["warmup_epochs"]), "min_lr": float(hp["min_lr"]),
+        "head_variant": head,
+        "head": {k: hp[k] for k in head_keys},
+        "swin": {"window_size": hp["window_size"], "n_blocks": hp["blocks_per_stage"],
+                 "num_heads": hp["stage_heads"][0], "c_shared": hp["stage_dims"][0],
+                 "head_dropout": 0.0},
+        "early_stopping": {"monitor": "val_csi_mid", "patience": int(hp["es_patience"])},
+        "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
+        "wall_times": wall_time.epoch_times,
+        "total_wall_time": sum(wall_time.epoch_times),
+        "history": {k: [float(v) for v in vals] for k, vals in history.history.items()},
+    }
+    history_path = output_dir / f"history_{run_tag}_finetuned.json"
+    with open(history_path, "w") as f:
+        json.dump(history_data, f, indent=2)
+    print(f"History saved to: {history_path}")
+    print("\n" + "=" * 70)
+    print("Fine-tune training complete.")
+    print("=" * 70)
+    return model_path, history_path
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -2370,6 +3524,16 @@ def main():
              "models/checkpoints/<mode>_<source>_latest.keras if it exists.",
     )
     parser.add_argument(
+        "--batch_size", type=int, default=None,
+        help="Override [defaults].batch_size for this run.",
+    )
+    parser.add_argument(
+        "--max_batches", type=int, default=None,
+        help="Dry run: train and validate on the first N batches of each "
+             "split for one epoch, then save. Checks a configuration end "
+             "to end without the cost of an epoch.",
+    )
+    parser.add_argument(
         "--list-modes", action="store_true",
         help="Print the available training modes with their descriptions "
              "and exit. No training is performed.",
@@ -2392,6 +3556,13 @@ def main():
              "extractor was trained on dates the dataset also covers. "
              "Scores measured under this flag are optimistic — the "
              "backbone has already seen those dates.",
+    )
+    parser.add_argument(
+        "--head", type=str, default=None, choices=list(FINETUNE_HEADS),
+        help="Fine-tune head, overriding [finetune].head: swin_unet (the "
+             "deterministic two-level correction head), swin_unet_cvae "
+             "(the same with the conditional VAE, rain track), or "
+             "swin_legacy (the earlier single-level Swin head).",
     )
 
     args = parser.parse_args()
@@ -2499,6 +3670,8 @@ def main():
               f"source: {SOURCE}  stage: {args.stage}")
         print("#" * 70)
         params = merge_for_mode(cfg, mode)
+        if args.batch_size:
+            params["batch_size"] = int(args.batch_size)
         print(f"  Effective hyperparameters: {params}")
 
         base_model_path = None
@@ -2546,6 +3719,12 @@ def main():
                     base_model_path if args.stage == "both"
                     else Path(args.base_checkpoint)
                 )
+                ft_cfg = dict(cfg["finetune"])
+                if args.head:
+                    ft_cfg["head"] = args.head
+                if args.max_batches:
+                    ft_cfg["epochs"] = 1
+                    ft_cfg["max_batches"] = int(args.max_batches)
                 train_finetune(
                     mode=mode,
                     data_root=args.data_root,
@@ -2554,7 +3733,7 @@ def main():
                     output_dir=args.output_dir,
                     source=SOURCE,
                     batch_size=params["batch_size"],
-                    finetune_cfg=cfg["finetune"],
+                    finetune_cfg=ft_cfg,
                     shuffle_buffer=params["shuffle_buffer"],
                     mixed_precision=params["mixed_precision"],
                     early_stopping_cfg=cfg["early_stopping"],

@@ -2123,6 +2123,11 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
         "head_dropout":  swin.get("head_dropout", 0.1),
     }
     ones_fraction = hist_meta.get("ones_fraction") or 0.0106
+    # The v2 heads record their variant and hyperparameters; the
+    # rebuild must use the same ones (and the class prior for the
+    # rain loss, which only the loss object needs).
+    finetune_cfg["head"] = hist_meta.get("head_variant", "swin_legacy")
+    finetune_cfg.update(hist_meta.get("head") or {})
 
     from train_models import build_finetune_model
     model, _loss, _metrics = build_finetune_model(
@@ -2450,6 +2455,8 @@ def main() -> int:
     is_lightning = (label_type == "lightning")
     is_rainfall = (label_type == "radar")
     run_hann_overlapped_inference = hysteresis_binary = None
+    from predict_full_domain import members_from_summary
+    member_of_patch = members_from_summary(args.validation_summary)
     high_per_lead: dict[int, float] | None = None
     # Rainfall: the tuned (LOW, HIGH) per lead from --validation_summary,
     # else the two flags for every lead.
@@ -2550,8 +2557,9 @@ def main() -> int:
             print(f"  Built inputs for {len(all_patches)} / {N_PATCHES} "
                   f"patches (from reprojected data)  |  "
                   f"DBSCAN-selected: {len(csv_active)}")
-            preds = model.predict(inputs, batch_size=args.batch_size,
-                                  verbose=0)
+            from predict_full_domain import predict_with_members
+            preds = predict_with_members(model, inputs, all_patches,
+                                         args.batch_size, member_of_patch)
             print(f"  Model output shape: {preds.shape}")
             pred_canvases = paste_predictions_to_canvas(
                 preds, all_patches, label_type,

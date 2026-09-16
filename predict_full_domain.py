@@ -319,6 +319,38 @@ def _build_group_batch(data_root: Path, mode_config: dict, group_key: str,
     return batch, all_patches
 
 
+def members_from_summary(summary_path) -> dict[int, int]:
+    """{patch: member} of a validation summary's member selection, the
+    per-patch winner among the members of a cVAE head; {} when the
+    summary has none."""
+    if not summary_path:
+        return {}
+    with open(summary_path) as f:
+        block = (json.load(f).get("members") or {}).get("member_of_patch") or {}
+    return {int(p): int(k) for p, k in block.items()}
+
+
+def predict_with_members(model, inputs, patches, batch_size, member_of_patch):
+    """model.predict, or, for a cVAE head with a per-patch member
+    selection, the composite of the members' predictions: every patch
+    takes the member that won it in the validation, the prior mean's
+    member 0 where none is recorded."""
+    if not member_of_patch or not hasattr(model, "set_member"):
+        return model.predict(inputs, batch_size=batch_size, verbose=0)
+    n_members = max(member_of_patch.values()) + 1
+    outs = []
+    for k in range(n_members):
+        model.set_member(k)
+        outs.append(model.predict(inputs, batch_size=batch_size, verbose=0))
+    model.set_member(-1)
+    composite = outs[0].copy()
+    for j, patch in enumerate(patches):
+        composite[j] = outs[member_of_patch.get(int(patch), 0)][j]
+    used = sorted({member_of_patch.get(int(p), 0) for p in patches})
+    print(f"  Members: composite of {n_members} draws, members {used} on these patches")
+    return composite
+
+
 def build_inputs_for_reference(data_root: Path, mode_config: dict,
                                date_str: str, ref_utc: str,
                                step_minutes: int,
@@ -1242,6 +1274,7 @@ def main() -> int:
     # --threshold survives only as an optional override for the raw-
     # probability heatmap's colormap centering.
     print("\nLoading model...")
+    member_of_patch = members_from_summary(args.validation_summary)
     model = load_model_artifact(
         model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
         period=args.period, weights=args.weights,
@@ -1354,7 +1387,8 @@ def main() -> int:
                   "Skipping.")
             continue
 
-        preds = model.predict(inputs, batch_size=args.batch_size, verbose=0)
+        preds = predict_with_members(model, inputs, valid_patches, args.batch_size,
+                                     member_of_patch)
         canvases = paste_predictions_to_canvas(preds, valid_patches, label_type)
         print(f"  Predicted {len(valid_patches)} patch(es); "
               f"canvases {canvases[0].shape}")
