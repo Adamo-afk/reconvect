@@ -359,7 +359,7 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ```
 - **Descriere** — construiește encoder-forecasterul pe baza `metadata.json`. Restaurează automat un set de date arhivat.
 - **Scrie** — `models/coalition_<run_tag>.keras` **CRITIC**
-- **Scrie** — `models/history_<run_tag>.json` — mod, sursă, etapă, tip de etichetă, epoci, durată de execuție.
+- **Scrie** — `models/history_<run_tag>.json` — mod, sursă, etapă, tip de etichetă, epoci, durată de execuție. Fiecare etapă (bază, finetune, transferul de cunoștințe) își scrie istoricul după fiecare epocă, `"complete": false` până la încheierea rulării, astfel încât o rulare întreruptă își păstrează curbele, iar una reluată le continuă.
 - **Scrie** — `models/coalition_<run_tag>.meta.json` **CRITIC** — perioada pe care a fost antrenat modelul, verificată înaintea analizei de importanță a caracteristicilor, astfel încât un model să nu fie niciodată explicat cu date pe care a fost antrenat.
 
 ### A3. Finetune-ul capului de corecție

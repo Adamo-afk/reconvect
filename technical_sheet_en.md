@@ -342,7 +342,7 @@ python train_models.py --config training.config --mode mtg_lightning_opera_rainf
 ```
 - **Does** — builds the encoder-forecaster from `metadata.json`. Restores an archived dataset automatically.
 - **Writes** — `models/coalition_<run_tag>.keras` **CRITICAL**
-- **Writes** — `models/history_<run_tag>.json` — mode, source, stage, label type, epochs, wall time.
+- **Writes** — `models/history_<run_tag>.json` — mode, source, stage, label type, epochs, wall time. Every stage (base, fine-tune, distillation) writes its history after each epoch, `"complete": false` until the run ends, so an interrupted run keeps its curves and a resumed run continues them.
 - **Writes** — `models/coalition_<run_tag>.meta.json` **CRITICAL** — the period the model was trained on, checked before feature-importance analysis so a model is never explained with data it was trained on.
 
 ### A3. Fine-tune the correction head
