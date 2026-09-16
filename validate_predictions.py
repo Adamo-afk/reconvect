@@ -352,6 +352,64 @@ def _paste_label_canvases(labels: np.ndarray, patches: list[int],
     return canvases
 
 
+def _compose_by_patch(soft_k: list[list[np.ndarray]], patches: list[int],
+                      member_of_patch: dict[int, int]) -> list[np.ndarray]:
+    """Per lead, the soft canvas assembled patch by patch from the
+    member that won the patch (member 0 where none is assigned).
+    `soft_k[k][lead]` are the members' soft canvases."""
+    out = []
+    for i in range(len(soft_k[0])):
+        canvas = soft_k[0][i].copy()
+        for p in patches:
+            k = member_of_patch.get(p, 0)
+            if k:
+                r0, r1, c0, c1 = get_patch_bounds(p)
+                canvas[r0:r1, c0:c1] = soft_k[k][i][r0:r1, c0:c1]
+        out.append(canvas)
+    return out
+
+
+def _plot_member_csi(summary: dict, path: Path) -> None:
+    """One panel per member: the per-patch CSI of that member on the
+    validation split at the tuned thresholds, the bars of the patches
+    it won in green."""
+    block = summary.get("members") or {}
+    n = int(block.get("n_members", 0))
+    if n < 1:
+        return
+    winner = {int(p): int(k) for p, k in (block.get("member_of_patch") or {}).items()}
+    per = block.get("per_patch_csi") or {}
+    patches = list(range(1, N_PATCHES + 1))
+    fig, axes = plt.subplots(n, 1, figsize=(12, 2.6 * n + 1.2), sharex=True,
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for k, ax in enumerate(axes):
+        vals = [float((per.get(str(k)) or {}).get(str(p), np.nan)) for p in patches]
+        colors = ["tab:green" if winner.get(p) == k else "lightgray" for p in patches]
+        bars = ax.bar(patches, [0.0 if np.isnan(x) else x for x in vals], color=colors,
+                      edgecolor="black", linewidth=0.6)
+        for bar, x in zip(bars, vals):
+            ax.annotate("n/a" if np.isnan(x) else f"{x:.3f}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 2), textcoords="offset points", ha="center",
+                        va="bottom", fontsize=7)
+        n_won = sum(1 for p in patches if winner.get(p) == k)
+        ax.set_title(f"member {k} (z draw {k}): CSI per patch, "
+                     f"{n_won} patch{'es' if n_won != 1 else ''} won (green)")
+        ax.set_ylabel("CSI")
+        ax.set_ylim(0, max(1e-3, np.nanmax([np.nanmax(vals) if not all(np.isnan(vals)) else 0.0, 0.05])) * 1.25)
+        ax.grid(axis="y", alpha=0.3)
+    axes[-1].set_xticks(patches)
+    axes[-1].set_xlabel("patch")
+    fig.suptitle(f"{_run_title(summary)}  |  {n} members on the "
+                 f"{block.get('selection_split', 'validation')} split, "
+                 f"{block.get('n_samples', '?')} samples: the best member per patch",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(path, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Wrote {path.name}")
+
+
 def _paste_class_canvases(classes_by_step: dict, valid_patches: list[int],
                           n_lead: int) -> list[np.ndarray]:
     """SepConv class maps (step -> (N, 256, 256)) onto full canvases,
@@ -1676,6 +1734,8 @@ def make_plots(summary_path: Path) -> list[Path]:
         _plot_hmf_percentiles(summary, rows, offsets, step, out("hmf_percentiles"))
     if not _plot_hysteresis_gain(summary, offsets, step, out("hysteresis")):
         made.pop()
+    if summary.get("members"):
+        _plot_member_csi(summary, out("members"))
     pp = summary.get("post_processing") or {}
     if pp.get("low_sweep"):
         plot_rainfall_tuning(summary, out("tuning_low"), out("tuning_high"))
@@ -1701,7 +1761,8 @@ def run_extraction(track: str, year: int, month: int,
                    period=None,
                    baseline: bool = False,
                    datasets_root: Path | None = None,
-                   batch_size: int = 32):
+                   batch_size: int = 32,
+                   members: int = 3):
     """Extraction mode for the rainfall track, in three phases.
 
     1. LOW per lead, tuned on samples drawn from the VALIDATION split:
@@ -1792,6 +1853,17 @@ def run_extraction(track: str, year: int, month: int,
                                     period=period, weights=WEIGHTS)
         print(f"  Loaded: {model.count_params():,} parameters")
     from visualize_gt_vs_pred import build_full_soft_pred
+    # Members of a cVAE head: the thresholds are tuned on the prior mean
+    # (phases 1-2); phase 2b draws the members and picks the best one per
+    # patch on the validation split; the scope is scored on the composite.
+    n_members = (int(members) if (not baseline and members
+                                  and getattr(model, "cvae", False)
+                                  and hasattr(model, "set_member")) else 0)
+    members_on = [False]
+    member_of_patch: dict[int, int] = {}
+    member_store: dict = {}
+    if n_members:
+        print(f"  Members:   {n_members} draws of the latent, selected per patch")
 
     scope_splits = [SPLIT] if SPLIT else ["train", "validation", "test"]
 
@@ -1807,6 +1879,13 @@ def run_extraction(track: str, year: int, month: int,
                 data_root=str(data_root), source=source,
                 batch_size=18, batched=True)
             return np.stack([classes[i + 1] for i in range(L)], axis=1)
+        if members_on[0]:
+            outs = []
+            for k in range(n_members):
+                model.set_member(k)
+                outs.append(model(inputs, training=False).numpy())
+            model.set_member(-1)
+            return np.stack(outs, axis=1)            # (B, K, L, H, W, C)
         return model(inputs, training=False).numpy()
 
     def _run(splits, allowed, label, per_sample):
@@ -1830,6 +1909,22 @@ def run_extraction(track: str, year: int, month: int,
                     pred_canvases = _paste_class_canvases(
                         {i + 1: out[:, i] for i in range(L)}, patches, L)
                     scores, eligible = None, None
+                elif out.ndim == 6:
+                    # (N, K, L, H, W, C): the members; the composite takes
+                    # per patch the member that won it
+                    soft_k = [build_full_soft_pred(out[:, k], patches, n_classes=out.shape[-1])
+                              for k in range(out.shape[1])]
+                    member_store["soft_k"] = soft_k
+                    soft = _compose_by_patch(soft_k, patches, member_of_patch)
+                    pred_canvases = [np.where(np.any(s > 0, axis=-1), np.argmax(s, axis=-1), -1)
+                                     .astype(np.int32) for s in soft]
+                    scores, eligible = [], []
+                    for i in range(L):
+                        argmax = np.argmax(soft[i], axis=-1)
+                        p_arg = np.take_along_axis(soft[i], argmax[..., None],
+                                                   axis=-1).squeeze(-1)
+                        scores.append(np.where(argmax > 0, p_arg, 0.0).astype(np.float32))
+                        eligible.append(argmax > 0)
                 else:
                     pred_canvases = paste_predictions_to_canvas(
                         out, patches, label_type="radar")
@@ -1974,6 +2069,56 @@ def run_extraction(track: str, year: int, month: int,
         for i in range(L):
             pair_per_lead.setdefault(i, pair_per_lead[tuned[0]])
 
+    # ---- Phase 2b: the members, the best one per patch -------------------
+    member_selection: dict = {}
+    if n_members:
+        print(f"\nPhase 2b - {n_members} members on the validation split: per-patch "
+              f"CSI at the tuned pair, the best member wins each patch")
+        members_on[0] = True
+        acc_k: list[dict] = [{} for _ in range(n_members)]
+
+        def _phase2b(n, date_str, ref_utc, pred_canvases, scores, eligible, gts):
+            soft_k = member_store["soft_k"]
+
+            def one(i):
+                lo, hi = pair_per_lead[i]
+                res = []
+                for k in range(n_members):
+                    s = soft_k[k][i]
+                    argmax = np.argmax(s, axis=-1)
+                    p_arg = np.take_along_axis(s, argmax[..., None], axis=-1).squeeze(-1)
+                    score = np.where(argmax > 0, p_arg, 0.0).astype(np.float32)
+                    _conf, per_patch = sweep_hysteresis(score, lo, [hi], gts[i],
+                                                        eligible=(argmax > 0))
+                    res.append(per_patch[hi])
+                return res
+
+            results = _map_leads(one, L)
+            for i in range(L):
+                for k in range(n_members):
+                    _merge_patch_counts(acc_k[k], i, results[i][k])
+
+        _run(["validation"], tuning_selected,
+             "Phase 2b - member selection on the validation split", _phase2b)
+        scores_k = [per_patch_scores(a) for a in acc_k]
+        for patch in range(1, N_PATCHES + 1):
+            cands = [(scores_k[k][str(patch)]["csi"], k) for k in range(n_members)
+                     if str(patch) in scores_k[k]]
+            if cands:
+                member_of_patch[patch] = max(cands, key=lambda t: (t[0], -t[1]))[1]
+        member_selection = {
+            "n_members": n_members,
+            "selection_split": "validation",
+            "n_samples": len(tune_dates),
+            "member_of_patch": {str(p): k for p, k in sorted(member_of_patch.items())},
+            "per_patch_csi": {str(k): {p: v["csi"] for p, v in scores_k[k].items()}
+                              for k in range(n_members)},
+            "n_samples_per_patch": ({p: v["n_samples"] for p, v in scores_k[0].items()}
+                                    if scores_k else {}),
+        }
+        print("  member per patch: "
+              + " ".join(f"{p}:{k}" for p, k in sorted(member_of_patch.items())))
+
     # ---- Phase 3: score the scope at the chosen pair per lead ----------
     rows: list[dict] = []
     confusion_raw = {i: {"TP": 0, "FP": 0, "FN": 0, "TN": 0} for i in range(L)}
@@ -2071,6 +2216,8 @@ def run_extraction(track: str, year: int, month: int,
             for i, off in enumerate(LEAD_STEP_OFFSETS)},
         "raw_definition": "argmax class map, no hysteresis",
     }
+    if member_selection:
+        extra["members"] = member_selection
 
     stem = f"{track}_{scope_stem(year, month)}_{tag}"
     _write_csv(rows, output_dir / f"{stem}_samples.csv")
@@ -4233,6 +4380,12 @@ def main() -> int:
                              f"the draw (default {MONTH_BATCH}).")
     parser.add_argument("--seed", type=int, default=SEED,
                         help=f"Seed of the draw (default {SEED}).")
+    parser.add_argument("--members", type=int, default=3,
+                        help="Rainfall track, cVAE fine-tuned head: draws of "
+                             "the latent scored per patch on the validation "
+                             "split; the best member wins each patch and the "
+                             "scope is scored on that composite (default 3, "
+                             "0 disables). Ignored by other models.")
     parser.add_argument("--cache_gb", type=float, default=None,
                         help="Rainfall track: memory budget for keeping the "
                              "phase-1 predictions of the tuning samples so "
@@ -4354,6 +4507,7 @@ def main() -> int:
                     baseline=baseline,
                     datasets_root=args.datasets_root,
                     batch_size=args.batch_size,
+                    members=args.members,
                 )
                 _release()
         else:

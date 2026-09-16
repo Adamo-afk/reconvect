@@ -1848,6 +1848,11 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
             "c_shared":      swin_cfg.get("c_shared", 64),
             "head_dropout":  swin_cfg.get("head_dropout", 0.1),
         }
+        # The v2 heads record their variant and hyperparameters; the
+        # rebuild must use the same ones (and the class prior for the
+        # rain loss, which only the loss object needs).
+        finetune_cfg["head"] = hist_meta.get("head_variant", "swin_legacy")
+        finetune_cfg.update(hist_meta.get("head") or {})
 
         # Lazy import here so the base-model path doesn't pay the cost of
         # importing train_models when it isn't needed.
