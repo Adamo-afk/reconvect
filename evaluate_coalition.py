@@ -1654,10 +1654,9 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     # The period belongs in the tag: weights, statistics and splits are
     # all written per period, and resolving any of them to the untagged
     # name reads another model's artefacts.
+    from train_models import finetune_suffix, finetune_ckpt_stem
     run_tag = build_run_tag(mode, source, period)
-    variant_suffix = ("_finetuned" if finetuned
-                      else "_kd" if kd
-                      else "")
+    variant_suffix = finetune_suffix(finetuned) or ("_kd" if kd else "")
     artifact_tag = f"{run_tag}{variant_suffix}"
     # A `latest` run gets its own folder so it never replaces the `best` one.
     output_dir = Path(output_dir) / (
@@ -1747,7 +1746,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
         # The per-epoch checkpoint sidecar records the last epoch that
         # ran; the history alone cannot tell that from the restored one.
         sidecar = (model_dir / "checkpoints"
-                   / (f"{run_tag}_finetune_latest.json" if finetuned
+                   / (f"{finetune_ckpt_stem(run_tag, finetuned)}.json" if finetuned
                       else f"{run_tag}_latest.json"))
         plot_training_history(history_path, output_dir, sidecar_path=sidecar)
     else:
@@ -1759,7 +1758,7 @@ def evaluate(mode, data_root, model_dir, output_dir, batch_size=32,
     # The finetune stage writes its own checkpoint under a different
     # name, so the variant has to pick the matching one.
     if weights == "latest":
-        ckpt_stem = (f"{run_tag}_finetune_latest" if finetuned
+        ckpt_stem = (finetune_ckpt_stem(run_tag, finetuned) if finetuned
                      else f"{run_tag}_kd_latest" if kd
                      else f"{run_tag}_latest")
         model_path = model_dir / "checkpoints" / f"{ckpt_stem}.keras"
@@ -2068,10 +2067,15 @@ def main():
     )
     parser.add_argument(
         "--finetuned", action="store_true",
-        help="Evaluate the Swin-head fine-tuned model "
+        help="Evaluate the fine-tuned model "
              "(coalition_<mode>_<source>_finetuned.keras) instead of "
              "the base coalition_<mode>_<source>.keras. Dataset path "
              "and label_type are unchanged."
+    )
+    parser.add_argument(
+        "--cvae", action="store_true",
+        help="Evaluate the conditional-VAE fine-tuned head "
+             "(coalition_<mode>_<source>_finetuned_cvae.keras).",
     )
     parser.add_argument(
         "--kd", action="store_true",
@@ -2165,6 +2169,8 @@ def main():
     if args.mode is None:
         parser.error("the following arguments are required: --mode")
 
+    if args.cvae:
+        args.finetuned = "cvae"
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive.")
 

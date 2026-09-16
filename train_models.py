@@ -1612,6 +1612,21 @@ class PosWeightedBCE(tf.keras.losses.Loss):
 FINETUNE_HEADS = ("swin_legacy", "swin_unet", "swin_unet_cvae")
 
 
+def finetune_suffix(finetuned) -> str:
+    """Artefact suffix of a fine-tuned variant: "_finetuned" for the
+    deterministic heads (finetuned=True), "_finetuned_cvae" for the
+    conditional VAE (finetuned="cvae"), "" for a base model. Both rain
+    heads can then sit in one models folder."""
+    if finetuned == "cvae":
+        return "_finetuned_cvae"
+    return "_finetuned" if finetuned else ""
+
+
+def finetune_ckpt_stem(run_tag: str, finetuned) -> str:
+    """Stem of the per-epoch checkpoint of a fine-tune run."""
+    return f"{run_tag}_finetune{'_cvae' if finetuned == 'cvae' else ''}_latest"
+
+
 def finetune_head_defaults() -> dict:
     """Hyperparameters of the v2 head, the values chosen inside the
     recommended ranges; [finetune] in training.config overrides them."""
@@ -3333,6 +3348,8 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
     ensemble monitor for the cVAE."""
     hp = dict(finetune_cfg)
     head = hp["head"]
+    variant = "cvae" if head == "swin_unet_cvae" else True
+    art = finetune_suffix(variant)            # _finetuned or _finetuned_cvae
     epochs = int(hp["epochs"])
     print("=" * 70)
     print(f"COALITION-4 Training (finetune v2: {head}) - Mode: {mode}  Source: {source}")
@@ -3401,8 +3418,8 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
     ckpt_cfg = checkpoint_cfg or {}
     ckpt_enabled = ckpt_cfg.get("enabled", True)
     ckpt_dir = output_dir / "checkpoints"
-    ckpt_path = ckpt_dir / f"{run_tag}_finetune_latest.keras"
-    ckpt_meta = ckpt_dir / f"{run_tag}_finetune_latest.json"
+    ckpt_path = ckpt_dir / f"{finetune_ckpt_stem(run_tag, variant)}.keras"
+    ckpt_meta = ckpt_dir / f"{finetune_ckpt_stem(run_tag, variant)}.json"
     initial_epoch = 0
     if ckpt_enabled and resume and ckpt_path.is_file():
         try:
@@ -3452,7 +3469,7 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
             "wall_times": wall_time.epoch_times,
             "total_wall_time": sum(wall_time.epoch_times),
         }
-    history_writer = HistoryWriter(output_dir / f"history_{run_tag}_finetuned.json",
+    history_writer = HistoryWriter(output_dir / f"history_{run_tag}{art}.json",
                                    _v2_meta, initial_epoch)
     callbacks.append(history_writer)      # last: it records what the others log
 
@@ -3460,7 +3477,7 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
     history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
                         initial_epoch=initial_epoch, callbacks=callbacks)
 
-    model_path = output_dir / f"coalition_{run_tag}_finetuned.keras"
+    model_path = output_dir / f"coalition_{run_tag}{art}.keras"
     model.save_weights(str(model_path))
     print(f"\nFine-tuned weights saved to: {model_path}")
     sidecar = save_model_period(model_path, ds_period, mode=mode, source=source,
