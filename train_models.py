@@ -2614,6 +2614,53 @@ class WallTimeCallback(tf.keras.callbacks.Callback):
             print(f"  Average per epoch: {np.mean(self.epoch_times):.1f}s")
 
 
+class HistoryWriter(tf.keras.callbacks.Callback):
+    """Writes the history JSON after every epoch, so an interrupted run
+    keeps its curves. `meta_fn()` returns the static fields of the
+    document; `history` accumulates the per-epoch logs and, on a resume,
+    continues the file's own history up to `initial_epoch`. The stage
+    calls write(complete=True) at the end; until then the file carries
+    "complete": false. Put it last in the callbacks so it sees what the
+    other callbacks add to the logs."""
+
+    def __init__(self, path, meta_fn, initial_epoch: int = 0):
+        super().__init__()
+        self.path = Path(path)
+        self.meta_fn = meta_fn
+        self.history: dict[str, list] = {}
+        if initial_epoch > 0 and self.path.is_file():
+            try:
+                with open(self.path) as f:
+                    prev = json.load(f).get("history") or {}
+                self.history = {k: [float(x) for x in v[:initial_epoch]]
+                                for k, v in prev.items()}
+                print(f"  History: continuing {self.path.name} from epoch {initial_epoch}")
+            except (OSError, ValueError):
+                self.history = {}
+
+    def on_epoch_end(self, epoch, logs=None):
+        for k, v in (logs or {}).items():
+            try:
+                self.history.setdefault(k, []).append(float(v))
+            except (TypeError, ValueError):
+                continue
+        self.write(complete=False)
+
+    def write(self, complete: bool = True):
+        doc = dict(self.meta_fn())
+        doc["epochs_completed"] = len(self.history.get("loss", []))
+        doc["history"] = self.history
+        doc["complete"] = bool(complete)
+        try:
+            tmp = self.path.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(doc, f, indent=2)
+            tmp.replace(self.path)
+        except OSError as e:
+            print(f"  WARNING: could not write {self.path}: {e}")
+        return self.path
+
+
 class _ResumableCheckpoint(tf.keras.callbacks.Callback):
     """Per-epoch checkpoint that writes both the .keras model file and a
     small JSON sidecar with the next-epoch index, so a subsequent run can
@@ -2901,6 +2948,19 @@ def train(mode, data_root, epochs, batch_size, output_dir,
 
     # Train
     print("\nStarting training...")
+    def _base_meta():
+        return {
+            "mode": mode, "source": source, "stage": "base",
+            "label_type": label_type, "batch_size": batch_size,
+            "dropout": dropout, "norm": norm,
+            "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
+            "wall_times": wall_time.epoch_times,
+            "total_wall_time": sum(wall_time.epoch_times),
+        }
+    history_writer = HistoryWriter(output_dir / f"history_{run_tag}.json",
+                                   _base_meta, initial_epoch)
+    callbacks.append(history_writer)
+
     history = model.fit(
         train_ds,
         validation_data=val_ds,
@@ -2923,25 +2983,9 @@ def train(mode, data_root, epochs, batch_size, output_dir,
     print(f"Period sidecar  : {sidecar} "
           f"({ds_period or 'no period declared'})")
 
-    # Save history
-    history_data = {
-        "mode": mode,
-        "source": source,
-        "stage": "base",
-        "label_type": label_type,
-        "epochs_completed": len(history.history.get("loss", [])),
-        "batch_size": batch_size,
-        "dropout": dropout,
-        "norm": norm,
-        "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
-        "wall_times": wall_time.epoch_times,
-        "total_wall_time": sum(wall_time.epoch_times),
-        "history": {k: [float(v) for v in vals]
-                    for k, vals in history.history.items()},
-    }
-    history_path = output_dir / f"history_{run_tag}.json"
-    with open(history_path, 'w') as f:
-        json.dump(history_data, f, indent=2)
+    # Save history (the writer has been saving it after every epoch;
+    # this is the complete version)
+    history_path = history_writer.write(complete=True)
     print(f"History saved to: {history_path}")
 
     print("\n" + "=" * 70)
@@ -3212,6 +3256,29 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
         print(f"  Checkpoint:     per-epoch -> {ckpt_path}")
     print()
 
+    def _legacy_meta():
+        return {
+            "mode": mode, "source": source, "stage": "finetune",
+            "label_type": label_type, "base_model": str(base_model_path),
+            "batch_size": batch_size,
+            "optimizer": finetune_cfg["optimizer"],
+            "weight_decay": finetune_cfg["weight_decay"],
+            "initial_lr": finetune_cfg["initial_lr"],
+            "swin": {
+                "window_size":   finetune_cfg["window_size"],
+                "n_blocks":      finetune_cfg["n_swin_blocks"],
+                "num_heads":     finetune_cfg["num_heads"],
+                "c_shared":      finetune_cfg["c_shared"],
+                "head_dropout":  finetune_cfg["head_dropout"],
+            },
+            "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
+            "wall_times": wall_time.epoch_times,
+            "total_wall_time": sum(wall_time.epoch_times),
+        }
+    history_writer = HistoryWriter(output_dir / f"history_{run_tag}_finetuned.json",
+                                   _legacy_meta, initial_epoch)
+    callbacks.append(history_writer)
+
     print("\nStarting fine-tune training...")
     history = model.fit(
         train_ds,
@@ -3244,33 +3311,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     print(f"Period sidecar  : {sidecar} "
           f"({ds_period or 'no period declared'})")
 
-    history_data = {
-        "mode": mode,
-        "source": source,
-        "stage": "finetune",
-        "label_type": label_type,
-        "base_model": str(base_model_path),
-        "epochs_completed": len(history.history.get("loss", [])),
-        "batch_size": batch_size,
-        "optimizer": finetune_cfg["optimizer"],
-        "weight_decay": finetune_cfg["weight_decay"],
-        "initial_lr": finetune_cfg["initial_lr"],
-        "swin": {
-            "window_size":   finetune_cfg["window_size"],
-            "n_blocks":      finetune_cfg["n_swin_blocks"],
-            "num_heads":     finetune_cfg["num_heads"],
-            "c_shared":      finetune_cfg["c_shared"],
-            "head_dropout":  finetune_cfg["head_dropout"],
-        },
-        "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
-        "wall_times": wall_time.epoch_times,
-        "total_wall_time": sum(wall_time.epoch_times),
-        "history": {k: [float(v) for v in vals]
-                    for k, vals in history.history.items()},
-    }
-    history_path = output_dir / f"history_{run_tag}_finetuned.json"
-    with open(history_path, 'w') as f:
-        json.dump(history_data, f, indent=2)
+    history_path = history_writer.write(complete=True)
     print(f"History saved to: {history_path}")
 
     print("\n" + "=" * 70)
@@ -3392,6 +3433,29 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
         callbacks.append(_WeightsCheckpoint(ckpt_path, ckpt_meta))
         print(f"  Checkpoint:     per-epoch weights -> {ckpt_path}")
 
+    head_keys = [k for k in finetune_head_defaults() if k in hp]
+
+    def _v2_meta():
+        return {
+            "mode": mode, "source": source, "stage": "finetune",
+            "label_type": label_type, "base_model": str(base_model_path),
+            "batch_size": batch_size,
+            "optimizer": "adamw", "weight_decay": wd, "initial_lr": lr,
+            "warmup_epochs": int(hp["warmup_epochs"]), "min_lr": float(hp["min_lr"]),
+            "head_variant": head,
+            "head": {k: hp[k] for k in head_keys},
+            "swin": {"window_size": hp["window_size"], "n_blocks": hp["blocks_per_stage"],
+                     "num_heads": hp["stage_heads"][0], "c_shared": hp["stage_dims"][0],
+                     "head_dropout": 0.0},
+            "early_stopping": {"monitor": "val_csi_mid", "patience": int(hp["es_patience"])},
+            "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
+            "wall_times": wall_time.epoch_times,
+            "total_wall_time": sum(wall_time.epoch_times),
+        }
+    history_writer = HistoryWriter(output_dir / f"history_{run_tag}_finetuned.json",
+                                   _v2_meta, initial_epoch)
+    callbacks.append(history_writer)      # last: it records what the others log
+
     print("\nStarting fine-tune training (v2)...")
     history = model.fit(train_ds, validation_data=val_ds, epochs=epochs,
                         initial_epoch=initial_epoch, callbacks=callbacks)
@@ -3412,28 +3476,7 @@ def _train_finetune_v2(mode, source, period, run_tag, base_model_path, output_di
     with open(sidecar, "w", encoding="utf-8") as fh:
         json.dump(blob, fh, indent=2)
 
-    head_keys = [k for k in finetune_head_defaults() if k in hp]
-    history_data = {
-        "mode": mode, "source": source, "stage": "finetune",
-        "label_type": label_type, "base_model": str(base_model_path),
-        "epochs_completed": len(history.history.get("loss", [])),
-        "batch_size": batch_size,
-        "optimizer": "adamw", "weight_decay": wd, "initial_lr": lr,
-        "warmup_epochs": int(hp["warmup_epochs"]), "min_lr": float(hp["min_lr"]),
-        "head_variant": head,
-        "head": {k: hp[k] for k in head_keys},
-        "swin": {"window_size": hp["window_size"], "n_blocks": hp["blocks_per_stage"],
-                 "num_heads": hp["stage_heads"][0], "c_shared": hp["stage_dims"][0],
-                 "head_dropout": 0.0},
-        "early_stopping": {"monitor": "val_csi_mid", "patience": int(hp["es_patience"])},
-        "ones_fraction": float(ones_fraction) if label_type == "lightning" else None,
-        "wall_times": wall_time.epoch_times,
-        "total_wall_time": sum(wall_time.epoch_times),
-        "history": {k: [float(v) for v in vals] for k, vals in history.history.items()},
-    }
-    history_path = output_dir / f"history_{run_tag}_finetuned.json"
-    with open(history_path, "w") as f:
-        json.dump(history_data, f, indent=2)
+    history_path = history_writer.write(complete=True)
     print(f"History saved to: {history_path}")
     print("\n" + "=" * 70)
     print("Fine-tune training complete.")

@@ -77,6 +77,7 @@ from train_models import (
     WallTimeCallback,
     load_training_config,
     cosine_warmup_schedule,
+    HistoryWriter,
 )
 
 from pipeline_config import (
@@ -525,10 +526,39 @@ def train_kd(
     print("Starting KD training")
     print("-" * 70)
     t0 = time.time()
+    hist_path = model_dir / f"history_{student_run_tag}_kd.json"
+
+    def _kd_meta():
+        return {
+            "teacher_mode": teacher_mode,
+            "student_mode": student_mode,
+            "source": source,
+            "period": str(period) if period else None,
+            "teacher_finetuned": teacher_finetuned,
+            "kd_alpha": alpha,
+            "kd_temperature": temperature,
+            "kd_soft_weight": soft_weight,
+            "kd_weight_floor": weight_floor,
+            "soft_loss_form": "KL(teacher || student) x T^2",
+            "epochs_configured": epochs,
+            "batch_size": batch_size,
+            "lr_schedule": {"type": "cosine_warmup", **lr_schedule},
+            "patience": patience,
+            "seed": seed,
+            "student_params": int(student.count_params()),
+            "teacher_params": int(teacher.count_params()),
+            "student_hr_channels": STUDENT_HR_CHANNELS,
+            "teacher_hr_channels": int(teacher_input_shapes["past_hr"][-1]),
+            "wall_time_sec": time.time() - t0,
+            "epoch_wall_times": wall_timer.epoch_times,
+        }
+    history_writer = HistoryWriter(hist_path, _kd_meta, initial_epoch)
+
     history = kd_model.fit(
         train_ds, validation_data=val_ds, epochs=epochs,
         initial_epoch=initial_epoch,
-        callbacks=[lr_sched, early_stop, wall_timer, _StudentCheckpoint()],
+        callbacks=[lr_sched, early_stop, wall_timer, _StudentCheckpoint(),
+                   history_writer],
         verbose=1,
     )
     total_time = time.time() - t0
@@ -537,38 +567,8 @@ def train_kd(
     student.save(str(student_path))
     print(f"\nSaved student: {student_path}")
 
-    hist_path = model_dir / f"history_{student_run_tag}_kd.json"
-    hist_data = {
-        "teacher_mode": teacher_mode,
-        "student_mode": student_mode,
-        "source": source,
-        "period": str(period) if period else None,
-        "teacher_finetuned": teacher_finetuned,
-        "kd_alpha": alpha,
-        "kd_temperature": temperature,
-        "kd_soft_weight": soft_weight,
-        "kd_weight_floor": weight_floor,
-        "soft_loss_form": "KL(teacher || student) x T^2",
-        "epochs_configured": epochs,
-        "epochs_completed": len(history.history.get("loss", [])),
-        "batch_size": batch_size,
-        "lr_schedule": {"type": "cosine_warmup", **lr_schedule},
-        "patience": patience,
-        "seed": seed,
-        "student_params": int(student.count_params()),
-        "teacher_params": int(teacher.count_params()),
-        "student_hr_channels": STUDENT_HR_CHANNELS,
-        "teacher_hr_channels": int(teacher_input_shapes["past_hr"][-1]),
-        "wall_time_sec": total_time,
-        "epoch_wall_times": wall_timer.epoch_times,
-        "history": {
-            k: [float(v) for v in vals]
-            for k, vals in history.history.items()
-        },
-    }
-    with open(hist_path, "w") as f:
-        json.dump(hist_data, f, indent=2)
-    print(f"Saved history: {hist_path}")
+    history_writer.write(complete=True)
+    print(f"Saved history: {hist_path}  ({total_time:.0f} s)")
 
     # The training curves, with the exact values at the best and the
     # last epoch, where the student's evaluation will land too.
