@@ -2081,6 +2081,10 @@ class FinetuneModelV2(tf.keras.Model):
         self.t_loss.update_state(loss)
         self.t_forecast.update_state(l_forecast)
         if self.cvae:
+            # the training forward already samples z from the posterior,
+            # so the "q" value is the forecast loss itself here; only on
+            # validation do the two differ (prior mean vs posterior)
+            self.t_forecast_q.update_state(l_forecast)
             self.t_kl.update_state(kl)
             self.t_active.update_state(active)
         self._update_skill(inputs, y, probs)
