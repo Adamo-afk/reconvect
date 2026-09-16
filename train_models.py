@@ -3108,7 +3108,7 @@ def train_finetune(mode, data_root, base_model_path, output_dir,
     if finetune_cfg.get("max_batches"):
         n = int(finetune_cfg["max_batches"])
         train_ds, val_ds = train_ds.take(n), val_ds.take(n)
-        print(f"  DRY RUN: {n} batch(es) per split, one epoch")
+        print(f"  DRY RUN: {n} batch(es) per split")
     print("  Datasets loaded")
 
     if finetune_cfg.get("head", "swin_legacy") != "swin_legacy":
@@ -3573,8 +3573,12 @@ def main():
     parser.add_argument(
         "--max_batches", type=int, default=None,
         help="Dry run: train and validate on the first N batches of each "
-             "split for one epoch, then save. Checks a configuration end "
-             "to end without the cost of an epoch.",
+             "split, then save. Checks a configuration end to end without "
+             "the cost of an epoch; combine with --epochs.",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Override the configured number of epochs for this run.",
     )
     parser.add_argument(
         "--list-modes", action="store_true",
@@ -3715,6 +3719,8 @@ def main():
         params = merge_for_mode(cfg, mode)
         if args.batch_size:
             params["batch_size"] = int(args.batch_size)
+        if args.epochs:
+            params["epochs"] = int(args.epochs)
         print(f"  Effective hyperparameters: {params}")
 
         base_model_path = None
@@ -3766,8 +3772,9 @@ def main():
                 if args.head:
                     ft_cfg["head"] = args.head
                 if args.max_batches:
-                    ft_cfg["epochs"] = 1
                     ft_cfg["max_batches"] = int(args.max_batches)
+                if args.epochs:
+                    ft_cfg["epochs"] = int(args.epochs)
                 train_finetune(
                     mode=mode,
                     data_root=args.data_root,
