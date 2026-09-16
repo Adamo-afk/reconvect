@@ -232,11 +232,11 @@ def artifact_tag(mode: str, source: str, period=None, finetuned: bool = False,
     for the baseline. build_patch_ensemble resolves member summaries by
     the same string, and a comparison across models keys on it.
     """
-    from train_models import build_run_tag
+    from train_models import build_run_tag, finetune_suffix
     tag = build_run_tag(mode, source, period)
     if baseline:
         return f"sepconv_{tag}" + ("_latest" if WEIGHTS == "latest" else "")
-    return (tag + ("_finetuned" if finetuned else "_kd" if kd else "")
+    return (tag + (finetune_suffix(finetuned) or ("_kd" if kd else ""))
             + ("_latest" if WEIGHTS == "latest" else ""))
 
 
@@ -4462,10 +4462,11 @@ def main() -> int:
         `mode:kd` / `mode:finetuned` name the variant per entry, else the
         global flags apply."""
         mode, _, variant = spec.partition(":")
-        if variant not in ("", "kd", "finetuned", "base"):
+        if variant not in ("", "kd", "finetuned", "cvae", "base"):
             parser.error(f"unknown variant {variant!r} in --mode {spec}; "
-                         f"use mode, mode:finetuned or mode:kd")
-        finetuned = variant == "finetuned" or (variant == "" and args.finetuned)
+                         f"use mode, mode:finetuned, mode:cvae or mode:kd")
+        finetuned = ("cvae" if variant == "cvae"
+                     else variant == "finetuned" or (variant == "" and args.finetuned))
         kd = variant == "kd" or (variant == "" and args.kd)
         return mode, period, baseline, finetuned, kd
 

@@ -2036,7 +2036,7 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
     tf.keras.mixed_precision.set_global_policy("mixed_float16")
     # Central naming helper. Deferred import so this module doesn't
     # depend on train_models at import time.
-    from train_models import build_run_tag
+    from train_models import build_run_tag, finetune_suffix, finetune_ckpt_stem
     run_tag = build_run_tag(mode, source, period)
 
     def _resolve(kind_suffix: str) -> Path:
@@ -2087,11 +2087,12 @@ def load_model_artifact(model_dir: Path, mode: str, source: str,
     # The fine-tuned state is rebuilt and its weights loaded by name; the
     # rebuild needs the *final* base save regardless of which fine-tune
     # state is asked for.
-    ft_path = (ckpt_dir / f"{run_tag}_finetune_latest.keras"
-               if weights == "latest" else _resolve("_finetuned"))
+    ft_path = (ckpt_dir / f"{finetune_ckpt_stem(run_tag, finetuned)}.keras"
+               if weights == "latest"
+               else _resolve(finetune_suffix(finetuned)))
     base_path = _resolve("")
     # History JSON follows the same tag as the finetuned checkpoint.
-    history_path = model_dir / f"history_{run_tag}_finetuned.json"
+    history_path = model_dir / f"history_{run_tag}{finetune_suffix(finetuned)}.json"
     if not ft_path.is_file():
         raise FileNotFoundError(f"Fine-tuned model not found: {ft_path}")
     if not base_path.is_file():
@@ -2170,7 +2171,8 @@ def resolve_threshold(label_type: str, mode: str, source: str,
     if eval_results_path is None:
         run_tag = build_run_tag(mode, source, period)
         if finetuned:
-            run_tag = f"{run_tag}_finetuned"
+            from train_models import finetune_suffix
+            run_tag = f"{run_tag}{finetune_suffix(finetuned)}"
         elif kd:
             run_tag = f"{run_tag}_kd"
         eval_results_path = (Path("evaluation") / f"eval_{run_tag}"
@@ -2254,6 +2256,9 @@ def main() -> int:
                              "(rebuilt + load_weights, same trick as "
                              "evaluate_coalition). Mutually exclusive "
                              "with --kd.")
+    parser.add_argument("--cvae", action="store_true",
+                        help="Use the conditional-VAE fine-tuned head, "
+                             "coalition_<run_tag>_finetuned_cvae.keras.")
     parser.add_argument("--kd", action="store_true",
                         help="Use coalition_<run_tag>_kd.keras — the "
                              "knowledge-distillation student saved by "
@@ -2359,11 +2364,11 @@ def main() -> int:
     label_type = mode_config["label_type"]
     step_minutes = _load_step_minutes(data_root)
 
-    from train_models import build_run_tag  # local import: keep TF-heavy load lazy
+    from train_models import build_run_tag, finetune_suffix  # local import: keep TF-heavy load lazy
+    if args.cvae:
+        args.finetuned = "cvae"
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
-    variant_suffix = (("_finetuned" if args.finetuned
-                       else "_kd" if args.kd
-                       else "")
+    variant_suffix = ((finetune_suffix(args.finetuned) or ("_kd" if args.kd else ""))
                       + ("_latest" if args.weights == "latest" else ""))
     artifact_tag = f"{run_tag}{variant_suffix}"
     # Named after this script, not after predict_full_domain, which
@@ -2371,7 +2376,8 @@ def main() -> int:
     output_dir = Path(args.output_dir) / f"visualize_gt_vs_pred_{artifact_tag}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    variant_label = ("finetuned" if args.finetuned
+    variant_label = ("finetuned cVAE" if args.finetuned == "cvae"
+                     else "finetuned" if args.finetuned
                      else "KD student" if args.kd
                      else "base")
     print("=" * 70)

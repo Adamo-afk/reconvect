@@ -1124,6 +1124,9 @@ def main() -> int:
                         help="Load coalition_<run_tag>_finetuned.keras "
                              "(rebuilt + load_weights, same trick as "
                              "evaluate_coalition).")
+    parser.add_argument("--cvae", action="store_true",
+                        help="Load the conditional-VAE fine-tuned head, "
+                             "coalition_<run_tag>_finetuned_cvae.keras.")
     parser.add_argument("--kd", action="store_true",
                         help="Load the knowledge-distillation student weights "
                              "coalition_<run_tag>_kd.keras produced by "
@@ -1203,9 +1206,10 @@ def main() -> int:
         parser.error("give --date (with a time flag), or --pick")
     data_root = Path(args.data_root)
     model_dir = Path(args.model_dir)
-    variant_suffix = (("_finetuned" if args.finetuned
-                       else "_kd" if args.kd
-                       else "")
+    from train_models import finetune_suffix
+    if args.cvae:
+        args.finetuned = "cvae"
+    variant_suffix = ((finetune_suffix(args.finetuned) or ("_kd" if args.kd else ""))
                       + ("_latest" if args.weights == "latest" else ""))
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
     output_dir = Path(args.output_dir) / (
@@ -1246,7 +1250,8 @@ def main() -> int:
     print("=" * 70)
     print("COALITION-4 Inference (full-domain)")
     print("=" * 70)
-    variant_label = ("finetuned" if args.finetuned
+    variant_label = ("finetuned cVAE" if args.finetuned == "cvae"
+                     else "finetuned" if args.finetuned
                      else "KD student" if args.kd
                      else "base")
     print(f"  Mode:            {args.mode}  (label_type={label_type})")
