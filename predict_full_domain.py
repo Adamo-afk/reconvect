@@ -146,6 +146,16 @@ def sync_window_from_sequence_config():
         return
     INPUT_STEP_OFFSETS[:] = list(range(-int(past), 1))
     LEAD_STEP_OFFSETS[:] = list(range(1, int(future) + 1))
+    # Run as a script this module is `__main__`, and lightning_postproc
+    # imports a second copy under its own name; sync that copy's lists
+    # too, else the Hann path builds the fallback window.
+    import sys
+    for name in ("predict_full_domain", "__main__"):
+        mod = sys.modules.get(name)
+        if (mod is not None and hasattr(mod, "INPUT_STEP_OFFSETS")
+                and mod.INPUT_STEP_OFFSETS is not INPUT_STEP_OFFSETS):
+            mod.INPUT_STEP_OFFSETS[:] = list(INPUT_STEP_OFFSETS)
+            mod.LEAD_STEP_OFFSETS[:] = list(LEAD_STEP_OFFSETS)
     try:
         import visualize_gt_vs_pred as _vz
         _vz.sync_window_from_sequence_config(past, future)
