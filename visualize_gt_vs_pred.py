@@ -2289,9 +2289,10 @@ def main() -> int:
                              "post-processing path used to build Row 3. "
                              "Default 128 = 50%% overlap (55 patches on "
                              "the 768x1536 canvas).")
-    parser.add_argument("--lightning_low_threshold", type=float, default=0.90,
-                        help="Hysteresis LOW threshold for lightning "
-                             "Row 3. Default 0.90 (operational).")
+    parser.add_argument("--lightning_low_threshold", type=float, default=None,
+                        help="Hysteresis LOW threshold for lightning Row 3, "
+                             "for every lead. Default: the per-lead LOW of "
+                             "--validation_summary, else 0.90.")
     parser.add_argument("--lightning_high_threshold", type=float,
                         default=None,
                         help="Hysteresis HIGH threshold applied to every "
@@ -2494,8 +2495,13 @@ def main() -> int:
         high_per_lead = _resolve_high_threshold_per_lead(
             _resolver_args, step_minutes,
         )
+        from predict_full_domain import _resolve_low_threshold_per_lead
+        low_per_lead = _resolve_low_threshold_per_lead(
+            argparse.Namespace(validation_summary=args.validation_summary,
+                               lightning_low_threshold=args.lightning_low_threshold),
+            step_minutes)
         print(f"  Lightning post-proc: stride={args.stride}  "
-              f"low={args.lightning_low_threshold:.2f}  "
+              f"low per lead={{{', '.join(f't+{o*step_minutes}={l:.2f}' for o, l in low_per_lead.items())}}}  "
               f"high per lead={{{', '.join(f't+{o*step_minutes}={h:.2f}' for o, h in high_per_lead.items())}}}")
 
     # ---- Aggregate accumulators (rainfall only; per-sample canvases) ----
@@ -2545,7 +2551,7 @@ def main() -> int:
             pred_canvases = prob_canvases
             row3_canvases = [
                 hysteresis_binary(
-                    prob_canvases[k], low=args.lightning_low_threshold,
+                    prob_canvases[k], low=low_per_lead[_PF_LEAD_STEP_OFFSETS[k]],
                     high=high_per_lead[_PF_LEAD_STEP_OFFSETS[k]],
                 )
                 for k in range(len(prob_canvases))
@@ -2617,7 +2623,7 @@ def main() -> int:
             threshold=threshold, output_path=out_png,
             step_minutes=step_minutes,
             row3_canvases=row3_canvases,
-            postproc_low=(args.lightning_low_threshold if is_lightning
+            postproc_low=(low_per_lead if is_lightning
                           else rain_low_per_lead),
             postproc_high_per_lead=(high_per_lead if is_lightning
                                     else rain_high_per_lead),
@@ -2640,7 +2646,7 @@ def main() -> int:
                 threshold=threshold, output_path=zoom_png,
                 step_minutes=step_minutes,
                 row3_canvases=row3_canvases,
-                postproc_low=(args.lightning_low_threshold if is_lightning
+                postproc_low=(low_per_lead if is_lightning
                               else rain_low_per_lead),
                 postproc_high_per_lead=(high_per_lead if is_lightning
                                         else None),

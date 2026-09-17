@@ -1607,12 +1607,12 @@ def _plot_hmf_percentiles(summary: dict, rows: list[dict], offsets: list[int],
     print(f"  Wrote {path.name}")
 
 
-def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
-    """The two rainfall tuning figures from the summary: phase 1, pooled
-    CSI against the plain threshold per lead with the chosen LOW starred;
-    phase 2, pooled CSI of every (LOW, HIGH) window per lead with the
-    chosen pair starred. Both on the validation-split samples."""
+def _plot_low_sweep(summary: dict, out_low: Path) -> None:
+    """Phase 1 of either track: the pooled CSI on the validation-split
+    samples against the LOW threshold, one line per tuned lead, the
+    chosen LOW dashed; from post_processing.low_sweep."""
     pp = summary["post_processing"]
+    lightning = summary.get("track") == "lightning"
     leads = list(pp["low_sweep"])
     all_leads = list(pp["low_threshold_per_lead"])
     colors, markers = lead_palette(len(all_leads))
@@ -1628,7 +1628,8 @@ def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
                 label=f"{lead}: LOW {low:.2f} (CSI {best:.3f})"
                       + ("  - reused by every lead" if reused else ""))
         ax.axvline(low, color=color_of[lead], linestyle='--', alpha=0.7, linewidth=1)
-    ax.set_xlabel("threshold on p(argmax) of rainy-argmax pixels")
+    ax.set_xlabel("threshold on p(lightning)" if lightning
+                  else "threshold on p(argmax) of rainy-argmax pixels")
     ax.set_ylabel("pooled CSI (validation split)")
     ax.set_title("Phase 1 - LOW" + (" per lead" if not reused else " from t+1")
                  + " (dashed = chosen)")
@@ -1639,6 +1640,18 @@ def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
     plt.close(fig)
     print(f"  Wrote {Path(out_low).name}")
 
+
+def plot_rainfall_tuning(summary: dict, out_low: Path, out_high: Path) -> None:
+    """The two rainfall tuning figures from the summary: phase 1, pooled
+    CSI against LOW per lead (the shared helper); phase 2, pooled CSI of
+    every (LOW, HIGH) window per lead with the chosen pair in full
+    colour. Both on the validation-split samples."""
+    _plot_low_sweep(summary, out_low)
+    pp = summary["post_processing"]
+    all_leads = list(pp["low_threshold_per_lead"])
+    colors, markers = lead_palette(len(all_leads))
+    color_of = {lead: colors[i] for i, lead in enumerate(all_leads)}
+    reused = (pp.get("tune_leads") == "first" and len(all_leads) > 1)
     wleads = list(pp["window_sweep"])
     fig, axes = plt.subplots(1, len(wleads), figsize=(max(9, 5 * len(wleads)), 4.8),
                              squeeze=False, constrained_layout=True)
@@ -1737,7 +1750,11 @@ def make_plots(summary_path: Path) -> list[Path]:
     if summary.get("members"):
         _plot_member_csi(summary, out("members"))
     pp = summary.get("post_processing") or {}
-    if pp.get("low_sweep"):
+    if pp.get("low_sweep") and summary.get("track") == "lightning":
+        # --lightning_tune_low: the LOW sweep, then the HIGH sweep above it
+        _plot_low_sweep(summary, out("tuning_low"))
+        plot_tuning_from_summary(summary_path, out("tuning"))
+    elif pp.get("low_sweep"):
         plot_rainfall_tuning(summary, out("tuning_low"), out("tuning_high"))
     elif pp.get("tuning_scores"):
         plot_tuning_from_summary(summary_path, out("tuning"))
@@ -3094,7 +3111,7 @@ def _write_json_lightning(
     aggregate_confusion_per_lead: dict[int, dict],
     tuning_scores: dict[int, dict[float, dict]],
     best_high_per_lead: dict[int, float],
-    low_threshold: float,
+    low_per_lead: dict[int, float],
     step_minutes: int,
     path: Path,
     *,
@@ -3102,6 +3119,10 @@ def _write_json_lightning(
     high_coverage_pct: float = HIGH_COVERAGE_PCT,
     per_patch: dict | None = None,
     extra: dict | None = None,
+    low_source: str = "evaluation optimal_threshold",
+    low_sweep: dict | None = None,
+    phase1_low: dict | None = None,
+    tune_leads: str = "each",
 ):
     """Aggregate summary that mirrors the rainfall JSON schema and adds
     the `post_processing` block predict_full_domain.py consumes for the
@@ -3166,13 +3187,26 @@ def _write_json_lightning(
         "metrics_per_lead": metrics_at_best,
         "high_coverage_samples_per_lead": high_cov_lists,
         "post_processing": {
-            "low_threshold": low_threshold,
-            "high_grid": sorted(float(h) for h in next((t for t in tuning_scores.values() if t), {})),
+            # one LOW when every lead shares it (the evaluation's, or the
+            # flag), else the t+1 value; the per-lead block is authoritative
+            "low_threshold": (float(low_per_lead[0]) if len(set(low_per_lead.values())) == 1
+                              else float(low_per_lead[0])),
+            "low_threshold_per_lead": {
+                f"t+{offset * step_minutes}": float(low_per_lead[i])
+                for i, offset in enumerate(LEAD_STEP_OFFSETS)},
+            "low_source": low_source,
+            "high_grid_per_lead": {
+                lead_titles[i]: sorted(float(h) for h in tuning_scores[i])
+                for i in range(len(LEAD_STEP_OFFSETS)) if tuning_scores.get(i)},
             "high_threshold_per_lead": high_named,
             "tuning_scores": tuning_scores_named,
             "tuning_metric": "csi",
+            "tune_leads": tune_leads,
         },
     }
+    if low_sweep:
+        doc["post_processing"]["low_sweep"] = low_sweep
+        doc["post_processing"]["phase1_low_per_lead"] = phase1_low or {}
     if per_patch is not None:
         doc["per_patch"] = per_patch
     if extra:
@@ -3214,6 +3248,7 @@ def run_extraction_lightning(
     period=None,
     eval_root: Path = Path("./evaluation"),
     tune_leads: str = "each",
+    tune_low: bool = False,
 ):
     """Extraction mode for the lightning track.
 
@@ -3234,16 +3269,25 @@ def run_extraction_lightning(
     print(f"  Data root: {data_root}")
     print(f"  Model:     {mode} ({source}{' finetuned' if finetuned else ''}"
           f"{' KD student' if kd else ''})  -> {tag}")
-    if low_threshold is None:
-        low_threshold = lightning_low_from_evaluation(eval_root, tag)
-    else:
+    # LOW: the flag, or (--lightning_tune_low) a phase-1 sweep per lead
+    # on the validation split, or the evaluation's operating threshold.
+    if low_threshold is not None:
         print(f"  LOW = {low_threshold:.3f} (--lightning_low_threshold)")
-    high_grid = [round(low_threshold + 0.01 * k, 2)
-                 for k in range(1, int(round((0.99 - low_threshold) / 0.01)) + 1)]
-    if not high_grid:
-        raise SystemExit(f"LOW {low_threshold:.2f} leaves no room for a HIGH sweep")
-    print(f"  Post-proc: low={low_threshold:.2f}  "
-          f"high {high_grid[0]:.2f}..{high_grid[-1]:.2f} ({len(high_grid)} candidates)")
+        low_source = "--lightning_low_threshold"
+    elif tune_low:
+        print("  LOW: phase 1 sweeps it per lead on the validation split "
+              "(--lightning_tune_low)")
+        low_source = "phase 1 sweep on the validation split"
+    else:
+        low_threshold = lightning_low_from_evaluation(eval_root, tag)
+        low_source = "evaluation optimal_threshold"
+
+    def _high_grid(low: float) -> list[float]:
+        grid = [round(low + 0.01 * k, 2)
+                for k in range(1, int(round((0.99 - low) / 0.01)) + 1)]
+        if not grid:
+            raise SystemExit(f"LOW {low:.2f} leaves no room for a HIGH sweep")
+        return grid
     from pipeline_config import resolve_datasets_root
     datasets_root = resolve_datasets_root(data_root, datasets_root)
     dataset_mode = KD_TEACHER_MODE if kd else mode
@@ -3321,17 +3365,67 @@ def run_extraction_lightning(
               + (f", {missing} selected reference(s) without records" if missing else ""))
         return done
 
-    # ---- Phase A: HIGH per lead on the validation-split samples --------
     tuned = list(range(L)) if tune_leads == "each" else [0]
     print(f"  Tuning: {'per lead' if tune_leads == 'each' else 't+1 only, reused by every lead'}")
+    low_per_lead: dict[int, float] = {}
+    low_sweep_named: dict = {}
+    phase1_low_named: dict = {}
+    tune_dates: list = []
+
+    # ---- Phase 1 (optional): LOW per lead from a plain threshold sweep --
+    if tune_low:
+        low_grid = np.round(np.arange(0.01, 1.00, 0.01), 2)
+        tune_hist: list = []        # [n_t][L] (pos, neg, gt_pos_total)
+
+        def _phase1(n, date_str, ref_utc, probs, gts):
+            def one(i):
+                if i not in tuned or gts[i] is None:
+                    return None
+                eligible = np.ones(gts[i].shape, dtype=bool)
+                pos, neg = score_histograms(probs[i], gts[i], eligible)
+                return pos, neg, int(((gts[i] > 0) & (gts[i] >= 0)).sum())
+            tune_hist.append(_map_leads(one, L))
+
+        tune_dates = _run(["validation"], tuning_selected,
+                          "Phase 1 - LOW sweep on the validation split", _phase1)
+        if not tune_dates:
+            raise SystemExit("no tuning sample produced predictions")
+        print("\nPhase 1 result (plain threshold on p, pooled CSI):")
+        for i in tuned:
+            offset = LEAD_STEP_OFFSETS[i]
+            hs = [h[i] for h in tune_hist if h[i] is not None]
+            if not hs:
+                raise SystemExit(f"no ground truth for lead t+{offset * step_minutes}")
+            pos = sum(h[0] for h in hs)
+            neg = sum(h[1] for h in hs)
+            gt_tot = sum(h[2] for h in hs)
+            csi = csi_from_histograms(pos, neg, low_grid, gt_tot)
+            low_sweep_named[f"t+{offset * step_minutes}"] = {
+                f"{t:.2f}": float(c) for t, c in zip(low_grid, csi)}
+            low_per_lead[i] = float(low_grid[int(np.argmax(csi))])
+            phase1_low_named[f"t+{offset * step_minutes}"] = low_per_lead[i]
+            print(f"  t+{offset * step_minutes}: LOW={low_per_lead[i]:.2f}  "
+                  f"CSI={csi[int(np.argmax(csi))]:.4f}")
+        for i in range(L):
+            low_per_lead.setdefault(i, low_per_lead[tuned[0]])
+    else:
+        low_per_lead = {i: float(low_threshold) for i in range(L)}
+    high_grid_per_lead = {i: _high_grid(low_per_lead[i]) for i in range(L)}
+    print("  Post-proc: " + "  ".join(
+        f"t+{LEAD_STEP_OFFSETS[i] * step_minutes}: low={low_per_lead[i]:.2f} "
+        f"high {high_grid_per_lead[i][0]:.2f}..{high_grid_per_lead[i][-1]:.2f} "
+        f"({len(high_grid_per_lead[i])})" for i in tuned))
+
+    # ---- Phase A: HIGH per lead on the validation-split samples --------
     tune_conf: list = []   # [n_t][L][n_high] (tp, fp, fn, tn); zeros when no GT
 
     def _phase_a(n, date_str, ref_utc, probs, gts):
         def one(i):
+            grid = high_grid_per_lead[i]
             if i not in tuned or gts[i] is None:
-                return [(0, 0, 0, 0)] * len(high_grid)
-            conf, _ = sweep_hysteresis(probs[i], low_threshold, high_grid, gts[i])
-            return [conf[h] for h in high_grid]
+                return [(0, 0, 0, 0)] * len(grid)
+            conf, _ = sweep_hysteresis(probs[i], low_per_lead[i], grid, gts[i])
+            return [conf[h] for h in grid]
         tune_conf.append(_map_leads(one, L))
 
     tune_dates = _run(["validation"], tuning_selected,
@@ -3343,6 +3437,7 @@ def run_extraction_lightning(
     print("\nPhase A result (pooled CSI on the validation split):")
     for i in tuned:
         offset = LEAD_STEP_OFFSETS[i]
+        high_grid = high_grid_per_lead[i]
         for j, h in enumerate(high_grid):
             tp = sum(c[i][j][0] for c in tune_conf)
             fp = sum(c[i][j][1] for c in tune_conf)
@@ -3374,9 +3469,9 @@ def run_extraction_lightning(
             if gts[i] is None:
                 return None
             h = best_high_per_lead[LEAD_STEP_OFFSETS[i]]
-            conf, patches = sweep_hysteresis(probs[i], low_threshold, [h], gts[i])
+            conf, patches = sweep_hysteresis(probs[i], low_per_lead[i], [h], gts[i])
             gt = gts[i]
-            pred = probs[i] >= low_threshold
+            pred = probs[i] >= low_per_lead[i]
             gt_pos = gt > 0
             gt_neg = gt == 0
             raw = (int((pred & gt_pos).sum()), int((pred & gt_neg).sum()),
@@ -3421,24 +3516,27 @@ def run_extraction_lightning(
     _write_json_lightning(
         year, month, selected, rows,
         aggregate_confusion_per_lead, tuning_scores,
-        best_high_per_lead, low_threshold, step_minutes,
+        best_high_per_lead, low_per_lead, step_minutes,
         output_dir / f"{stem}_summary.json",
         rainfall_threshold_mmh=rainfall_threshold_mmh,
         high_coverage_pct=high_coverage_pct,
         per_patch=per_patch_scores(patch_acc),
+        low_source=low_source, low_sweep=low_sweep_named or None,
+        phase1_low=phase1_low_named or None, tune_leads=tune_leads,
         extra={
             "metrics_per_lead_raw": {
                 f"t+{off * step_minutes}": _summarise_confusion(raw_confusion_per_lead[i])
                 for i, off in enumerate(LEAD_STEP_OFFSETS)},
-            "raw_definition": f"p >= LOW {low_threshold:.2f}, no hysteresis",
+            "raw_definition": ("p >= LOW per lead ("
+                               + ", ".join(f"t+{LEAD_STEP_OFFSETS[i] * step_minutes}: "
+                                           f"{low_per_lead[i]:.2f}" for i in range(L))
+                               + "), no hysteresis"),
             "sampling": {"max_samples": MAX_SAMPLES, "month_batch": MONTH_BATCH,
                          "seed": SEED},
             "tuning": {"split": "validation", "n_samples": len(tune_dates),
                        "tune_leads": tune_leads,
                        "samples": [[d, r] for d, r in tune_dates],
-                       "low_source": ("--lightning_low_threshold"
-                                      if low_threshold is not None and False
-                                      else "evaluation optimal_threshold")},
+                       "low_source": low_source},
         },
     )
     make_plots(output_dir / f"{stem}_summary.json")
@@ -4315,6 +4413,13 @@ def main() -> int:
                              f"and the kd track. Default {DEFAULT_STRIDE} = 50%% "
                              "overlap. The extraction predicts the split "
                              "records and does not use it.")
+    parser.add_argument("--lightning_tune_low", action="store_true",
+                        help="Lightning track: add a phase 1 that sweeps LOW "
+                             "per lead (0.01..0.99, plain threshold, pooled "
+                             "CSI) on the validation split, as the rainfall "
+                             "track does, instead of taking the evaluation's "
+                             "threshold; HIGH is then swept above each "
+                             "lead's LOW. --tune_leads applies to it.")
     parser.add_argument("--lightning_low_threshold", type=float, default=None,
                         help="Hysteresis LOW threshold (lightning). Default: "
                              "the threshold the evaluation tuned for this "
@@ -4544,6 +4649,7 @@ def main() -> int:
                     period=period,
                     eval_root=Path(args.eval_root),
                     tune_leads=args.tune_leads,
+                    tune_low=args.lightning_tune_low,
                 )
                 _release()
         else:
