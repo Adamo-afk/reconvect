@@ -338,14 +338,15 @@ def predict_with_members(model, inputs, patches, batch_size, member_of_patch):
     if not member_of_patch or not hasattr(model, "set_member"):
         return model.predict(inputs, batch_size=batch_size, verbose=0)
     n_members = max(member_of_patch.values()) + 1
-    outs = []
-    for k in range(n_members):
-        model.set_member(k)
-        outs.append(model.predict(inputs, batch_size=batch_size, verbose=0))
-    model.set_member(-1)
-    composite = outs[0].copy()
+    n = len(next(iter(inputs.values())))
+    chunks = []
+    for start in range(0, n, max(1, int(batch_size))):
+        chunk = {k: tf.convert_to_tensor(a[start:start + batch_size]) for k, a in inputs.items()}
+        chunks.append(model.predict_members(chunk, n_members))   # (b, K, ...)
+    stacked = np.concatenate(chunks, axis=0)                       # (N, K, L, H, W, C)
+    composite = stacked[:, 0].copy()
     for j, patch in enumerate(patches):
-        composite[j] = outs[member_of_patch.get(int(patch), 0)][j]
+        composite[j] = stacked[j, member_of_patch.get(int(patch), 0)]
     used = sorted({member_of_patch.get(int(p), 0) for p in patches})
     print(f"  Members: composite of {n_members} draws, members {used} on these patches")
     return composite
