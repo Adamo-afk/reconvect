@@ -58,6 +58,14 @@ LIGHTNING_METRICS = [
 DEFAULT_SEASONS = {"DJF": [12, 1, 2], "MAM": [3, 4, 5],
                    "JJA": [6, 7, 8], "SON": [9, 10, 11]}
 DEFAULT_LEVELS = [50, 60, 70, 80, 90]
+LOWER_IS_BETTER = {"FAR"}
+
+
+def metric_title(key: str, title: str) -> str:
+    """The metric's name with the direction that is better."""
+    if key in LOWER_IS_BETTER:
+        return f"{title} \u2193 (lower is better)"
+    return f"{title} \u2191 (higher is better)"
 PALETTE = plt.get_cmap("tab10")
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "h", "<"]
 
@@ -171,7 +179,8 @@ def load_evaluations(eval_root: Path, track: str, include_baseline: bool,
 
 def plot_metrics_per_lead(models: list[dict], metrics: list[tuple[str, str]],
                           labels: dict[str, str], out_dir: Path, track: str):
-    """One figure per metric, every model a line; plus a grid of all."""
+    """One grid figure: a panel per metric, every model a line, the
+    title of each panel saying which direction is better."""
     if not models:
         return
     n = len(metrics)
@@ -180,28 +189,23 @@ def plot_metrics_per_lead(models: list[dict], metrics: list[tuple[str, str]],
     grid, gaxes = plt.subplots(rows, cols, figsize=(6 * cols, 4.4 * rows),
                                squeeze=False)
     for idx, (key, title) in enumerate(metrics):
-        fig, ax = plt.subplots(figsize=(7, 4.8))
-        for target in (ax, gaxes[idx // cols][idx % cols]):
-            for j, m in enumerate(models):
-                xs = m["leads"]
-                ys = [m["per_lead"][x].get(key) for x in xs]
-                if all(v is None for v in ys):
-                    continue
-                target.plot(xs, ys, marker=MARKERS[j % len(MARKERS)],
-                            color=PALETTE(j % 10), linewidth=2, markersize=6,
-                            linestyle="--" if m["baseline"] else "-",
-                            label=labels.get(m["tag"], m["tag"]))
-            target.set_xlabel("Lead time (min)")
-            target.set_ylabel(title)
-            target.set_title(title)
-            leads = sorted({x for m in models for x in m["leads"]})
-            target.set_xticks(leads)
-            target.grid(True, alpha=0.3)
-            target.legend(fontsize=7)
-        fig.tight_layout()
-        fig.savefig(out_dir / f"metrics_per_leadtime_{key}.png", dpi=150,
-                    bbox_inches="tight")
-        plt.close(fig)
+        target = gaxes[idx // cols][idx % cols]
+        for j, m in enumerate(models):
+            xs = m["leads"]
+            ys = [m["per_lead"][x].get(key) for x in xs]
+            if all(v is None for v in ys):
+                continue
+            target.plot(xs, ys, marker=MARKERS[j % len(MARKERS)],
+                        color=PALETTE(j % 10), linewidth=2, markersize=6,
+                        linestyle="--" if m["baseline"] else "-",
+                        label=labels.get(m["tag"], m["tag"]))
+        target.set_xlabel("Lead time (min)")
+        target.set_ylabel(title)
+        target.set_title(metric_title(key, title))
+        leads = sorted({x for m in models for x in m["leads"]})
+        target.set_xticks(leads)
+        target.grid(True, alpha=0.3)
+        target.legend(fontsize=7)
     for idx in range(n, rows * cols):
         gaxes[idx // cols][idx % cols].set_visible(False)
     grid.suptitle(f"{track} - every evaluated model, per lead time",
@@ -210,7 +214,7 @@ def plot_metrics_per_lead(models: list[dict], metrics: list[tuple[str, str]],
     grid.savefig(out_dir / "metrics_per_leadtime.png", dpi=150,
                  bbox_inches="tight")
     plt.close(grid)
-    print(f"  Wrote metrics_per_leadtime.png + {n} per-metric figures")
+    print("  Wrote metrics_per_leadtime.png")
 
 
 def write_table(models: list[dict], metrics: list[tuple[str, str]],
@@ -249,7 +253,10 @@ def write_table(models: list[dict], metrics: list[tuple[str, str]],
     for key, title in metrics:
         col_spec = "l" + "r" * (len(leads) + 1)
         tex += ["\\begin{tabular}{" + col_spec + "}", "\\toprule",
-                "\\textbf{" + title + "} & " + " & ".join(f"t+{x}" for x in leads)
+                "\\textbf{" + title + "} "
+                + ("($\\downarrow$ lower is better)" if key in LOWER_IS_BETTER
+                   else "($\\uparrow$ higher is better)")
+                + " & " + " & ".join(f"t+{x}" for x in leads)
                 + " & agg. \\\\", "\\midrule"]
         columns = [[m["per_lead"].get(x, {}).get(key) for m in models] for x in leads]
         columns.append([m["aggregate"].get(key) for m in models])
@@ -312,9 +319,8 @@ def write_table(models: list[dict], metrics: list[tuple[str, str]],
                     and abs(columns[c][r - 1] - best[c]) < 1e-9:
                 cell.set_text_props(fontweight="bold")
                 cell.set_facecolor("#dff0d8")
-        ax.set_title(title, fontsize=11, fontweight="bold", loc="left")
-    fig.suptitle(f"{track} - model comparison (best per column in bold; "
-                 f"{'FAR lower' if any(k == 'FAR' for k, _ in metrics) else 'higher'} is better)",
+        ax.set_title(metric_title(key, title), fontsize=11, fontweight="bold", loc="left")
+    fig.suptitle(f"{track} - model comparison (best per column in bold)",
                  fontsize=12, fontweight="bold")
     fig.savefig(out_dir / "comparison_table.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
