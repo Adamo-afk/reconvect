@@ -462,11 +462,12 @@ def _print_prob_stats(prob_canvases: list[np.ndarray],
         p_max = float(p.max()); p_mean = float(p.mean())
         p_p99 = float(np.percentile(p, 99.0))
         p_p999 = float(np.percentile(p, 99.9))
-        above_low = int((p >= low).sum())
+        lo = _low_at(low, offset)
+        above_low = int((p >= lo).sum())
         above_high = int((p >= high_per_lead[offset]).sum())
         print(f"    t+{lead_min:>3d}: max={p_max:.3f} mean={p_mean:.4f} "
               f"p99={p_p99:.3f} p99.9={p_p999:.3f} "
-              f"px>={low:.2f}: {above_low}  px>={high_per_lead[offset]:.2f}: "
+              f"px>={lo:.2f}: {above_low}  px>={high_per_lead[offset]:.2f}: "
               f"{above_high}")
 
 
@@ -533,6 +534,41 @@ def _resolve_high_threshold_per_lead(
         return {offset: float(args.lightning_high_threshold)
                 for offset in LEAD_STEP_OFFSETS}
     return {offset: DEFAULT_HIGH_THRESHOLD for offset in LEAD_STEP_OFFSETS}
+
+
+def _low_at(low, offset: int) -> float:
+    """The LOW of one lead: a per-lead dict keyed by the lead offset, or
+    one value for every lead."""
+    if isinstance(low, dict):
+        return float(low[offset])
+    return float(low)
+
+
+def _resolve_low_threshold_per_lead(args: argparse.Namespace, step_minutes: int
+                                    ) -> dict[int, float]:
+    """{lead_offset_steps: low_threshold} of the lightning hysteresis:
+    --lightning_low_threshold for every lead when given, else the
+    validation summary's low_threshold_per_lead (the evaluation's
+    threshold, or the phase-1 sweep of --lightning_tune_low), else
+    0.90."""
+    if getattr(args, "lightning_low_threshold", None) is not None:
+        return {o: float(args.lightning_low_threshold) for o in LEAD_STEP_OFFSETS}
+    if getattr(args, "validation_summary", None):
+        with open(args.validation_summary) as f:
+            pp = (json.load(f).get("post_processing") or {})
+        named = pp.get("low_threshold_per_lead") or {}
+        if named:
+            out = {}
+            for o in LEAD_STEP_OFFSETS:
+                key = f"t+{o * step_minutes}"
+                if key not in named:
+                    raise SystemExit(f"validation summary is missing "
+                                     f"post_processing.low_threshold_per_lead[{key}]")
+                out[o] = float(named[key])
+            return out
+        if pp.get("low_threshold") is not None:
+            return {o: float(pp["low_threshold"]) for o in LEAD_STEP_OFFSETS}
+    return {o: 0.90 for o in LEAD_STEP_OFFSETS}
 
 
 def _resolve_rainfall_thresholds(args: argparse.Namespace, step_minutes: int
@@ -697,12 +733,12 @@ def _plot_lightning_2x3(
         _apply_frame(ax_ov)
         if gt is not None:
             subtitle = (
-                f"Occurrence overlap  (low={low:.2f}, high={high_per_lead[offset]:.2f})\n"
+                f"Occurrence overlap  (low={_low_at(low, offset):.2f}, high={high_per_lead[offset]:.2f})\n"
                 f"{_format_hmf_pct(hits, misses, false_alarms)}"
             )
         else:
             subtitle = (
-                f"Occurrence overlap  (low={low:.2f}, high={high_per_lead[offset]:.2f})"
+                f"Occurrence overlap  (low={_low_at(low, offset):.2f}, high={high_per_lead[offset]:.2f})"
             )
         ax_ov.set_title(subtitle, fontsize=11)
 
@@ -1290,12 +1326,13 @@ def main() -> int:
     # Prepare lightning post-processing state once (no cost when unused).
     is_lightning = (label_type == "lightning")
     stride = args.stride if args.stride is not None else 128
-    low_threshold = (args.lightning_low_threshold
-                     if args.lightning_low_threshold is not None
-                     else 0.90)
+    low_threshold: dict[int, float] | float = (
+        args.lightning_low_threshold if args.lightning_low_threshold is not None else 0.90)
     if is_lightning:
         high_per_lead = _resolve_high_threshold_per_lead(args, step_minutes)
-        print(f"  Lightning post-proc: stride={stride}  low={low_threshold:.2f}  "
+        low_threshold = _resolve_low_threshold_per_lead(args, step_minutes)
+        print(f"  Lightning post-proc: stride={stride}  "
+              f"low per lead={{{', '.join(f't+{o*step_minutes}={l:.2f}' for o, l in low_threshold.items())}}}  "
               f"high per lead={{{', '.join(f't+{o*step_minutes}={h:.2f}' for o, h in high_per_lead.items())}}}")
         if restrict_to_patches is not None:
             print("  (ignoring --patches: Hann-overlap always covers the full canvas)")
@@ -1320,7 +1357,7 @@ def main() -> int:
                 continue
             bin_canvases = [
                 hysteresis_binary(
-                    prob_canvases[k], low=low_threshold,
+                    prob_canvases[k], low=_low_at(low_threshold, LEAD_STEP_OFFSETS[k]),
                     high=high_per_lead[LEAD_STEP_OFFSETS[k]],
                 )
                 for k in range(len(prob_canvases))
