@@ -216,7 +216,9 @@ def plot_metrics_per_lead(models: list[dict], metrics: list[tuple[str, str]],
 def write_table(models: list[dict], metrics: list[tuple[str, str]],
                 labels: dict[str, str], out_dir: Path, track: str):
     """Rows: models. Columns: metric x lead, plus the aggregate.
-    CSV for machines, Markdown for the README, LaTeX for the paper."""
+    CSV for machines, LaTeX for the paper, PNG as the asset of the
+    README: one block per metric, the best value per column in bold
+    (FAR lower is better)."""
     if not models:
         return
     leads = sorted({x for m in models for x in m["leads"]})
@@ -239,25 +241,6 @@ def write_table(models: list[dict], metrics: list[tuple[str, str]],
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
-
-    # Markdown: one block per metric so the table fits a page width.
-    md = [f"# {track} - model comparison", ""]
-    for key, title in metrics:
-        md.append(f"## {title}")
-        md.append("")
-        md.append("| Model | " + " | ".join(f"t+{x}" for x in leads) + " | aggregate |")
-        md.append("|---|" + "---|" * (len(leads) + 1))
-        for m in models:
-            cells = []
-            for x in leads:
-                v = m["per_lead"].get(x, {}).get(key)
-                cells.append("" if v is None else f"{v:.3f}")
-            v = m["aggregate"].get(key)
-            cells.append("" if v is None else f"{v:.3f}")
-            name = labels.get(m["tag"], m["tag"]) + (" (baseline)" if m["baseline"] else "")
-            md.append(f"| {name} | " + " | ".join(cells) + " |")
-        md.append("")
-    (out_dir / "comparison_table.md").write_text("\n".join(md), encoding="utf-8")
 
     # LaTeX: booktabs, the best value per column in bold. FAR is lower-is-better.
     tex = ["\\begin{table}[t]", "\\centering", "\\small",
@@ -294,7 +277,48 @@ def write_table(models: list[dict], metrics: list[tuple[str, str]],
         tex += ["\\bottomrule", "\\end{tabular}", "\\vspace{0.6em}", ""]
     tex += ["\\end{table}"]
     (out_dir / "comparison_table.tex").write_text("\n".join(tex), encoding="utf-8")
-    print("  Wrote comparison_table.csv / .md / .tex")
+
+    # PNG: the same blocks rendered as a figure, the best per column bold.
+    n_rows = len(models)
+    fig, axes = plt.subplots(len(metrics), 1,
+                             figsize=(max(9, 1.4 * (len(leads) + 2) + 4),
+                                      0.42 * (n_rows + 1.4) * len(metrics) + 0.8),
+                             constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    for ax, (key, title) in zip(axes, metrics):
+        ax.axis("off")
+        columns = [[m["per_lead"].get(x, {}).get(key) for m in models] for x in leads]
+        columns.append([m["aggregate"].get(key) for m in models])
+        best = []
+        for col in columns:
+            vals = [v for v in col if v is not None]
+            best.append(None if not vals else (min(vals) if key == "FAR" else max(vals)))
+        cells, row_names = [], []
+        for i, m in enumerate(models):
+            row_names.append(labels.get(m["tag"], m["tag"])
+                             + (" (baseline)" if m["baseline"] else ""))
+            cells.append(["--" if col[i] is None else f"{col[i]:.3f}" for col in columns])
+        table = ax.table(cellText=cells, rowLabels=row_names,
+                         colLabels=[f"t+{x}" for x in leads] + ["aggregate"],
+                         loc="upper center", cellLoc="center")
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.0, 1.35)
+        for (r, c), cell in table.get_celld().items():
+            if r == 0 or c == -1:
+                cell.set_text_props(fontweight="bold")
+                cell.set_facecolor("#e8e8e8")
+            elif best[c] is not None and columns[c][r - 1] is not None \
+                    and abs(columns[c][r - 1] - best[c]) < 1e-9:
+                cell.set_text_props(fontweight="bold")
+                cell.set_facecolor("#dff0d8")
+        ax.set_title(title, fontsize=11, fontweight="bold", loc="left")
+    fig.suptitle(f"{track} - model comparison (best per column in bold; "
+                 f"{'FAR lower' if any(k == 'FAR' for k, _ in metrics) else 'higher'} is better)",
+                 fontsize=12, fontweight="bold")
+    fig.savefig(out_dir / "comparison_table.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("  Wrote comparison_table.csv / .tex / .png")
 
 
 # ============================================================================
