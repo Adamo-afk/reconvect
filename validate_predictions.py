@@ -1444,7 +1444,7 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                 ax1.annotate("n/a" if np.isnan(v) else f"{v:.1f}",
                              (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                              xytext=(0, 2), textcoords="offset points",
-                             ha="center", va="bottom", fontsize=9, fontweight="bold")
+                             ha="center", va="bottom", fontsize=8, fontweight="bold")
     ax1.set_xticks(x)
     ax1.set_xticklabels(lead_titles, fontsize=10)
     ax1.set_ylim(0, 112)
@@ -1461,7 +1461,7 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                        color=HYSTERESIS_COLORS[name], edgecolor="black", linewidth=0.8,
                        label=labels[name])
         for bar, v in zip(bars, vals):
-            _bar_text(ax2, bar, v, " pt")
+            _bar_text(ax2, bar, v, "", size=9)
     ax2.axhline(0.0, color="black", linewidth=1.2)
     ax2.set_xlim(-0.7, n_lead - 0.3)
     ax2.set_xticks(x)
