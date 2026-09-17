@@ -120,17 +120,23 @@ def canonical_tag(tag: str) -> tuple[str, str]:
 
 
 def load_evaluations(eval_root: Path, track: str, include_baseline: bool,
-                     only: set[str] | None) -> list[dict]:
+                     only: set[str] | None, weights: str = "any") -> list[dict]:
     """One record per evaluated model of `track`:
     {tag, baseline, leads: [min], per_lead: {min: {metric: v}}, aggregate}."""
     by_tag: dict[str, dict] = {}
+    wanted = dict(canonical_tag(t) for t in (only or []))
     for results_path in sorted(eval_root.glob("eval_*/evaluation_results.json")):
         raw_tag = results_path.parent.name[len("eval_"):]
-        tag, weights = canonical_tag(raw_tag)
+        tag, state = canonical_tag(raw_tag)
         baseline = tag.startswith("sepconv_")
         if baseline and not include_baseline:
             continue
-        if only and tag not in only and raw_tag not in only:
+        if only:
+            # --models names the exact artefact: a plain tag is the final
+            # save, a _latest tag the checkpoint run
+            if tag not in wanted or wanted[tag] != state:
+                continue
+        elif weights != "any" and state != weights:
             continue
         if tag in by_tag and by_tag[tag]["weights"] == "best":
             print(f"  NOTE: {tag} evaluated with both weights; using best, "
@@ -154,7 +160,7 @@ def load_evaluations(eval_root: Path, track: str, include_baseline: bool,
         if tag in by_tag:
             print(f"  NOTE: {tag} evaluated with both weights; using best, "
                   f"skipping eval_{by_tag[tag]['raw_tag']}")
-        by_tag[tag] = {"tag": tag, "raw_tag": raw_tag, "weights": weights,
+        by_tag[tag] = {"tag": tag, "raw_tag": raw_tag, "weights": state,
                        "baseline": baseline,
                        "leads": sorted(per_lead), "per_lead": per_lead,
                        "aggregate": aggregate, "path": str(results_path),
@@ -327,6 +333,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
                  only: set[str] | None, split: str | None = None,
                  year: int | None = None, month: int | None = None,
                  threshold_mmh: float | None = None,
+                 weights: str = "any",
                  ) -> dict[str, list[dict]]:
     """{tag: rows} from the per-sample CSVs that match the scope.
 
@@ -343,6 +350,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
         rf"(?:(\d{{4}})_(\d{{2}})_)?thr([\d.]+)mmh_(.+)_samples\.csv$")
     per_model: dict[str, list[dict]] = defaultdict(list)
     val_weights: dict[str, str] = {}
+    wanted = dict(canonical_tag(t) for t in (only or []))
     legacy = 0
     used: list[str] = []
     seen_thresholds: set[float] = set()
@@ -352,7 +360,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
             legacy += 1
             continue
         f_split, f_year, f_month, f_thr, raw_tag = m.groups()
-        tag, weights = canonical_tag(raw_tag)
+        tag, state = canonical_tag(raw_tag)
         if tag in ("finetuned", "kd"):
             # The pre-tag naming put only the variant in the name.
             legacy += 1
@@ -368,9 +376,12 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
             continue
         if tag.startswith("sepconv_") and not include_baseline:
             continue
-        if only and tag not in only and raw_tag not in only:
+        if only:
+            if tag not in wanted or wanted[tag] != state:
+                continue
+        elif weights != "any" and state != weights:
             continue
-        if tag in val_weights and val_weights[tag] != weights:
+        if tag in val_weights and val_weights[tag] != state:
             if val_weights[tag] == "best":
                 print(f"  NOTE: {tag} validated with both weights; using best, "
                       f"skipping {path.name}")
@@ -378,7 +389,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
             print(f"  NOTE: {tag} validated with both weights; using best, "
                   f"dropping the latest rows")
             per_model[tag] = []
-        val_weights[tag] = weights
+        val_weights[tag] = state
         seen_thresholds.add(float(f_thr))
         if threshold_mmh is not None and float(f_thr) != float(threshold_mmh):
             continue
@@ -554,8 +565,17 @@ def main() -> int:
                         help="Add the SepConv-ens baseline (tags starting "
                              "with sepconv_). Rainfall only: no lightning "
                              "baseline exists yet.")
+    parser.add_argument("--weights", default="any", choices=["best", "latest", "any"],
+                        help="Which saved state of each model to read: best "
+                             "(the final saves only), latest (the per-epoch "
+                             "checkpoint runs only, the _latest artefacts), or "
+                             "any (default: best when it exists, else latest; "
+                             "the _latest suffix never splits a model in two).")
     parser.add_argument("--models", nargs="+", default=None, metavar="TAG",
-                        help="Restrict to these artifact tags.")
+                        help="Restrict to these artefact tags, each naming the "
+                             "exact saved state: a plain tag is the final "
+                             "save, a tag ending in _latest the checkpoint "
+                             "run. Overrides --weights for the listed models.")
     parser.add_argument("--label", action="append", default=[], metavar="TAG=NAME",
                         help="Display name for a tag, repeatable.")
     parser.add_argument("--hit_levels", nargs="+", type=int, default=DEFAULT_LEVELS,
@@ -595,10 +615,11 @@ def main() -> int:
 
     print(f"\n1. Evaluation results under {args.eval_root}")
     models = load_evaluations(Path(args.eval_root), args.track,
-                              args.include_baseline, only)
+                              args.include_baseline, only, weights=args.weights)
     for m in models:
         print(f"   {m['tag']:55s} leads {m['leads']}"
-              f"{'  (baseline)' if m['baseline'] else ''}")
+              f"{'  (baseline)' if m['baseline'] else ''}"
+              f"{'  [latest weights]' if m['weights'] == 'latest' else ''}")
     if not models:
         print("   none found")
     metrics = RAINFALL_METRICS if args.track == "rainfall" else LIGHTNING_METRICS
@@ -609,7 +630,8 @@ def main() -> int:
     per_model = load_samples(Path(args.validation_dir), args.track,
                              args.include_baseline, only,
                              split=args.split, year=args.year, month=args.month,
-                             threshold_mmh=args.rainfall_threshold_mmh)
+                             threshold_mmh=args.rainfall_threshold_mmh,
+                             weights=args.weights)
     thr_used = args.rainfall_threshold_mmh
     if thr_used is None:
         # One threshold on disk (load_samples refused otherwise): read it
