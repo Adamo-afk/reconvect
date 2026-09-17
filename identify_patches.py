@@ -989,6 +989,117 @@ def resolve_parameters(args, output_dir):
             base['rule'], source, recorded)
 
 
+DEFAULT_SWEEP = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50]
+
+
+def threshold_sweep(data_root, output_dir, thresholds, chosen, stride=1,
+                    start_date=None, end_date=None, date_filter=None):
+    """How the selection depends on the rain-rate threshold: every
+    `stride`-th OPERA field of the range is clustered once per
+    threshold with the DBSCAN parameters in force (eps, min_samples,
+    rule), and the figure shows, against the threshold, the share of
+    timesteps with at least one selected patch (the active samples) and
+    the mean number of selected patches per active sample, with a mark
+    at `chosen`, the threshold in force. Writes
+    <output_dir>/plots/threshold_sweep.png and .csv. Nothing else is
+    written: this is a look at the rule, not a rebuild of the index."""
+    import csv as _csv
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    thresholds = sorted(set(float(t) for t in thresholds) | {float(chosen)})
+    all_files = discover_opera_files(data_root)
+    if date_filter:
+        all_files = [(d, f) for d, f in all_files if d == date_filter]
+    if start_date:
+        all_files = [(d, f) for d, f in all_files if d >= start_date]
+    if end_date:
+        all_files = [(d, f) for d, f in all_files if d <= end_date]
+    files = all_files[::max(1, int(stride))]
+    if not files:
+        print("No OPERA files in the range.")
+        return False
+    print("=" * 70)
+    print("Threshold sweep of the DBSCAN selection")
+    print("=" * 70)
+    print(f"  fields     : {len(files)} of {len(all_files)} (every {stride})")
+    print(f"  thresholds : {', '.join(f'{t:g}' for t in thresholds)} mm/h")
+    print(f"  in force   : {chosen:g} mm/h, eps {DBSCAN_EPS}, min_samples "
+          f"{DBSCAN_MIN_SAMPLES}, rule {DBSCAN_RULE}")
+    active = {t: 0 for t in thresholds}
+    patches = {t: 0 for t in thresholds}
+    n_done = 0
+    for i, (date_str, filepath) in enumerate(files, 1):
+        try:
+            field = load_array(filepath)
+        except Exception as e:
+            print(f"  skip {filepath}: {e}")
+            continue
+        if field.ndim == 3:
+            field = np.squeeze(field, axis=0)
+        field = np.where(np.isnan(field), 0.0, field)
+        n_done += 1
+        for t in thresholds:
+            mask, centres = dbscan_clusters(field, threshold=t)
+            sel = selection_mask(mask, centres)
+            n = len(identify_active_patches(sel))
+            if n:
+                active[t] += 1
+                patches[t] += n
+        if i == 1 or i % 200 == 0 or i == len(files):
+            print(f"  [{i}/{len(files)}] {date_str}  active at {chosen:g} mm/h so far: "
+                  f"{active[chosen]}/{n_done}")
+    if not n_done:
+        print("No field could be read.")
+        return False
+
+    plot_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    share = [100.0 * active[t] / n_done for t in thresholds]
+    per_active = [(patches[t] / active[t]) if active[t] else 0.0 for t in thresholds]
+    scale = len(all_files) / n_done          # scanned -> whole range
+    with open(os.path.join(plot_dir, "threshold_sweep.csv"), "w", newline="",
+              encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["threshold_mmh", "active_samples_scanned", "scanned_samples",
+                    "active_share_pct", "active_samples_estimated_range",
+                    "selected_patches_scanned", "patches_per_active_sample"])
+        for t, sh, pa in zip(thresholds, share, per_active):
+            w.writerow([t, active[t], n_done, round(sh, 3),
+                        int(round(active[t] * scale)), patches[t], round(pa, 3)])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8.5), sharex=True,
+                                   constrained_layout=True)
+    ax1.plot(thresholds, share, marker="o", color="tab:blue", linewidth=2)
+    ax1.set_ylabel("timesteps with >= 1 selected patch (%)")
+    ax1.set_title(f"Active samples against the rain-rate threshold "
+                  f"({n_done} of {len(all_files)} timesteps scanned, every {stride}; "
+                  f"eps {DBSCAN_EPS}, min_samples {DBSCAN_MIN_SAMPLES}, rule {DBSCAN_RULE})")
+    ax2.plot(thresholds, per_active, marker="s", color="tab:orange", linewidth=2)
+    ax2.set_ylabel("selected patches per active sample")
+    ax2.set_xlabel("threshold (mm/h): pixels strictly above it are clustered")
+    k = thresholds.index(float(chosen))
+    for ax, vals, unit in ((ax1, share, " %"), (ax2, per_active, "")):
+        ax.axvline(chosen, color="red", linestyle="--", linewidth=1.5)
+        ax.annotate(f"in force: {chosen:g} mm/h\n{vals[k]:.1f}{unit}"
+                    + (f"  (~{int(round(active[chosen] * scale)):,} of "
+                       f"{len(all_files):,} timesteps)" if ax is ax1 else ""),
+                    (chosen, vals[k]), xytext=(8, 8), textcoords="offset points",
+                    color="red", fontsize=9, fontweight="bold")
+        for t, v in zip(thresholds, vals):
+            ax.annotate(f"{v:.1f}", (t, v), xytext=(0, 5), textcoords="offset points",
+                        ha="center", fontsize=7)
+        ax.grid(alpha=0.3)
+    ax2.set_xticks(thresholds)
+    ax2.set_xticklabels([f"{t:g}" for t in thresholds], fontsize=8)
+    out_png = os.path.join(plot_dir, "threshold_sweep.png")
+    fig.savefig(out_png, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nWrote {out_png} and threshold_sweep.csv")
+    return True
+
+
 def purge_plots(output_dir):
     """Delete every .gif, .png and .nc under <output_dir>/plots.
 
@@ -1372,6 +1483,20 @@ if __name__ == "__main__":
              "active timestep lands in plots/nc/. Requires --date."
     )
     parser.add_argument(
+        "--sweep", type=float, nargs="*", default=None, metavar="MMH",
+        help="Visualisation only: cluster every --sweep_stride-th OPERA field "
+             "of the range at each listed threshold (default "
+             + ", ".join(str(t) for t in DEFAULT_SWEEP)
+             + " mm/h) and draw the share of active samples and the patches "
+             "per active sample against the threshold, with a mark at the "
+             "threshold in force (--threshold, else the index's). Writes "
+             "plots/threshold_sweep.png and .csv; the index is not touched."
+    )
+    parser.add_argument(
+        "--sweep_stride", type=int, default=4,
+        help="Every Nth timestep of the range enters the sweep (default 4)."
+    )
+    parser.add_argument(
         "--purge_plots", action="store_true",
         help="Delete every .gif, .png and .nc under <output_dir>/plots, "
              "then exit. They are diagnostics that nothing reads, and "
@@ -1401,6 +1526,13 @@ if __name__ == "__main__":
     # run that names nothing reproduces it instead of the constants.
     (DBSCAN_THRESHOLD, DBSCAN_EPS, DBSCAN_MIN_SAMPLES, DBSCAN_RULE,
      DBSCAN_SOURCE, _recorded) = resolve_parameters(args, args.output_dir)
+    if args.sweep is not None:
+        ok = threshold_sweep(
+            args.data_root, args.output_dir,
+            thresholds=args.sweep or DEFAULT_SWEEP, chosen=DBSCAN_THRESHOLD,
+            stride=args.sweep_stride, start_date=args.start, end_date=args.end,
+            date_filter=args.date)
+        raise SystemExit(0 if ok else 1)
 
     ok = run_pipeline(
         data_root=args.data_root,
