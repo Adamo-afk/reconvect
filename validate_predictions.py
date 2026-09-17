@@ -337,7 +337,8 @@ def _paste_label_canvases(labels: np.ndarray, patches: list[int],
                           label_type: str) -> list[np.ndarray]:
     """The ground truth of one reference from its records' labels
     (N, L, 256, 256, C): one int32 canvas per lead with the class index
-    (radar: argmax of the one-hot) or 0/1 (lightning) at the records'
+    (radar: argmax of the one-hot; classes: the index itself, the
+    baseline's binned rain rate) or 0/1 (lightning) at the records'
     patch slots and -1 elsewhere, the marker every scorer treats as
     'no model output here'."""
     canvases = []
@@ -346,8 +347,13 @@ def _paste_label_canvases(labels: np.ndarray, patches: list[int],
         for p_pos, patch_num in enumerate(patches):
             r0, r1, c0, c1 = get_patch_bounds(patch_num)
             lab = labels[p_pos, i]
-            canvas[r0:r1, c0:c1] = (np.argmax(lab, axis=-1) if label_type == "radar"
-                                    else (lab[..., 0] > 0.5)).astype(np.int32)
+            if label_type == "radar":
+                cls = np.argmax(lab, axis=-1)
+            elif label_type == "classes":
+                cls = lab[..., 0]
+            else:
+                cls = lab[..., 0] > 0.5
+            canvas[r0:r1, c0:c1] = cls.astype(np.int32)
         canvases.append(canvas)
     return canvases
 
@@ -1885,7 +1891,7 @@ def run_extraction(track: str, year: int, month: int,
 
     print(f"\nLoading model ...")
     if baseline:
-        from sepconv_predict import load_base_models, predict_classes
+        from sepconv_predict import load_base_models, predict_classes, to_mmh, bin_to_classes
         from sepconv_compose import MAX_STEP as _SEPCONV_MAX_STEP
         from train_models import build_run_tag
         if L != _SEPCONV_MAX_STEP:
@@ -1949,7 +1955,15 @@ def run_extraction(track: str, year: int, month: int,
                 k = len(done) + 1
                 if k == 1 or k % 100 == 0:
                     print(f"  [{k}/{len(allowed)}] {date_str} {ref_utc}")
-                gt_canvases = _paste_label_canvases(labels, patches, "radar")
+                if baseline:
+                    # the baseline's labels are the rain rate in log-z space,
+                    # not one-hot classes: denormalise with the baseline's own
+                    # statistics and bin at the shared class edges
+                    classes = bin_to_classes(to_mmh(labels[..., 0], period,
+                                                    data_root=str(data_root), source=source))
+                    gt_canvases = _paste_label_canvases(classes[..., None], patches, "classes")
+                else:
+                    gt_canvases = _paste_label_canvases(labels, patches, "radar")
                 if baseline:
                     pred_canvases = _paste_class_canvases(
                         {i + 1: out[:, i] for i in range(L)}, patches, L)
