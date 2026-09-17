@@ -45,11 +45,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 RAINFALL_METRICS = [
-    ("accuracy", "Accuracy"),
-    ("balanced_accuracy", "Balanced accuracy"),
-    ("macro_f1", "Macro F1"),
-    ("macro_csi", "Macro CSI"),
-    ("wet_csi", "Mean CSI, wet classes"),
+    # the two class-mean scores of the 5-class evaluation, then the
+    # scores of the >= 10 mm/h event (class >= 1 against class 0), the
+    # same six the lightning table shows
+    ("macro_f1", "F1 (mean over the 5 classes)"),
+    ("macro_csi", "CSI (mean over the 5 classes)"),
+    ("CSI", "CSI (rain >= 10 mm/h)"), ("POD", "POD (rain >= 10 mm/h)"),
+    ("FAR", "FAR (rain >= 10 mm/h)"), ("ETS", "ETS (rain >= 10 mm/h)"),
+    ("HSS", "HSS (rain >= 10 mm/h)"), ("PSS", "PSS (rain >= 10 mm/h)"),
 ]
 LIGHTNING_METRICS = [
     ("CSI", "CSI"), ("POD", "POD"), ("FAR", "FAR"),
@@ -92,17 +95,41 @@ def track_of(results: dict) -> str | None:
     return None
 
 
+def event_scores(cm) -> dict:
+    """CSI, POD, FAR, ETS, HSS and PSS of the >= 10 mm/h event from a
+    5-class confusion matrix (rows: truth, columns: prediction): the
+    event is class >= 1, the non-event class 0."""
+    cm = np.asarray(cm, dtype=np.float64)
+    if cm.ndim != 2 or cm.shape[0] < 2:
+        return {}
+    tp = cm[1:, 1:].sum()
+    fp = cm[0, 1:].sum()
+    fn = cm[1:, 0].sum()
+    tn = cm[0, 0]
+    n = tp + fp + fn + tn
+    eps = 1e-12
+    pod = tp / (tp + fn + eps)
+    far = fp / (tp + fp + eps)
+    fpr = fp / (fp + tn + eps)
+    a_r = (tp + fp) * (tp + fn) / (n + eps)
+    return {
+        "CSI": tp / (tp + fp + fn + eps),
+        "POD": pod,
+        "FAR": far,
+        "ETS": (tp - a_r) / (tp + fp + fn - a_r + eps),
+        "HSS": 2 * (tp * tn - fp * fn) / ((tp + fn) * (fn + tn) + (tp + fp) * (fp + tn) + eps),
+        "PSS": pod - fpr,
+    }
+
+
 def rainfall_metrics(block: dict) -> dict:
-    """The five rainfall numbers, derived from per_class when a file
-    predates the macro keys."""
+    """The rainfall numbers of one lead (or the aggregate): the class-mean
+    F1 and CSI of the 5-class evaluation (derived from per_class when a
+    file predates the macro keys) and the six event scores from the
+    confusion matrix."""
     per_class = block.get("per_class") or {}
     names = list(per_class)
-    out = {"accuracy": block.get("accuracy")}
-    if "balanced_accuracy" in block:
-        out["balanced_accuracy"] = block["balanced_accuracy"]
-    elif per_class:
-        out["balanced_accuracy"] = float(np.mean(
-            [per_class[c]["recall"] for c in names]))
+    out = {}
     if "macro_f1" in block:
         out["macro_f1"] = block["macro_f1"]
     elif per_class:
@@ -111,8 +138,8 @@ def rainfall_metrics(block: dict) -> dict:
         out["macro_csi"] = block["macro_csi"]
     elif per_class:
         out["macro_csi"] = float(np.mean([per_class[c]["csi"] for c in names]))
-    if per_class and len(names) > 1:
-        out["wet_csi"] = float(np.mean([per_class[c]["csi"] for c in names[1:]]))
+    if block.get("confusion_matrix") is not None:
+        out.update(event_scores(block["confusion_matrix"]))
     return out
 
 
