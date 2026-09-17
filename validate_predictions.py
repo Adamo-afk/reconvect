@@ -1416,15 +1416,18 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
     raw = {lt: _rates(counts[lt]["raw"]) for lt in lead_titles}
     post = {lt: _rates(counts[lt]["post"]) for lt in lead_titles}
 
-    def _bar_text(ax, bar, v, unit, size=10):
+    def _bar_text(ax, bar, v, unit, size=10, lift=0):
+        """The value above (or below) a bar; `lift` raises the label by
+        that many points so neighbouring labels sit on two rows."""
         y = bar.get_height()
+        off = 3 + lift
         ax.annotate("n/a" if np.isnan(v) else f"{v + 0.0:+.1f}{unit}",
                     (bar.get_x() + bar.get_width() / 2, y),
-                    xytext=(0, 3 if y >= 0 else -3), textcoords="offset points",
+                    xytext=(0, off if y >= 0 else -off), textcoords="offset points",
                     ha="center", va="bottom" if y >= 0 else "top",
                     fontsize=size, fontweight="bold")
 
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(max(9, 2.8 * n_lead + 3), 14),
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(max(10, 3.6 * n_lead + 3), 14),
                                         constrained_layout=True)
     x = np.arange(n_lead)
 
@@ -1461,7 +1464,7 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                        color=HYSTERESIS_COLORS[name], edgecolor="black", linewidth=0.8,
                        label=labels[name])
         for bar, v in zip(bars, vals):
-            _bar_text(ax2, bar, v, "", size=9)
+            _bar_text(ax2, bar, v, " pt", size=9, lift=12 if j == 1 else 0)
     ax2.axhline(0.0, color="black", linewidth=1.2)
     ax2.set_xlim(-0.7, n_lead - 0.3)
     ax2.set_xticks(x)
@@ -1490,7 +1493,7 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                                edgecolor="black", linewidth=0.6,
                                label=f"{labels[name]} {which}")
                 for bar, v in zip(bars, vals):
-                    _bar_text(ax3, bar, v, "", size=8)
+                    _bar_text(ax3, bar, v, " pt", size=8, lift=12 if which == "raw" else 0)
         ax3.axhline(0.0, color="black", linewidth=1.2)
         ax3.set_xticks(xb)
         ax3.set_xticklabels([
