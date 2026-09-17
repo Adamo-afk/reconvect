@@ -365,7 +365,7 @@ python predict_full_domain.py --mode ... --pick csi|active [--top_n N] --validat
 - **Does** — stitches overlapping Hann-weighted patches into a full canvas at `--stride 128` (50 % overlap), removing the 256-px tiling seams.
 - **Writes** — `inference/predict_<run_tag>/*.npy`, `*_hyst.npy` — saved as arrays so a threshold sweep never re-runs inference.
 - **Graph** — `*_hits.png`, `*_perclass_hits.png`
-- **Alone** — `--pick csi` runs the `--top_n` best samples (default 5) by mean CSI over leads of a validation run, `--pick active` the `--top_n` with the most ground-truth-active pixels over the leads; the outputs are prefixed `csi_top<NN>_` or `active_top<NN>_` so the two sets coexist. No ground truth is needed at run time. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
+- **Alone** — `--pick csi` runs the `--top_n` best samples (default 5) by mean CSI over leads of a validation run, `--pick active` the `--top_n` with the most ground-truth-active pixels over the leads; the outputs are prefixed `csi_top<NN>_` or `active_top<NN>_` so the two sets coexist. No ground truth is needed at run time. `--baseline --period w44` runs the SepConv-ens baseline instead of a model, its class map through the same figures with no post-processing; the visualiser (A6) takes the same flag. `--validation_summary` applies the tuned thresholds per lead for both tracks (LOW and HIGH for rainfall); without it the fallback is 0.20 / 0.25.
 
 ### A5. Validation and threshold tuning
 ```bash
