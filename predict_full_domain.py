@@ -330,6 +330,34 @@ def members_from_summary(summary_path) -> dict[int, int]:
     return {int(p): int(k) for p, k in block.items()}
 
 
+def load_baseline(model_dir, period, weights="best"):
+    """The SepConv-ens base models of the baseline for `period`, as the
+    validation loads them; returns (base_models, run_tag)."""
+    from sepconv_predict import load_base_models
+    from sepconv_ensemble_training import SEPCONV_MODE
+    from train_models import build_run_tag
+    run_tag = build_run_tag(SEPCONV_MODE, SOURCE, period)
+    return load_base_models(Path(model_dir), run_tag, weights=weights), run_tag
+
+
+def predict_baseline(base_models, inputs, period, data_root, n_leads, batch_size=18):
+    """The baseline's forecast for one reference's patches as one-hot
+    class maps (N, L, 256, 256, 5): the SepConv rollout in log-z space,
+    denormalised with the baseline's own statistics and binned at the
+    shared class edges. One-hot so the rainfall figures treat it like
+    any softmax output; with p(argmax) = 1 everywhere the hysteresis
+    keeps every rainy pixel, so the post-processed map is the class map,
+    as in the validation."""
+    from sepconv_predict import predict_classes
+    past = np.asarray(inputs["past_hr"])
+    frames = [past[:, t, :, :, 0] for t in range(past.shape[1])]
+    classes, _mmh = predict_classes(base_models, frames, period, max_step=n_leads,
+                                    data_root=str(data_root), source=SOURCE,
+                                    batch_size=batch_size, batched=True)
+    stack = np.stack([classes[i + 1] for i in range(n_leads)], axis=1)   # (N, L, H, W)
+    return np.eye(5, dtype=np.float32)[stack.astype(np.int64)]
+
+
 def predict_with_members(model, inputs, patches, batch_size, member_of_patch):
     """model.predict, or, for a cVAE head with a per-patch member
     selection, the composite of the members' predictions: every patch
@@ -589,12 +617,17 @@ def _resolve_rainfall_thresholds(args: argparse.Namespace, step_minutes: int
         lows = pp.get("low_threshold_per_lead") or {}
         low_single = pp.get("low_threshold")
         lo_out, hi_out = {}, {}
+        if str(pp.get("method", "")).startswith("none"):
+            # a baseline summary: no thresholds were tuned, and none are
+            # needed (its outputs are class maps)
+            return ({o: DEFAULT_RAIN_LOW for o in LEAD_STEP_OFFSETS},
+                    {o: DEFAULT_RAIN_HIGH for o in LEAD_STEP_OFFSETS})
         for offset in LEAD_STEP_OFFSETS:
             key = f"t+{offset}"
             if key not in highs or highs[key] is None:
                 raise SystemExit(
                     f"validation summary {summary_path} has no tuned rainfall "
-                    f"HIGH for {key} (a baseline summary has none).")
+                    f"HIGH for {key}.")
             hi_out[offset] = float(highs[key])
             lo = lows.get(key, low_single)
             if lo is None:
@@ -1164,6 +1197,11 @@ def main() -> int:
     parser.add_argument("--cvae", action="store_true",
                         help="Load the conditional-VAE fine-tuned head, "
                              "coalition_<run_tag>_finetuned_cvae.keras.")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Run the SepConv-ens baseline of --period instead "
+                             "of a model: its class map goes through the same "
+                             "figures, with no post-processing. --mode is "
+                             "ignored.")
     parser.add_argument("--kd", action="store_true",
                         help="Load the knowledge-distillation student weights "
                              "coalition_<run_tag>_kd.keras produced by "
@@ -1237,6 +1275,15 @@ def main() -> int:
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive "
                      "(the KD student has no swin head).")
+    if args.baseline and (args.kd or args.finetuned):
+        parser.error("--baseline takes no --kd / --finetuned / --cvae")
+    if args.baseline:
+        if not args.period:
+            parser.error("--baseline needs --period (the baseline's window, e.g. w44)")
+        # the baseline shares the radar-only input group; its labels are
+        # binned to the same classes, so the radar-only mode config
+        # describes what the figures need
+        args.mode = "opera_radar_only_rainfall"
     if args.pick and not args.validation_summary:
         parser.error("--pick needs --validation_summary")
     if not args.pick and not args.date:
@@ -1249,6 +1296,9 @@ def main() -> int:
     variant_suffix = ((finetune_suffix(args.finetuned) or ("_kd" if args.kd else ""))
                       + ("_latest" if args.weights == "latest" else ""))
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
+    if args.baseline:
+        from sepconv_ensemble_training import SEPCONV_MODE
+        run_tag = f"sepconv_{build_run_tag(SEPCONV_MODE, SOURCE, args.period)}"
     output_dir = Path(args.output_dir) / (
         f"predict_{run_tag}{variant_suffix}"
     )
@@ -1317,11 +1367,17 @@ def main() -> int:
     # probability heatmap's colormap centering.
     print("\nLoading model...")
     member_of_patch = members_from_summary(args.validation_summary)
-    model = load_model_artifact(
-        model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
-        period=args.period, weights=args.weights,
-    )
-    print(f"  Loaded: {model.count_params():,} parameters")
+    base_models = None
+    if args.baseline:
+        base_models, base_tag = load_baseline(model_dir, args.period, weights=args.weights)
+        model = None
+        print(f"  Loaded SepConv-ens baseline {base_tag}: leads {sorted(base_models)}")
+    else:
+        model = load_model_artifact(
+            model_dir, args.mode, SOURCE, args.finetuned, kd=args.kd,
+            period=args.period, weights=args.weights,
+        )
+        print(f"  Loaded: {model.count_params():,} parameters")
 
     # 3. Per-reference-time inference
     # Prepare lightning post-processing state once (no cost when unused).
@@ -1430,8 +1486,12 @@ def main() -> int:
                   "Skipping.")
             continue
 
-        preds = predict_with_members(model, inputs, valid_patches, args.batch_size,
-                                     member_of_patch)
+        if base_models is not None:
+            preds = predict_baseline(base_models, inputs, args.period, data_root,
+                                     len(LEAD_STEP_OFFSETS), batch_size=args.batch_size)
+        else:
+            preds = predict_with_members(model, inputs, valid_patches, args.batch_size,
+                                         member_of_patch)
         canvases = paste_predictions_to_canvas(preds, valid_patches, label_type)
         print(f"  Predicted {len(valid_patches)} patch(es); "
               f"canvases {canvases[0].shape}")

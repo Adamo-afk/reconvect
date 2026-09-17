@@ -2259,6 +2259,11 @@ def main() -> int:
     parser.add_argument("--cvae", action="store_true",
                         help="Use the conditional-VAE fine-tuned head, "
                              "coalition_<run_tag>_finetuned_cvae.keras.")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Visualise the SepConv-ens baseline of --period "
+                             "instead of a model: its class map goes through "
+                             "the same rows, with no post-processing. --mode "
+                             "is ignored.")
     parser.add_argument("--kd", action="store_true",
                         help="Use coalition_<run_tag>_kd.keras — the "
                              "knowledge-distillation student saved by "
@@ -2325,6 +2330,12 @@ def main() -> int:
                              "for rainfall/radar modes; ignored otherwise.")
     args = parser.parse_args()
 
+    if args.baseline and (args.kd or args.finetuned or args.cvae):
+        parser.error("--baseline takes no --kd / --finetuned / --cvae")
+    if args.baseline:
+        if not args.period:
+            parser.error("--baseline needs --period (the baseline's window, e.g. w44)")
+        args.mode = "opera_radar_only_rainfall"
     if args.kd and args.finetuned:
         parser.error("--kd and --finetuned are mutually exclusive "
                      "(the KD student is trained fresh from scratch, "
@@ -2369,6 +2380,9 @@ def main() -> int:
     if args.cvae:
         args.finetuned = "cvae"
     run_tag = build_run_tag(args.mode, SOURCE, args.period)
+    if args.baseline:
+        from sepconv_ensemble_training import SEPCONV_MODE
+        run_tag = f"sepconv_{build_run_tag(SEPCONV_MODE, SOURCE, args.period)}"
     variant_suffix = ((finetune_suffix(args.finetuned) or ("_kd" if args.kd else ""))
                       + ("_latest" if args.weights == "latest" else ""))
     artifact_tag = f"{run_tag}{variant_suffix}"
@@ -2399,11 +2413,19 @@ def main() -> int:
     )
 
     print(f"\nLoading model...")
-    model = load_model_artifact(
-        Path(args.model_dir), args.mode, SOURCE, args.finetuned,
-        kd=args.kd, period=args.period, weights=args.weights,
-    )
-    print(f"  Loaded: {model.count_params():,} parameters")
+    base_models = None
+    if args.baseline:
+        from predict_full_domain import load_baseline
+        base_models, base_tag = load_baseline(Path(args.model_dir), args.period,
+                                              weights=args.weights)
+        model = None
+        print(f"  Loaded SepConv-ens baseline {base_tag}: leads {sorted(base_models)}")
+    else:
+        model = load_model_artifact(
+            Path(args.model_dir), args.mode, SOURCE, args.finetuned,
+            kd=args.kd, period=args.period, weights=args.weights,
+        )
+        print(f"  Loaded: {model.count_params():,} parameters")
 
     # Resolve country borders + Romania-centred view extent once now so
     # the script reports both the border source (cartopy Natural Earth
@@ -2569,9 +2591,13 @@ def main() -> int:
             print(f"  Built inputs for {len(all_patches)} / {N_PATCHES} "
                   f"patches (from reprojected data)  |  "
                   f"DBSCAN-selected: {len(csv_active)}")
-            from predict_full_domain import predict_with_members
-            preds = predict_with_members(model, inputs, all_patches,
-                                         args.batch_size, member_of_patch)
+            from predict_full_domain import predict_with_members, predict_baseline
+            if base_models is not None:
+                preds = predict_baseline(base_models, inputs, args.period, data_root,
+                                         len(LABEL_STEP_OFFSETS), batch_size=args.batch_size)
+            else:
+                preds = predict_with_members(model, inputs, all_patches,
+                                             args.batch_size, member_of_patch)
             print(f"  Model output shape: {preds.shape}")
             pred_canvases = paste_predictions_to_canvas(
                 preds, all_patches, label_type,
