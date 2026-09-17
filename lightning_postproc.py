@@ -43,6 +43,7 @@ from predict_full_domain import (
     _VARIABLE_TO_GROUP,
     INPUT_STEP_OFFSETS,
     _ref_to_hhmm,
+    sync_window_from_sequence_config,
 )
 from extract_patches import _resolve_hhmm as snap_hhmm_to_product
 
@@ -264,6 +265,10 @@ def build_inputs_for_reference_overlapped(
     canvas even in the presence of some missing feeds") rather than
     the training-time "skip incomplete patches" behaviour.
     """
+    # The window of the period in force (create_datasets holds it after
+    # init_sequence_config); this module's copy of the offsets is synced
+    # here so a script run as __main__ cannot leave it on the fallback.
+    sync_window_from_sequence_config()
     positions = enumerate_positions(canvas_shape, patch_size, stride)
     inputs: dict[str, np.ndarray] = {}
     all_missing = True
