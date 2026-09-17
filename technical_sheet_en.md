@@ -393,7 +393,9 @@ python validate_predictions.py --track rainfall --split test --mode mtg_lightnin
 python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
 python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
+python generate_report.py --year Y --month M --split test --rainfall_threshold_mmh 8 --pred_coupling --period f34 --weights latest --rainfall_variant cvae --top_n 5 --coupling_only
 ```
+- **Coupling** — `--coupling_only` stops after the coupling figures, without the text generation and the PDF; `--split` reads the split-scope validation runs restricted to the month; the `--top_n` references with the most coupled pixels each get a coupling figure; with `--pred_coupling` the figure couples the predictions of the models named by `--period`, `--weights` and the two variants, post-processed at the thresholds both summaries tuned (rainfall LOW / HIGH per lead, lightning LOW / HIGH per lead, the cVAE members from the rainfall summary).
 - **Note** — the visualiser builds its ground truth from the patch files of the `--csv` rows, so a picked timestep must be a row of that CSV (validate on `--split test` and pass the test CSV).
 - **Writes** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 
