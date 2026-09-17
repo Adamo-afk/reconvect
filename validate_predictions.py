@@ -1929,12 +1929,8 @@ def run_extraction(track: str, year: int, month: int,
                 batch_size=18, batched=True)
             return np.stack([classes[i + 1] for i in range(L)], axis=1)
         if members_on[0]:
-            outs = []
-            for k in range(n_members):
-                model.set_member(k)
-                outs.append(model(inputs, training=False).numpy())
-            model.set_member(-1)
-            return np.stack(outs, axis=1)            # (B, K, L, H, W, C)
+            # one backbone pass, the head once per member
+            return model.predict_members(inputs, n_members)   # (B, K, L, H, W, C)
         return model(inputs, training=False).numpy()
 
     def _run(splits, allowed, label, per_sample):

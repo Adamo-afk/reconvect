@@ -1971,6 +1971,17 @@ class FinetuneModelV2(tf.keras.Model):
         -1 uses the prior mean (the deterministic forecast)."""
         self.member.assign(int(k))
 
+    def predict_members(self, inputs, n_members: int):
+        """The forecasts of members 0 .. n_members-1 for one batch, as
+        one array (B, K, L, H, W, C). The frozen backbone runs once; only
+        the head, which is what the latent changes, runs per member. The
+        draws are the ones set_member(k) would make."""
+        feats, logits_b = self.feature_model(inputs, training=False)
+        outs = [self.head(feats, logits_b, inputs, training=False,
+                          member=tf.constant(k, dtype=tf.int32))
+                for k in range(int(n_members))]
+        return np.stack([np.asarray(o, dtype=np.float32) for o in outs], axis=1)
+
     @property
     def metrics(self):
         base = [self.t_loss, self.t_forecast]
@@ -2165,13 +2176,9 @@ def _ensemble_metrics(model, dataset, n_members: int, max_batches: int = 20) -> 
     for b, (inputs, y) in enumerate(dataset):
         if b >= max_batches:
             break
-        members = []
-        for k in range(n_members):
-            model.set_member(k)
-            members.append(np.asarray(model(inputs, training=False), dtype=np.float32))
-        model.set_member(-1)
         y = np.asarray(y, dtype=np.float32)
-        stack = np.stack(members, axis=0)                     # (K, B, L, H, W, C)
+        stack = np.transpose(model.predict_members(inputs, n_members),
+                             (1, 0, 2, 3, 4, 5))           # (K, B, L, H, W, C)
         mean = stack.mean(axis=0)
         if n_out > 1:
             cum_f = np.cumsum(mean, axis=-1)
