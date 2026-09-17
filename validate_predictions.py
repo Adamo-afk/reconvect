@@ -1374,14 +1374,11 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                           path: Path) -> bool:
     """What the hysteresis changes on the scope samples, three plots.
 
-    1. Per lead, the rates relative to the ground truth (hits = TP,
-       misses = FN, false alarms = FP, each over the GT-active pixels),
-       raw (hatched) and post-processed (solid), the counts under the
-       lead.
-    2. Per lead, the rates relative to the ground truth (hits = TP,
-       misses = FN, false alarms = FP, each over the GT-active pixels),
-       as the difference post-processed minus raw in percentage points,
-       both rates under the lead.
+    1. Per lead, the rates: hits and misses over the GT-active pixels,
+       false alarms over the predicted-active pixels (the rates of every
+       hmf figure), raw (hatched) and post-processed (solid).
+    2. Per lead, the difference post-processed minus raw of each rate,
+       in percentage points, both rates under the lead.
     3. For the leads after the first, the change of each of those rates
        against the first lead, in percentage points, raw (hatched) and
        post-processed (solid).
@@ -1410,22 +1407,22 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
         return {"hits": tp, "misses": fn, "false_alarms": fp}[name]
 
     def _rates(trip):
+        # hits and misses over the GT-active pixels, false alarms over the
+        # predicted-active pixels: the three rates of every hmf figure
         tp, fp, fn = trip
-        gt = tp + fn
-        if gt <= 0:
-            return {"hits": np.nan, "misses": np.nan, "false_alarms": np.nan}
-        return {"hits": 100.0 * tp / gt, "misses": 100.0 * fn / gt,
-                "false_alarms": 100.0 * fp / gt}
+        r = _hmf_percentages(tp, fp, fn)
+        return {k: (np.nan if v is None else float(v)) for k, v in r.items()}
 
     raw = {lt: _rates(counts[lt]["raw"]) for lt in lead_titles}
     post = {lt: _rates(counts[lt]["post"]) for lt in lead_titles}
 
-    def _bar_text(ax, bar, v, unit):
+    def _bar_text(ax, bar, v, unit, size=10):
         y = bar.get_height()
         ax.annotate("n/a" if np.isnan(v) else f"{v + 0.0:+.1f}{unit}",
                     (bar.get_x() + bar.get_width() / 2, y),
                     xytext=(0, 3 if y >= 0 else -3), textcoords="offset points",
-                    ha="center", va="bottom" if y >= 0 else "top", fontsize=8)
+                    ha="center", va="bottom" if y >= 0 else "top",
+                    fontsize=size, fontweight="bold")
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(max(9, 2.8 * n_lead + 3), 14),
                                         constrained_layout=True)
@@ -1447,15 +1444,13 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                 ax1.annotate("n/a" if np.isnan(v) else f"{v:.1f}",
                              (bar.get_x() + bar.get_width() / 2, bar.get_height()),
                              xytext=(0, 2), textcoords="offset points",
-                             ha="center", va="bottom", fontsize=7)
+                             ha="center", va="bottom", fontsize=9, fontweight="bold")
     ax1.set_xticks(x)
-    ax1.set_xticklabels([
-        lt + "".join(f"\n{labels[name]} {_count(counts[lt]['raw'], name):,} -> "
-                     f"{_count(counts[lt]['post'], name):,}" for name in HMF_NAMES)
-        for lt in lead_titles], fontsize=8)
-    ax1.set_ylabel("% of the GT-active pixels")
-    ax1.set_title("1. Hits, misses and false alarms in % of the GT-active pixels, per lead: "
-                  "raw (hatched) and post-processed (solid); counts under the lead")
+    ax1.set_xticklabels(lead_titles, fontsize=10)
+    ax1.set_ylim(0, 112)
+    ax1.set_ylabel("%")
+    ax1.set_title("1. Hits and misses in % of the GT-active pixels, false alarms in % of the "
+                  "predicted-active pixels, per lead: raw (hatched) and post-processed (solid)")
     ax1.legend(loc="best", fontsize=8, ncol=3)
     width = 0.3
 
@@ -1472,10 +1467,10 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
     ax2.set_xticks(x)
     ax2.set_xticklabels([
         lt + "".join(f"\n{labels[name]} {raw[lt][name]:.1f} % -> {post[lt][name]:.1f} %"
-                     for name in HMF_NAMES) for lt in lead_titles], fontsize=8)
+                     for name in HMF_NAMES) for lt in lead_titles], fontsize=9)
     ax2.set_ylabel("post-processed minus raw (percentage points)")
-    ax2.set_title("2. Difference of the hit / miss / false-alarm rates, each in % of the "
-                  "GT-active pixels: post-processed minus raw per lead (raw -> post under the lead)")
+    ax2.set_title("2. Difference of the hit / miss / false-alarm rates: post-processed "
+                  "minus raw per lead (raw -> post under the lead)")
     ax2.legend(loc="best", fontsize=9)
 
     # ---- 3. change against the first lead, raw and post
@@ -1495,12 +1490,12 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                                edgecolor="black", linewidth=0.6,
                                label=f"{labels[name]} {which}")
                 for bar, v in zip(bars, vals):
-                    _bar_text(ax3, bar, v, " pt")
+                    _bar_text(ax3, bar, v, "", size=8)
         ax3.axhline(0.0, color="black", linewidth=1.2)
         ax3.set_xticks(xb)
         ax3.set_xticklabels([
             lt + "".join(f"\n{labels[name]} raw {raw[lt][name]:.1f} % / post {post[lt][name]:.1f} %"
-                         for name in HMF_NAMES) for lt in later], fontsize=8)
+                         for name in HMF_NAMES) for lt in later], fontsize=9)
         ax3.set_ylabel(f"rate minus its {first} value (percentage points)")
         ax3.set_title(f"3. Against {first}: change of each rate at the later leads, raw (hatched) "
                       f"and post-processed (solid); {first}: " + ", ".join(
