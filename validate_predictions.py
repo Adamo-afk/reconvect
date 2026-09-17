@@ -1372,17 +1372,24 @@ HYSTERESIS_COLORS = {"hits": "tab:orange", "misses": "tab:blue",
 
 def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                           path: Path) -> bool:
-    """What the hysteresis changes on the scope samples, in rates
-    relative to the ground truth: hits = TP / GT-active, misses =
-    FN / GT-active, false alarms = FP / GT-active, all in % of the
-    GT-active pixels, for the raw decision (rainfall: the argmax class
-    map; lightning: p >= LOW) and for the post-processed one.
+    """What the hysteresis changes on the scope samples, three plots.
 
-    Top: per lead, the difference post minus raw of each rate, in
-    percentage points, with both rates under the lead. Bottom: for the
-    leads after the first, the change of each rate against the first
-    lead, in percentage points, raw (hatched) and post-processed
-    (solid). Needs `metrics_per_lead_raw`; returns False without it."""
+    1. Per lead, the gain (+) or loss (-) of hits, misses and false
+       alarms from the raw decision to the post-processed one, in % of
+       the raw count, up always meaning better (more hits, fewer misses,
+       fewer false alarms), touching bars around the zero line, the
+       counts under the lead.
+    2. Per lead, the rates relative to the ground truth (hits = TP,
+       misses = FN, false alarms = FP, each over the GT-active pixels),
+       as the difference post-processed minus raw in percentage points,
+       both rates under the lead.
+    3. For the leads after the first, the change of each of those rates
+       against the first lead, in percentage points, raw (hatched) and
+       post-processed (solid).
+
+    Raw is the argmax class map on the rainfall track and p >= LOW on
+    the lightning track. Needs `metrics_per_lead_raw`; returns False
+    without it."""
     raw_per_lead = summary.get("metrics_per_lead_raw")
     post_per_lead = summary.get("metrics_per_lead") or {}
     pp = summary.get("post_processing") or {}
@@ -1390,56 +1397,86 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
         print("  No raw-versus-post counts in this summary; hysteresis figure skipped")
         return False
     lead_titles = [f"t+{o * step}" for o in offsets]
+    labels = {"hits": "hits", "misses": "misses", "false_alarms": "false alarms"}
+    n_lead = len(lead_titles)
 
-    def _rates(block):
-        tp, fp, fn = (float(block.get(k, 0)) for k in ("TP", "FP", "FN"))
+    counts = {}
+    for lt in lead_titles:
+        r, p = raw_per_lead.get(lt) or {}, post_per_lead.get(lt) or {}
+        counts[lt] = {"raw": (int(r.get("TP", 0)), int(r.get("FP", 0)), int(r.get("FN", 0))),
+                      "post": (int(p.get("TP", 0)), int(p.get("FP", 0)), int(p.get("FN", 0)))}
+
+    def _count(trip, name):
+        tp, fp, fn = trip
+        return {"hits": tp, "misses": fn, "false_alarms": fp}[name]
+
+    def _rates(trip):
+        tp, fp, fn = trip
         gt = tp + fn
         if gt <= 0:
             return {"hits": np.nan, "misses": np.nan, "false_alarms": np.nan}
         return {"hits": 100.0 * tp / gt, "misses": 100.0 * fn / gt,
                 "false_alarms": 100.0 * fp / gt}
 
-    raw = {lt: _rates(raw_per_lead.get(lt) or {}) for lt in lead_titles}
-    post = {lt: _rates(post_per_lead.get(lt) or {}) for lt in lead_titles}
-    labels = {"hits": "hits", "misses": "misses", "false_alarms": "false alarms"}
-    n_lead = len(lead_titles)
+    raw = {lt: _rates(counts[lt]["raw"]) for lt in lead_titles}
+    post = {lt: _rates(counts[lt]["post"]) for lt in lead_titles}
 
-    def _bar_text(ax, bar, v, unit=" pt"):
+    def _bar_text(ax, bar, v, unit):
         y = bar.get_height()
         ax.annotate("n/a" if np.isnan(v) else f"{v + 0.0:+.1f}{unit}",
                     (bar.get_x() + bar.get_width() / 2, y),
                     xytext=(0, 3 if y >= 0 else -3), textcoords="offset points",
                     ha="center", va="bottom" if y >= 0 else "top", fontsize=8)
 
-    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(9, 2.8 * n_lead + 3), 9.5),
-                                         constrained_layout=True)
-
-    # ---- top: post minus raw, per lead
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(max(9, 2.8 * n_lead + 3), 14),
+                                        constrained_layout=True)
     x = np.arange(n_lead)
+
+    # ---- 1. gains and losses of the counts, up is better
     width = 0.3
     for j, name in enumerate(HMF_NAMES):
-        vals = [post[lt][name] - raw[lt][name] for lt in lead_titles]
-        bars = ax_top.bar(x + (j - 1) * width, [0.0 if np.isnan(v) else v for v in vals],
-                          width, color=HYSTERESIS_COLORS[name], edgecolor="black",
-                          linewidth=0.8, label=labels[name])
+        vals = []
+        for lt in lead_titles:
+            a, b = _count(counts[lt]["raw"], name), _count(counts[lt]["post"], name)
+            change = 100.0 * (b - a) / a if a else np.nan
+            vals.append(change if name == "hits" else -change)
+        bars = ax1.bar(x + (j - 1) * width, [0.0 if np.isnan(v) else v for v in vals], width,
+                       color=HYSTERESIS_COLORS[name], edgecolor="black", linewidth=0.8,
+                       label=labels[name])
         for bar, v in zip(bars, vals):
-            _bar_text(ax_top, bar, v)
-    ax_top.axhline(0.0, color="black", linewidth=1.2)
-    ax_top.set_xlim(-0.7, n_lead - 0.3)
-    ax_top.set_xticks(x)
-    ax_top.set_xticklabels([
+            _bar_text(ax1, bar, v, " %")
+    ax1.axhline(0.0, color="black", linewidth=1.2)
+    ax1.set_xlim(-0.7, n_lead - 0.3)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([
+        lt + "".join(f"\n{labels[name]} {_count(counts[lt]['raw'], name):,} -> "
+                     f"{_count(counts[lt]['post'], name):,}" for name in HMF_NAMES)
+        for lt in lead_titles], fontsize=8)
+    ax1.set_ylabel("gain (+) / loss (-), % of the raw count")
+    ax1.set_title("1. What the hysteresis gains (+) or loses (-) per lead: more hits, "
+                  "fewer misses, fewer false alarms count as gains")
+    ax1.legend(loc="best", fontsize=9)
+
+    # ---- 2. post minus raw of the GT-relative rates, per lead
+    for j, name in enumerate(HMF_NAMES):
+        vals = [post[lt][name] - raw[lt][name] for lt in lead_titles]
+        bars = ax2.bar(x + (j - 1) * width, [0.0 if np.isnan(v) else v for v in vals], width,
+                       color=HYSTERESIS_COLORS[name], edgecolor="black", linewidth=0.8,
+                       label=labels[name])
+        for bar, v in zip(bars, vals):
+            _bar_text(ax2, bar, v, " pt")
+    ax2.axhline(0.0, color="black", linewidth=1.2)
+    ax2.set_xlim(-0.7, n_lead - 0.3)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels([
         lt + "".join(f"\n{labels[name]} {raw[lt][name]:.1f} % -> {post[lt][name]:.1f} %"
                      for name in HMF_NAMES) for lt in lead_titles], fontsize=8)
-    ax_top.set_ylabel("post-processed minus raw (percentage points)")
-    ax_top.set_title("Hysteresis vs raw, per lead: difference of the hit / miss / false-alarm "
-                     "rates, each in % of the GT-active pixels (raw -> post under the lead)")
-    for side in ("top", "right"):
-        ax_top.spines[side].set_visible(False)
-    ax_top.grid(axis="y", alpha=0.3)
-    ax_top.margins(y=0.3)
-    ax_top.legend(loc="best", fontsize=9)
+    ax2.set_ylabel("post-processed minus raw (percentage points)")
+    ax2.set_title("2. Difference of the hit / miss / false-alarm rates, each in % of the "
+                  "GT-active pixels: post-processed minus raw per lead (raw -> post under the lead)")
+    ax2.legend(loc="best", fontsize=9)
 
-    # ---- bottom: change against the first lead, raw and post
+    # ---- 3. change against the first lead, raw and post
     first = lead_titles[0]
     later = lead_titles[1:]
     if later:
@@ -1448,33 +1485,34 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
         for j, name in enumerate(HMF_NAMES):
             for k, (which, src) in enumerate((("raw", raw), ("post", post))):
                 vals = [src[lt][name] - src[first][name] for lt in later]
-                bars = ax_bot.bar(xb + (2 * j + k - 2.5) * width,
-                                  [0.0 if np.isnan(v) else v for v in vals], width,
-                                  color=HYSTERESIS_COLORS[name],
-                                  alpha=0.45 if which == "raw" else 1.0,
-                                  hatch="//" if which == "raw" else None,
-                                  edgecolor="black", linewidth=0.6,
-                                  label=f"{labels[name]} {which}")
+                bars = ax3.bar(xb + (2 * j + k - 2.5) * width,
+                               [0.0 if np.isnan(v) else v for v in vals], width,
+                               color=HYSTERESIS_COLORS[name],
+                               alpha=0.45 if which == "raw" else 1.0,
+                               hatch="//" if which == "raw" else None,
+                               edgecolor="black", linewidth=0.6,
+                               label=f"{labels[name]} {which}")
                 for bar, v in zip(bars, vals):
-                    _bar_text(ax_bot, bar, v)
-        ax_bot.axhline(0.0, color="black", linewidth=1.2)
-        ax_bot.set_xticks(xb)
-        ax_bot.set_xticklabels([
+                    _bar_text(ax3, bar, v, " pt")
+        ax3.axhline(0.0, color="black", linewidth=1.2)
+        ax3.set_xticks(xb)
+        ax3.set_xticklabels([
             lt + "".join(f"\n{labels[name]} raw {raw[lt][name]:.1f} % / post {post[lt][name]:.1f} %"
                          for name in HMF_NAMES) for lt in later], fontsize=8)
-        ax_bot.set_ylabel(f"rate minus its {first} value (percentage points)")
-        ax_bot.set_title(f"Against {first}: change of each rate at the later leads, "
-                         f"raw (hatched) and post-processed (solid); "
-                         f"{first} rates: " + ", ".join(
-                             f"{labels[n]} raw {raw[first][n]:.1f} % / post {post[first][n]:.1f} %"
-                             for n in HMF_NAMES))
-        for side in ("top", "right"):
-            ax_bot.spines[side].set_visible(False)
-        ax_bot.grid(axis="y", alpha=0.3)
-        ax_bot.margins(y=0.3)
-        ax_bot.legend(loc="best", fontsize=8, ncol=3)
+        ax3.set_ylabel(f"rate minus its {first} value (percentage points)")
+        ax3.set_title(f"3. Against {first}: change of each rate at the later leads, raw (hatched) "
+                      f"and post-processed (solid); {first}: " + ", ".join(
+                          f"{labels[n]} raw {raw[first][n]:.1f} % / post {post[first][n]:.1f} %"
+                          for n in HMF_NAMES))
+        ax3.legend(loc="best", fontsize=8, ncol=3)
     else:
-        ax_bot.set_visible(False)
+        ax3.set_visible(False)
+
+    for ax in (ax1, ax2, ax3):
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.grid(axis="y", alpha=0.3)
+        ax.margins(y=0.3)
 
     raw_def = summary.get("raw_definition") or (
         "argmax class map, no hysteresis" if summary.get("track") == "rainfall"
