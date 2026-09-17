@@ -410,7 +410,9 @@ python validate_predictions.py --track rainfall --split test --mode mtg_lightnin
 python visualize_gt_vs_pred.py --mode ... --csv our_data/test_data_<source>_<period>.csv
 python visualize_gt_vs_pred.py --mode ... --csv ... --pick csi|active [--top_n N] --validation_summary validation/<summary>.json
 python generate_report.py --year Y --month M
+python generate_report.py --year Y --month M --split test --rainfall_threshold_mmh 8 --pred_coupling --period f34 --weights latest --rainfall_variant cvae --top_n 5 --coupling_only
 ```
+- **Cuplare** — `--coupling_only` se oprește după figurile de cuplare, fără generarea textului și fără PDF; `--split` citește execuțiile de validare pe partiție, restrânse la lună; cele `--top_n` referințe cu cei mai mulți pixeli cuplați primesc câte o figură de cuplare; cu `--pred_coupling` figura cuplează predicțiile modelelor numite prin `--period`, `--weights` și cele două variante, post-procesate la pragurile calibrate de ambele rezumate (LOW / HIGH per orizont pentru precipitații și fulgere, membrii cVAE din rezumatul de precipitații).
 - **Notă** — vizualizatorul construiește adevărul de teren din fișierele de patch ale rândurilor din `--csv`, astfel încât un moment selectat trebuie să fie un rând al acelui CSV (validați pe `--split test` și indicați CSV-ul de test).
 - **Scrie** — `visualize_gt_vs_pred_plots/…`, `validation/report_<Y>_<M>.pdf`
 

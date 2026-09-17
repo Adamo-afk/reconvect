@@ -102,17 +102,24 @@ def resolve_stem(validation_dir: Path, base: str, tag: str | None) -> str:
 
 def _discover_track_artefacts(validation_dir: Path, track: str,
                               year: int, month: int,
-                              tag: str | None = None) -> dict:
+                              tag: str | None = None,
+                              split: str | None = None,
+                              threshold_mmh: float | None = None) -> dict:
     """Return a dict describing what's on disk for one (track, year, month).
-
     `tag` is the validated model's artifact tag; see resolve_stem.
+    With `split` the run is a split-scope validation,
+    <track>_<split>_thr<T>mmh_<tag>, and the report restricts it to its
+    (year, month) downstream.
     """
-    if track == "rainfall":
-        base = RAINFALL_STEM_TEMPLATE.format(year=year, month=month)
-    elif track == "lightning":
-        base = LIGHTNING_STEM_TEMPLATE.format(year=year, month=month)
-    else:
+    if track not in ("rainfall", "lightning"):
         raise ValueError(f"unknown track: {track!r}")
+    if split:
+        thr = threshold_mmh if threshold_mmh is not None else 10.0
+        base = f"{track}_{split}_thr{thr:g}mmh"
+    elif track == "rainfall":
+        base = RAINFALL_STEM_TEMPLATE.format(year=year, month=month)
+    else:
+        base = LIGHTNING_STEM_TEMPLATE.format(year=year, month=month)
     stem = resolve_stem(validation_dir, base, tag)
 
     # Summary and CSV are flat; the run's figures sit in validation/<stem>/.
@@ -245,7 +252,8 @@ def _index_per_date(sample_rows: list[dict]) -> dict[str, list[dict]]:
     return dict(idx)
 
 
-def load_track_data(artefacts: dict, step_minutes: int) -> dict:
+def load_track_data(artefacts: dict, step_minutes: int,
+                    year: int | None = None, month: int | None = None) -> dict:
     """Parse the discovered artefacts. Returns a dict:
         {
           "track": "rainfall"|"lightning",
@@ -270,6 +278,14 @@ def load_track_data(artefacts: dict, step_minutes: int) -> dict:
     samples = load_samples_csv(
         artefacts["samples_csv"], track, step_minutes,
     )
+    if year is not None and month is not None:
+        # a split-scope run spans the whole pool; the report is one month
+        prefix = f"{year:04d}-{month:02d}-"
+        samples = [r for r in samples if str(r.get("date", "")).startswith(prefix)]
+        summary = dict(summary)
+        summary["initial_selection"] = [
+            e for e in summary.get("initial_selection", [])
+            if str(e[0]).startswith(prefix)]
     return {
         "track": track,
         "summary": summary,
@@ -860,6 +876,11 @@ def render_pred_coupling_figure(
     lightning_high_per_lead: dict[int, float] | None,
     rainfall_available: bool,
     lightning_available: bool,
+    period=None,
+    weights: str = "best",
+    lightning_low_per_lead: dict[int, float] | None = None,
+    rainfall_thresholds: tuple[dict, dict] | None = None,
+    rainfall_member_of_patch: dict | None = None,
 ) -> Path | None:
     """Render the 3x3 GT-vs-predicted coupling figure. Returns the saved
     path, or None if inputs / models are unavailable at this reference.
@@ -901,10 +922,11 @@ def render_pred_coupling_figure(
     c_lo, c_hi, r_lo, r_hi = _vf._VIEW_EXTENT
 
     # Init sequence config + normalization stats before any transform runs.
-    init_sequence_config(str(data_root), rainfall_source)
+    from periods import normalization_stats_name
+    init_sequence_config(str(data_root), rainfall_source, period=period)
     sync_window_from_sequence_config()
     set_normalization_stats_path(
-        data_root / f"normalization_stats_{rainfall_source}.json"
+        data_root / normalization_stats_name(rainfall_source, period)
     )
     step_minutes = _load_step_minutes(data_root)
     lead_minutes_list = list(lead_minutes)
@@ -913,11 +935,12 @@ def render_pred_coupling_figure(
     # the two model.predict calls below).
     rainfall_model = load_model_artifact(
         model_dir, rainfall_mode, rainfall_source,
-        finetuned=rainfall_finetuned,
+        finetuned=rainfall_finetuned, period=period, weights=weights,
     )
     lightning_model = load_model_artifact(
         model_dir, lightning_mode, lightning_source,
-        finetuned=lightning_finetuned, kd=lightning_kd,
+        finetuned=lightning_finetuned, kd=lightning_kd, period=period,
+        weights=weights,
     )
 
     # ---- Rainfall inference: mode_config drives input build; output is
@@ -928,10 +951,21 @@ def render_pred_coupling_figure(
     )
     if not rain_valid_patches:
         return None
-    rain_preds = rainfall_model.predict(rain_inputs, batch_size=18, verbose=0)
-    rain_class_canvases = paste_predictions_to_canvas(
-        rain_preds, rain_valid_patches, "radar",
-    )
+    from predict_full_domain import predict_with_members
+    from visualize_gt_vs_pred import (build_full_soft_pred, rainfall_hysteresis,
+                                      DEFAULT_RAIN_LOW, DEFAULT_RAIN_HIGH)
+    rain_preds = predict_with_members(rainfall_model, rain_inputs, rain_valid_patches,
+                                      18, rainfall_member_of_patch or {})
+    # the post-processed class maps: the rainfall hysteresis at the pair
+    # the validation tuned per lead (the same product it scored)
+    soft = build_full_soft_pred(rain_preds, rain_valid_patches,
+                                n_classes=rain_preds.shape[-1])
+    lo_per_lead, hi_per_lead = rainfall_thresholds or ({}, {})
+    rain_class_canvases = [
+        rainfall_hysteresis(soft[k],
+                            low=float(lo_per_lead.get(offset, DEFAULT_RAIN_LOW)),
+                            high=float(hi_per_lead.get(offset, DEFAULT_RAIN_HIGH)))
+        for k, offset in enumerate(LEAD_STEP_OFFSETS)]
 
     # ---- Lightning inference: Hann-overlap + hysteresis produces per-lead
     # (H, W) int8 binary canvases matching the operational path.
@@ -944,12 +978,13 @@ def render_pred_coupling_figure(
     if prob_canvases is None:
         return None
     high_per_lead = lightning_high_per_lead or {}
+    low_per_lead = lightning_low_per_lead or {}
     lightning_bin_canvases = []
     for k, offset in enumerate(LEAD_STEP_OFFSETS):
         h = high_per_lead.get(offset, DEFAULT_HIGH_THRESHOLD)
+        lo = low_per_lead.get(offset, lightning_low_threshold)
         lightning_bin_canvases.append(
-            hysteresis_binary(prob_canvases[k],
-                              low=lightning_low_threshold, high=h)
+            hysteresis_binary(prob_canvases[k], low=lo, high=h)
         )
 
     # ---- Figure setup.
@@ -1059,6 +1094,34 @@ def render_pred_coupling_figure(
 # plots recognises the labels immediately.
 _RAINFALL_BAND_EDGES = [10.0, 20.0, 30.0, 40.0, float("inf")]
 _RAINFALL_BAND_LABELS = ["10-20 mm/h", "20-30 mm/h", "30-40 mm/h", ">=40 mm/h"]
+
+
+def _lead_minutes_of(per_track_loaded: dict, step_minutes: int) -> list[int]:
+    """The leads of the validated runs, in minutes, from the summaries'
+    metrics_per_lead keys (t+15, t+30, ...); three steps when absent."""
+    for loaded in per_track_loaded.values():
+        keys = list((loaded["summary"].get("metrics_per_lead") or {}).keys())
+        mins = []
+        for k in keys:
+            try:
+                v = int(k.replace("t+", ""))
+            except ValueError:
+                continue
+            # rainfall summaries key by step index, lightning by minutes
+            mins.append(v * step_minutes if v < step_minutes else v)
+        if mins:
+            return sorted(set(mins))
+    return [step_minutes, 2 * step_minutes, 3 * step_minutes]
+
+
+def _top_active_coupling_refs(facts_per_ref: dict, n: int) -> list[tuple[str, str]]:
+    """The (date, ref_utc) of the n references with the most coupled
+    pixels over their leads, most active first; references without any
+    coupling are left out."""
+    scored = [(_reference_coupling_activity(d), k) for k, d in facts_per_ref.items()]
+    scored = [(sc, k) for sc, k in scored if sc > 0]
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [k for _, k in scored[:max(0, int(n))]]
 
 
 def _reference_coupling_activity(ref_data: dict) -> int:
@@ -1199,6 +1262,11 @@ def build_facts_index(
     pred_coupling: bool = False,
     model_dir: Path | None = None,
     pred_lightning_high_per_lead: dict[int, float] | None = None,
+    pred_lightning_low_per_lead: dict[int, float] | None = None,
+    pred_rainfall_thresholds: tuple[dict, dict] | None = None,
+    pred_models: dict | None = None,
+    rainfall_member_of_patch: dict | None = None,
+    top_n: int = 5,
 ) -> dict:
     """For every (date, reference) that appears in EITHER track's initial
     selection, compute the per-lead facts dict. Renders the coupling-
@@ -1231,7 +1299,7 @@ def build_facts_index(
 
     rainfall_available = "rainfall" in per_track_loaded
     lightning_available = "lightning" in per_track_loaded
-    lead_minutes = [step_minutes, 2 * step_minutes, 3 * step_minutes]
+    lead_minutes = _lead_minutes_of(per_track_loaded, step_minutes)
 
     # Union the selections across whichever tracks are loaded. Under the
     # OPERA-driven parity convention (both tracks share select_samples)
@@ -1261,15 +1329,18 @@ def build_facts_index(
             "per_lead": per_lead,
         }
 
-    # Pass 2: pick the peak-activity reference and render ONE coupling
-    # PNG for it. When --pred_coupling is set, the 3x3 GT-vs-predicted
-    # figure IS that image (its Row 1 already contains the GT view, so
-    # a separate GT-only file would just duplicate content). Otherwise
-    # we fall back to the 1x3 GT-only render.
-    most_active_ref = _find_most_active_coupling_ref(facts_per_ref)
+    # Pass 2: the top_n references by coupled pixels each get a coupling
+    # PNG. When --pred_coupling is set, the 3x3 GT-vs-predicted figure IS
+    # that image (its Row 1 already contains the GT view); otherwise the
+    # 1x3 GT-only render. The most active one leads the period summary.
+    top_refs = _top_active_coupling_refs(facts_per_ref, top_n)
+    most_active_ref = top_refs[0] if top_refs else None
     coupling_output_dir.mkdir(parents=True, exist_ok=True)
-    if most_active_ref is not None:
-        date_str, ref_utc = most_active_ref
+    pred_models = pred_models or {}
+    for rank, this_ref in enumerate(top_refs, 1):
+        date_str, ref_utc = this_ref
+        print(f"  coupling figure {rank}/{len(top_refs)}: {date_str} {ref_utc} "
+              f"({_reference_coupling_activity(facts_per_ref[this_ref]):,} coupled px)")
         safe_ref = ref_utc.replace(":", "")
 
         pred_rendered = None
@@ -1292,17 +1363,22 @@ def build_facts_index(
                         date_str, ref_utc, lead_minutes,
                         data_root, pred_coupling_path,
                         model_dir=model_dir,
-                        rainfall_mode="mtg_lightning_opera_rainfall",
+                        rainfall_mode=pred_models.get("rainfall_mode", "mtg_lightning_opera_rainfall"),
                         rainfall_source="dbscan",
-                        rainfall_finetuned=False,
-                        lightning_mode="mtg_lightning_opera_occurrence",
+                        rainfall_finetuned=pred_models.get("rainfall_finetuned", False),
+                        lightning_mode=pred_models.get("lightning_mode", "mtg_lightning_opera_occurrence"),
                         lightning_source="dbscan",
-                        lightning_finetuned=False,
-                        lightning_kd=False,
+                        lightning_finetuned=pred_models.get("lightning_finetuned", False),
+                        lightning_kd=pred_models.get("lightning_kd", False),
                         lightning_low_threshold=0.90,
                         lightning_high_per_lead=pred_lightning_high_per_lead,
                         rainfall_available=rainfall_available,
                         lightning_available=lightning_available,
+                        period=pred_models.get("period"),
+                        weights=pred_models.get("weights", "best"),
+                        lightning_low_per_lead=pred_lightning_low_per_lead,
+                        rainfall_thresholds=pred_rainfall_thresholds,
+                        rainfall_member_of_patch=rainfall_member_of_patch,
                     )
                     if pred_rendered is not None:
                         print(f"  pred_coupling: {pred_rendered.name}")
@@ -1317,7 +1393,7 @@ def build_facts_index(
         if pred_rendered is not None:
             # Pred figure contains GT as Row 1 — use it as the single
             # coupling image, no separate GT render.
-            facts_per_ref[most_active_ref]["coupling_figure_path"] = pred_rendered
+            facts_per_ref[this_ref]["coupling_figure_path"] = pred_rendered
         else:
             # Fallback / --pred_coupling not set: GT-only 1x3 render.
             coupling_path = (
@@ -1328,7 +1404,7 @@ def build_facts_index(
                 rainfall_available=rainfall_available,
                 lightning_available=lightning_available,
             )
-            facts_per_ref[most_active_ref]["coupling_figure_path"] = rendered
+            facts_per_ref[this_ref]["coupling_figure_path"] = rendered
 
     period_coupling_summary = _compute_period_coupling_summary(
         facts_per_ref, most_active_ref,
@@ -3171,6 +3247,36 @@ def main() -> int:
     parser.add_argument("--model_dir", type=str, default=str(resolve_model_dir()),
                         help="Directory with the model checkpoints "
                              "(only used when --pred_coupling is set).")
+    parser.add_argument("--split", type=str, default=None,
+                        choices=["train", "validation", "test"],
+                        help="Read split-scope validation runs "
+                             "(<track>_<split>_thr<T>mmh_<tag>) instead of "
+                             "month-scope ones, restricted to --year/--month.")
+    parser.add_argument("--rainfall_threshold_mmh", type=float, default=10.0,
+                        help="The selection threshold in the split-scope "
+                             "file names (default 10).")
+    parser.add_argument("--coupling_only", action="store_true",
+                        help="Stop after the coupling figures: no text "
+                             "generation, no PDF. The way to produce the "
+                             "top-N coupling figures on their own.")
+    parser.add_argument("--top_n", type=int, default=5,
+                        help="How many references, the most active by "
+                             "coupled pixels, get a coupling figure (default 5).")
+    parser.add_argument("--period", type=str, default=None,
+                        help="Period label of the models for --pred_coupling "
+                             "(e.g. f34).")
+    parser.add_argument("--weights", type=str, default="best",
+                        choices=["best", "latest"],
+                        help="Saved state of the models for --pred_coupling.")
+    parser.add_argument("--rainfall_variant", type=str, default="base",
+                        choices=["base", "finetuned", "cvae"],
+                        help="Rainfall model for --pred_coupling; cvae composes "
+                             "the members recorded in the rainfall summary.")
+    parser.add_argument("--lightning_variant", type=str, default="base",
+                        choices=["base", "finetuned", "kd"],
+                        help="Lightning model for --pred_coupling.")
+    parser.add_argument("--rainfall_mode", type=str, default="mtg_lightning_opera_rainfall")
+    parser.add_argument("--lightning_mode", type=str, default="mtg_lightning_opera_occurrence")
 
     args = parser.parse_args()
 
@@ -3209,6 +3315,7 @@ def main() -> int:
             validation_dir, track, args.year, args.month,
             tag=(args.rainfall_tag if track == "rainfall"
                  else args.lightning_tag),
+            split=args.split, threshold_mmh=args.rainfall_threshold_mmh,
         )
         per_track_paths[track] = artefacts
         _print_discovery(artefacts)
@@ -3243,7 +3350,9 @@ def main() -> int:
             print(f"--- {track}: skipping parse (summary or samples missing) ---")
             continue
         try:
-            loaded = load_track_data(artefacts, step_minutes)
+            loaded = load_track_data(artefacts, step_minutes,
+                                     year=args.year if args.split else None,
+                                     month=args.month if args.split else None)
         except Exception as e:
             raise SystemExit(f"failed to parse {track} artefacts: {e}")
         per_track_loaded[track] = loaded
@@ -3266,20 +3375,55 @@ def main() -> int:
     # lightning_postproc.DEFAULT_HIGH_THRESHOLD (0.95) per lead when the
     # summary is absent or missing the block.
     pred_lightning_high_per_lead: dict[int, float] | None = None
+    pred_lightning_low_per_lead: dict[int, float] | None = None
+    pred_rainfall_thresholds: tuple[dict, dict] | None = None
+    rainfall_member_of_patch: dict | None = None
+    pred_models = {
+        "period": args.period, "weights": args.weights,
+        "rainfall_mode": args.rainfall_mode, "lightning_mode": args.lightning_mode,
+        "rainfall_finetuned": ("cvae" if args.rainfall_variant == "cvae"
+                               else args.rainfall_variant == "finetuned"),
+        "lightning_finetuned": args.lightning_variant == "finetuned",
+        "lightning_kd": args.lightning_variant == "kd",
+    }
     if args.pred_coupling:
         light = per_track_loaded.get("lightning")
         if light is not None:
             pp = light["summary"].get("post_processing") or {}
-            named = pp.get("high_threshold_per_lead") or {}
-            resolved: dict[int, float] = {}
-            for offset in (1, 2, 3):
+            n_leads = len(_lead_minutes_of(per_track_loaded, step_minutes))
+            highs = pp.get("high_threshold_per_lead") or {}
+            lows = pp.get("low_threshold_per_lead") or {}
+            resolved_h: dict[int, float] = {}
+            resolved_l: dict[int, float] = {}
+            for offset in range(1, n_leads + 1):
                 key = f"t+{offset * step_minutes}"
-                if key in named:
-                    resolved[offset] = float(named[key])
-            if resolved:
-                pred_lightning_high_per_lead = resolved
-                print(f"  pred_coupling: per-lead high thresholds from "
-                      f"lightning summary: {resolved}")
+                if key in highs:
+                    resolved_h[offset] = float(highs[key])
+                if key in lows:
+                    resolved_l[offset] = float(lows[key])
+                elif pp.get("low_threshold") is not None:
+                    resolved_l[offset] = float(pp["low_threshold"])
+            if resolved_h:
+                pred_lightning_high_per_lead = resolved_h
+            if resolved_l:
+                pred_lightning_low_per_lead = resolved_l
+            print(f"  pred_coupling: lightning LOW {resolved_l} HIGH {resolved_h} "
+                  f"from the lightning summary")
+        rain = per_track_loaded.get("rainfall")
+        if rain is not None:
+            pp = rain["summary"].get("post_processing") or {}
+            lows = pp.get("low_threshold_per_lead") or {}
+            highs = pp.get("high_threshold_per_lead") or {}
+            lo = {int(k.replace("t+", "")): float(v) for k, v in lows.items() if v is not None}
+            hi = {int(k.replace("t+", "")): float(v) for k, v in highs.items() if v is not None}
+            if lo and hi:
+                pred_rainfall_thresholds = (lo, hi)
+                print(f"  pred_coupling: rainfall LOW {lo} HIGH {hi} from the rainfall summary")
+            if args.rainfall_variant == "cvae":
+                from predict_full_domain import members_from_summary
+                rainfall_member_of_patch = members_from_summary(
+                    per_track_paths["rainfall"]["summary_json"])
+                print(f"  pred_coupling: cVAE members per patch: {rainfall_member_of_patch}")
 
     facts_index: dict | None = None
     try:
@@ -3289,6 +3433,11 @@ def main() -> int:
             pred_coupling=args.pred_coupling,
             model_dir=Path(args.model_dir) if args.pred_coupling else None,
             pred_lightning_high_per_lead=pred_lightning_high_per_lead,
+            pred_lightning_low_per_lead=pred_lightning_low_per_lead,
+            pred_rainfall_thresholds=pred_rainfall_thresholds,
+            pred_models=pred_models,
+            rainfall_member_of_patch=rainfall_member_of_patch,
+            top_n=args.top_n,
         )
     except Exception as e:
         # GT canvases are typically missing until the user has run reproject
@@ -3297,6 +3446,15 @@ def main() -> int:
         import traceback
         print(f"WARN: facts extraction failed: {type(e).__name__}: {e}")
         traceback.print_exc()
+    if args.coupling_only:
+        figs = sorted(str(v["coupling_figure_path"]) for v in
+                      (facts_index or {}).get("references", {}).values()
+                      if v.get("coupling_figure_path")) if facts_index else []
+        print(f"\n--coupling_only: {len(figs)} coupling figure(s) written under "
+              f"{validation_dir / 'rainfall_lightning_coupling'}; stopping here.")
+        for f in figs:
+            print(f"  {Path(f).name}")
+        return 0
         print("(skipping facts dump; report will be paths-only when we build "
               "the PDF layer)")
     else:
