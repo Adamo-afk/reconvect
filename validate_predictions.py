@@ -1374,11 +1374,10 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                           path: Path) -> bool:
     """What the hysteresis changes on the scope samples, three plots.
 
-    1. Per lead, the gain (+) or loss (-) of hits, misses and false
-       alarms from the raw decision to the post-processed one, in % of
-       the raw count, up always meaning better (more hits, fewer misses,
-       fewer false alarms), touching bars around the zero line, the
-       counts under the lead.
+    1. Per lead, the rates relative to the ground truth (hits = TP,
+       misses = FN, false alarms = FP, each over the GT-active pixels),
+       raw (hatched) and post-processed (solid), the counts under the
+       lead.
     2. Per lead, the rates relative to the ground truth (hits = TP,
        misses = FN, false alarms = FP, each over the GT-active pixels),
        as the difference post-processed minus raw in percentage points,
@@ -1432,30 +1431,33 @@ def _plot_hysteresis_gain(summary: dict, offsets: list[int], step: int,
                                         constrained_layout=True)
     x = np.arange(n_lead)
 
-    # ---- 1. gains and losses of the counts, up is better
-    width = 0.3
+    # ---- 1. the rates themselves, raw (hatched) and post (solid), per lead
+    width = 0.8 / 6
     for j, name in enumerate(HMF_NAMES):
-        vals = []
-        for lt in lead_titles:
-            a, b = _count(counts[lt]["raw"], name), _count(counts[lt]["post"], name)
-            change = 100.0 * (b - a) / a if a else np.nan
-            vals.append(change if name == "hits" else -change)
-        bars = ax1.bar(x + (j - 1) * width, [0.0 if np.isnan(v) else v for v in vals], width,
-                       color=HYSTERESIS_COLORS[name], edgecolor="black", linewidth=0.8,
-                       label=labels[name])
-        for bar, v in zip(bars, vals):
-            _bar_text(ax1, bar, v, " %")
-    ax1.axhline(0.0, color="black", linewidth=1.2)
-    ax1.set_xlim(-0.7, n_lead - 0.3)
+        for k, (which, src) in enumerate((("raw", raw), ("post", post))):
+            vals = [src[lt][name] for lt in lead_titles]
+            bars = ax1.bar(x + (2 * j + k - 2.5) * width,
+                           [0.0 if np.isnan(v) else v for v in vals], width,
+                           color=HYSTERESIS_COLORS[name],
+                           alpha=0.45 if which == "raw" else 1.0,
+                           hatch="//" if which == "raw" else None,
+                           edgecolor="black", linewidth=0.6,
+                           label=f"{labels[name]} {which}")
+            for bar, v in zip(bars, vals):
+                ax1.annotate("n/a" if np.isnan(v) else f"{v:.1f}",
+                             (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                             xytext=(0, 2), textcoords="offset points",
+                             ha="center", va="bottom", fontsize=7)
     ax1.set_xticks(x)
     ax1.set_xticklabels([
         lt + "".join(f"\n{labels[name]} {_count(counts[lt]['raw'], name):,} -> "
                      f"{_count(counts[lt]['post'], name):,}" for name in HMF_NAMES)
         for lt in lead_titles], fontsize=8)
-    ax1.set_ylabel("gain (+) / loss (-), % of the raw count")
-    ax1.set_title("1. What the hysteresis gains (+) or loses (-) per lead: more hits, "
-                  "fewer misses, fewer false alarms count as gains")
-    ax1.legend(loc="best", fontsize=9)
+    ax1.set_ylabel("% of the GT-active pixels")
+    ax1.set_title("1. Hits, misses and false alarms in % of the GT-active pixels, per lead: "
+                  "raw (hatched) and post-processed (solid); counts under the lead")
+    ax1.legend(loc="best", fontsize=8, ncol=3)
+    width = 0.3
 
     # ---- 2. post minus raw of the GT-relative rates, per lead
     for j, name in enumerate(HMF_NAMES):
