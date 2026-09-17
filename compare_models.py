@@ -108,17 +108,33 @@ def rainfall_metrics(block: dict) -> dict:
     return out
 
 
+def canonical_tag(tag: str) -> tuple[str, str]:
+    """(model tag without the weights suffix, weights). The `_latest`
+    suffix names which saved state a run scored, not another model, so
+    a model's `best` and `latest` artefacts are matched as one model
+    here; when both are on disk the `best` one is used and the other
+    noted."""
+    if tag.endswith("_latest"):
+        return tag[:-len("_latest")], "latest"
+    return tag, "best"
+
+
 def load_evaluations(eval_root: Path, track: str, include_baseline: bool,
                      only: set[str] | None) -> list[dict]:
     """One record per evaluated model of `track`:
     {tag, baseline, leads: [min], per_lead: {min: {metric: v}}, aggregate}."""
-    found = []
+    by_tag: dict[str, dict] = {}
     for results_path in sorted(eval_root.glob("eval_*/evaluation_results.json")):
-        tag = results_path.parent.name[len("eval_"):]
+        raw_tag = results_path.parent.name[len("eval_"):]
+        tag, weights = canonical_tag(raw_tag)
         baseline = tag.startswith("sepconv_")
         if baseline and not include_baseline:
             continue
-        if only and tag not in only:
+        if only and tag not in only and raw_tag not in only:
+            continue
+        if tag in by_tag and by_tag[tag]["weights"] == "best":
+            print(f"  NOTE: {tag} evaluated with both weights; using best, "
+                  f"skipping eval_{raw_tag}")
             continue
         try:
             results = json.loads(results_path.read_text(encoding="utf-8"))
@@ -135,12 +151,16 @@ def load_evaluations(eval_root: Path, track: str, include_baseline: bool,
         agg_block = results.get("aggregate") or {}
         aggregate = (rainfall_metrics(agg_block) if track == "rainfall"
                      else {k: agg_block.get(k) for k, _ in LIGHTNING_METRICS})
-        found.append({"tag": tag, "baseline": baseline,
-                      "leads": sorted(per_lead), "per_lead": per_lead,
-                      "aggregate": aggregate, "path": str(results_path),
-                      "n_samples": results.get("n_samples"),
-                      "split": results.get("split")})
-    return found
+        if tag in by_tag:
+            print(f"  NOTE: {tag} evaluated with both weights; using best, "
+                  f"skipping eval_{by_tag[tag]['raw_tag']}")
+        by_tag[tag] = {"tag": tag, "raw_tag": raw_tag, "weights": weights,
+                       "baseline": baseline,
+                       "leads": sorted(per_lead), "per_lead": per_lead,
+                       "aggregate": aggregate, "path": str(results_path),
+                       "n_samples": results.get("n_samples"),
+                       "split": results.get("split")}
+    return list(by_tag.values())
 
 
 def plot_metrics_per_lead(models: list[dict], metrics: list[tuple[str, str]],
@@ -322,6 +342,7 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
         rf"^{track}_(?:(train|validation|test)_)?"
         rf"(?:(\d{{4}})_(\d{{2}})_)?thr([\d.]+)mmh_(.+)_samples\.csv$")
     per_model: dict[str, list[dict]] = defaultdict(list)
+    val_weights: dict[str, str] = {}
     legacy = 0
     used: list[str] = []
     seen_thresholds: set[float] = set()
@@ -330,7 +351,8 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
         if not m:
             legacy += 1
             continue
-        f_split, f_year, f_month, f_thr, tag = m.groups()
+        f_split, f_year, f_month, f_thr, raw_tag = m.groups()
+        tag, weights = canonical_tag(raw_tag)
         if tag in ("finetuned", "kd"):
             # The pre-tag naming put only the variant in the name.
             legacy += 1
@@ -346,8 +368,17 @@ def load_samples(validation_dir: Path, track: str, include_baseline: bool,
             continue
         if tag.startswith("sepconv_") and not include_baseline:
             continue
-        if only and tag not in only:
+        if only and tag not in only and raw_tag not in only:
             continue
+        if tag in val_weights and val_weights[tag] != weights:
+            if val_weights[tag] == "best":
+                print(f"  NOTE: {tag} validated with both weights; using best, "
+                      f"skipping {path.name}")
+                continue
+            print(f"  NOTE: {tag} validated with both weights; using best, "
+                  f"dropping the latest rows")
+            per_model[tag] = []
+        val_weights[tag] = weights
         seen_thresholds.add(float(f_thr))
         if threshold_mmh is not None and float(f_thr) != float(threshold_mmh):
             continue
