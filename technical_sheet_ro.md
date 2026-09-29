@@ -801,7 +801,7 @@ $$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_i\,(1 - p_{t,i})^{\gamma}\Big(-
 - $\tilde y_{i,k} = (1-\varepsilon)\,y_{i,k} + \varepsilon/K$ — eticheta după netezire; $\varepsilon$ = `label_smoothing`, $K = 5$
 - $p_{t,i} = \sum_k \tilde y_{i,k}\,p_{i,k}$ — probabilitatea clasei corecte
 - $\alpha_i = \sum_k \tilde y_{i,k}\,\alpha_k$ — ponderea de clasă a pixelului
-- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\operatorname{median}(f)/f_k$; `none`: 1; plafonată la `alpha_max`
+- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\mathrm{median}(f)/f_k$; `none`: 1; plafonată la `alpha_max`
 - $\gamma$ — exponentul focal (`gamma`); 0 pentru termenul de prognoză al cVAE
 - cu `weighting = none` și `gamma = 0` funcția de cost devine entropia încrucișată simplă cu netezirea etichetelor
 
@@ -815,7 +815,9 @@ $$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} w_{k(y_i)}\,(y_i - \hat y_i)^2, \qquad
 
 **Programul cosinus cu încălzire** (`cosine_warmup_schedule`). Rata de învățare a modelelor de bază, a modelului-student și a capetelor de finetune, fiecare etapă cu propria secțiune din `training.config`.
 
-$$\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e \lt E_w \\[8pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}$$
+```math
+\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e < E_w \\[6pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}
+```
 
 - $e$ — indicele epocii, de la 0
 - $\eta_0$, $\eta_{\min}$ — `initial_lr`, `min_lr`
@@ -865,11 +867,11 @@ $$\mathcal{L} = \mathcal{L}_{\text{fc}} + \beta_t\,\frac{1}{D}\sum_{d=1}^{D}\max
 
 **Funcția de cost a transferului** (`kd_loss`). Modelul-student reproduce simultan probabilitățile atenuate ale modelului-profesor și adevărul de referință.
 
-$$\tilde p = \sigma\Big(\frac{\operatorname{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
+$$\tilde p = \sigma\Big(\frac{\mathrm{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
 
 $$\mathcal{L}_{\text{soft}} = T^2\,\frac{\sum_i w_i\,\mathrm{KL}_i}{\sum_i w_i}, \qquad \mathcal{L} = \alpha\,\mathcal{L}_{\text{soft}} + (1 - \alpha)\,\mathcal{L}_{\text{hard}}$$
 
-- $t_i$, $s_i$ — probabilitățile modelului-profesor și ale modelului-student; $\tilde t_i$, $\tilde s_i$ — formele lor atenuate, cu $\operatorname{logit}(p) = \log p - \log(1-p)$
+- $t_i$, $s_i$ — probabilitățile modelului-profesor și ale modelului-student; $\tilde t_i$, $\tilde s_i$ — formele lor atenuate, cu $\mathrm{logit}(p) = \log p - \log(1-p)$
 - $T$ — temperatura (`--kd_temperature`, 2); $T^2$ restabilește scara gradientului
 - $\mathrm{KL}_i$ — divergența distribuției atenuate a profesorului față de cea a studentului, zero pentru un student perfect
 - $w_i = t_i + w_0$ — ponderarea după profesor, cu pragul minim $w_0$ (`--kd_weight_floor`, 0,01); `--kd_soft_weight none` impune $w_i = 1$, forma Hinton

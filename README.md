@@ -1375,7 +1375,7 @@ $$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_i\,(1 - p_{t,i})^{\gamma}\Big(-
 - $\tilde y_{i,k} = (1-\varepsilon)\,y_{i,k} + \varepsilon/K$ — the label after smoothing; $\varepsilon$ = `label_smoothing`, $K = 5$
 - $p_{t,i} = \sum_k \tilde y_{i,k}\,p_{i,k}$ — probability of the true class
 - $\alpha_i = \sum_k \tilde y_{i,k}\,\alpha_k$ — the class weight of the pixel
-- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\operatorname{median}(f)/f_k$; `none`: 1; capped at `alpha_max`
+- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\mathrm{median}(f)/f_k$; `none`: 1; capped at `alpha_max`
 - $\gamma$ — focal exponent (`gamma`); 0 for the forecast term of the cVAE
 - with `weighting = none` and `gamma = 0` the loss is the plain cross-entropy with label smoothing
 
@@ -1389,7 +1389,9 @@ $$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} w_{k(y_i)}\,(y_i - \hat y_i)^2, \qquad
 
 **Cosine schedule with warm-up** (`cosine_warmup_schedule`). The learning rate of the base models, the distilled student and the fine-tune heads, each stage with its own section of `training.config`.
 
-$$\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e \lt E_w \\[8pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}$$
+```math
+\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e < E_w \\[6pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}
+```
 
 - $e$ — the epoch index, from 0
 - $\eta_0$, $\eta_{\min}$ — `initial_lr`, `min_lr`
@@ -1439,11 +1441,11 @@ $$\mathcal{L} = \mathcal{L}_{\text{fc}} + \beta_t\,\frac{1}{D}\sum_{d=1}^{D}\max
 
 **Distillation loss** (`kd_loss`). The student matches the teacher's softened probabilities and the ground truth at once.
 
-$$\tilde p = \sigma\Big(\frac{\operatorname{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
+$$\tilde p = \sigma\Big(\frac{\mathrm{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
 
 $$\mathcal{L}_{\text{soft}} = T^2\,\frac{\sum_i w_i\,\mathrm{KL}_i}{\sum_i w_i}, \qquad \mathcal{L} = \alpha\,\mathcal{L}_{\text{soft}} + (1 - \alpha)\,\mathcal{L}_{\text{hard}}$$
 
-- $t_i$, $s_i$ — teacher and student probabilities; $\tilde t_i$, $\tilde s_i$ — their softened forms, with $\operatorname{logit}(p) = \log p - \log(1-p)$
+- $t_i$, $s_i$ — teacher and student probabilities; $\tilde t_i$, $\tilde s_i$ — their softened forms, with $\mathrm{logit}(p) = \log p - \log(1-p)$
 - $T$ — the temperature (`--kd_temperature`, 2); $T^2$ restores the gradient scale
 - $\mathrm{KL}_i$ — the divergence of the teacher's softened distribution from the student's, zero for a perfect student
 - $w_i = t_i + w_0$ — teacher weighting with the floor $w_0$ (`--kd_weight_floor`, 0.01); `--kd_soft_weight none` sets $w_i = 1$, the Hinton form
