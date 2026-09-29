@@ -708,3 +708,159 @@ python compress_datasets.py --move TAG --to ROOT      # carry a compressed datas
 3. Coverage summary before the Data Store backfill — the backfill requests exactly the cycles the missing-timestep JSON names.
 4. Coverage summary before deleting raw chunks — once they are gone, `--scan raw` can no longer describe the archive, and only the `npy` and `reprojected` views remain valid.
 5. Patch extraction before dataset creation, and re-extraction whenever `patch_index.csv` is rebuilt — a patch file records tiles by position, so a changed activity list silently shifts which tile each position holds.
+
+---
+
+## 13. Formulas
+
+The formulas the pipeline runs, in the order the data meets them. The scores (CSI, FSS, Brier, …) are listed in the outputs reference. $f$ and $f_k$ are the class fractions of the training scope, from `lightning_fraction_<source>[_<period>].json` and `opera_rainfall_fraction_<source>[_<period>].json`.
+
+### Inputs and labels
+
+**Pooling to the MR tier.** A 2 km product is the block mean of the 1 km canvas, never an upsample (`extract_patches.average_pool`).
+
+$$\bar x_{i,j} = \frac{1}{4}\sum_{a=0}^{1}\sum_{b=0}^{1} x_{2i+a,\;2j+b}$$
+
+- $x$ — the field on the 1 km grid (a 256 × 256 tile)
+- $\bar x$ — the pooled field at 2 km (128 × 128); a factor 4 pools 4 × 4 blocks
+
+**Linear z-score.** Brightness temperatures and reflectivity, centred and scaled with the training-split statistics.
+
+$$\tilde x = \frac{x - \mu}{\sigma}$$
+
+- $x$ — the raw value; NaN and values above the missing sentinel are replaced by the variable's fill value first
+- $\mu$, $\sigma$ — mean and standard deviation over the training split, from `normalization_stats_<source>[_<period>].json`
+
+**Log z-score.** Rain rate, lightning density and current: heavy-tailed and zero-inflated, so they are clipped, logged, then z-scored; the statistics are computed in log space.
+
+$$\tilde x = \frac{\log_{10}\max(x, c) - \mu}{\sigma}, \qquad x = 10^{\,\tilde x\sigma + \mu}$$
+
+- $c$ — the clip floor, equal to the fill value: 0.01 mm/h for rain rate, $10^{-4}$ for density, $10^{-8}$ for current
+- $\mu$, $\sigma$ — mean and standard deviation of $\log_{10}\max(x,c)$ over the training split
+- the second form inverts a SepConv prediction back to mm/h (`logz_to_mmh`); thresholds are never applied in z-space
+
+**Rain-rate classes.** The 5-class label of the rainfall track; the SepConv output is binned at the same edges after inversion.
+
+$$k(R) = \sum_{e \in \{10,\,20,\,30,\,40\}} \mathbf{1}[R \ge e]$$
+
+- $R$ — rain rate in mm/h (NaN → 0)
+- $k$ — the class: 0 for $R \lt 10$, 1 for 10–20, 2 for 20–30, 3 for 30–40, 4 for $R \ge 40$; the label is its one-hot vector
+- in z-space the edges become $e_z = (\log_{10} e - \mu)/\sigma$ (`mmh_to_logz`), which is how the SepConv loss reads the class of a target
+
+**Class fractions.** The priors every class weight is derived from.
+
+$$f_k = \frac{N_k}{N}$$
+
+- $N_k$ — pixels of class $k$ over the patches of the training scope (the scope CSV of the split)
+- $N$ — all pixels of that scope
+- $f$ — for lightning, the fraction of occurrence pixels ($f \approx 2.0 \times 10^{-4}$ for `dbscan_f34`)
+
+### Training losses
+
+**Weighted focal binary cross-entropy** (`WeightedFocalLoss`). The base lightning loss and the hard term of the distillation: the focal factor down-weights the easy pixels, the class weights balance the two classes.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_{y_i}\,(1 - p_{t,i})^{\gamma}\,\big(-\log p_{t,i}\big)$$
+
+- $p_{t,i}$ — the probability of the true class: $p_i$ if $y_i = 1$, $1 - p_i$ otherwise; $p_i$ clipped to $[10^{-7}, 1 - 10^{-7}]$
+- $\gamma = 2$ — focusing parameter
+- $\alpha_1 = 1/(2f)$ — weight of the lightning-present pixels
+- $\alpha_0 = 1/(2(1-f))$ — weight of the clear-sky pixels
+- $f$ — the occurrence fraction above
+
+**Weighted focal categorical cross-entropy** (`WeightedFocalCategoricalCrossentropy`, `[radar_loss]`). The base rainfall loss and the forecast term of both rain fine-tune heads.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_i\,(1 - p_{t,i})^{\gamma}\Big(-\sum_{k=0}^{K-1} \tilde y_{i,k}\log p_{i,k}\Big)$$
+
+- $\tilde y_{i,k} = (1-\varepsilon)\,y_{i,k} + \varepsilon/K$ — the label after smoothing; $\varepsilon$ = `label_smoothing`, $K = 5$
+- $p_{t,i} = \sum_k \tilde y_{i,k}\,p_{i,k}$ — probability of the true class
+- $\alpha_i = \sum_k \tilde y_{i,k}\,\alpha_k$ — the class weight of the pixel
+- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\operatorname{median}(f)/f_k$; `none`: 1; capped at `alpha_max`
+- $\gamma$ — focal exponent (`gamma`); 0 for the forecast term of the cVAE
+- with `weighting = none` and `gamma = 0` the loss is the plain cross-entropy with label smoothing
+
+**Weighted MSE in log z-space** (`WeightedMSELogZ`, SepConv-ens). Plain MSE is minimised by predicting the dry point mass everywhere; the weight of a pixel follows the class of its target.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} w_{k(y_i)}\,(y_i - \hat y_i)^2, \qquad w_k = \min\Big(\frac{f_0}{f_k},\,1000\Big)$$
+
+- $y_i$, $\hat y_i$ — target and prediction in log z-space
+- $k(y_i)$ — the class of the target, from the edges mapped into z-space
+- $w_k$ — inverse frequency relative to class 0, capped at 1000 (`SEPCONV_WEIGHT_CAP`)
+
+**Cosine schedule with warm-up** (`cosine_warmup_schedule`). The learning rate of the base models, the distilled student and the fine-tune heads, each stage with its own section of `training.config`.
+
+$$\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e \lt E_w \\[8pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}$$
+
+- $e$ — the epoch index, from 0
+- $\eta_0$, $\eta_{\min}$ — `initial_lr`, `min_lr`
+- $E_w$, $E$ — `warmup_epochs` and the total number of epochs; the ramp reaches $\eta_0$ at the start of epoch $E_w$
+
+### The fine-tune head
+
+**Residual correction.** The head corrects the logits of the frozen backbone; the heads start at zero and $s_l = 1$, so step 0 is the frozen model.
+
+$$\ell_l = s_l\,L_{b,l} + h_l(x)$$
+
+- $L_{b,l}$ — the backbone logits at lead $l$
+- $s_l$ — a trained scalar per lead (`lb_scale`)
+- $h_l(x)$ — the correction of the Swin-UNet at lead $l$; the monitor `corr_ratio` is $\lVert h_l(x)\rVert / \lVert L_{b,l}\rVert$
+
+**Positive-weighted BCE** (`PosWeightedBCE`, lightning head).
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} -\Big(w_+\,y_i \log p_i + (1 - y_i)\log(1 - p_i)\Big), \qquad w_+ = \min\Big(\frac{1-f}{f},\,30\Big)$$
+
+- $w_+$ — the positive-class weight: the negative-to-positive ratio, capped at `pos_weight_cap`
+- with `lightning_gamma` $\gt 0$ every term is multiplied by $(1 - p_{t,i})^{\gamma}$, the fallback when false alarms dominate
+
+**Rain forecast term.** Both rain heads: the weighted focal CE per lead plus an expected-class distance that pushes probability mass toward the neighbouring bins.
+
+$$\mathcal{L}_{\text{fc}} = \sum_{l} \lambda_l\Big[\mathcal{L}_{\text{CE}}(y_l, p_l) + \lambda_c\,\frac{1}{N}\sum_{i=1}^{N}\Big|\sum_{k} k\,p_{i,l,k} - \sum_{k} k\,y_{i,l,k}\Big|\Big]$$
+
+- $\mathcal{L}_{\text{CE}}$ — the weighted focal categorical cross-entropy above ($\gamma = 0$ for the cVAE)
+- $\sum_k k\,p_{i,l,k}$ — the expected class of pixel $i$ at lead $l$; the second sum is its true class
+- $\lambda_c$ — `expected_class_weight` (0.2)
+- $\lambda_l$ — `lead_weights` (1 for every lead)
+
+**Conditional VAE** (`swin_unet_cvae`). A latent modulates the level-2 features through a gated FiLM; the objective is the forecast term plus the weighted KL divergence of the posterior from the prior, with free bits and a warm-up.
+
+$$c \leftarrow c + \sigma\big(g(c)\big)\odot\big(\gamma(z)\odot c + \beta(z)\big), \qquad z = \mu + e^{s}\odot\epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+$$\mathrm{KL}_d = \frac{1}{B}\sum_{b=1}^{B}\frac{1}{2}\Big(\frac{\sigma_q^2}{\sigma_p^2} + \frac{(\mu_q - \mu_p)^2}{\sigma_p^2} - 1 - \log\frac{\sigma_q^2}{\sigma_p^2}\Big)_{b,d}$$
+
+$$\mathcal{L} = \mathcal{L}_{\text{fc}} + \beta_t\,\frac{1}{D}\sum_{d=1}^{D}\max(\mathrm{KL}_d,\,\kappa), \qquad \beta_t = \beta\,\min\Big(1,\,\frac{e+1}{E_\beta}\Big)$$
+
+- $c$ — the level-2 features; $g$, $\gamma$, $\beta$ — 1 × 1 convolutions, $\gamma$ and $\beta$ zero-initialised, the gate bias at −2 (the gate mostly closed at start)
+- $z$ — the $16^2 \times 32$ latent, upsampled to the grid of $c$; $\mu$, $s$ — mean and log standard deviation of the prior $p(z \mid c)$ at inference and of the posterior $q(z \mid c, y)$ in training; member $k$ fixes the seed of $\epsilon$, member −1 uses $\mu$
+- $\mathrm{KL}_d$ — the divergence of $q$ from $p$ per latent dimension $d$, averaged over the batch $B$; `active_units` counts the $d$ with $\mathrm{KL}_d \gt 0.02$
+- $\kappa$ — `free_bits` (0.2 nats): dimensions below it are not pushed further toward the prior
+- $\beta$, $E_\beta$ — `beta`, `beta_warmup_epochs`: $\beta_t$ grows linearly to $\beta$, then stays
+
+### Knowledge distillation (lightning track)
+
+**Distillation loss** (`kd_loss`). The student matches the teacher's softened probabilities and the ground truth at once.
+
+$$\tilde p = \sigma\Big(\frac{\operatorname{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
+
+$$\mathcal{L}_{\text{soft}} = T^2\,\frac{\sum_i w_i\,\mathrm{KL}_i}{\sum_i w_i}, \qquad \mathcal{L} = \alpha\,\mathcal{L}_{\text{soft}} + (1 - \alpha)\,\mathcal{L}_{\text{hard}}$$
+
+- $t_i$, $s_i$ — teacher and student probabilities; $\tilde t_i$, $\tilde s_i$ — their softened forms, with $\operatorname{logit}(p) = \log p - \log(1-p)$
+- $T$ — the temperature (`--kd_temperature`, 2); $T^2$ restores the gradient scale
+- $\mathrm{KL}_i$ — the divergence of the teacher's softened distribution from the student's, zero for a perfect student
+- $w_i = t_i + w_0$ — teacher weighting with the floor $w_0$ (`--kd_weight_floor`, 0.01); `--kd_soft_weight none` sets $w_i = 1$, the Hinton form
+- $\mathcal{L}_{\text{hard}}$ — the weighted focal BCE on the ground truth; $\alpha$ — `--kd_alpha` (0.7)
+
+### Inference and post-processing
+
+**Hann blending** (`paste_predictions_hann_blended`). Overlapping patch predictions are averaged with a window that fades toward the patch edges, which removes the tiling seams.
+
+$$w_{a,b} = h_a\,h_b, \qquad h_a = \frac{1}{2}\Big(1 - \cos\frac{2\pi(a+1)}{P+1}\Big), \qquad \hat p(u,v) = \frac{\sum_j w_j(u,v)\,p_j(u,v)}{\sum_j w_j(u,v)}$$
+
+- $P$ — the patch size (256); $a, b$ — the row and column inside the patch, from 0; the two exact zeros of the Hann window are dropped so every pixel keeps a non-zero weight
+- $p_j$, $w_j$ — the prediction and the window of patch $j$ pasted at its position; the sums run over the patches covering the pixel $(u, v)$; stride 128 gives 50 % overlap
+
+**Hysteresis** (`hysteresis_binary`). Two thresholds: a pixel is kept when it passes LOW and its connected component holds a pixel passing HIGH, which keeps weak but anchored cells and rejects isolated noise.
+
+$$M = \{\,i : p_i \ge \tau_{\text{lo}}\,\}, \qquad \hat y_i = \mathbf{1}\Big[\,i \in C \subseteq M \ \text{ with } \ \max_{j \in C} p_j \ge \tau_{\text{hi}}\,\Big]$$
+
+- $p_i$ — the score of pixel $i$: the blended probability for lightning; for rainfall $p_{i,k^*}\,\mathbf{1}[k^* \gt 0]$ with $k^* = \arg\max_k p_{i,k}$, so only pixels whose argmax is a rainy class are candidates
+- $C$ — an 8-connected component of $M$; $\tau_{\text{lo}}$, $\tau_{\text{hi}}$ — LOW and HIGH per lead, tuned on the validation split by pooled CSI (`summary.json → post_processing`)
+- kept rainfall pixels keep their class $k^*$; rejected pixels become class 0

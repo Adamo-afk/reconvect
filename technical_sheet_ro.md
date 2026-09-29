@@ -735,3 +735,159 @@ python compress_datasets.py --move TAG --to ROOT      # mută un set de date com
 3. Sumarul de acoperire înaintea completării din Data Store — completarea solicită exact ciclurile enumerate în fișierul JSON al pașilor de timp lipsă.
 4. Sumarul de acoperire înaintea ștergerii datelor brute — odată eliminate, `--scan raw` nu mai poate descrie arhiva, rămânând valide doar perspectivele `npy` și `reprojected`.
 5. Decuparea patch-urilor înaintea construirii seturilor de date, precum și re-decuparea ori de câte ori `patch_index.csv` este reconstruit — un fișier de patch consemnează plăcile după poziție, astfel încât o listă de activitate modificată deplasează în mod silențios placa aflată pe fiecare poziție.
+
+---
+
+## 13. Formule
+
+Formulele pe care le execută fluxul de prelucrare, în ordinea în care datele le întâlnesc. Scorurile (CSI, FSS, Brier, …) sunt enumerate în referința rezultatelor din `README.md`. $f$ și $f_k$ sunt fracțiile claselor din perimetrul de antrenare, citite din `lightning_fraction_<source>[_<period>].json` și `opera_rainfall_fraction_<source>[_<period>].json`.
+
+### Intrări și etichete
+
+**Agregarea la nivelul MR.** Un produs la 2 km este media pe blocuri a câmpului de 1 km, niciodată o supraeșantionare (`extract_patches.average_pool`).
+
+$$\bar x_{i,j} = \frac{1}{4}\sum_{a=0}^{1}\sum_{b=0}^{1} x_{2i+a,\;2j+b}$$
+
+- $x$ — câmpul pe grila de 1 km (o placă de 256 × 256)
+- $\bar x$ — câmpul agregat la 2 km (128 × 128); un factor 4 agregă blocuri de 4 × 4
+
+**Scorul z liniar.** Temperaturile de strălucire și reflectivitatea, centrate și scalate cu statisticile setului de antrenare.
+
+$$\tilde x = \frac{x - \mu}{\sigma}$$
+
+- $x$ — valoarea brută; valorile NaN și cele peste sentinela de lipsă sunt înlocuite mai întâi cu valoarea de umplere a variabilei
+- $\mu$, $\sigma$ — media și abaterea standard pe setul de antrenare, din `normalization_stats_<source>[_<period>].json`
+
+**Scorul z logaritmic.** Rata de precipitații, densitatea și curentul descărcărilor electrice: distribuții cu coadă grea și exces de zerouri, deci sunt plafonate inferior, logaritmate și abia apoi standardizate; statisticile se calculează în spațiul logaritmic.
+
+$$\tilde x = \frac{\log_{10}\max(x, c) - \mu}{\sigma}, \qquad x = 10^{\,\tilde x\sigma + \mu}$$
+
+- $c$ — pragul inferior de plafonare, egal cu valoarea de umplere: 0,01 mm/h pentru rata de precipitații, $10^{-4}$ pentru densitate, $10^{-8}$ pentru curent
+- $\mu$, $\sigma$ — media și abaterea standard ale $\log_{10}\max(x,c)$ pe setul de antrenare
+- a doua formă readuce o predicție SepConv în mm/h (`logz_to_mmh`); pragurile nu se aplică niciodată în spațiul z
+
+**Clasele ratei de precipitații.** Eticheta cu 5 clase a categoriei de precipitații; ieșirea SepConv este discretizată la aceleași limite după inversare.
+
+$$k(R) = \sum_{e \in \{10,\,20,\,30,\,40\}} \mathbf{1}[R \ge e]$$
+
+- $R$ — rata de precipitații în mm/h (NaN → 0)
+- $k$ — clasa: 0 pentru $R \lt 10$, 1 pentru 10–20, 2 pentru 20–30, 3 pentru 30–40, 4 pentru $R \ge 40$; eticheta este vectorul său one-hot
+- în spațiul z limitele devin $e_z = (\log_{10} e - \mu)/\sigma$ (`mmh_to_logz`), forma în care funcția de cost SepConv citește clasa unei ținte
+
+**Fracțiile claselor.** Distribuțiile a priori din care derivă toate ponderile de clasă.
+
+$$f_k = \frac{N_k}{N}$$
+
+- $N_k$ — pixelii din clasa $k$ pe patch-urile perimetrului de antrenare (fișierul CSV de perimetru al setului)
+- $N$ — toți pixelii acelui perimetru
+- $f$ — pentru descărcările electrice, fracția pixelilor cu apariție ($f \approx 2{,}0 \times 10^{-4}$ pentru `dbscan_f34`)
+
+### Funcțiile de cost la antrenare
+
+**Entropia încrucișată binară focală ponderată** (`WeightedFocalLoss`). Funcția de cost a modelului de bază pentru descărcări electrice și termenul dur al transferului de cunoștințe: factorul focal reduce ponderea pixelilor ușor de clasificat, iar ponderile de clasă echilibrează cele două clase.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_{y_i}\,(1 - p_{t,i})^{\gamma}\,\big(-\log p_{t,i}\big)$$
+
+- $p_{t,i}$ — probabilitatea clasei corecte: $p_i$ dacă $y_i = 1$, altfel $1 - p_i$; $p_i$ plafonat la $[10^{-7}, 1 - 10^{-7}]$
+- $\gamma = 2$ — parametrul de focalizare
+- $\alpha_1 = 1/(2f)$ — ponderea pixelilor cu descărcări electrice
+- $\alpha_0 = 1/(2(1-f))$ — ponderea pixelilor fără descărcări
+- $f$ — fracția de apariție de mai sus
+
+**Entropia încrucișată categorială focală ponderată** (`WeightedFocalCategoricalCrossentropy`, `[radar_loss]`). Funcția de cost a modelului de bază pentru precipitații și termenul de prognoză al ambelor capete de finetune pentru precipitații.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} \alpha_i\,(1 - p_{t,i})^{\gamma}\Big(-\sum_{k=0}^{K-1} \tilde y_{i,k}\log p_{i,k}\Big)$$
+
+- $\tilde y_{i,k} = (1-\varepsilon)\,y_{i,k} + \varepsilon/K$ — eticheta după netezire; $\varepsilon$ = `label_smoothing`, $K = 5$
+- $p_{t,i} = \sum_k \tilde y_{i,k}\,p_{i,k}$ — probabilitatea clasei corecte
+- $\alpha_i = \sum_k \tilde y_{i,k}\,\alpha_k$ — ponderea de clasă a pixelului
+- $\alpha_k$ — `inverse`: $1/(K f_k)$; `median`: $\operatorname{median}(f)/f_k$; `none`: 1; plafonată la `alpha_max`
+- $\gamma$ — exponentul focal (`gamma`); 0 pentru termenul de prognoză al cVAE
+- cu `weighting = none` și `gamma = 0` funcția de cost devine entropia încrucișată simplă cu netezirea etichetelor
+
+**MSE ponderat în spațiul log-z** (`WeightedMSELogZ`, SepConv-ens). MSE simplu este minimizat prezicând peste tot masa punctuală a pixelilor fără precipitații; ponderea unui pixel urmează clasa țintei sale.
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} w_{k(y_i)}\,(y_i - \hat y_i)^2, \qquad w_k = \min\Big(\frac{f_0}{f_k},\,1000\Big)$$
+
+- $y_i$, $\hat y_i$ — ținta și predicția în spațiul log-z
+- $k(y_i)$ — clasa țintei, după limitele transpuse în spațiul z
+- $w_k$ — inversul frecvenței raportat la clasa 0, plafonat la 1000 (`SEPCONV_WEIGHT_CAP`)
+
+**Programul cosinus cu încălzire** (`cosine_warmup_schedule`). Rata de învățare a modelelor de bază, a modelului-student și a capetelor de finetune, fiecare etapă cu propria secțiune din `training.config`.
+
+$$\eta(e) = \begin{cases} \eta_{\min} + (\eta_0 - \eta_{\min})\,\dfrac{e + 1}{E_w} & e \lt E_w \\[8pt] \eta_{\min} + \dfrac{\eta_0 - \eta_{\min}}{2}\Big(1 + \cos \pi\,\dfrac{e - E_w}{E - E_w}\Big) & e \ge E_w \end{cases}$$
+
+- $e$ — indicele epocii, de la 0
+- $\eta_0$, $\eta_{\min}$ — `initial_lr`, `min_lr`
+- $E_w$, $E$ — `warmup_epochs` și numărul total de epoci; rampa atinge $\eta_0$ la începutul epocii $E_w$
+
+### Capul de finetune
+
+**Corecția reziduală.** Capul corectează logiții modelului de bază înghețat; capetele pornesc de la zero și $s_l = 1$, astfel încât pasul 0 este chiar modelul înghețat.
+
+$$\ell_l = s_l\,L_{b,l} + h_l(x)$$
+
+- $L_{b,l}$ — logiții modelului de bază la anticipația $l$
+- $s_l$ — un scalar antrenat per anticipație (`lb_scale`)
+- $h_l(x)$ — corecția rețelei Swin-UNet la anticipația $l$; indicatorul `corr_ratio` este $\lVert h_l(x)\rVert / \lVert L_{b,l}\rVert$
+
+**BCE cu pondere pozitivă** (`PosWeightedBCE`, capul pentru descărcări electrice).
+
+$$\mathcal{L} = \frac{1}{N}\sum_{i=1}^{N} -\Big(w_+\,y_i \log p_i + (1 - y_i)\log(1 - p_i)\Big), \qquad w_+ = \min\Big(\frac{1-f}{f},\,30\Big)$$
+
+- $w_+$ — ponderea clasei pozitive: raportul negative/pozitive, plafonat la `pos_weight_cap`
+- cu `lightning_gamma` $\gt 0$ fiecare termen este înmulțit cu $(1 - p_{t,i})^{\gamma}$, soluția de rezervă atunci când predomină alarmele false
+
+**Termenul de prognoză pentru precipitații.** Ambele capete pentru precipitații: entropia încrucișată focală ponderată per anticipație plus o distanță a clasei așteptate, care împinge masa de probabilitate spre clasele vecine.
+
+$$\mathcal{L}_{\text{fc}} = \sum_{l} \lambda_l\Big[\mathcal{L}_{\text{CE}}(y_l, p_l) + \lambda_c\,\frac{1}{N}\sum_{i=1}^{N}\Big|\sum_{k} k\,p_{i,l,k} - \sum_{k} k\,y_{i,l,k}\Big|\Big]$$
+
+- $\mathcal{L}_{\text{CE}}$ — entropia încrucișată categorială focală ponderată de mai sus ($\gamma = 0$ pentru cVAE)
+- $\sum_k k\,p_{i,l,k}$ — clasa așteptată a pixelului $i$ la anticipația $l$; a doua sumă este clasa sa reală
+- $\lambda_c$ — `expected_class_weight` (0,2)
+- $\lambda_l$ — `lead_weights` (1 pentru fiecare anticipație)
+
+**VAE condițional** (`swin_unet_cvae`). O variabilă latentă modulează trăsăturile nivelului 2 printr-un FiLM cu poartă; obiectivul este termenul de prognoză plus divergența KL ponderată a distribuției a posteriori față de cea a priori, cu biți liberi și o perioadă de încălzire.
+
+$$c \leftarrow c + \sigma\big(g(c)\big)\odot\big(\gamma(z)\odot c + \beta(z)\big), \qquad z = \mu + e^{s}\odot\epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+
+$$\mathrm{KL}_d = \frac{1}{B}\sum_{b=1}^{B}\frac{1}{2}\Big(\frac{\sigma_q^2}{\sigma_p^2} + \frac{(\mu_q - \mu_p)^2}{\sigma_p^2} - 1 - \log\frac{\sigma_q^2}{\sigma_p^2}\Big)_{b,d}$$
+
+$$\mathcal{L} = \mathcal{L}_{\text{fc}} + \beta_t\,\frac{1}{D}\sum_{d=1}^{D}\max(\mathrm{KL}_d,\,\kappa), \qquad \beta_t = \beta\,\min\Big(1,\,\frac{e+1}{E_\beta}\Big)$$
+
+- $c$ — trăsăturile nivelului 2; $g$, $\gamma$, $\beta$ — convoluții 1 × 1, $\gamma$ și $\beta$ inițializate la zero, deplasarea porții la −2 (poarta aproape închisă la început)
+- $z$ — variabila latentă de $16^2 \times 32$, supraeșantionată la grila lui $c$; $\mu$, $s$ — media și logaritmul abaterii standard ale distribuției a priori $p(z \mid c)$ la inferență și ale celei a posteriori $q(z \mid c, y)$ la antrenare; membrul $k$ fixează sămânța lui $\epsilon$, membrul −1 folosește $\mu$
+- $\mathrm{KL}_d$ — divergența lui $q$ față de $p$ pe fiecare dimensiune latentă $d$, mediată pe lotul $B$; `active_units` numără dimensiunile $d$ cu $\mathrm{KL}_d \gt 0{,}02$
+- $\kappa$ — `free_bits` (0,2 nats): dimensiunile aflate sub acest nivel nu mai sunt împinse spre distribuția a priori
+- $\beta$, $E_\beta$ — `beta`, `beta_warmup_epochs`: $\beta_t$ crește liniar până la $\beta$, apoi rămâne constant
+
+### Transferul de cunoștințe (categoria descărcărilor electrice)
+
+**Funcția de cost a transferului** (`kd_loss`). Modelul-student reproduce simultan probabilitățile atenuate ale modelului-profesor și adevărul de referință.
+
+$$\tilde p = \sigma\Big(\frac{\operatorname{logit}(p)}{T}\Big), \qquad \mathrm{KL}_i = \tilde t_i \log\frac{\tilde t_i}{\tilde s_i} + (1 - \tilde t_i)\log\frac{1 - \tilde t_i}{1 - \tilde s_i}$$
+
+$$\mathcal{L}_{\text{soft}} = T^2\,\frac{\sum_i w_i\,\mathrm{KL}_i}{\sum_i w_i}, \qquad \mathcal{L} = \alpha\,\mathcal{L}_{\text{soft}} + (1 - \alpha)\,\mathcal{L}_{\text{hard}}$$
+
+- $t_i$, $s_i$ — probabilitățile modelului-profesor și ale modelului-student; $\tilde t_i$, $\tilde s_i$ — formele lor atenuate, cu $\operatorname{logit}(p) = \log p - \log(1-p)$
+- $T$ — temperatura (`--kd_temperature`, 2); $T^2$ restabilește scara gradientului
+- $\mathrm{KL}_i$ — divergența distribuției atenuate a profesorului față de cea a studentului, zero pentru un student perfect
+- $w_i = t_i + w_0$ — ponderarea după profesor, cu pragul minim $w_0$ (`--kd_weight_floor`, 0,01); `--kd_soft_weight none` impune $w_i = 1$, forma Hinton
+- $\mathcal{L}_{\text{hard}}$ — entropia încrucișată binară focală ponderată față de adevărul de referință; $\alpha$ — `--kd_alpha` (0,7)
+
+### Inferență și post-procesare
+
+**Ponderarea Hann** (`paste_predictions_hann_blended`). Predicțiile patch-urilor suprapuse sunt mediate cu o fereastră care se atenuează spre marginile patch-ului, ceea ce elimină cusăturile mozaicului.
+
+$$w_{a,b} = h_a\,h_b, \qquad h_a = \frac{1}{2}\Big(1 - \cos\frac{2\pi(a+1)}{P+1}\Big), \qquad \hat p(u,v) = \frac{\sum_j w_j(u,v)\,p_j(u,v)}{\sum_j w_j(u,v)}$$
+
+- $P$ — dimensiunea patch-ului (256); $a, b$ — rândul și coloana în interiorul patch-ului, de la 0; cele două zerouri exacte ale ferestrei Hann sunt eliminate, astfel încât fiecare pixel păstrează o pondere nenulă
+- $p_j$, $w_j$ — predicția și fereastra patch-ului $j$ așezate la poziția sa; sumele parcurg patch-urile care acoperă pixelul $(u, v)$; pasul de 128 dă o suprapunere de 50 %
+
+**Histerezisul** (`hysteresis_binary`). Două praguri: un pixel este păstrat dacă depășește pragul LOW și componenta sa conexă conține un pixel care depășește pragul HIGH, ceea ce păstrează celulele slabe dar ancorate și respinge zgomotul izolat.
+
+$$M = \{\,i : p_i \ge \tau_{\text{lo}}\,\}, \qquad \hat y_i = \mathbf{1}\Big[\,i \in C \subseteq M \ \text{ cu } \ \max_{j \in C} p_j \ge \tau_{\text{hi}}\,\Big]$$
+
+- $p_i$ — scorul pixelului $i$: probabilitatea ponderată Hann pentru descărcări electrice; pentru precipitații $p_{i,k^*}\,\mathbf{1}[k^* \gt 0]$ cu $k^* = \arg\max_k p_{i,k}$, deci doar pixelii al căror argmax este o clasă cu precipitații sunt candidați
+- $C$ — o componentă 8-conexă a lui $M$; $\tau_{\text{lo}}$, $\tau_{\text{hi}}$ — LOW și HIGH per anticipație, calibrate pe setul de validare după CSI-ul cumulat (`summary.json → post_processing`)
+- pixelii de precipitații păstrați își rețin clasa $k^*$; cei respinși devin clasa 0
